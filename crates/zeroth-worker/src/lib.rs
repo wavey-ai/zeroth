@@ -4395,7 +4395,22 @@ async fn upsert_provider_profile(
     };
 
     upsert_identity_from_profile(db, &user_id, profile, raw_profile_json, now).await?;
+    let identity_user_id = get_identity_user_id(db, profile).await?;
+    validate_provider_identity_attached_to_user(identity_user_id.as_deref(), &user_id)
+        .map_err(worker_error)?;
     Ok(user_id)
+}
+
+#[cfg(any(test, target_arch = "wasm32"))]
+fn validate_provider_identity_attached_to_user(
+    actual_user_id: Option<&str>,
+    expected_user_id: &str,
+) -> Result<(), String> {
+    match actual_user_id {
+        Some(actual_user_id) if actual_user_id == expected_user_id => Ok(()),
+        Some(_) => Err("provider identity is already linked to another user".to_owned()),
+        None => Err("provider identity could not be linked to the user".to_owned()),
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -10259,6 +10274,18 @@ mod tests {
             error.description,
             "email domain is not allowed for this client"
         );
+    }
+
+    #[test]
+    fn provider_identity_attachment_validation_rejects_missing_or_conflicting_identity() {
+        validate_provider_identity_attached_to_user(Some("usr_123"), "usr_123").unwrap();
+
+        let error = validate_provider_identity_attached_to_user(None, "usr_123").unwrap_err();
+        assert_eq!(error, "provider identity could not be linked to the user");
+
+        let error =
+            validate_provider_identity_attached_to_user(Some("usr_other"), "usr_123").unwrap_err();
+        assert_eq!(error, "provider identity is already linked to another user");
     }
 
     #[test]
