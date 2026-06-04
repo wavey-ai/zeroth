@@ -25,7 +25,9 @@ use zeroth_oidc::authorization_request_redirect_uri_registered_for_client;
 use zeroth_oidc::parse_authorization_request;
 #[cfg(any(test, target_arch = "wasm32"))]
 use zeroth_oidc::validate_authorization_request_for_client;
-use zeroth_oidc::{AuthorizationPrompt, AuthorizationRequest, AuthorizationRequestError};
+#[cfg(any(test, target_arch = "wasm32"))]
+use zeroth_oidc::AuthorizationPrompt;
+use zeroth_oidc::{AuthorizationRequest, AuthorizationRequestError};
 use zeroth_providers::well_known;
 #[cfg(any(test, target_arch = "wasm32"))]
 use zeroth_providers::TokenAuth;
@@ -65,6 +67,7 @@ const CLIENT_ID_MAX_CHARS: usize = 128;
 const CLIENT_NAME_MAX_CHARS: usize = 128;
 const CLIENT_URI_MAX_BYTES: usize = 2048;
 const CLIENT_URI_LIST_LIMIT: usize = 32;
+const CLIENT_EMAIL_DOMAIN_MAX_BYTES: usize = 253;
 const USER_LIST_LIMIT: i32 = 100;
 const USER_MANAGEMENT_BODY_LIMIT: usize = 1024;
 const USER_ID_MAX_CHARS: usize = 128;
@@ -335,6 +338,8 @@ struct ClientRow {
     #[serde(default)]
     allowed_origins_json: String,
     #[serde(default)]
+    allowed_email_domains_json: String,
+    #[serde(default)]
     confidential: i32,
     #[serde(default)]
     disabled_at: Option<i32>,
@@ -353,6 +358,7 @@ struct ClientResponse {
     name: String,
     redirect_uris: Vec<String>,
     allowed_origins: Vec<String>,
+    allowed_email_domains: Vec<String>,
     confidential: bool,
     disabled: bool,
     has_secret: bool,
@@ -422,6 +428,8 @@ struct ClientUpsertRequest {
     redirect_uris: Vec<String>,
     #[serde(default, alias = "allowed_origins")]
     allowed_origins: Vec<String>,
+    #[serde(default, alias = "allowed_email_domains")]
+    allowed_email_domains: Vec<String>,
     #[serde(default)]
     confidential: bool,
     #[serde(default, alias = "client_secret")]
@@ -438,6 +446,7 @@ struct ValidatedClientUpsert {
     name: String,
     redirect_uris: Vec<String>,
     allowed_origins: Vec<String>,
+    allowed_email_domains: Vec<String>,
     confidential: bool,
     secret_hash: Option<String>,
     disabled: bool,
@@ -570,6 +579,8 @@ struct AuthTransactionRow {
     #[serde(default)]
     nonce: Option<String>,
     #[serde(default)]
+    provider_nonce: Option<String>,
+    #[serde(default)]
     code_challenge: Option<String>,
     #[serde(default)]
     code_challenge_method: Option<String>,
@@ -597,6 +608,7 @@ struct ProviderCallback {
     state: String,
     code: Option<String>,
     provider_error: Option<ProviderCallbackError>,
+    apple_user_json: Option<String>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -642,6 +654,22 @@ struct SpotifyApiProfile {
 struct SpotifyApiImage {
     #[serde(default)]
     url: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
+struct AppleCallbackUser {
+    #[serde(default)]
+    name: Option<AppleCallbackUserName>,
+    #[serde(default)]
+    email: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
+struct AppleCallbackUserName {
+    #[serde(default, rename = "firstName")]
+    first_name: Option<String>,
+    #[serde(default, rename = "lastName")]
+    last_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -1178,6 +1206,7 @@ async fn handle_request(request: Request, env: Env) -> worker::Result<Response> 
 
     match (request.method(), url.path()) {
         (Method::Options, path) if cors_path(path) => cors_preflight(request, env).await,
+        (Method::Get, "/") => redirect_to_path(&url, "/admin"),
         (Method::Get, "/health") => json(&HealthResponse {
             ok: true,
             service: "zeroth",
@@ -1353,7 +1382,8 @@ async fn provider_callback(mut request: Request, env: Env) -> worker::Result<Res
         }
     };
     let resolved_profile =
-        match resolve_provider_profile(&provider, &token_set, &record.transaction).await {
+        match resolve_provider_profile(&provider, &token_set, &record.transaction, &callback).await
+        {
             Ok(profile) => profile,
             Err(error) => {
                 record_audit_event(
@@ -1428,6 +1458,55 @@ async fn provider_callback(mut request: Request, env: Env) -> worker::Result<Res
         );
     }
 
+    let Some(client) = get_client(&db, &record.transaction.client_id.0).await? else {
+        let error = ProviderCallbackError::invalid_request("client is disabled or not found");
+        record_audit_event(
+            &db,
+            &request,
+            "client.login.denied",
+            None,
+            Some(&record.transaction.client_id.0),
+            Some(&resolved_profile.profile.provider_id.0),
+            serde_json::json!({ "reason": "client_inactive" }),
+            now,
+        )
+        .await;
+        let response = redirect_to_provider_callback_error(
+            &record.transaction,
+            &config.issuer().issuer,
+            &error,
+        )?;
+        return with_set_cookie(
+            response,
+            &clear_transaction_cookie(&config.transaction_cookie_name),
+        );
+    };
+    if let Err(error) = validate_client_email_domain_policy(&client, &resolved_profile.profile) {
+        record_audit_event(
+            &db,
+            &request,
+            "client.login.denied",
+            None,
+            Some(&record.transaction.client_id.0),
+            Some(&resolved_profile.profile.provider_id.0),
+            serde_json::json!({
+                "reason": "email_domain_policy",
+                "emailVerified": resolved_profile.profile.email_verified
+            }),
+            now,
+        )
+        .await;
+        let response = redirect_to_provider_callback_error(
+            &record.transaction,
+            &config.issuer().issuer,
+            &error,
+        )?;
+        return with_set_cookie(
+            response,
+            &clear_transaction_cookie(&config.transaction_cookie_name),
+        );
+    }
+
     if record.transaction.session_return_to.is_some() {
         let user_id = upsert_provider_profile(
             &db,
@@ -1464,7 +1543,12 @@ async fn provider_callback(mut request: Request, env: Env) -> worker::Result<Res
         let response = redirect_to_session_login_return(&record.transaction)?;
         let response = with_set_cookie(
             response,
-            &session_cookie(&config.cookie_name, &session_id, SESSION_TTL_SECONDS),
+            &session_cookie(
+                &config.cookie_name,
+                &session_id,
+                SESSION_TTL_SECONDS,
+                config.cookie_domain.as_deref(),
+            ),
         )?;
         return with_set_cookie(
             response,
@@ -1520,7 +1604,12 @@ async fn provider_callback(mut request: Request, env: Env) -> worker::Result<Res
     let response = redirect_to_client(&record.transaction, &config.issuer().issuer, &zeroth_code)?;
     let response = with_set_cookie(
         response,
-        &session_cookie(&config.cookie_name, &session_id, SESSION_TTL_SECONDS),
+        &session_cookie(
+            &config.cookie_name,
+            &session_id,
+            SESSION_TTL_SECONDS,
+            config.cookie_domain.as_deref(),
+        ),
     )?;
     with_set_cookie(
         response,
@@ -2203,7 +2292,10 @@ async fn sessions(request: Request, env: Env) -> worker::Result<Response> {
 
             let response = json(&serde_json::json!({ "ok": true }))?;
             let response = if session_id == current.session.id {
-                with_set_cookie(response, &clear_session_cookie(&config.cookie_name))?
+                with_set_cookie(
+                    response,
+                    &clear_session_cookie(&config.cookie_name, config.cookie_domain.as_deref()),
+                )?
             } else {
                 response
             };
@@ -2402,12 +2494,14 @@ async fn identity_link(request: Request, env: Env) -> worker::Result<Response> {
     let provider = provider_from_env(&env, &provider_id)?;
     let provider_redirect_uri = config.issuer().provider_callback_endpoint();
     let provider_state = random_token()?;
+    let provider_nonce = random_token()?;
     let now = unix_timestamp_seconds();
     cleanup_expired_auth_transactions(&db, now).await?;
     let transaction = auth_transaction_from_link_request(
         &client,
         &provider_id,
         provider_state,
+        provider_nonce,
         provider_redirect_uri,
         return_to,
         query_param(&request_url, "state"),
@@ -2421,7 +2515,7 @@ async fn identity_link(request: Request, env: Env) -> worker::Result<Response> {
         .authorize_url(ProviderAuthorizeRequest {
             redirect_uri: &transaction.provider_redirect_uri,
             state: &transaction.provider_state,
-            nonce: None,
+            nonce: provider_authorize_nonce(&transaction),
             code_challenge: None,
             scopes: None,
         })
@@ -2550,11 +2644,17 @@ async fn logout(request: Request, env: Env) -> worker::Result<Response> {
 
     if let Some(target) = redirect_target {
         let response = Response::redirect(target)?;
-        return with_set_cookie(response, &clear_session_cookie(&config.cookie_name));
+        return with_set_cookie(
+            response,
+            &clear_session_cookie(&config.cookie_name, config.cookie_domain.as_deref()),
+        );
     }
 
     let response = json(&serde_json::json!({ "ok": true }))?;
-    let response = with_set_cookie(response, &clear_session_cookie(&config.cookie_name))?;
+    let response = with_set_cookie(
+        response,
+        &clear_session_cookie(&config.cookie_name, config.cookie_domain.as_deref()),
+    )?;
     with_cors_actual_headers(response, origin.as_deref())
 }
 
@@ -2685,12 +2785,14 @@ async fn hosted_session_login(request: Request, env: Env) -> worker::Result<Resp
     let provider = provider_from_env(&env, &provider_id)?;
     let provider_redirect_uri = config.issuer().provider_callback_endpoint();
     let provider_state = random_token()?;
+    let provider_nonce = random_token()?;
     let now = unix_timestamp_seconds();
     cleanup_expired_auth_transactions(&db, now).await?;
     let transaction = auth_transaction_from_session_login_request(
         &client,
         &provider_id,
         provider_state,
+        provider_nonce,
         provider_redirect_uri,
         return_to,
         query_param(&url, "state"),
@@ -2702,7 +2804,7 @@ async fn hosted_session_login(request: Request, env: Env) -> worker::Result<Resp
         .authorize_url(ProviderAuthorizeRequest {
             redirect_uri: &transaction.provider_redirect_uri,
             state: &transaction.provider_state,
-            nonce: None,
+            nonce: provider_authorize_nonce(&transaction),
             code_challenge: None,
             scopes: None,
         })
@@ -2936,12 +3038,14 @@ async fn authorize(request: Request, env: Env) -> worker::Result<Response> {
     let provider = provider_from_env(&env, &provider_id)?;
     let provider_redirect_uri = config.issuer().provider_callback_endpoint();
     let provider_state = random_token()?;
+    let provider_nonce = random_token()?;
     let now = unix_timestamp_seconds();
     cleanup_expired_auth_transactions(&db, now).await?;
     let transaction = auth_transaction_from_request(
         &authorization_request,
         &provider_id,
         provider_state,
+        provider_nonce,
         provider_redirect_uri,
         now,
     );
@@ -2951,7 +3055,7 @@ async fn authorize(request: Request, env: Env) -> worker::Result<Response> {
         .authorize_url(ProviderAuthorizeRequest {
             redirect_uri: &transaction.provider_redirect_uri,
             state: &transaction.provider_state,
-            nonce: transaction.nonce.as_deref(),
+            nonce: provider_authorize_nonce(&transaction),
             code_challenge: None,
             scopes: None,
         })
@@ -3425,6 +3529,7 @@ fn application_ui_from_client(client: &Client) -> ApplicationUi {
         public_client: !client.confidential,
         redirect_uris: client.redirect_uris.clone(),
         allowed_origins: client.allowed_origins.clone(),
+        allowed_email_domains: client.allowed_email_domains.clone(),
     }
 }
 
@@ -3436,6 +3541,7 @@ fn client_admin_ui_from_row(row: ClientRow) -> Result<ClientAdminUi, String> {
         confidential: response.confidential,
         redirect_uris: response.redirect_uris,
         allowed_origins: response.allowed_origins,
+        allowed_email_domains: response.allowed_email_domains,
         disabled: response.disabled,
         has_secret: response.has_secret,
     })
@@ -3454,6 +3560,15 @@ fn html(document: String) -> worker::Result<Response> {
 }
 
 #[cfg(target_arch = "wasm32")]
+fn redirect_to_path(request_url: &url::Url, path: &str) -> worker::Result<Response> {
+    let mut target = request_url.clone();
+    target.set_path(path);
+    target.set_query(None);
+    target.set_fragment(None);
+    Response::redirect(target)
+}
+
+#[cfg(target_arch = "wasm32")]
 async fn provider_callback_from_request(
     request: &mut Request,
     url: &url::Url,
@@ -3464,6 +3579,7 @@ async fn provider_callback_from_request(
             query_param(url, "state"),
             query_param(url, "error"),
             query_param(url, "error_description"),
+            None,
         ),
         Method::Post => {
             let form = request.form_data().await.map_err(|error| {
@@ -3476,6 +3592,7 @@ async fn provider_callback_from_request(
                 form.get_field("state"),
                 form.get_field("error"),
                 form.get_field("error_description"),
+                form.get_field("user"),
             )
         }
         _ => Err(ProviderCallbackError::invalid_request(
@@ -3489,6 +3606,7 @@ fn provider_callback_from_values(
     state: Option<String>,
     error: Option<String>,
     error_description: Option<String>,
+    apple_user_json: Option<String>,
 ) -> Result<ProviderCallback, ProviderCallbackError> {
     if let Some(error) = error {
         if error.is_empty() {
@@ -3506,6 +3624,7 @@ fn provider_callback_from_values(
                 description: error_description
                     .unwrap_or_else(|| "provider returned an authorization error".to_owned()),
             }),
+            apple_user_json: None,
         });
     }
 
@@ -3522,6 +3641,7 @@ fn provider_callback_from_values(
         state,
         code: Some(code),
         provider_error: None,
+        apple_user_json: apple_user_json.filter(|value| !value.trim().is_empty()),
     })
 }
 
@@ -3544,6 +3664,7 @@ async fn get_registered_client(
     let row = db
         .prepare(
             "SELECT id, name, secret_hash, redirect_uris_json, allowed_origins_json,
+                    allowed_email_domains_json,
                     confidential, disabled_at
              FROM zeroth_clients
              WHERE id = ?
@@ -3567,6 +3688,7 @@ async fn get_client_row_for_admin(
     let args = [worker::d1::D1Type::Text(client_id)];
     db.prepare(
         "SELECT id, name, secret_hash, redirect_uris_json, allowed_origins_json,
+                allowed_email_domains_json,
                 confidential, disabled_at
          FROM zeroth_clients
          WHERE id = ?
@@ -3582,6 +3704,7 @@ async fn list_client_rows_for_admin(db: &worker::d1::D1Database) -> worker::Resu
     let args = [worker::d1::D1Type::Integer(CLIENT_LIST_LIMIT)];
     db.prepare(
         "SELECT id, name, secret_hash, redirect_uris_json, allowed_origins_json,
+                allowed_email_domains_json,
                 confidential, disabled_at
          FROM zeroth_clients
          ORDER BY id
@@ -3605,6 +3728,12 @@ async fn upsert_client(
     let allowed_origins_json = serde_json::to_string(&client.allowed_origins).map_err(|error| {
         worker::Error::RustError(format!("could not serialize allowed origins: {error}"))
     })?;
+    let allowed_email_domains_json =
+        serde_json::to_string(&client.allowed_email_domains).map_err(|error| {
+            worker::Error::RustError(format!(
+                "could not serialize allowed email domains: {error}"
+            ))
+        })?;
     let secret_hash = d1_optional_text(client.secret_hash.as_deref());
     let disabled_at = if client.disabled {
         worker::d1::D1Type::Integer(now)
@@ -3619,6 +3748,7 @@ async fn upsert_client(
         worker::d1::D1Type::Integer(confidential),
         worker::d1::D1Type::Text(&redirect_uris_json),
         worker::d1::D1Type::Text(&allowed_origins_json),
+        worker::d1::D1Type::Text(&allowed_email_domains_json),
         worker::d1::D1Type::Integer(now),
         worker::d1::D1Type::Integer(now),
         disabled_at,
@@ -3627,8 +3757,9 @@ async fn upsert_client(
     db.prepare(
         "INSERT INTO zeroth_clients (
              id, name, secret_hash, confidential, redirect_uris_json,
-             allowed_origins_json, created_at, updated_at, disabled_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             allowed_origins_json, allowed_email_domains_json, created_at, updated_at,
+             disabled_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
              name = excluded.name,
              secret_hash = CASE
@@ -3639,6 +3770,7 @@ async fn upsert_client(
              confidential = excluded.confidential,
              redirect_uris_json = excluded.redirect_uris_json,
              allowed_origins_json = excluded.allowed_origins_json,
+             allowed_email_domains_json = excluded.allowed_email_domains_json,
              updated_at = excluded.updated_at,
              disabled_at = excluded.disabled_at",
     )
@@ -3711,7 +3843,7 @@ async fn get_auth_transaction(
     let row = db
         .prepare(
             "SELECT provider_state, client_id, provider_id, redirect_uri, provider_redirect_uri,
-                    app_state, nonce, code_challenge, code_challenge_method, scope,
+                    app_state, nonce, provider_nonce, code_challenge, code_challenge_method, scope,
                     link_user_id, link_session_id, session_return_to, created_at, expires_at,
                     consumed_at
              FROM zeroth_auth_transactions
@@ -4927,6 +5059,7 @@ async fn put_auth_transaction(
     let expires_at = system_time_to_d1_integer(transaction.expires_at)?;
     let app_state = d1_optional_text(transaction.app_state.as_deref());
     let nonce = d1_optional_text(transaction.nonce.as_deref());
+    let provider_nonce = d1_optional_text(transaction.provider_nonce.as_deref());
     let code_challenge = d1_optional_text(transaction.code_challenge.as_deref());
     let code_challenge_method = d1_optional_text(transaction.code_challenge_method.as_deref());
     let link_user_id = d1_optional_text(
@@ -4945,6 +5078,7 @@ async fn put_auth_transaction(
         worker::d1::D1Type::Text(&transaction.provider_redirect_uri),
         app_state,
         nonce,
+        provider_nonce,
         code_challenge,
         code_challenge_method,
         worker::d1::D1Type::Text(&scope),
@@ -4958,9 +5092,9 @@ async fn put_auth_transaction(
     db.prepare(
         "INSERT INTO zeroth_auth_transactions (
              provider_state, client_id, provider_id, redirect_uri, provider_redirect_uri,
-             app_state, nonce, code_challenge, code_challenge_method, scope, link_user_id,
+             app_state, nonce, provider_nonce, code_challenge, code_challenge_method, scope, link_user_id,
              link_session_id, session_return_to, created_at, expires_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind_refs(&args)?
     .run()
@@ -5246,6 +5380,7 @@ fn auth_transaction_from_request(
     request: &AuthorizationRequest,
     provider_id: &str,
     provider_state: String,
+    provider_nonce: String,
     provider_redirect_uri: String,
     created_at: i32,
 ) -> AuthTransaction {
@@ -5257,6 +5392,7 @@ fn auth_transaction_from_request(
         provider_redirect_uri,
         app_state: request.state.clone(),
         nonce: request.nonce.clone(),
+        provider_nonce: Some(provider_nonce),
         code_challenge: request.code_challenge.clone(),
         code_challenge_method: request
             .code_challenge_method
@@ -5275,6 +5411,7 @@ fn auth_transaction_from_session_login_request(
     client: &Client,
     provider_id: &str,
     provider_state: String,
+    provider_nonce: String,
     provider_redirect_uri: String,
     return_to: String,
     app_state: Option<String>,
@@ -5288,6 +5425,7 @@ fn auth_transaction_from_session_login_request(
         provider_redirect_uri,
         app_state,
         nonce: None,
+        provider_nonce: Some(provider_nonce),
         code_challenge: None,
         code_challenge_method: None,
         scope: ScopeSet::new(["openid", "email", "profile"]),
@@ -5303,6 +5441,7 @@ fn auth_transaction_from_link_request(
     client: &Client,
     provider_id: &str,
     provider_state: String,
+    provider_nonce: String,
     provider_redirect_uri: String,
     return_to: String,
     app_state: Option<String>,
@@ -5318,6 +5457,7 @@ fn auth_transaction_from_link_request(
         provider_redirect_uri,
         app_state,
         nonce: None,
+        provider_nonce: Some(provider_nonce),
         code_challenge: None,
         code_challenge_method: None,
         scope: ScopeSet::new(["openid", "email", "profile"]),
@@ -5339,6 +5479,7 @@ fn auth_transaction_from_row(row: AuthTransactionRow) -> Result<StoredAuthTransa
             provider_redirect_uri: row.provider_redirect_uri,
             app_state: row.app_state,
             nonce: row.nonce,
+            provider_nonce: row.provider_nonce,
             code_challenge: row.code_challenge,
             code_challenge_method: row.code_challenge_method,
             scope: ScopeSet::new(row.scope.split_whitespace()),
@@ -6687,6 +6828,7 @@ fn validate_client_upsert_request(
     let name = validate_client_name(&request.name)?;
     let redirect_uris = validate_redirect_uris(&request.redirect_uris)?;
     let allowed_origins = validate_allowed_origins(&request.allowed_origins)?;
+    let allowed_email_domains = validate_allowed_email_domains(&request.allowed_email_domains)?;
     let secret_hash = validated_client_secret_hash(
         request.confidential,
         request.client_secret.as_deref(),
@@ -6698,6 +6840,7 @@ fn validate_client_upsert_request(
         name,
         redirect_uris,
         allowed_origins,
+        allowed_email_domains,
         confidential: request.confidential,
         secret_hash,
         disabled: request.disabled,
@@ -6894,6 +7037,118 @@ fn validate_allowed_origins(raw: &[String]) -> Result<Vec<String>, ClientManagem
     Ok(origins)
 }
 
+fn validate_allowed_email_domains(raw: &[String]) -> Result<Vec<String>, ClientManagementError> {
+    if raw.len() > CLIENT_URI_LIST_LIMIT {
+        return Err(ClientManagementError::invalid_request(format!(
+            "client can register at most {CLIENT_URI_LIST_LIMIT} allowed email domains"
+        )));
+    }
+
+    let mut domains = Vec::with_capacity(raw.len());
+    for raw_domain in raw {
+        push_unique(&mut domains, normalize_allowed_email_domain(raw_domain)?);
+    }
+    Ok(domains)
+}
+
+fn normalize_allowed_email_domain(raw: &str) -> Result<String, ClientManagementError> {
+    let value = raw.trim().strip_prefix('@').unwrap_or_else(|| raw.trim());
+    if value.is_empty() {
+        return Err(ClientManagementError::invalid_request(
+            "allowed email domain must not be empty",
+        ));
+    }
+    if value.len() > CLIENT_EMAIL_DOMAIN_MAX_BYTES {
+        return Err(ClientManagementError::invalid_request(format!(
+            "allowed email domain must be at most {CLIENT_EMAIL_DOMAIN_MAX_BYTES} bytes"
+        )));
+    }
+    if !value.is_ascii() {
+        return Err(ClientManagementError::invalid_request(
+            "allowed email domain must use ASCII",
+        ));
+    }
+    if !value.contains('.') {
+        return Err(ClientManagementError::invalid_request(
+            "allowed email domain must include a dot",
+        ));
+    }
+    if value.starts_with('.') || value.ends_with('.') {
+        return Err(ClientManagementError::invalid_request(
+            "allowed email domain must not start or end with a dot",
+        ));
+    }
+    for label in value.split('.') {
+        if label.is_empty() {
+            return Err(ClientManagementError::invalid_request(
+                "allowed email domain must not contain empty labels",
+            ));
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err(ClientManagementError::invalid_request(
+                "allowed email domain labels must not start or end with a hyphen",
+            ));
+        }
+        if !label
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return Err(ClientManagementError::invalid_request(
+                "allowed email domain contains unsupported characters",
+            ));
+        }
+    }
+    Ok(value.to_ascii_lowercase())
+}
+
+fn validate_client_email_domain_policy(
+    client: &Client,
+    profile: &ProviderProfile,
+) -> Result<(), ProviderCallbackError> {
+    if client.allowed_email_domains.is_empty() {
+        return Ok(());
+    }
+    if !profile.email_verified {
+        return Err(ProviderCallbackError::access_denied(
+            "verified email is required for this client",
+        ));
+    }
+
+    let email_domain = provider_profile_email_domain(profile)?;
+    if client
+        .allowed_email_domains
+        .iter()
+        .any(|allowed_domain| allowed_domain.eq_ignore_ascii_case(&email_domain))
+    {
+        return Ok(());
+    }
+
+    Err(ProviderCallbackError::access_denied(
+        "email domain is not allowed for this client",
+    ))
+}
+
+fn provider_profile_email_domain(
+    profile: &ProviderProfile,
+) -> Result<String, ProviderCallbackError> {
+    let email = profile
+        .email
+        .as_deref()
+        .map(str::trim)
+        .filter(|email| !email.is_empty())
+        .ok_or_else(|| ProviderCallbackError::access_denied("email is required for this client"))?;
+    let (_, domain) = email.rsplit_once('@').ok_or_else(|| {
+        ProviderCallbackError::access_denied("email domain is required for this client")
+    })?;
+    let domain = domain.trim();
+    if domain.is_empty() {
+        return Err(ProviderCallbackError::access_denied(
+            "email domain is required for this client",
+        ));
+    }
+    Ok(domain.to_ascii_lowercase())
+}
+
 fn validated_client_secret_hash(
     confidential: bool,
     client_secret: Option<&str>,
@@ -6976,6 +7231,10 @@ fn client_response_from_row(row: ClientRow) -> Result<ClientResponse, String> {
         allowed_origins: parse_string_array_json(
             &row.allowed_origins_json,
             "allowed_origins_json",
+        )?,
+        allowed_email_domains: parse_string_array_json(
+            &row.allowed_email_domains_json,
+            "allowed_email_domains_json",
         )?,
         confidential: row.confidential != 0,
         disabled: row.disabled_at.is_some(),
@@ -7333,7 +7592,7 @@ fn authorization_request_may_reuse_session(
     session: &SessionRow,
     now: i32,
 ) -> bool {
-    request.prompt != AuthorizationPrompt::Login
+    request.prompt.allows_session_reuse()
         && authorization_request_session_is_fresh(request, session, now)
 }
 
@@ -7348,12 +7607,16 @@ fn authorization_request_session_is_fresh(
         .unwrap_or(true)
 }
 
-fn session_cookie(name: &str, value: &str, max_age_seconds: i32) -> String {
-    format!("{name}={value}; Path=/; Max-Age={max_age_seconds}; HttpOnly; Secure; SameSite=Lax")
+fn session_cookie(name: &str, value: &str, max_age_seconds: i32, domain: Option<&str>) -> String {
+    let domain = cookie_domain_attribute(domain);
+    format!(
+        "{name}={value}; Path=/; Max-Age={max_age_seconds};{domain} HttpOnly; Secure; SameSite=Lax"
+    )
 }
 
-fn clear_session_cookie(name: &str) -> String {
-    format!("{name}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax")
+fn clear_session_cookie(name: &str, domain: Option<&str>) -> String {
+    let domain = cookie_domain_attribute(domain);
+    format!("{name}=; Path=/; Max-Age=0;{domain} HttpOnly; Secure; SameSite=Lax")
 }
 
 fn transaction_cookie(name: &str, value: &str, max_age_seconds: i32) -> String {
@@ -7362,6 +7625,28 @@ fn transaction_cookie(name: &str, value: &str, max_age_seconds: i32) -> String {
 
 fn clear_transaction_cookie(name: &str) -> String {
     format!("{name}=; Path=/oauth2/callback; Max-Age=0; HttpOnly; Secure; SameSite=None")
+}
+
+fn cookie_domain_attribute(domain: Option<&str>) -> String {
+    let Some(domain) = domain.and_then(valid_cookie_domain) else {
+        return String::new();
+    };
+    format!(" Domain={domain};")
+}
+
+fn valid_cookie_domain(domain: &str) -> Option<&str> {
+    let domain = domain.trim();
+    if domain.is_empty() {
+        return None;
+    }
+    if domain
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+    {
+        Some(domain)
+    } else {
+        None
+    }
 }
 
 fn cookie_value(cookie_header: Option<&str>, name: &str) -> Option<String> {
@@ -7800,6 +8085,10 @@ fn client_from_row(row: ClientRow) -> Result<Option<Client>, String> {
             &row.allowed_origins_json,
             "allowed_origins_json",
         )?,
+        allowed_email_domains: parse_string_array_json(
+            &row.allowed_email_domains_json,
+            "allowed_email_domains_json",
+        )?,
         confidential: row.confidential != 0,
     }))
 }
@@ -7816,6 +8105,8 @@ fn server_config(env: &Env, request_url: &url::Url) -> ZerothServerConfig {
             .unwrap_or_else(|| request_url.origin().ascii_serialization()),
         cookie_name: env_string(env, "SESSION_COOKIE_NAME")
             .unwrap_or_else(|| ZerothServerConfig::default().cookie_name),
+        cookie_domain: env_string(env, "SESSION_COOKIE_DOMAIN")
+            .and_then(|value| valid_cookie_domain(&value).map(str::to_owned)),
         transaction_cookie_name: env_string(env, "TX_COOKIE_NAME")
             .unwrap_or_else(|| ZerothServerConfig::default().transaction_cookie_name),
     }
@@ -7845,6 +8136,20 @@ fn is_supported_provider_id(provider_id: &str) -> bool {
         provider_id,
         well_known::APPLE | well_known::GOOGLE | well_known::SPOTIFY
     )
+}
+
+fn provider_authorize_nonce(transaction: &AuthTransaction) -> Option<&str> {
+    if !provider_uses_oidc_nonce(&transaction.provider_id.0) {
+        return None;
+    }
+    transaction
+        .provider_nonce
+        .as_deref()
+        .or(transaction.nonce.as_deref())
+}
+
+fn provider_uses_oidc_nonce(provider_id: &str) -> bool {
+    matches!(provider_id, well_known::APPLE | well_known::GOOGLE)
 }
 
 fn authorization_login_request_present(url: &url::Url) -> bool {
@@ -8434,11 +8739,12 @@ async fn resolve_provider_profile(
     provider: &OAuthProvider,
     token_set: &ProviderTokenSet,
     transaction: &AuthTransaction,
+    callback: &ProviderCallback,
 ) -> Result<ResolvedProviderProfile, ProviderProfileError> {
     match provider.id().0.as_str() {
         well_known::SPOTIFY => fetch_spotify_profile(provider, token_set).await,
         well_known::APPLE | well_known::GOOGLE => {
-            resolve_oidc_provider_profile(provider, token_set, transaction).await
+            resolve_oidc_provider_profile(provider, token_set, transaction, callback).await
         }
         provider_id => Err(ProviderProfileError::invalid_response(format!(
             "unsupported provider profile source: {provider_id}"
@@ -8451,6 +8757,7 @@ async fn resolve_oidc_provider_profile(
     provider: &OAuthProvider,
     token_set: &ProviderTokenSet,
     transaction: &AuthTransaction,
+    callback: &ProviderCallback,
 ) -> Result<ResolvedProviderProfile, ProviderProfileError> {
     let id_token = token_set
         .id_token
@@ -8464,17 +8771,37 @@ async fn resolve_oidc_provider_profile(
         ProviderIdTokenValidation {
             provider_id: &provider.id().0,
             client_id: &provider.config().client_id,
-            nonce: transaction.nonce.as_deref(),
+            nonce: provider_authorize_nonce(transaction),
             now,
         },
     )
     .await?;
     let claims = verified.claims;
+    let apple_user = if provider.id().0 == well_known::APPLE {
+        callback
+            .apple_user_json
+            .as_deref()
+            .map(apple_callback_user_from_json)
+            .transpose()?
+    } else {
+        None
+    };
+    let display_name = claims.name.or_else(|| {
+        apple_user
+            .as_ref()
+            .and_then(apple_callback_user_display_name)
+    });
+    let raw_profile_json = merge_oidc_raw_profile_json(
+        &verified.raw_claims_json,
+        apple_user
+            .as_ref()
+            .and_then(|_| callback.apple_user_json.as_deref()),
+    );
     let source = ProviderProfileSource::OidcClaims {
         sub: claims.sub,
         email: claims.email,
         email_verified: boolish_claim(claims.email_verified.as_ref()).unwrap_or(false),
-        name: claims.name,
+        name: display_name,
         picture: claims.picture,
     };
     let profile = provider
@@ -8486,8 +8813,40 @@ async fn resolve_oidc_provider_profile(
 
     Ok(ResolvedProviderProfile {
         profile,
-        raw_profile_json: Some(verified.raw_claims_json),
+        raw_profile_json,
     })
+}
+
+fn apple_callback_user_from_json(value: &str) -> Result<AppleCallbackUser, ProviderProfileError> {
+    serde_json::from_str(value).map_err(|error| {
+        ProviderProfileError::invalid_response(format!("invalid Apple callback user JSON: {error}"))
+    })
+}
+
+fn apple_callback_user_display_name(user: &AppleCallbackUser) -> Option<String> {
+    let name = user.name.as_ref()?;
+    let first = name.first_name.as_deref().map(str::trim).unwrap_or("");
+    let last = name.last_name.as_deref().map(str::trim).unwrap_or("");
+    let display_name = match (first.is_empty(), last.is_empty()) {
+        (false, false) => format!("{first} {last}"),
+        (false, true) => first.to_owned(),
+        (true, false) => last.to_owned(),
+        (true, true) => String::new(),
+    };
+    (!display_name.is_empty()).then_some(display_name)
+}
+
+fn merge_oidc_raw_profile_json(claims_json: &str, apple_user_json: Option<&str>) -> Option<String> {
+    let Some(apple_user_json) = apple_user_json else {
+        return Some(claims_json.to_owned());
+    };
+    let claims = serde_json::from_str::<serde_json::Value>(claims_json).ok()?;
+    let apple_user = serde_json::from_str::<serde_json::Value>(apple_user_json).ok()?;
+    serde_json::to_string(&serde_json::json!({
+        "id_token_claims": claims,
+        "apple_user": apple_user,
+    }))
+    .ok()
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -9089,6 +9448,13 @@ impl ProviderCallbackError {
             description: description.into(),
         }
     }
+
+    fn access_denied(description: impl Into<String>) -> Self {
+        Self {
+            code: "access_denied".to_owned(),
+            description: description.into(),
+        }
+    }
 }
 
 impl ProviderTokenExchangeError {
@@ -9677,6 +10043,7 @@ mod tests {
             secret_hash: None,
             redirect_uris_json: r#"["wavey://auth/callback"]"#.to_owned(),
             allowed_origins_json: "[]".to_owned(),
+            allowed_email_domains_json: "[]".to_owned(),
             confidential: 0,
             disabled_at: None,
         })
@@ -9696,6 +10063,7 @@ mod tests {
             secret_hash: Some(format!("sha256:{}", hash_secret("web-secret"))),
             redirect_uris_json: r#"["https://app.example.com/callback"]"#.to_owned(),
             allowed_origins_json: "[]".to_owned(),
+            allowed_email_domains_json: "[]".to_owned(),
             confidential: 1,
             disabled_at: Some(1_780_000_000),
         })
@@ -9744,8 +10112,26 @@ mod tests {
             upsert.allowed_origins,
             vec!["https://app.example.com".to_owned()]
         );
+        assert_eq!(upsert.allowed_email_domains, Vec::<String>::new());
         assert!(!upsert.confidential);
         assert_eq!(upsert.secret_hash, None);
+    }
+
+    #[test]
+    fn client_upsert_accepts_normalized_allowed_email_domains() {
+        let upsert = client_upsert_from_value(serde_json::json!({
+            "id": "wavey-admin",
+            "name": "Wavey Admin",
+            "redirectUris": ["https://id.example.com/admin"],
+            "allowedEmailDomains": [" @Wavey.ai ", "wavey.ai", "example.com"],
+            "confidential": false
+        }))
+        .unwrap();
+
+        assert_eq!(
+            upsert.allowed_email_domains,
+            vec!["wavey.ai".to_owned(), "example.com".to_owned()]
+        );
     }
 
     #[test]
@@ -9824,6 +10210,58 @@ mod tests {
     }
 
     #[test]
+    fn client_upsert_rejects_invalid_allowed_email_domains() {
+        let error = client_upsert_from_value(serde_json::json!({
+            "id": "wavey-admin",
+            "name": "Wavey Admin",
+            "redirectUris": ["https://id.example.com/admin"],
+            "allowedEmailDomains": ["wavey"],
+            "confidential": false
+        }))
+        .unwrap_err();
+
+        assert_eq!(error.description, "allowed email domain must include a dot");
+    }
+
+    #[test]
+    fn client_email_domain_policy_requires_verified_allowed_domain() {
+        let client = Client {
+            id: ClientId("admin".to_owned()),
+            name: "Admin".to_owned(),
+            redirect_uris: vec!["https://id.example.com/admin".to_owned()],
+            allowed_origins: vec![],
+            allowed_email_domains: vec!["wavey.ai".to_owned()],
+            confidential: false,
+        };
+        let mut profile = ProviderProfile {
+            provider_id: ProviderId(well_known::GOOGLE.to_owned()),
+            subject: zeroth_core::Subject("google-sub".to_owned()),
+            email: Some("Admin@Wavey.ai".to_owned()),
+            email_verified: true,
+            display_name: None,
+            picture_url: None,
+        };
+
+        validate_client_email_domain_policy(&client, &profile).unwrap();
+
+        profile.email_verified = false;
+        let error = validate_client_email_domain_policy(&client, &profile).unwrap_err();
+        assert_eq!(error.code, "access_denied");
+        assert_eq!(
+            error.description,
+            "verified email is required for this client"
+        );
+
+        profile.email_verified = true;
+        profile.email = Some("admin@example.com".to_owned());
+        let error = validate_client_email_domain_policy(&client, &profile).unwrap_err();
+        assert_eq!(
+            error.description,
+            "email domain is not allowed for this client"
+        );
+    }
+
+    #[test]
     fn client_response_marks_disabled_and_secret_state() {
         let response = client_response_from_row(ClientRow {
             id: "web".to_owned(),
@@ -9831,6 +10269,7 @@ mod tests {
             secret_hash: Some(format!("sha256:{}", hash_secret("web-secret"))),
             redirect_uris_json: r#"["https://app.example.com/callback"]"#.to_owned(),
             allowed_origins_json: r#"["https://app.example.com"]"#.to_owned(),
+            allowed_email_domains_json: r#"["example.com"]"#.to_owned(),
             confidential: 1,
             disabled_at: Some(1_780_000_000),
         })
@@ -9966,6 +10405,7 @@ mod tests {
             secret_hash: Some(format!("sha256:{}", hash_secret("web-secret"))),
             redirect_uris_json: r#"["https://app.example.com/callback"]"#.to_owned(),
             allowed_origins_json: r#"["https://app.example.com"]"#.to_owned(),
+            allowed_email_domains_json: r#"["example.com"]"#.to_owned(),
             confidential: 1,
             disabled_at: Some(1_780_000_000),
         })
@@ -10019,11 +10459,17 @@ mod tests {
             &request,
             well_known::APPLE,
             "provider-state".to_owned(),
+            "provider-nonce".to_owned(),
             "https://id.example.com/oauth2/callback".to_owned(),
             1_780_000_000,
         );
 
         assert_eq!(transaction.provider_state, "provider-state");
+        assert_eq!(transaction.nonce, Some("nonce-1".to_owned()));
+        assert_eq!(
+            transaction.provider_nonce,
+            Some("provider-nonce".to_owned())
+        );
         assert_eq!(transaction.app_state, Some("app-state".to_owned()));
         assert_eq!(transaction.redirect_uri, "wavey://auth/callback");
         assert_eq!(
@@ -10043,6 +10489,7 @@ mod tests {
             name: "Wavey Web".to_owned(),
             redirect_uris: vec!["https://app.example.com/auth/callback".to_owned()],
             allowed_origins: vec!["https://app.example.com".to_owned()],
+            allowed_email_domains: vec![],
             confidential: false,
         };
 
@@ -10050,6 +10497,7 @@ mod tests {
             &client,
             well_known::SPOTIFY,
             "provider-state".to_owned(),
+            "provider-nonce".to_owned(),
             "https://id.example.com/oauth2/callback".to_owned(),
             "https://app.example.com/settings".to_owned(),
             Some("app-state".to_owned()),
@@ -10059,6 +10507,10 @@ mod tests {
         );
 
         assert_eq!(transaction.client_id, ClientId("web".to_owned()));
+        assert_eq!(
+            transaction.provider_nonce,
+            Some("provider-nonce".to_owned())
+        );
         assert_eq!(transaction.redirect_uri, "https://app.example.com/settings");
         assert_eq!(transaction.app_state, Some("app-state".to_owned()));
         assert_eq!(transaction.link_user_id, Some(UserId("usr_123".to_owned())));
@@ -10074,6 +10526,7 @@ mod tests {
             name: "Browser SSO".to_owned(),
             redirect_uris: vec!["https://app.example.com/auth/callback".to_owned()],
             allowed_origins: vec!["https://app.example.com".to_owned()],
+            allowed_email_domains: vec![],
             confidential: false,
         };
 
@@ -10081,6 +10534,7 @@ mod tests {
             &client,
             well_known::GOOGLE,
             "provider-state".to_owned(),
+            "provider-nonce".to_owned(),
             "https://id.example.com/oauth2/callback".to_owned(),
             "https://app.example.com/dashboard".to_owned(),
             Some("app-state".to_owned()),
@@ -10088,6 +10542,10 @@ mod tests {
         );
 
         assert_eq!(transaction.client_id, ClientId("browser".to_owned()));
+        assert_eq!(
+            transaction.provider_nonce,
+            Some("provider-nonce".to_owned())
+        );
         assert_eq!(
             transaction.redirect_uri,
             "https://app.example.com/dashboard"
@@ -10102,12 +10560,51 @@ mod tests {
     }
 
     #[test]
+    fn provider_authorize_nonce_prefers_provider_nonce_for_oidc() {
+        let client = Client {
+            id: ClientId("browser".to_owned()),
+            name: "Browser SSO".to_owned(),
+            redirect_uris: vec!["https://app.example.com/auth/callback".to_owned()],
+            allowed_origins: vec!["https://app.example.com".to_owned()],
+            allowed_email_domains: vec![],
+            confidential: false,
+        };
+        let google_transaction = auth_transaction_from_session_login_request(
+            &client,
+            well_known::GOOGLE,
+            "provider-state".to_owned(),
+            "provider-nonce".to_owned(),
+            "https://id.example.com/oauth2/callback".to_owned(),
+            "https://app.example.com/dashboard".to_owned(),
+            None,
+            1_780_000_000,
+        );
+        let spotify_transaction = auth_transaction_from_session_login_request(
+            &client,
+            well_known::SPOTIFY,
+            "provider-state".to_owned(),
+            "provider-nonce".to_owned(),
+            "https://id.example.com/oauth2/callback".to_owned(),
+            "https://app.example.com/dashboard".to_owned(),
+            None,
+            1_780_000_000,
+        );
+
+        assert_eq!(
+            provider_authorize_nonce(&google_transaction),
+            Some("provider-nonce")
+        );
+        assert_eq!(provider_authorize_nonce(&spotify_transaction), None);
+    }
+
+    #[test]
     fn identity_link_return_to_is_client_bounded() {
         let client = Client {
             id: ClientId("web".to_owned()),
             name: "Wavey Web".to_owned(),
             redirect_uris: vec!["wavey://auth/callback".to_owned()],
             allowed_origins: vec!["https://app.example.com".to_owned()],
+            allowed_email_domains: vec![],
             confidential: false,
         };
 
@@ -10188,6 +10685,7 @@ mod tests {
             name: "Wavey Web".to_owned(),
             redirect_uris: vec!["wavey://auth/callback".to_owned()],
             allowed_origins: vec!["https://app.example.com".to_owned()],
+            allowed_email_domains: vec![],
             confidential: false,
         };
 
@@ -10235,10 +10733,12 @@ mod tests {
                 name: "Wavey Web".to_owned(),
                 redirect_uris: vec!["https://app.example.com/auth/callback".to_owned()],
                 allowed_origins: vec!["https://app.example.com".to_owned()],
+                allowed_email_domains: vec![],
                 confidential: false,
             },
             well_known::GOOGLE,
             "provider-state".to_owned(),
+            "provider-nonce".to_owned(),
             "https://id.example.com/oauth2/callback".to_owned(),
             "https://app.example.com/settings?tab=login".to_owned(),
             Some("app-state".to_owned()),
@@ -10278,12 +10778,14 @@ mod tests {
             name: "Browser SSO".to_owned(),
             redirect_uris: vec!["https://app.example.com/auth/callback".to_owned()],
             allowed_origins: vec!["https://app.example.com".to_owned()],
+            allowed_email_domains: vec![],
             confidential: false,
         };
         let transaction = auth_transaction_from_session_login_request(
             &client,
             well_known::GOOGLE,
             "provider-state".to_owned(),
+            "provider-nonce".to_owned(),
             "https://id.example.com/oauth2/callback".to_owned(),
             "https://app.example.com/dashboard?existing=1".to_owned(),
             Some("app-state".to_owned()),
@@ -10314,6 +10816,7 @@ mod tests {
             provider_redirect_uri: "https://id.example.com/oauth2/callback".to_owned(),
             app_state: Some("app-state".to_owned()),
             nonce: None,
+            provider_nonce: Some("provider-nonce".to_owned()),
             code_challenge: Some("challenge".to_owned()),
             code_challenge_method: Some("S256".to_owned()),
             scope: zeroth_core::ScopeSet::new(["openid", "email"]),
@@ -10354,12 +10857,14 @@ mod tests {
             name: "Browser SSO".to_owned(),
             redirect_uris: vec!["https://app.example.com/auth/callback".to_owned()],
             allowed_origins: vec!["https://app.example.com".to_owned()],
+            allowed_email_domains: vec![],
             confidential: false,
         };
         let transaction = auth_transaction_from_session_login_request(
             &client,
             well_known::GOOGLE,
             "provider-state".to_owned(),
+            "provider-nonce".to_owned(),
             "https://id.example.com/oauth2/callback".to_owned(),
             "https://app.example.com/dashboard?existing=1".to_owned(),
             Some("app-state".to_owned()),
@@ -10398,6 +10903,7 @@ mod tests {
             provider_redirect_uri: "https://id.example.com/oauth2/callback".to_owned(),
             app_state: Some("app-state".to_owned()),
             nonce: None,
+            provider_nonce: Some("provider-nonce".to_owned()),
             code_challenge: Some("challenge".to_owned()),
             code_challenge_method: Some("S256".to_owned()),
             scope: zeroth_core::ScopeSet::new(["openid", "email"]),
@@ -10481,6 +10987,7 @@ mod tests {
             name: "Wavey iOS".to_owned(),
             redirect_uris: vec!["wavey://auth/callback".to_owned()],
             allowed_origins: vec![],
+            allowed_email_domains: vec![],
             confidential: false,
         };
         let request = AuthorizationRequest {
@@ -11497,10 +12004,26 @@ mod tests {
 
     #[test]
     fn session_cookie_is_secure_http_only_and_lax() {
-        let cookie = session_cookie("zeroth_session", "sess_123", SESSION_TTL_SECONDS);
+        let cookie = session_cookie("zeroth_session", "sess_123", SESSION_TTL_SECONDS, None);
 
         assert!(cookie.starts_with("zeroth_session=sess_123; Path=/;"));
         assert!(cookie.contains("Max-Age=2592000"));
+        assert!(cookie.contains("HttpOnly"));
+        assert!(cookie.contains("Secure"));
+        assert!(cookie.contains("SameSite=Lax"));
+        assert!(!cookie.contains("Domain="));
+    }
+
+    #[test]
+    fn session_cookie_can_target_parent_domain() {
+        let cookie = session_cookie(
+            "zeroth_session",
+            "sess_123",
+            SESSION_TTL_SECONDS,
+            Some(".wavey.ai"),
+        );
+
+        assert!(cookie.contains("Domain=.wavey.ai"));
         assert!(cookie.contains("HttpOnly"));
         assert!(cookie.contains("Secure"));
         assert!(cookie.contains("SameSite=Lax"));
@@ -11508,12 +12031,32 @@ mod tests {
 
     #[test]
     fn clear_session_cookie_expires_browser_cookie() {
-        let cookie = clear_session_cookie("zeroth_session");
+        let cookie = clear_session_cookie("zeroth_session", None);
 
         assert_eq!(
             cookie,
             "zeroth_session=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax"
         );
+    }
+
+    #[test]
+    fn clear_session_cookie_uses_parent_domain_when_configured() {
+        let cookie = clear_session_cookie("zeroth_session", Some(".wavey.ai"));
+
+        assert_eq!(
+            cookie,
+            "zeroth_session=; Path=/; Max-Age=0; Domain=.wavey.ai; HttpOnly; Secure; SameSite=Lax"
+        );
+    }
+
+    #[test]
+    fn cookie_domain_attribute_rejects_header_delimiters() {
+        assert_eq!(
+            cookie_domain_attribute(Some(".wavey.ai")),
+            " Domain=.wavey.ai;"
+        );
+        assert_eq!(cookie_domain_attribute(Some("bad.example; Secure")), "");
+        assert_eq!(cookie_domain_attribute(Some("bad.example\r\nX: y")), "");
     }
 
     #[test]
@@ -11612,6 +12155,20 @@ mod tests {
         request.max_age = None;
         request.prompt = AuthorizationPrompt::Login;
         assert!(!authorization_request_may_reuse_session(
+            &request,
+            &session,
+            1_780_000_100
+        ));
+
+        request.prompt = AuthorizationPrompt::SelectAccount;
+        assert!(!authorization_request_may_reuse_session(
+            &request,
+            &session,
+            1_780_000_100
+        ));
+
+        request.prompt = AuthorizationPrompt::Consent;
+        assert!(authorization_request_may_reuse_session(
             &request,
             &session,
             1_780_000_100
@@ -11954,12 +12511,31 @@ mod tests {
             Some("provider-state".to_owned()),
             None,
             None,
+            None,
         )
         .unwrap();
 
         assert_eq!(callback.state, "provider-state");
         assert_eq!(callback.code, Some("provider-code".to_owned()));
         assert_eq!(callback.provider_error, None);
+        assert_eq!(callback.apple_user_json, None);
+    }
+
+    #[test]
+    fn callback_values_preserve_apple_user_json() {
+        let callback = provider_callback_from_values(
+            Some("provider-code".to_owned()),
+            Some("provider-state".to_owned()),
+            None,
+            None,
+            Some(r#"{"name":{"firstName":"Ada","lastName":"Lovelace"}}"#.to_owned()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            callback.apple_user_json.as_deref(),
+            Some(r#"{"name":{"firstName":"Ada","lastName":"Lovelace"}}"#)
+        );
     }
 
     #[test]
@@ -11969,6 +12545,7 @@ mod tests {
             Some("provider-state".to_owned()),
             Some("access_denied".to_owned()),
             Some("User cancelled".to_owned()),
+            Some(r#"{"name":{"firstName":"Ada"}}"#.to_owned()),
         )
         .unwrap();
         let error = callback.provider_error.unwrap();
@@ -11986,11 +12563,53 @@ mod tests {
             None,
             Some("access_denied".to_owned()),
             Some("User cancelled".to_owned()),
+            None,
         )
         .unwrap_err();
 
         assert_eq!(error.code, "invalid_request");
         assert_eq!(error.description, "missing state");
+    }
+
+    #[test]
+    fn apple_callback_user_display_name_joins_name_parts() {
+        let user = apple_callback_user_from_json(
+            r#"{"name":{"firstName":"  Ada ","lastName":" Lovelace "},"email":"ada@example.com"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            apple_callback_user_display_name(&user),
+            Some("Ada Lovelace".to_owned())
+        );
+    }
+
+    #[test]
+    fn apple_callback_user_display_name_accepts_single_name_part() {
+        let user = apple_callback_user_from_json(r#"{"name":{"firstName":"Ada"}}"#).unwrap();
+        assert_eq!(
+            apple_callback_user_display_name(&user),
+            Some("Ada".to_owned())
+        );
+
+        let user = apple_callback_user_from_json(r#"{"name":{"lastName":"Lovelace"}}"#).unwrap();
+        assert_eq!(
+            apple_callback_user_display_name(&user),
+            Some("Lovelace".to_owned())
+        );
+    }
+
+    #[test]
+    fn oidc_raw_profile_json_preserves_apple_callback_user() {
+        let raw = merge_oidc_raw_profile_json(
+            r#"{"sub":"apple-sub","email":"ada@example.com"}"#,
+            Some(r#"{"name":{"firstName":"Ada","lastName":"Lovelace"}}"#),
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+
+        assert_eq!(value["id_token_claims"]["sub"], "apple-sub");
+        assert_eq!(value["apple_user"]["name"]["firstName"], "Ada");
     }
 
     #[test]
@@ -12003,6 +12622,7 @@ mod tests {
             provider_redirect_uri: "https://id.example.com/oauth2/callback".to_owned(),
             app_state: Some("app-state".to_owned()),
             nonce: Some("nonce-1".to_owned()),
+            provider_nonce: Some("provider-nonce".to_owned()),
             code_challenge: Some("challenge".to_owned()),
             code_challenge_method: Some("S256".to_owned()),
             scope: "openid email".to_owned(),
@@ -12021,6 +12641,10 @@ mod tests {
             ProviderId(well_known::GOOGLE.to_owned())
         );
         assert!(record.transaction.scope.contains("email"));
+        assert_eq!(
+            record.transaction.provider_nonce,
+            Some("provider-nonce".to_owned())
+        );
         assert_eq!(
             record.transaction.link_user_id,
             Some(UserId("usr_123".to_owned()))
@@ -12046,6 +12670,7 @@ mod tests {
             provider_redirect_uri: "https://id.example.com/oauth2/callback".to_owned(),
             app_state: None,
             nonce: None,
+            provider_nonce: Some("provider-nonce".to_owned()),
             code_challenge: Some("challenge".to_owned()),
             code_challenge_method: Some("S256".to_owned()),
             scope: "openid".to_owned(),
@@ -12074,6 +12699,7 @@ mod tests {
             provider_redirect_uri: "https://id.example.com/oauth2/callback".to_owned(),
             app_state: None,
             nonce: None,
+            provider_nonce: Some("provider-nonce".to_owned()),
             code_challenge: Some("challenge".to_owned()),
             code_challenge_method: Some("S256".to_owned()),
             scope: "openid".to_owned(),
@@ -12229,6 +12855,7 @@ mod tests {
                 name: "Wavey iOS".to_owned(),
                 redirect_uris: vec!["wavey://auth/callback".to_owned()],
                 allowed_origins: vec![],
+                allowed_email_domains: vec![],
                 confidential: false,
             },
             secret_hash: None,
@@ -12242,6 +12869,7 @@ mod tests {
                 name: "Wavey Web".to_owned(),
                 redirect_uris: vec!["https://app.example.com/auth/callback".to_owned()],
                 allowed_origins: vec!["https://app.example.com".to_owned()],
+                allowed_email_domains: vec![],
                 confidential: true,
             },
             secret_hash: Some(format!("sha256:{}", hash_secret(secret))),

@@ -6,6 +6,7 @@ use zeroth_oidc::OidcIssuer;
 pub struct ZerothServerConfig {
     pub public_base_url: String,
     pub cookie_name: String,
+    pub cookie_domain: Option<String>,
     pub transaction_cookie_name: String,
 }
 
@@ -229,6 +230,7 @@ impl Default for ZerothServerConfig {
         Self {
             public_base_url: "http://localhost:8080".to_owned(),
             cookie_name: "zeroth_session".to_owned(),
+            cookie_domain: None,
             transaction_cookie_name: "zeroth_tx".to_owned(),
         }
     }

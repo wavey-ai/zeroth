@@ -669,6 +669,7 @@ pub struct ApplicationUi {
     pub public_client: bool,
     pub redirect_uris: Vec<String>,
     pub allowed_origins: Vec<String>,
+    pub allowed_email_domains: Vec<String>,
 }
 
 /// Registered client row shown in the Zeroth management UI.
@@ -679,6 +680,7 @@ pub struct ClientAdminUi {
     pub confidential: bool,
     pub redirect_uris: Vec<String>,
     pub allowed_origins: Vec<String>,
+    pub allowed_email_domains: Vec<String>,
     pub disabled: bool,
     pub has_secret: bool,
 }
@@ -1035,6 +1037,7 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
                                         <th>"Type"</th>
                                         <th>"Redirect URIs"</th>
                                         <th>"Origins"</th>
+                                        <th>"Email domains"</th>
                                     </tr>
                                 </thead>
                                 <tbody>{application_rows}</tbody>
@@ -1233,6 +1236,7 @@ pub fn ClientsAdminApp(state: ClientsAdminUiState) -> impl IntoView {
                                         <th>"Status"</th>
                                         <th>"Redirect URIs"</th>
                                         <th>"Origins"</th>
+                                        <th>"Email domains"</th>
                                         <th>"Actions"</th>
                                     </tr>
                                 </thead>
@@ -1271,6 +1275,10 @@ pub fn ClientsAdminApp(state: ClientsAdminUiState) -> impl IntoView {
                                     <div class="zeroth-field">
                                         <label for="zeroth-client-origins">"Allowed origins"</label>
                                         <textarea id="zeroth-client-origins" name="allowedOrigins" spellcheck="false"></textarea>
+                                    </div>
+                                    <div class="zeroth-field">
+                                        <label for="zeroth-client-email-domains">"Email domains"</label>
+                                        <textarea id="zeroth-client-email-domains" name="allowedEmailDomains" spellcheck="false"></textarea>
                                     </div>
                                     <div class="zeroth-field">
                                         <label for="zeroth-client-secret">"Client secret"</label>
@@ -1396,6 +1404,7 @@ fn application_row(application: ApplicationUi) -> impl IntoView {
     };
     let redirects = join_or_dash(application.redirect_uris);
     let origins = join_or_dash(application.allowed_origins);
+    let email_domains = join_or_dash(application.allowed_email_domains);
 
     view! {
         <tr>
@@ -1406,6 +1415,7 @@ fn application_row(application: ApplicationUi) -> impl IntoView {
             <td>{kind}</td>
             <td>{redirects}</td>
             <td>{origins}</td>
+            <td>{email_domains}</td>
         </tr>
     }
 }
@@ -1545,8 +1555,10 @@ fn client_admin_row(client: ClientAdminUi) -> impl IntoView {
     };
     let redirects = join_or_dash(client.redirect_uris.clone());
     let origins = join_or_dash(client.allowed_origins.clone());
+    let email_domains = join_or_dash(client.allowed_email_domains.clone());
     let redirect_lines = client.redirect_uris.join("\n");
     let origin_lines = client.allowed_origins.join("\n");
+    let email_domain_lines = client.allowed_email_domains.join("\n");
     let disabled = client.disabled.to_string();
     let confidential = client.confidential.to_string();
     let client_id = client.client_id;
@@ -1562,6 +1574,7 @@ fn client_admin_row(client: ClientAdminUi) -> impl IntoView {
             data-client-disabled=disabled
             data-client-redirects=redirect_lines
             data-client-origins=origin_lines
+            data-client-email-domains=email_domain_lines
         >
             <td>
                 <div class="zeroth-row-title">{client_name}</div>
@@ -1574,6 +1587,7 @@ fn client_admin_row(client: ClientAdminUi) -> impl IntoView {
             <td><span class=status_class>{status}</span></td>
             <td>{redirects}</td>
             <td>{origins}</td>
+            <td>{email_domains}</td>
             <td>
                 <button class="zeroth-action" type="button" data-zeroth-edit-client="true">"Edit"</button>
             </td>
@@ -1847,7 +1861,8 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
       confidential: row.dataset.clientConfidential === "true",
       disabled: row.dataset.clientDisabled === "true",
       redirectUris: splitLines(row.dataset.clientRedirects || ""),
-      allowedOrigins: splitLines(row.dataset.clientOrigins || "")
+      allowedOrigins: splitLines(row.dataset.clientOrigins || ""),
+      allowedEmailDomains: splitLines(row.dataset.clientEmailDomains || "")
     };
   }
 
@@ -1857,6 +1872,7 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
     form.elements.type.value = client.confidential ? "confidential" : "public";
     form.elements.redirectUris.value = (client.redirectUris || client.redirect_uris || []).join("\n");
     form.elements.allowedOrigins.value = (client.allowedOrigins || client.allowed_origins || []).join("\n");
+    form.elements.allowedEmailDomains.value = (client.allowedEmailDomains || client.allowed_email_domains || []).join("\n");
     form.elements.clientSecret.value = "";
     form.elements.disabled.checked = Boolean(client.disabled);
     editorMode.textContent = client.id ? "Edit" : "New";
@@ -1867,7 +1883,7 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
     rows.replaceChildren();
     count.textContent = String(clients.length);
     if (clients.length === 0) {
-      renderEmptyRows(rows, 6);
+      renderEmptyRows(rows, 7);
       return;
     }
 
@@ -1879,6 +1895,7 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
       row.dataset.clientDisabled = String(client.disabled);
       row.dataset.clientRedirects = (client.redirectUris || client.redirect_uris || []).join("\n");
       row.dataset.clientOrigins = (client.allowedOrigins || client.allowed_origins || []).join("\n");
+      row.dataset.clientEmailDomains = (client.allowedEmailDomains || client.allowed_email_domains || []).join("\n");
 
       const name = document.createElement("td");
       setText(name, client.name, "zeroth-row-title");
@@ -1900,6 +1917,9 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
       const origins = document.createElement("td");
       origins.textContent = (client.allowedOrigins || client.allowed_origins || []).join(", ") || "-";
 
+      const emailDomains = document.createElement("td");
+      emailDomains.textContent = (client.allowedEmailDomains || client.allowed_email_domains || []).join(", ") || "-";
+
       const actions = document.createElement("td");
       const edit = document.createElement("button");
       edit.className = "zeroth-action";
@@ -1917,7 +1937,7 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
         actions.appendChild(disable);
       }
 
-      row.append(name, type, state, redirects, origins, actions);
+      row.append(name, type, state, redirects, origins, emailDomains, actions);
       rows.appendChild(row);
     }
   }
@@ -2157,6 +2177,7 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
       name: data.get("name"),
       redirectUris: splitLines(data.get("redirectUris") || ""),
       allowedOrigins: splitLines(data.get("allowedOrigins") || ""),
+      allowedEmailDomains: splitLines(data.get("allowedEmailDomains") || ""),
       confidential: data.get("type") === "confidential",
       disabled: form.elements.disabled.checked
     };
@@ -2440,6 +2461,7 @@ mod tests {
             public_client: true,
             redirect_uris: vec!["https://app.example.com/callback".to_owned()],
             allowed_origins: vec!["https://app.example.com".to_owned()],
+            allowed_email_domains: vec!["example.com".to_owned()],
         });
 
         let html = render_account_html(state);
@@ -2464,6 +2486,7 @@ mod tests {
             confidential: false,
             redirect_uris: vec!["wavey://auth/callback".to_owned()],
             allowed_origins: Vec::new(),
+            allowed_email_domains: Vec::new(),
             disabled: false,
             has_secret: false,
         });

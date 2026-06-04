@@ -5,5 +5,6 @@
 .env
 .env.*
 *.log
+*.p8
 *.rs.bk
 .DS_Store

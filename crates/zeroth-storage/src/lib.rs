@@ -123,6 +123,11 @@ pub mod compatibility {
         name: "session_return_to",
         definition: "TEXT",
     };
+    pub const AUTH_TRANSACTION_PROVIDER_NONCE: CompatibilityColumn = CompatibilityColumn {
+        table: "zeroth_auth_transactions",
+        name: "provider_nonce",
+        definition: "TEXT",
+    };
     pub const AUTH_CODE_SESSION_ID: CompatibilityColumn = CompatibilityColumn {
         table: "zeroth_auth_codes",
         name: "session_id",
@@ -138,14 +143,22 @@ pub mod compatibility {
         name: "auth_time",
         definition: "INTEGER",
     };
+    pub const CLIENT_ALLOWED_EMAIL_DOMAINS: CompatibilityColumn = CompatibilityColumn {
+        table: "zeroth_clients",
+        name: "allowed_email_domains_json",
+        definition: "TEXT NOT NULL DEFAULT '[]'",
+    };
 
     pub const TABLES: &[&str] = &[
+        "zeroth_clients",
         "zeroth_auth_transactions",
         "zeroth_auth_codes",
         "zeroth_refresh_tokens",
     ];
 
     pub const ALL: &[CompatibilityColumn] = &[
+        CLIENT_ALLOWED_EMAIL_DOMAINS,
+        AUTH_TRANSACTION_PROVIDER_NONCE,
         AUTH_TRANSACTION_LINK_USER_ID,
         AUTH_TRANSACTION_LINK_SESSION_ID,
         AUTH_TRANSACTION_SESSION_RETURN_TO,
@@ -219,8 +232,11 @@ mod tests {
         assert!(compatibility::TABLES.contains(&"zeroth_auth_transactions"));
         assert!(compatibility::TABLES.contains(&"zeroth_auth_codes"));
         assert!(compatibility::TABLES.contains(&"zeroth_refresh_tokens"));
+        assert!(compatibility::TABLES.contains(&"zeroth_clients"));
 
         for column in [
+            "allowed_email_domains_json",
+            "provider_nonce",
             "link_user_id",
             "link_session_id",
             "session_return_to",

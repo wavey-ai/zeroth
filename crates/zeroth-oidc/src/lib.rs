@@ -43,6 +43,8 @@ pub enum AuthorizationPrompt {
     Default,
     None,
     Login,
+    Consent,
+    SelectAccount,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -261,6 +263,12 @@ impl PkceChallengeMethod {
     }
 }
 
+impl AuthorizationPrompt {
+    pub fn allows_session_reuse(&self) -> bool {
+        !matches!(self, Self::Login | Self::SelectAccount)
+    }
+}
+
 fn parse_prompt(raw: &str) -> Result<AuthorizationPrompt, AuthorizationRequestError> {
     let values = raw.split_whitespace().collect::<Vec<_>>();
     if values.is_empty() {
@@ -279,15 +287,18 @@ fn parse_prompt(raw: &str) -> Result<AuthorizationPrompt, AuthorizationRequestEr
     if values.iter().any(|value| *value == "login") {
         return Ok(AuthorizationPrompt::Login);
     }
-    if values
+    if !values
         .iter()
         .all(|value| matches!(*value, "consent" | "select_account"))
     {
-        return Ok(AuthorizationPrompt::Default);
+        return Err(AuthorizationRequestError::invalid_request(
+            "prompt must be none, login, consent, or select_account",
+        ));
     }
-    Err(AuthorizationRequestError::invalid_request(
-        "prompt must be none, login, consent, or select_account",
-    ))
+    if values.iter().any(|value| *value == "select_account") {
+        return Ok(AuthorizationPrompt::SelectAccount);
+    }
+    Ok(AuthorizationPrompt::Consent)
 }
 
 fn parse_max_age(raw: &str) -> Result<i32, AuthorizationRequestError> {
@@ -389,6 +400,35 @@ mod tests {
     }
 
     #[test]
+    fn parses_interactive_prompt_values() {
+        let consent = Url::parse(
+            "https://id.example.com/authorize?response_type=code&client_id=ios&redirect_uri=wavey://auth/callback&scope=openid&prompt=consent&code_challenge=abc&code_challenge_method=S256",
+        )
+        .unwrap();
+        let select_account = Url::parse(
+            "https://id.example.com/authorize?response_type=code&client_id=ios&redirect_uri=wavey://auth/callback&scope=openid&prompt=select_account&code_challenge=abc&code_challenge_method=S256",
+        )
+        .unwrap();
+        let combined = Url::parse(
+            "https://id.example.com/authorize?response_type=code&client_id=ios&redirect_uri=wavey://auth/callback&scope=openid&prompt=consent%20select_account&code_challenge=abc&code_challenge_method=S256",
+        )
+        .unwrap();
+
+        assert_eq!(
+            parse_authorization_request(&consent).unwrap().prompt,
+            AuthorizationPrompt::Consent
+        );
+        assert_eq!(
+            parse_authorization_request(&select_account).unwrap().prompt,
+            AuthorizationPrompt::SelectAccount
+        );
+        assert_eq!(
+            parse_authorization_request(&combined).unwrap().prompt,
+            AuthorizationPrompt::SelectAccount
+        );
+    }
+
+    #[test]
     fn rejects_invalid_max_age_values() {
         for max_age in ["-1", "abc", "2147483648"] {
             let url = Url::parse(&format!(
@@ -451,6 +491,7 @@ mod tests {
             name: "iOS".to_owned(),
             redirect_uris: vec!["wavey://auth/callback".to_owned()],
             allowed_origins: vec![],
+            allowed_email_domains: vec![],
             confidential: false,
         };
 
@@ -478,6 +519,7 @@ mod tests {
             name: "Infidelity macOS".to_owned(),
             redirect_uris: vec!["http://localhost/oidc-callback".to_owned()],
             allowed_origins: vec![],
+            allowed_email_domains: vec![],
             confidential: false,
         };
 
@@ -494,6 +536,7 @@ mod tests {
             name: "Infidelity macOS".to_owned(),
             redirect_uris: vec!["http://localhost/oidc-callback".to_owned()],
             allowed_origins: vec![],
+            allowed_email_domains: vec![],
             confidential: false,
         };
 

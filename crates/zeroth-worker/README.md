@@ -65,12 +65,14 @@ Example public iOS client:
 
 ```sql
 INSERT INTO zeroth_clients (
-  id, name, confidential, redirect_uris_json, allowed_origins_json, created_at, updated_at
+  id, name, confidential, redirect_uris_json, allowed_origins_json,
+  allowed_email_domains_json, created_at, updated_at
 ) VALUES (
   'wavey-ios',
   'Wavey iOS',
   0,
   '["wavey://auth/callback"]',
+  '[]',
   '[]',
   strftime('%s','now'),
   strftime('%s','now')
@@ -81,12 +83,14 @@ Example native loopback client:
 
 ```sql
 INSERT INTO zeroth_clients (
-  id, name, confidential, redirect_uris_json, allowed_origins_json, created_at, updated_at
+  id, name, confidential, redirect_uris_json, allowed_origins_json,
+  allowed_email_domains_json, created_at, updated_at
 ) VALUES (
   'infidelity-macos',
   'Infidelity macOS',
   0,
   '["http://localhost/oidc-callback"]',
+  '[]',
   '[]',
   strftime('%s','now'),
   strftime('%s','now')
@@ -102,7 +106,8 @@ Example web client:
 
 ```sql
 INSERT INTO zeroth_clients (
-  id, name, secret_hash, confidential, redirect_uris_json, allowed_origins_json, created_at, updated_at
+  id, name, secret_hash, confidential, redirect_uris_json, allowed_origins_json,
+  allowed_email_domains_json, created_at, updated_at
 ) VALUES (
   'wavey-web',
   'Wavey Web',
@@ -110,10 +115,16 @@ INSERT INTO zeroth_clients (
   1,
   '["https://app.example.com/auth/callback"]',
   '["https://app.example.com"]',
+  '["example.com"]',
   strftime('%s','now'),
   strftime('%s','now')
 );
 ```
+
+`allowed_email_domains_json` is optional client policy. Leave it as `[]` for
+public clients that can accept any provider account, or set domains such as
+`["example.com"]` to require a verified provider email whose domain matches the
+client allowlist before Zeroth issues a session or authorization code.
 
 For confidential clients, `secret_hash` is the SHA-256 hex digest of the client
 secret, optionally prefixed with `sha256:`. `/oauth/token` accepts
@@ -133,6 +144,7 @@ curl -X POST "https://id.example.com/clients" \
     "name": "Wavey iOS",
     "redirectUris": ["wavey://auth/callback"],
     "allowedOrigins": [],
+    "allowedEmailDomains": [],
     "confidential": false
   }'
 
@@ -143,8 +155,9 @@ curl -X DELETE -H "Authorization: Bearer $ADMIN_TOKEN" \
 `GET /clients?client_id=...` returns one client; `GET /clients` returns at most
 256 clients. `POST /clients` creates or updates a client. Confidential clients
 may send `clientSecret` to have Zeroth hash it, or `secretHash` when the hash is
-already produced outside the Worker. `DELETE /clients?client_id=...` disables
-the client instead of deleting the row.
+already produced outside the Worker. `allowedEmailDomains` accepts up to 32
+ASCII domains and requires provider emails to be verified before matching.
+`DELETE /clients?client_id=...` disables the client instead of deleting the row.
 
 `GET /ready` is the public deployment preflight endpoint. It returns `200` only
 when the issuer URL is HTTPS, Zeroth signing material is present and parseable,
@@ -242,6 +255,14 @@ wrangler secret put ADMIN_EMAILS # optional verified primary-email allowlist
 wrangler secret put APPLE_APP_SITE_ASSOCIATION_JSON # optional public AASA payload
 ```
 
+Non-secret deployment vars include `PUBLIC_BASE_URL`, `SESSION_COOKIE_NAME`,
+`TX_COOKIE_NAME`, and optional `SESSION_COOKIE_DOMAIN`. Leave
+`SESSION_COOKIE_DOMAIN` unset for a host-only Zeroth session cookie, or set it
+to a parent domain such as `.example.com` when one first-party registrable
+domain owns multiple subdomain apps. This is the Zeroth-native equivalent of
+the useful shared-cookie behavior from a deployment-specific identity broker;
+unrelated domains still need OIDC redirects and app-local sessions.
+
 Apple can be configured in either of two ways:
 
 - `APPLE_CLIENT_SECRET`: a pre-minted Sign in with Apple client-secret JWT.
@@ -324,9 +345,9 @@ Current guardrails:
 - Event inspection stays bounded even when filtered because `/events` uses
   exact-match query parameters with indexed lookups and a fixed 100-row limit.
 - Management writes are bounded: `POST /clients` accepts only JSON bodies up to
-  8 KiB, validates at most 32 redirect URIs and 32 allowed origins, and uses a
-  single D1 upsert. `PATCH /users` accepts only a 1 KiB JSON body for the
-  reversible disabled state.
+  8 KiB, validates at most 32 redirect URIs, 32 allowed origins, and 32 allowed
+  email domains, and uses a single D1 upsert. `PATCH /users` accepts only a 1
+  KiB JSON body for the reversible disabled state.
 - Audit details are bounded to 1 KiB and oversized details are replaced with a
   small truncation marker before they are inserted into D1.
 - Profile writes are bounded: `PATCH /profile` accepts only JSON bodies up to 4
@@ -408,8 +429,10 @@ Current guardrails:
   `state` to match the short-lived browser transaction cookie, requires the
   conditional D1 update that consumes the one-time provider state to report
   exactly one changed row, exchanges the provider code for upstream tokens,
-  verifies Google/Apple RS256 ID tokens against provider JWKS, persists
-  Google/Apple users/identities from verified claims, persists Spotify
+  verifies Google/Apple RS256 ID tokens against provider JWKS and a
+  Zeroth-owned provider nonce separate from the downstream app nonce, persists
+  Google/Apple users/identities from verified claims, preserves Apple's
+  first-consent `user` JSON for display-name capture, persists Spotify
   users/identities from Spotify's profile API, creates a D1-backed browser
   session, sets the secure session cookie, clears the transaction cookie, and
   then either redirects to the browser login `return_to` URL or issues a Zeroth
@@ -443,7 +466,11 @@ Current guardrails:
 - `GET /.well-known/openid-configuration` advertises the authorization,
   token, revocation, introspection, userinfo, JWKS, and end-session endpoints,
   ES256 token signing, `query` response mode, supported prompt values, and
-  `authorization_response_iss_parameter_supported: true`.
+  `authorization_response_iss_parameter_supported: true`. `prompt=none`
+  performs silent SSO only with a fresh active session, `prompt=login` and
+  `prompt=select_account` force the hosted picker to ignore the current session,
+  and `prompt=consent` is parsed explicitly while remaining a no-op until
+  consent records exist.
 - `GET /.well-known/oauth-authorization-server` serves the same issuer-derived
   endpoint metadata for OAuth-only resource servers and advertises revocation
   and introspection client-auth methods.
