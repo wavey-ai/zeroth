@@ -1,0 +1,10 @@
+[package]
+name = "zeroth-storage"
+version.workspace = true
+edition.workspace = true
+description = "Storage traits for Zeroth"
+license.workspace = true
+homepage.workspace = true
+
+[dependencies]
+zeroth-core.workspace = true

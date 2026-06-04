@@ -1,0 +1,11 @@
+[package]
+name = "zeroth-oidc"
+version.workspace = true
+edition.workspace = true
+description = "OIDC protocol surface for Zeroth"
+license.workspace = true
+homepage.workspace = true
+
+[dependencies]
+url.workspace = true
+zeroth-core.workspace = true

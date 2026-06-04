@@ -1,0 +1,9 @@
+/target
+/crates/zeroth-worker/build/
+/.wrangler/
+.dev.vars
+.env
+.env.*
+*.log
+*.rs.bk
+.DS_Store

@@ -1,0 +1,65 @@
+[package]
+name = "zeroth"
+version.workspace = true
+edition.workspace = true
+description = "Minimal first-party identity provider and social login broker"
+license.workspace = true
+homepage.workspace = true
+
+[workspace]
+members = [
+    "crates/zeroth-cli",
+    "crates/zeroth-core",
+    "crates/zeroth-oidc",
+    "crates/zeroth-providers",
+    "crates/zeroth-server",
+    "crates/zeroth-storage",
+    "crates/zeroth-ui",
+    "crates/zeroth-worker",
+]
+resolver = "2"
+
+[features]
+default = []
+ui = ["dep:zeroth-ui"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+homepage = "https://wavey.ai"
+
+[workspace.dependencies]
+zeroth-core = { version = "0.1.0", path = "crates/zeroth-core" }
+zeroth-oidc = { version = "0.1.0", path = "crates/zeroth-oidc" }
+zeroth-providers = { version = "0.1.0", path = "crates/zeroth-providers" }
+zeroth-server = { version = "0.1.0", path = "crates/zeroth-server" }
+zeroth-storage = { version = "0.1.0", path = "crates/zeroth-storage" }
+zeroth-ui = { version = "0.1.0", path = "crates/zeroth-ui" }
+zeroth-worker = { version = "0.1.0", path = "crates/zeroth-worker" }
+base64 = "0.22"
+console_error_panic_hook = "0.1"
+getrandom = { version = "0.2", features = ["js"] }
+leptos = { version = "0.8.12", default-features = false, features = ["ssr"] }
+p256 = { version = "0.13", features = ["ecdsa", "pem", "pkcs8"] }
+rsa = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = { version = "0.10", features = ["oid"] }
+url = "2"
+urlencoding = "2"
+web-sys = { version = "0.3", features = [
+    "Crypto",
+    "CryptoKey",
+    "SubtleCrypto",
+    "WorkerGlobalScope",
+] }
+worker = { version = "0.8.3", features = ["d1"] }
+
+[dependencies]
+zeroth-core.workspace = true
+zeroth-oidc.workspace = true
+zeroth-providers.workspace = true
+zeroth-server.workspace = true
+zeroth-storage.workspace = true
+zeroth-ui = { workspace = true, optional = true }

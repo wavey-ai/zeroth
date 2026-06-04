@@ -1,0 +1,11 @@
+[package]
+name = "zeroth-providers"
+version.workspace = true
+edition.workspace = true
+description = "Upstream identity provider adapters for Zeroth"
+license.workspace = true
+homepage.workspace = true
+
+[dependencies]
+zeroth-core.workspace = true
+url.workspace = true

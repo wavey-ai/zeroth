@@ -1,0 +1,12 @@
+[package]
+name = "zeroth-ui"
+version.workspace = true
+edition.workspace = true
+description = "Leptos account and hosted-login UI for Zeroth"
+license.workspace = true
+homepage.workspace = true
+
+[dependencies]
+leptos.workspace = true
+url.workspace = true
+zeroth-providers.workspace = true

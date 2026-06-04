@@ -1,0 +1,36 @@
+[package]
+name = "zeroth-worker"
+version.workspace = true
+edition.workspace = true
+description = "Cloudflare Worker deployment surface for Zeroth"
+license.workspace = true
+homepage.workspace = true
+exclude = ["build/**"]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+base64.workspace = true
+console_error_panic_hook.workspace = true
+getrandom.workspace = true
+p256.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+url.workspace = true
+urlencoding.workspace = true
+web-sys.workspace = true
+worker.workspace = true
+zeroth-core.workspace = true
+zeroth-oidc.workspace = true
+zeroth-providers.workspace = true
+zeroth-server.workspace = true
+zeroth-storage.workspace = true
+zeroth-ui.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rsa.workspace = true
+
+[dev-dependencies]
+rsa.workspace = true

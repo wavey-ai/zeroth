@@ -1,0 +1,21 @@
+name = "zeroth-worker"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-06-04"
+workers_dev = true
+
+[vars]
+PUBLIC_BASE_URL = "http://localhost:8787"
+PRODUCT_NAME = "Zeroth"
+SESSION_COOKIE_NAME = "zeroth_session"
+TX_COOKIE_NAME = "zeroth_tx"
+APPLE_CLIENT_ID = "replace-with-apple-client-id"
+GOOGLE_CLIENT_ID = "replace-with-google-client-id"
+SPOTIFY_CLIENT_ID = "replace-with-spotify-client-id"
+
+[[d1_databases]]
+binding = "ZEROTH_DB"
+database_name = "zeroth"
+database_id = "replace-with-d1-database-id"
+
+[build]
+command = "cargo install -q worker-build && worker-build --release"

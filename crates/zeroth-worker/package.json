@@ -1,0 +1,15 @@
+{
+  "name": "@zeroth/worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "cargo check --package zeroth-worker",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^4.96.0"
+  }
+}
+

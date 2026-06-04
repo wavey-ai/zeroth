@@ -1,0 +1,13 @@
+[package]
+name = "zeroth-server"
+version.workspace = true
+edition.workspace = true
+description = "HTTP server boundary for Zeroth"
+license.workspace = true
+homepage.workspace = true
+
+[dependencies]
+zeroth-core.workspace = true
+zeroth-oidc.workspace = true
+zeroth-providers.workspace = true
+zeroth-storage.workspace = true
