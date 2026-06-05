@@ -121,9 +121,9 @@ a:hover {
 }
 
 .zeroth-login-mode .zeroth-main {
-  width: min(880px, 100%);
+  width: min(680px, 100%);
   margin: 0 auto;
-  padding: 44px 20px 28px;
+  padding: 38px 20px 28px;
 }
 
 .zeroth-login-intro {
@@ -182,19 +182,19 @@ a:hover {
 
 .zeroth-login-card {
   margin: 0 auto;
-  width: min(520px, 100%);
+  width: min(440px, 100%);
 }
 
 .zeroth-login-card .zeroth-panel-header {
-  padding: 13px 14px;
+  padding: 16px 18px;
 }
 
 .zeroth-login-card .zeroth-panel-title {
-  font-size: 16px;
+  font-size: 18px;
 }
 
 .zeroth-login-card .zeroth-panel-body {
-  padding: 14px;
+  padding: 18px;
 }
 
 .zeroth-local-auth {
@@ -227,19 +227,62 @@ a:hover {
 }
 
 .zeroth-login-mode .zeroth-provider {
-  grid-template-columns: 42px minmax(0, 1fr) auto;
-  padding: 14px 0;
+  grid-template-columns: 38px minmax(0, 1fr);
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid var(--z-line-strong);
+  border-radius: 8px;
+  background: #ffffff;
 }
 
 .zeroth-login-mode .zeroth-provider-badge {
-  width: 38px;
-  height: 38px;
+  width: 34px;
+  height: 34px;
   border-radius: 8px;
 }
 
 .zeroth-login-mode .zeroth-action {
   min-height: 36px;
   min-width: 94px;
+}
+
+.zeroth-login-mode .zeroth-provider-list {
+  gap: 10px;
+}
+
+.zeroth-login-mode .zeroth-provider > div {
+  display: none;
+}
+
+.zeroth-login-mode .zeroth-provider .zeroth-action {
+  border-color: var(--z-line-strong);
+  grid-column: 2;
+  justify-content: center;
+  min-width: 0;
+  width: 100%;
+  font-weight: 700;
+}
+
+.zeroth-login-mode .provider-apple .zeroth-action {
+  border-color: #1f2328;
+  background: #1f2328;
+  color: #ffffff;
+}
+
+.zeroth-login-mode .provider-apple .zeroth-action:hover {
+  border-color: #424a53;
+  background: #424a53;
+  color: #ffffff;
+}
+
+.zeroth-login-mode .provider-google .zeroth-action {
+  background: #ffffff;
+  color: #1f2328;
+}
+
+.zeroth-login-mode .provider-google .zeroth-action:hover {
+  border-color: #0969da;
+  color: #0969da;
 }
 
 .zeroth-nav {
@@ -1140,7 +1183,7 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
     let profile_action = endpoint_url(&config, "/profile");
     let logout_action = endpoint_url(&config, "/logout");
     let csrf_token = config.csrf_token.clone().unwrap_or_default();
-    let login_mode = config.provider_authorize_path == "/login" && !signed_in;
+    let login_mode = !signed_in && !config.link_identities;
     let shell_class = if login_mode {
         "zeroth-shell zeroth-login-mode"
     } else {
@@ -1160,6 +1203,11 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
         "zeroth-panel zeroth-login-card"
     } else {
         "zeroth-panel"
+    };
+    let login_client_status_class = if login_mode {
+        "zeroth-status zeroth-hidden"
+    } else {
+        "zeroth-status"
     };
     let passkey_register_class = if signed_in {
         "zeroth-form zeroth-passkey-register-form"
@@ -1227,9 +1275,12 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
                         <section id="login" class=login_panel_class>
                             <div class="zeroth-panel-header">
                                 <h2 class="zeroth-panel-title">{login_panel_title}</h2>
-                                <span class="zeroth-status">{config.client_id.clone()}</span>
+                                <span class=login_client_status_class>{config.client_id.clone()}</span>
                             </div>
                             <div class="zeroth-panel-body zeroth-local-auth">
+                                <div class="zeroth-provider-list">{provider_rows}</div>
+
+                                <div class="zeroth-divider">"Email"</div>
                                 <form class="zeroth-form zeroth-login-form" method="post" action=password_login_action data-zeroth-local-auth="password-login">
                                     <input type="hidden" name="clientId" value=config.client_id.clone() />
                                     <input type="hidden" name="returnTo" value=login_return_to.clone() />
@@ -1249,6 +1300,7 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
                                     </div>
                                 </form>
 
+                                <div class="zeroth-divider">"Magic link"</div>
                                 <form class="zeroth-form zeroth-login-form" method="post" action=magic_link_action data-zeroth-local-auth="magic-link">
                                     <input type="hidden" name="clientId" value=config.client_id.clone() />
                                     <input type="hidden" name="returnTo" value=login_return_to.clone() />
@@ -1288,9 +1340,6 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
                                         <button class="zeroth-action" type="submit">"Save passkey"</button>
                                     </div>
                                 </form>
-
-                                <div class="zeroth-divider">"SSO"</div>
-                                <div class="zeroth-provider-list">{provider_rows}</div>
                             </div>
                         </section>
 
@@ -1691,6 +1740,7 @@ pub fn ClientsAdminApp(state: ClientsAdminUiState) -> impl IntoView {
 
 fn provider_row(config: &ZerothUiConfig, provider: ProviderUi, signed_in: bool) -> impl IntoView {
     let linking = signed_in && config.link_identities;
+    let login_mode = !signed_in && !config.link_identities;
     let href = if !provider.enabled || (provider.connected && linking) {
         "#".to_owned()
     } else if linking {
@@ -1699,11 +1749,13 @@ fn provider_row(config: &ZerothUiConfig, provider: ProviderUi, signed_in: bool) 
         provider_authorize_url(config, &provider.id)
     };
     let action = if provider.connected && linking {
-        "Connected"
+        "Connected".to_owned()
     } else if linking {
-        "Link"
+        "Link".to_owned()
+    } else if login_mode {
+        format!("Continue with {}", provider.label)
     } else {
-        "Continue"
+        "Continue".to_owned()
     };
     let status = if provider.connected {
         "Connected"
@@ -2449,6 +2501,18 @@ async function zerothSignInWithPasskey(button) {
   window.location.assign((result && result.returnTo) || payload.returnTo || "/account");
 }
 
+function zerothSubmitAction(form, submitter) {
+  if (
+    submitter instanceof HTMLButtonElement &&
+    submitter.hasAttribute("formaction") &&
+    submitter.getAttribute("formaction")
+  ) {
+    return submitter.formAction;
+  }
+  const action = form.getAttribute("action");
+  return action ? new URL(action, window.location.href).toString() : form.action;
+}
+
 document.addEventListener("submit", async (event) => {
   const form = event.target;
   if (form instanceof HTMLFormElement && form.dataset.zerothLocalAuth) {
@@ -2466,9 +2530,7 @@ document.addEventListener("submit", async (event) => {
     if (mode !== "magic-link") {
       payload.password = String(data.get("password") || "");
     }
-    const action = submitter instanceof HTMLButtonElement && submitter.formAction
-      ? submitter.formAction
-      : form.action;
+    const action = zerothSubmitAction(form, submitter);
     const response = await fetch(action, {
       method: "POST",
       credentials: "include",
@@ -3516,14 +3578,21 @@ mod tests {
         ));
         state.config.provider_authorize_path = "/login".to_owned();
         state.config.return_to = Some("https://id.example.com/admin".to_owned());
-        state.providers = vec![ProviderUi::apple(false)];
+        state.config.link_identities = false;
+        state.providers = vec![ProviderUi::apple(false), ProviderUi::google(false)];
 
         let html = render_account_html(state);
+        let provider_index = html.find("zeroth-provider-list").unwrap();
+        let password_index = html.find("zeroth-login-form").unwrap();
 
         assert!(html.contains("zeroth-login-mode"));
         assert!(html.contains("zeroth-hero-mark"));
         assert!(html.contains(">Z<"));
         assert!(html.contains("Sign in"));
+        assert!(provider_index < password_index);
+        assert!(html.contains("Continue with Apple"));
+        assert!(html.contains("Continue with Google"));
+        assert!(html.contains("zeroth-status zeroth-hidden"));
         assert!(html.contains("/password/login"));
         assert!(html.contains("/password/register"));
         assert!(html.contains("/magic-links"));
@@ -3532,6 +3601,31 @@ mod tests {
         assert!(html.contains("zeroth-login-card"));
         assert!(html.contains("zeroth-panel zeroth-hidden"));
         assert!(html.contains("provider=apple"));
+    }
+
+    #[test]
+    fn hosted_authorize_html_uses_normal_login_surface() {
+        let mut state = ZerothUiState::new(ZerothUiConfig::new(
+            "https://id.example.com",
+            "browser-client",
+            "https://app.example.com/auth/callback",
+        ));
+        state.config.link_identities = false;
+        state.config.state = Some("state-1".to_owned());
+        state.config.code_challenge = Some("challenge-1".to_owned());
+        state.providers = vec![ProviderUi::apple(false), ProviderUi::google(false)];
+
+        let html = render_account_html(state);
+        let provider_index = html.find("zeroth-provider-list").unwrap();
+        let password_index = html.find("zeroth-login-form").unwrap();
+
+        assert!(html.contains("zeroth-login-mode"));
+        assert!(provider_index < password_index);
+        assert!(html.contains("Continue with Apple"));
+        assert!(html.contains("Continue with Google"));
+        assert!(html.contains("/authorize"));
+        assert!(html.contains("code_challenge=challenge-1"));
+        assert!(html.contains("state=state-1"));
     }
 
     #[test]
@@ -3550,6 +3644,9 @@ mod tests {
         assert!(document.contains("JSON.stringify(payload)"));
         assert!(document.contains("navigator.credentials.get"));
         assert!(document.contains("/passkeys/authenticate/options"));
+        assert!(document.contains("function zerothSubmitAction(form, submitter)"));
+        assert!(document.contains("submitter.hasAttribute(\"formaction\")"));
+        assert!(document.contains("zerothSubmitAction(form, submitter)"));
     }
 
     #[test]
@@ -3676,7 +3773,9 @@ mod tests {
                 last_sent_at: None,
                 last_failed_at: Some("1780000300".to_owned()),
                 last_error: Some("email_internal_server_error".to_owned()),
-                last_error_detail: Some("email.sending.error.internal_server [code: 10002]".to_owned()),
+                last_error_detail: Some(
+                    "email.sending.error.internal_server [code: 10002]".to_owned(),
+                ),
             }),
             notes: vec!["delivery_failed_recently".to_owned()],
         });
