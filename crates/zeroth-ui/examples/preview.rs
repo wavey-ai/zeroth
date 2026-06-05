@@ -48,6 +48,7 @@ fn main() {
             public_client: true,
             redirect_uris: vec!["wavey://auth/callback".to_owned()],
             allowed_origins: Vec::new(),
+            allowed_email_domains: Vec::new(),
         },
         ApplicationUi {
             client_id: "wavey-web".to_owned(),
@@ -55,6 +56,7 @@ fn main() {
             public_client: true,
             redirect_uris: vec!["https://app.wavey.local/auth/callback".to_owned()],
             allowed_origins: vec!["https://app.wavey.local".to_owned()],
+            allowed_email_domains: vec!["wavey.local".to_owned()],
         },
     ];
 

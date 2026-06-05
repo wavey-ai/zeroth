@@ -1,9 +1,11 @@
 /target
 /crates/zeroth-worker/build/
+/crates/zeroth-worker/wrangler.generated.jsonc
 /.wrangler/
 .dev.vars
 .env
 .env.*
 *.log
+*.p8
 *.rs.bk
 .DS_Store

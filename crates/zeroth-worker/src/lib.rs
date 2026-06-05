@@ -14,18 +14,22 @@ use rsa::{
     pkcs1v15::{Signature as RsaPkcs1v15Signature, VerifyingKey as RsaPkcs1v15VerifyingKey},
     BigUint, RsaPublicKey,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 #[cfg(target_arch = "wasm32")]
 use std::cell::RefCell;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use zeroth_core::{AuthTransaction, Client, ClientId, ProviderId, ScopeSet, UserId};
+use zeroth_core::{AuthTransaction, Client, ClientId, ProviderId, ScopeSet, Subject, UserId};
 use zeroth_oidc::authorization_request_redirect_uri_registered_for_client;
 #[cfg(target_arch = "wasm32")]
 use zeroth_oidc::parse_authorization_request;
 #[cfg(any(test, target_arch = "wasm32"))]
 use zeroth_oidc::validate_authorization_request_for_client;
-use zeroth_oidc::{AuthorizationPrompt, AuthorizationRequest, AuthorizationRequestError};
+#[cfg(any(test, target_arch = "wasm32"))]
+use zeroth_oidc::AuthorizationPrompt;
+use zeroth_oidc::{AuthorizationRequest, AuthorizationRequestError};
+use zeroth_oidc::{ZerothJwk, ZerothJwks, ZerothJwtClaims, ZerothTokenUse, ZerothTokenValidation};
 use zeroth_providers::well_known;
 #[cfg(any(test, target_arch = "wasm32"))]
 use zeroth_providers::TokenAuth;
@@ -34,14 +38,16 @@ use zeroth_providers::{
 };
 use zeroth_server::ZerothServerConfig;
 #[cfg(target_arch = "wasm32")]
-use zeroth_ui::ProviderAdminUi;
-#[cfg(target_arch = "wasm32")]
 use zeroth_ui::{render_account_document, ZerothUiConfig, ZerothUiState};
 #[cfg(target_arch = "wasm32")]
 use zeroth_ui::{render_clients_admin_document, ClientsAdminUiState};
 use zeroth_ui::{
     ApplicationUi, ClientAdminUi, EventAdminUi, IdentityUi, ProfileUi, ProviderKind, ProviderUi,
     SessionUi, UserAdminUi,
+};
+#[cfg(target_arch = "wasm32")]
+use zeroth_ui::{
+    LocalAuthAdminUi, LocalAuthDeliveryAdminUi, ProviderAdminUi, ProviderFailureAdminUi,
 };
 
 #[cfg(target_arch = "wasm32")]
@@ -65,14 +71,40 @@ const CLIENT_ID_MAX_CHARS: usize = 128;
 const CLIENT_NAME_MAX_CHARS: usize = 128;
 const CLIENT_URI_MAX_BYTES: usize = 2048;
 const CLIENT_URI_LIST_LIMIT: usize = 32;
+const CLIENT_EMAIL_DOMAIN_MAX_BYTES: usize = 253;
 const USER_LIST_LIMIT: i32 = 100;
 const USER_MANAGEMENT_BODY_LIMIT: usize = 1024;
 const USER_ID_MAX_CHARS: usize = 128;
 const AUDIT_EVENT_LIST_LIMIT: i32 = 100;
 const AUDIT_EVENT_TYPE_MAX_CHARS: usize = 96;
 const AUDIT_EVENT_DETAILS_MAX_BYTES: usize = 1024;
+const PROVIDER_FAILURE_EVENT_LIST_LIMIT: i32 = 30;
+const PROVIDER_FAILURE_CODE_MAX_CHARS: usize = 96;
+const PROVIDER_FAILURE_DESCRIPTION_MAX_CHARS: usize = 240;
 const SESSION_LIST_LIMIT: i32 = 100;
 const IDENTITY_LIST_LIMIT: i32 = 16;
+const PASSKEY_CHALLENGE_TTL_SECONDS: i32 = 5 * 60;
+const PASSKEY_CHALLENGE_CLEANUP_LIMIT: i32 = 64;
+const PASSKEY_CREDENTIAL_LIST_LIMIT: i32 = 64;
+const PASSKEY_BODY_LIMIT: usize = 16 * 1024;
+const PASSKEY_LABEL_MAX_CHARS: usize = 128;
+const PASSKEY_EMAIL_MAX_BYTES: usize = 320;
+const LOCAL_AUTH_BODY_LIMIT: usize = 8 * 1024;
+const LOCAL_AUTH_PROVIDER_ID: &str = "zeroth";
+const PASSWORD_MIN_BYTES: usize = 8;
+const PASSWORD_MAX_BYTES: usize = 1024;
+const PASSWORD_PBKDF2_ALG: &str = "pbkdf2-sha256";
+const PASSWORD_PBKDF2_DEFAULT_ITERATIONS: u32 = 8_192;
+const PASSWORD_PBKDF2_MIN_ITERATIONS: u32 = 1_000;
+const PASSWORD_PBKDF2_MAX_ITERATIONS: u32 = 100_000;
+const MAGIC_LINK_TTL_SECONDS: i32 = 10 * 60;
+const MAGIC_LINK_CLEANUP_LIMIT: i32 = 64;
+const MAGIC_LINK_EMAIL_ERROR_DETAIL_MAX_CHARS: usize = 160;
+const MAGIC_LINK_DELIVERY_CLOUDFLARE_EMAIL: &str = "cloudflare_email";
+const MAGIC_LINK_DELIVERY_WEBHOOK: &str = "webhook";
+const MAGIC_LINK_DELIVERY_RESEND: &str = "resend";
+const MAGIC_LINK_DELIVERY_MAILCHANNELS: &str = "mailchannels";
+const MAGIC_LINK_DELIVERY_UNSUPPORTED: &str = "unsupported";
 const PROFILE_PATCH_BODY_LIMIT: usize = 4 * 1024;
 const PROFILE_NAME_MAX_CHARS: usize = 128;
 const PROFILE_PICTURE_MAX_BYTES: usize = 2048;
@@ -80,9 +112,14 @@ const APPLE_CLIENT_SECRET_DEFAULT_TTL_SECONDS: i64 = 60 * 60 * 24 * 180;
 const APPLE_CLIENT_SECRET_MAX_TTL_SECONDS: i64 = 60 * 60 * 24 * 180;
 const APPLE_CLIENT_SECRET_CACHE_REFRESH_SECONDS: i64 = 60 * 60;
 const PROVIDER_JWKS_CACHE_TTL_SECONDS: i32 = 60 * 60;
+const TOKEN_EXCHANGE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
+const ID_TOKEN_SUBJECT_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:id_token";
+const ACCESS_TOKEN_SUBJECT_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:access_token";
+const DEFAULT_NATIVE_TOKEN_SCOPE: &str = "openid profile email";
 const CORS_ALLOW_METHODS: &str = "GET, POST, PATCH, DELETE, OPTIONS";
 const CORS_ALLOW_HEADERS: &str = "Authorization, Content-Type";
 const CORS_MAX_AGE_SECONDS: &str = "600";
+const ZEROTH_FAVICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="12" fill="#111827"/><path d="M17 16h30L25 48h25" fill="none" stroke="#f9fafb" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/></svg>"##;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -201,25 +238,14 @@ struct JwtClaims {
     name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     picture: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct SignedJwtHeader {
-    alg: String,
-    #[serde(default)]
-    kid: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    roles: Vec<String>,
 }
 
 #[derive(Clone)]
 struct Es256SigningKey {
     kid: String,
     signing_key: SigningKey,
-}
-
-#[derive(Clone)]
-struct Es256VerificationKey {
-    kid: String,
-    verifying_key: VerifyingKey,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -229,7 +255,6 @@ struct CachedSigningMaterial {
     private_key: String,
     previous_public_jwks: Option<String>,
     signing_key: Es256SigningKey,
-    verification_keys: Vec<Es256VerificationKey>,
     jwks: JwksResponse,
 }
 
@@ -335,6 +360,8 @@ struct ClientRow {
     #[serde(default)]
     allowed_origins_json: String,
     #[serde(default)]
+    allowed_email_domains_json: String,
+    #[serde(default)]
     confidential: i32,
     #[serde(default)]
     disabled_at: Option<i32>,
@@ -353,6 +380,7 @@ struct ClientResponse {
     name: String,
     redirect_uris: Vec<String>,
     allowed_origins: Vec<String>,
+    allowed_email_domains: Vec<String>,
     confidential: bool,
     disabled: bool,
     has_secret: bool,
@@ -368,6 +396,55 @@ struct ClientsResponse {
 #[serde(rename_all = "camelCase")]
 struct ProviderStatusResponse {
     providers: Vec<ProviderStatus>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalAuthStatusResponse {
+    methods: Vec<LocalAuthStatus>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalAuthStatus {
+    id: &'static str,
+    label: &'static str,
+    enabled: bool,
+    credential_storage: &'static str,
+    delivery: &'static str,
+    notes: Vec<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delivery_status: Option<LocalAuthDeliveryStatus>,
+}
+
+#[derive(Debug, Clone, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalAuthDeliveryStatus {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_issue_at: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_sent_at: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_failed_at: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_error_detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct MagicLinkDeliveryConfig {
+    transport: &'static str,
+    enabled: bool,
+    notes: Vec<&'static str>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum MagicLinkDeliveryTransport {
+    CloudflareEmail,
+    Webhook,
+    Resend,
+    MailChannels,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -409,7 +486,27 @@ struct ProviderStatus {
     enabled: bool,
     client_id_configured: bool,
     client_secret_configured: bool,
+    client_id_binding: &'static str,
+    secret_binding_sets: Vec<Vec<&'static str>>,
+    callback_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    web_domain: Option<String>,
     notes: Vec<&'static str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    activation_requirements: Vec<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_failure: Option<ProviderFailureStatus>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderFailureStatus {
+    event_type: String,
+    created_at: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -422,6 +519,8 @@ struct ClientUpsertRequest {
     redirect_uris: Vec<String>,
     #[serde(default, alias = "allowed_origins")]
     allowed_origins: Vec<String>,
+    #[serde(default, alias = "allowed_email_domains")]
+    allowed_email_domains: Vec<String>,
     #[serde(default)]
     confidential: bool,
     #[serde(default, alias = "client_secret")]
@@ -438,6 +537,7 @@ struct ValidatedClientUpsert {
     name: String,
     redirect_uris: Vec<String>,
     allowed_origins: Vec<String>,
+    allowed_email_domains: Vec<String>,
     confidential: bool,
     secret_hash: Option<String>,
     disabled: bool,
@@ -458,8 +558,16 @@ struct AdminUserRow {
     disabled_at: Option<i32>,
     #[serde(default)]
     email_verified: i32,
+    #[serde(default)]
+    admin_membership_active: i32,
     identity_count: i32,
     active_session_count: i32,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+struct AdminMembershipProbeRow {
+    user_id: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -475,6 +583,7 @@ struct AdminUserResponse {
     created_at: i32,
     updated_at: i32,
     disabled: bool,
+    admin: bool,
     identity_count: i32,
     active_session_count: i32,
 }
@@ -497,7 +606,10 @@ struct AdminUserDetailResponse {
 #[serde(deny_unknown_fields)]
 #[serde(rename_all = "camelCase")]
 struct AdminUserPatchRequest {
-    disabled: bool,
+    #[serde(default)]
+    disabled: Option<bool>,
+    #[serde(default)]
+    admin: Option<bool>,
 }
 
 #[allow(dead_code)]
@@ -516,6 +628,21 @@ struct AuditEventRow {
     ip_hash: Option<String>,
     #[serde(default)]
     user_agent: Option<String>,
+    details_json: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq)]
+struct MagicLinkDeliveryEventRow {
+    event_type: String,
+    created_at: i32,
+    details_json: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq)]
+struct ProviderFailureEventRow {
+    provider_id: String,
+    event_type: String,
+    created_at: i32,
     details_json: String,
 }
 
@@ -570,6 +697,8 @@ struct AuthTransactionRow {
     #[serde(default)]
     nonce: Option<String>,
     #[serde(default)]
+    provider_nonce: Option<String>,
+    #[serde(default)]
     code_challenge: Option<String>,
     #[serde(default)]
     code_challenge_method: Option<String>,
@@ -597,6 +726,7 @@ struct ProviderCallback {
     state: String,
     code: Option<String>,
     provider_error: Option<ProviderCallbackError>,
+    apple_user_json: Option<String>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -629,12 +759,15 @@ struct ProviderTokenExchangeError {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct SpotifyApiProfile {
+    #[serde(default)]
+    account_id: Option<String>,
+    #[serde(default)]
     id: String,
     #[serde(default)]
     email: Option<String>,
     #[serde(default)]
     display_name: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_default_vec")]
     images: Vec<SpotifyApiImage>,
 }
 
@@ -642,6 +775,22 @@ struct SpotifyApiProfile {
 struct SpotifyApiImage {
     #[serde(default)]
     url: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
+struct AppleCallbackUser {
+    #[serde(default)]
+    name: Option<AppleCallbackUserName>,
+    #[serde(default)]
+    email: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
+struct AppleCallbackUserName {
+    #[serde(default, rename = "firstName")]
+    first_name: Option<String>,
+    #[serde(default, rename = "lastName")]
+    last_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -798,6 +947,339 @@ struct IdentityRow {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
+struct PasskeyCredentialRow {
+    credential_id: String,
+    user_id: String,
+    #[serde(default)]
+    label: Option<String>,
+    public_key_x: String,
+    public_key_y: String,
+    sign_count: i32,
+    created_at: i32,
+    updated_at: i32,
+    #[serde(default)]
+    last_used_at: Option<i32>,
+    #[serde(default)]
+    disabled_at: Option<i32>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+struct PasskeyChallengeRow {
+    challenge_hash: String,
+    kind: String,
+    #[serde(default)]
+    user_id: Option<String>,
+    #[serde(default)]
+    client_id: Option<String>,
+    #[serde(default)]
+    return_to: Option<String>,
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    label: Option<String>,
+    created_at: i32,
+    expires_at: i32,
+    #[serde(default)]
+    consumed_at: Option<i32>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+struct LocalCredentialRow {
+    email: String,
+    user_id: String,
+    password_hash: String,
+    password_salt: String,
+    password_alg: String,
+    password_iterations: i32,
+    created_at: i32,
+    updated_at: i32,
+    #[serde(default)]
+    last_used_at: Option<i32>,
+    #[serde(default)]
+    disabled_at: Option<i32>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+struct MagicLinkRow {
+    token_hash: String,
+    email: String,
+    #[serde(default)]
+    user_id: Option<String>,
+    client_id: String,
+    return_to: String,
+    created_at: i32,
+    expires_at: i32,
+    #[serde(default)]
+    consumed_at: Option<i32>,
+    #[serde(default)]
+    ip_hash: Option<String>,
+    #[serde(default)]
+    user_agent: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+struct PasskeyRegisterOptionsRequest {
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default, alias = "display_name")]
+    display_name: Option<String>,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default, alias = "return_to")]
+    return_to: Option<String>,
+    #[serde(default, alias = "client_id")]
+    client_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+struct PasskeyAuthenticateOptionsRequest {
+    #[serde(default, alias = "return_to")]
+    return_to: Option<String>,
+    #[serde(default, alias = "client_id")]
+    client_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+struct PasswordRegisterRequest {
+    email: String,
+    password: String,
+    #[serde(default, alias = "display_name")]
+    display_name: Option<String>,
+    #[serde(default, alias = "return_to")]
+    return_to: Option<String>,
+    #[serde(default, alias = "client_id")]
+    client_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+struct PasswordLoginRequest {
+    email: String,
+    password: String,
+    #[serde(default, alias = "return_to")]
+    return_to: Option<String>,
+    #[serde(default, alias = "client_id")]
+    client_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+struct MagicLinkRequest {
+    email: String,
+    #[serde(default, alias = "return_to")]
+    return_to: Option<String>,
+    #[serde(default, alias = "client_id")]
+    client_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+struct MagicLinkConsumeRequest {
+    token: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalAuthResponse {
+    ok: bool,
+    return_to: String,
+    user: UserInfoResponse,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MagicLinkResponse {
+    ok: bool,
+    sent: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dev_link: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct LocalAuthSessionIssue {
+    session_id: String,
+    return_to: String,
+    user: UserRow,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+struct PasskeyRegisterVerifyRequest {
+    id: String,
+    raw_id: String,
+    response: PasskeyRegisterCredentialResponse,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+struct PasskeyRegisterCredentialResponse {
+    #[serde(rename = "clientDataJSON")]
+    client_data_json: String,
+    attestation_object: String,
+    #[serde(default)]
+    transports: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+struct PasskeyAuthenticateVerifyRequest {
+    id: String,
+    raw_id: String,
+    response: PasskeyAuthenticateCredentialResponse,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+struct PasskeyAuthenticateCredentialResponse {
+    #[serde(rename = "clientDataJSON")]
+    client_data_json: String,
+    authenticator_data: String,
+    signature: String,
+    #[serde(default)]
+    user_handle: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WebAuthnClientData {
+    #[serde(rename = "type")]
+    ceremony_type: String,
+    challenge: String,
+    origin: String,
+    #[serde(default)]
+    cross_origin: Option<bool>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PasskeyPublicKeyCredentialCreationOptions {
+    challenge: String,
+    rp: PasskeyRpEntity,
+    user: PasskeyUserEntity,
+    pub_key_cred_params: Vec<PasskeyPubKeyCredParam>,
+    timeout: u32,
+    authenticator_selection: PasskeyAuthenticatorSelection,
+    attestation: &'static str,
+    exclude_credentials: Vec<PasskeyCredentialDescriptor>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PasskeyPublicKeyCredentialRequestOptions {
+    challenge: String,
+    rp_id: String,
+    timeout: u32,
+    user_verification: &'static str,
+    allow_credentials: Vec<PasskeyCredentialDescriptor>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+struct PasskeyRpEntity {
+    id: String,
+    name: String,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+struct PasskeyUserEntity {
+    id: String,
+    name: String,
+    #[serde(rename = "displayName")]
+    display_name: String,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+struct PasskeyPubKeyCredParam {
+    #[serde(rename = "type")]
+    credential_type: &'static str,
+    alg: i32,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PasskeyAuthenticatorSelection {
+    resident_key: &'static str,
+    require_resident_key: bool,
+    user_verification: &'static str,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+struct PasskeyCredentialDescriptor {
+    #[serde(rename = "type")]
+    credential_type: &'static str,
+    id: String,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PasskeyOptionsResponse<T> {
+    public_key: T,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PasskeyVerifyResponse {
+    ok: bool,
+    return_to: String,
+    user: UserInfoResponse,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct PasskeyCredentialPublicKey {
+    x: Vec<u8>,
+    y: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct ParsedAuthenticatorData {
+    rp_id_hash: Vec<u8>,
+    flags: u8,
+    sign_count: i32,
+    credential_id: Option<Vec<u8>>,
+    public_key: Option<PasskeyCredentialPublicKey>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct ValidatedPasskeyRegistration {
+    credential_id: String,
+    public_key_x: String,
+    public_key_y: String,
+    sign_count: i32,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum CborValue {
+    Unsigned(u64),
+    Negative(i64),
+    Bytes(Vec<u8>),
+    Text(String),
+    Array(Vec<CborValue>),
+    Map(Vec<(CborValue, CborValue)>),
+    Bool(bool),
+    Null,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
 struct AuthCodeRow {
     code_hash: String,
     client_id: String,
@@ -829,6 +1311,12 @@ struct TokenExchangeForm {
     code: Option<String>,
     code_verifier: Option<String>,
     refresh_token: Option<String>,
+    scope: Option<String>,
+    subject_token: Option<String>,
+    subject_token_type: Option<String>,
+    provider: Option<String>,
+    provider_client_id: Option<String>,
+    nonce: Option<String>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -887,6 +1375,16 @@ struct AuthorizationCodeFields<'a> {
     code_verifier: Option<&'a str>,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct NativeProviderTokenFields<'a> {
+    provider_id: &'a str,
+    scope: Option<&'a str>,
+    subject_token: &'a str,
+    subject_token_type: &'a str,
+    provider_client_id: Option<&'a str>,
+    nonce: Option<&'a str>,
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 struct RefreshTokenRow {
@@ -935,6 +1433,7 @@ struct TokenIssue {
     email_verified: Option<bool>,
     name: Option<String>,
     picture: Option<String>,
+    roles: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -964,6 +1463,8 @@ struct UserTokenClaimsRow {
     disabled_at: Option<i32>,
     #[serde(default)]
     email_verified: i32,
+    #[serde(default)]
+    admin_membership_active: i32,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1079,6 +1580,8 @@ struct TokenIntrospectionResponse {
     exp: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     sid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    roles: Option<Vec<String>>,
 }
 
 impl TokenIntrospectionResponse {
@@ -1095,6 +1598,7 @@ impl TokenIntrospectionResponse {
             iat: None,
             exp: None,
             sid: None,
+            roles: None,
         }
     }
 
@@ -1111,6 +1615,7 @@ impl TokenIntrospectionResponse {
             iat: Some(claims.iat),
             exp: Some(claims.exp),
             sid: claims.sid.clone(),
+            roles: (!claims.roles.is_empty()).then_some(claims.roles.clone()),
         }
     }
 
@@ -1127,6 +1632,7 @@ impl TokenIntrospectionResponse {
             iat: Some(row.created_at),
             exp: Some(row.expires_at),
             sid: row.session_id.clone(),
+            roles: None,
         }
     }
 }
@@ -1158,6 +1664,12 @@ struct CurrentSession {
     user: UserRow,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum AdminAuthorization {
+    BootstrapToken,
+    Session { user_id: String },
+}
+
 #[cfg(target_arch = "wasm32")]
 use worker::wasm_bindgen::{JsCast as _, JsValue};
 #[cfg(target_arch = "wasm32")]
@@ -1175,32 +1687,30 @@ pub async fn main(request: Request, env: Env, _ctx: worker::Context) -> worker::
 #[cfg(target_arch = "wasm32")]
 async fn handle_request(request: Request, env: Env) -> worker::Result<Response> {
     let url = request.url()?;
+    let canonical_path = canonical_route_path(url.path());
+    let route_path = compatibility_route_path(canonical_path.as_ref());
 
-    match (request.method(), url.path()) {
+    match (request.method(), route_path.as_ref()) {
         (Method::Options, path) if cors_path(path) => cors_preflight(request, env).await,
+        (Method::Get, "/") => redirect_to_path(&url, "/admin"),
         (Method::Get, "/health") => json(&HealthResponse {
             ok: true,
             service: "zeroth",
         }),
         (Method::Get, "/ready") => ready(request, env),
-        (Method::Get, "/providers") => json(&vec![
-            ProviderResponse {
-                id: well_known::APPLE,
-                kind: "oidc",
-            },
-            ProviderResponse {
-                id: well_known::GOOGLE,
-                kind: "oidc",
-            },
-            ProviderResponse {
-                id: well_known::SPOTIFY,
-                kind: "oauth2",
-            },
-        ]),
+        (Method::Get, "/providers") => json(&provider_responses(&env)),
         (Method::Get, "/providers/status") => provider_status(request, env).await,
+        (Method::Get, "/api/providers/status") => provider_status(request, env).await,
+        (Method::Get, "/local-auth/status") => local_auth_status(request, env).await,
+        (Method::Get, "/api/local-auth/status") => local_auth_status(request, env).await,
         (Method::Get | Method::Post | Method::Delete, "/clients") => clients(request, env).await,
+        (Method::Get | Method::Post | Method::Delete, "/api/clients") => {
+            clients(request, env).await
+        }
         (Method::Get | Method::Patch, "/users") => users(request, env).await,
+        (Method::Get | Method::Patch, "/api/users") => users(request, env).await,
         (Method::Get, "/events") => events(request, env).await,
+        (Method::Get, "/api/events") => events(request, env).await,
         (Method::Get, "/routes") => json(&RoutesResponse {
             routes: ROUTES
                 .iter()
@@ -1218,13 +1728,28 @@ async fn handle_request(request: Request, env: Env) -> worker::Result<Response> 
         }
         (Method::Get, "/.well-known/jwks.json") => jwks(env),
         (Method::Get, "/.well-known/apple-app-site-association") => apple_app_site_association(env),
+        (Method::Get, "/favicon.ico" | "/favicon.svg") => favicon(),
+        (Method::Get, path) if quiet_browser_asset_path(path) => empty_cached_asset(),
+        (Method::Get, "/site.webmanifest" | "/manifest.json") => web_manifest(&env),
+        (Method::Get, "/browserconfig.xml") => browserconfig_xml(),
+        (Method::Get, "/robots.txt") => robots_txt(),
         (Method::Get, "/login") => hosted_login(request, env).await,
         (Method::Get, "/account") => hosted_account(request, env).await,
         (Method::Get, "/admin") => hosted_clients_admin(request, env).await,
         (Method::Get, "/admin/clients") => hosted_clients_admin(request, env).await,
+        (Method::Get, path) if admin_console_alias_path(path) => {
+            hosted_clients_admin(request, env).await
+        }
+        (Method::Get, path) if provider_authorize_alias_path(path) => {
+            redirect_to_provider_authorize_alias(&url)
+        }
         (Method::Get, "/authorize") => authorize(request, env).await,
         (Method::Get, "/__zeroth/db/status") => d1_schema_status(request, env).await,
+        (Method::Get, "/api/__zeroth/db/status") => d1_schema_status(request, env).await,
         (Method::Post, "/__zeroth/db/ensure") => ensure_d1_schema(request, env).await,
+        (Method::Get | Method::Post, path) if provider_callback_alias_path(path) => {
+            provider_callback(request, env).await
+        }
         (Method::Get | Method::Post, "/oauth2/callback") => provider_callback(request, env).await,
         (Method::Post, "/oauth/token") => oauth_token(request, env).await,
         (Method::Post, "/oauth/revoke") => oauth_revoke(request, env).await,
@@ -1235,8 +1760,53 @@ async fn handle_request(request: Request, env: Env) -> worker::Result<Response> 
         (Method::Get | Method::Patch, "/profile") => profile(request, env).await,
         (Method::Get, "/identities/link") => identity_link(request, env).await,
         (Method::Get | Method::Delete, "/identities") => identities(request, env).await,
+        (Method::Post, "/passkeys/register/options" | "/passkeys/registration/options") => {
+            passkey_register_options(request, env).await
+        }
+        (
+            Method::Post,
+            "/passkeys/register/verify"
+            | "/passkeys/register/finish"
+            | "/passkeys/registration/finish",
+        ) => passkey_register_verify(request, env).await,
+        (Method::Post, "/passkeys/authenticate/options" | "/passkeys/authentication/options") => {
+            passkey_authenticate_options(request, env).await
+        }
+        (Method::Post, "/passkeys/login/options") => {
+            passkey_authenticate_options(request, env).await
+        }
+        (
+            Method::Post,
+            "/passkeys/authenticate/verify"
+            | "/passkeys/authenticate/finish"
+            | "/passkeys/authentication/finish",
+        ) => passkey_authenticate_verify(request, env).await,
+        (Method::Post, "/passkeys/login/verify" | "/passkeys/login/finish") => {
+            passkey_authenticate_verify(request, env).await
+        }
+        (
+            Method::Get,
+            "/password/register" | "/password/login" | "/magic-links" | "/magic-link"
+            | "/magic_link",
+        ) => redirect_local_auth_get_to_login(request, env),
+        (Method::Post, "/password/register") => password_register(request, env).await,
+        (Method::Post, "/password/login") => password_login(request, env).await,
+        (Method::Post, "/magic-links" | "/magic-link" | "/magic_link" | "/magic-links/request") => {
+            magic_link_request(request, env).await
+        }
+        (
+            Method::Get | Method::Post,
+            "/magic-links/consume" | "/magic-link/consume" | "/magic_link/consume",
+        ) => magic_link_consume(request, env).await,
         (Method::Get, "/validate") => validate(request, env).await,
         (Method::Get | Method::Post, "/logout") => logout(request, env).await,
+        _ if known_route_path(route_path.as_ref()) => json_status(
+            &serde_json::json!({
+                "error": "method_not_allowed",
+                "errorDescription": "route exists but does not allow this method"
+            }),
+            405,
+        ),
         _ => json_status(&serde_json::json!({ "error": "not_found" }), 404),
     }
 }
@@ -1308,9 +1878,11 @@ async fn provider_callback(mut request: Request, env: Env) -> worker::Result<Res
         );
     }
     let Some(provider_code) = callback.code.as_deref() else {
-        let response = provider_callback_error_json(
-            &ProviderCallbackError::invalid_request("missing code"),
-            400,
+        let error = ProviderCallbackError::invalid_request("missing code");
+        let response = redirect_to_provider_callback_error(
+            &record.transaction,
+            &config.issuer().issuer,
+            &error,
         )?;
         return with_set_cookie(
             response,
@@ -1345,7 +1917,12 @@ async fn provider_callback(mut request: Request, env: Env) -> worker::Result<Res
                 now,
             )
             .await;
-            let response = provider_token_exchange_error_json(&error, 502)?;
+            let callback_error = provider_callback_error_from_token_exchange_error(&error);
+            let response = redirect_to_provider_callback_error(
+                &record.transaction,
+                &config.issuer().issuer,
+                &callback_error,
+            )?;
             return with_set_cookie(
                 response,
                 &clear_transaction_cookie(&config.transaction_cookie_name),
@@ -1353,7 +1930,8 @@ async fn provider_callback(mut request: Request, env: Env) -> worker::Result<Res
         }
     };
     let resolved_profile =
-        match resolve_provider_profile(&provider, &token_set, &record.transaction).await {
+        match resolve_provider_profile(&provider, &token_set, &record.transaction, &callback).await
+        {
             Ok(profile) => profile,
             Err(error) => {
                 record_audit_event(
@@ -1370,7 +1948,12 @@ async fn provider_callback(mut request: Request, env: Env) -> worker::Result<Res
                     now,
                 )
                 .await;
-                let response = provider_profile_error_json(&error, 502)?;
+                let callback_error = provider_callback_error_from_profile_error(&error);
+                let response = redirect_to_provider_callback_error(
+                    &record.transaction,
+                    &config.issuer().issuer,
+                    &callback_error,
+                )?;
                 return with_set_cookie(
                     response,
                     &clear_transaction_cookie(&config.transaction_cookie_name),
@@ -1428,6 +2011,55 @@ async fn provider_callback(mut request: Request, env: Env) -> worker::Result<Res
         );
     }
 
+    let Some(client) = get_client(&db, &record.transaction.client_id.0).await? else {
+        let error = ProviderCallbackError::invalid_request("client is disabled or not found");
+        record_audit_event(
+            &db,
+            &request,
+            "client.login.denied",
+            None,
+            Some(&record.transaction.client_id.0),
+            Some(&resolved_profile.profile.provider_id.0),
+            serde_json::json!({ "reason": "client_inactive" }),
+            now,
+        )
+        .await;
+        let response = redirect_to_provider_callback_error(
+            &record.transaction,
+            &config.issuer().issuer,
+            &error,
+        )?;
+        return with_set_cookie(
+            response,
+            &clear_transaction_cookie(&config.transaction_cookie_name),
+        );
+    };
+    if let Err(error) = validate_client_email_domain_policy(&client, &resolved_profile.profile) {
+        record_audit_event(
+            &db,
+            &request,
+            "client.login.denied",
+            None,
+            Some(&record.transaction.client_id.0),
+            Some(&resolved_profile.profile.provider_id.0),
+            serde_json::json!({
+                "reason": "email_domain_policy",
+                "emailVerified": resolved_profile.profile.email_verified
+            }),
+            now,
+        )
+        .await;
+        let response = redirect_to_provider_callback_error(
+            &record.transaction,
+            &config.issuer().issuer,
+            &error,
+        )?;
+        return with_set_cookie(
+            response,
+            &clear_transaction_cookie(&config.transaction_cookie_name),
+        );
+    }
+
     if record.transaction.session_return_to.is_some() {
         let user_id = upsert_provider_profile(
             &db,
@@ -1464,7 +2096,12 @@ async fn provider_callback(mut request: Request, env: Env) -> worker::Result<Res
         let response = redirect_to_session_login_return(&record.transaction)?;
         let response = with_set_cookie(
             response,
-            &session_cookie(&config.cookie_name, &session_id, SESSION_TTL_SECONDS),
+            &session_cookie(
+                &config.cookie_name,
+                &session_id,
+                SESSION_TTL_SECONDS,
+                config.cookie_domain.as_deref(),
+            ),
         )?;
         return with_set_cookie(
             response,
@@ -1520,7 +2157,12 @@ async fn provider_callback(mut request: Request, env: Env) -> worker::Result<Res
     let response = redirect_to_client(&record.transaction, &config.issuer().issuer, &zeroth_code)?;
     let response = with_set_cookie(
         response,
-        &session_cookie(&config.cookie_name, &session_id, SESSION_TTL_SECONDS),
+        &session_cookie(
+            &config.cookie_name,
+            &session_id,
+            SESSION_TTL_SECONDS,
+            config.cookie_domain.as_deref(),
+        ),
     )?;
     with_set_cookie(
         response,
@@ -1656,9 +2298,11 @@ async fn users(mut request: Request, env: Env) -> worker::Result<Response> {
     let db = env.d1(D1_BINDING)?;
     let config = server_config(&env, &request_url);
     let now = unix_timestamp_seconds();
-    if let Err(error) = validate_admin_request(&request, &env, &db, &config, now).await {
-        return client_management_error_json(&error);
-    }
+    let admin_authorization = match authorize_admin_request(&request, &env, &db, &config, now).await
+    {
+        Ok(admin_authorization) => admin_authorization,
+        Err(error) => return client_management_error_json(&error),
+    };
 
     match request.method() {
         Method::Get => {
@@ -1698,26 +2342,73 @@ async fn users(mut request: Request, env: Env) -> worker::Result<Response> {
                 Ok(patch) => patch,
                 Err(error) => return client_management_error_json(&error),
             };
-            set_admin_user_disabled(&db, &user_id, patch.disabled, now).await?;
-            if patch.disabled {
-                revoke_active_sessions_for_user(&db, &user_id, now).await?;
-                revoke_active_refresh_tokens_for_user(&db, &user_id, now).await?;
+            if patch.disabled.is_none() && patch.admin.is_none() {
+                return client_management_error_json(&ClientManagementError::invalid_request(
+                    "user patch must include disabled or admin",
+                ));
             }
-            record_audit_event(
-                &db,
-                &request,
-                if patch.disabled {
-                    "user.disable"
+            if matches!(
+                (&admin_authorization, patch.admin),
+                (AdminAuthorization::Session { user_id: current_user_id }, Some(false))
+                    if current_user_id.as_str() == user_id.as_str()
+            ) {
+                return client_management_error_json(&ClientManagementError::invalid_request(
+                    "cannot revoke the active admin session membership",
+                ));
+            }
+
+            if let Some(disabled) = patch.disabled {
+                set_admin_user_disabled(&db, &user_id, disabled, now).await?;
+                if disabled {
+                    revoke_active_sessions_for_user(&db, &user_id, now).await?;
+                    revoke_active_refresh_tokens_for_user(&db, &user_id, now).await?;
+                }
+                record_audit_event(
+                    &db,
+                    &request,
+                    if disabled {
+                        "user.disable"
+                    } else {
+                        "user.enable"
+                    },
+                    Some(&user_id),
+                    None,
+                    None,
+                    serde_json::json!({}),
+                    now,
+                )
+                .await;
+            }
+            if let Some(admin) = patch.admin {
+                if admin {
+                    let granted_by = admin_authorization_granted_by(&admin_authorization);
+                    upsert_admin_membership(&db, &user_id, &granted_by, now).await?;
+                    record_audit_event(
+                        &db,
+                        &request,
+                        "admin.membership.grant",
+                        Some(&user_id),
+                        None,
+                        None,
+                        serde_json::json!({ "grantedBy": granted_by, "mode": "admin_ui" }),
+                        now,
+                    )
+                    .await;
                 } else {
-                    "user.enable"
-                },
-                Some(&user_id),
-                None,
-                None,
-                serde_json::json!({}),
-                now,
-            )
-            .await;
+                    disable_admin_membership(&db, &user_id, now).await?;
+                    record_audit_event(
+                        &db,
+                        &request,
+                        "admin.membership.revoke",
+                        Some(&user_id),
+                        None,
+                        None,
+                        serde_json::json!({ "mode": "admin_ui" }),
+                        now,
+                    )
+                    .await;
+                }
+            }
 
             let response = admin_user_detail_response(&db, &user_id, now)
                 .await?
@@ -1739,8 +2430,26 @@ async fn provider_status(request: Request, env: Env) -> worker::Result<Response>
         return client_management_error_json(&error);
     }
 
+    let provider_failures = provider_failure_statuses(&db).await?;
     json(&ProviderStatusResponse {
-        providers: provider_status_rows(&env),
+        providers: provider_status_rows(&env, &config, true, &provider_failures),
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn local_auth_status(request: Request, env: Env) -> worker::Result<Response> {
+    let url = request.url()?;
+    let db = env.d1(D1_BINDING)?;
+    let config = server_config(&env, &url);
+    if let Err(error) =
+        validate_admin_request(&request, &env, &db, &config, unix_timestamp_seconds()).await
+    {
+        return client_management_error_json(&error);
+    }
+
+    let magic_link_delivery = magic_link_delivery_status(&db).await?;
+    json(&LocalAuthStatusResponse {
+        methods: local_auth_status_rows(&env, magic_link_delivery),
     })
 }
 
@@ -1816,9 +2525,21 @@ async fn oauth_token(mut request: Request, env: Env) -> worker::Result<Response>
             authorization_code_token(&db, &config, &signing_key, &form, now).await
         }
         "refresh_token" => refresh_token_token(&db, &config, &signing_key, &form, now).await,
+        TOKEN_EXCHANGE_GRANT_TYPE => {
+            native_provider_token(
+                &db,
+                &env,
+                &config,
+                &signing_key,
+                &registered_client.client,
+                &form,
+                now,
+            )
+            .await
+        }
         _ => token_exchange_error_json(
             &TokenExchangeError::unsupported_grant_type(
-                "grant_type must be authorization_code or refresh_token",
+                "grant_type must be authorization_code, refresh_token, or token exchange",
             ),
             400,
         ),
@@ -1971,6 +2692,150 @@ async fn refresh_token_token(
 }
 
 #[cfg(target_arch = "wasm32")]
+async fn native_provider_token(
+    db: &worker::d1::D1Database,
+    env: &Env,
+    config: &ZerothServerConfig,
+    signing_key: &Es256SigningKey,
+    client: &Client,
+    form: &TokenExchangeForm,
+    now: i32,
+) -> worker::Result<Response> {
+    let fields = match native_provider_token_fields(form) {
+        Ok(fields) => fields,
+        Err(error) => return token_exchange_error_json(&error, 400),
+    };
+    let scope = match native_token_scope(fields.scope) {
+        Ok(scope) => scope,
+        Err(error) => return token_exchange_error_json(&error, 400),
+    };
+    let provider_client_id =
+        match native_provider_client_id(env, fields.provider_id, fields.provider_client_id) {
+            Ok(provider_client_id) => provider_client_id,
+            Err(error) => return token_exchange_error_json(&error, 400),
+        };
+
+    let resolved = match resolve_native_provider_profile(&fields, &provider_client_id, now).await {
+        Ok(resolved) => resolved,
+        Err((error, status)) => return provider_profile_error_json(&error, status),
+    };
+    if let Err(error) = validate_client_email_domain_policy(client, &resolved.profile) {
+        return provider_callback_error_json(&error, 403);
+    }
+
+    let user_id = upsert_provider_profile(
+        db,
+        &resolved.profile,
+        resolved.raw_profile_json.as_deref(),
+        now,
+    )
+    .await?;
+    let user_claims = match get_user_token_claims(db, &user_id).await? {
+        Some(user_claims) => user_claims,
+        None => {
+            return token_exchange_error_json(
+                &TokenExchangeError::invalid_grant("provider identity user was not found"),
+                400,
+            )
+        }
+    };
+    if user_claims.disabled_at.is_some() {
+        return token_exchange_error_json(
+            &TokenExchangeError::invalid_grant("provider identity user is disabled"),
+            400,
+        );
+    }
+
+    let issue = TokenIssue::from_native_provider(&form.client_id, &user_id, &scope, now)
+        .with_user_claims(&user_claims);
+    let refresh_token = if scope_contains(Some(&scope), "offline_access") {
+        let token = random_token()?;
+        put_refresh_token_row(db, &hash_secret(&token), &issue, now).await?;
+        Some(token)
+    } else {
+        None
+    };
+    let response =
+        token_response(config, signing_key, &issue, refresh_token, now).map_err(worker_error)?;
+    json(&response)
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn resolve_native_provider_profile(
+    fields: &NativeProviderTokenFields<'_>,
+    provider_client_id: &str,
+    now: i32,
+) -> Result<ResolvedProviderProfile, (ProviderProfileError, u16)> {
+    match fields.provider_id {
+        well_known::APPLE | well_known::GOOGLE => {
+            resolve_native_oidc_provider_profile(fields, provider_client_id, now).await
+        }
+        well_known::SPOTIFY => resolve_native_spotify_profile(fields, provider_client_id).await,
+        provider_id => Err((
+            ProviderProfileError::invalid_response(format!(
+                "unsupported native provider: {provider_id}"
+            )),
+            400,
+        )),
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn resolve_native_oidc_provider_profile(
+    fields: &NativeProviderTokenFields<'_>,
+    provider_client_id: &str,
+    now: i32,
+) -> Result<ResolvedProviderProfile, (ProviderProfileError, u16)> {
+    let jwks = cached_provider_jwks(fields.provider_id, now)
+        .await
+        .map_err(|error| {
+            (
+                ProviderProfileError::invalid_response(format!(
+                    "could not load {} JWKS: {}",
+                    provider_label(fields.provider_id),
+                    error.description
+                )),
+                502,
+            )
+        })?;
+    let verified = verify_provider_id_token_with_web_crypto(
+        fields.subject_token,
+        &jwks,
+        ProviderIdTokenValidation {
+            provider_id: fields.provider_id,
+            client_id: provider_client_id,
+            nonce: fields.nonce,
+            now,
+        },
+    )
+    .await
+    .map_err(|error| (error, 401))?;
+
+    Ok(native_oidc_profile_from_verified_token(
+        fields.provider_id,
+        verified,
+    ))
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn resolve_native_spotify_profile(
+    fields: &NativeProviderTokenFields<'_>,
+    provider_client_id: &str,
+) -> Result<ResolvedProviderProfile, (ProviderProfileError, u16)> {
+    let provider = OAuthProvider::spotify(provider_client_id);
+    let token_set = ProviderTokenSet {
+        access_token: Some(fields.subject_token.to_owned()),
+        id_token: None,
+        refresh_token: None,
+        expires_in: None,
+    };
+
+    fetch_spotify_profile(&provider, &token_set)
+        .await
+        .map_err(|error| (error, 401))
+}
+
+#[cfg(target_arch = "wasm32")]
 async fn oauth_revoke(mut request: Request, env: Env) -> worker::Result<Response> {
     let origin = request_origin(&request)?;
     let form = match token_revocation_form_from_request(&mut request).await {
@@ -2066,7 +2931,7 @@ async fn oauth_introspect(mut request: Request, env: Env) -> worker::Result<Resp
     let response = introspection_response_for_token(
         &db,
         &config,
-        &material.verification_keys,
+        &material.jwks,
         &form,
         unix_timestamp_seconds(),
     )
@@ -2086,12 +2951,7 @@ async fn userinfo(request: Request, env: Env) -> worker::Result<Response> {
     let material = signing_material_from_env(&env)?;
     let config = server_config(&env, &request_url);
     let now = unix_timestamp_seconds();
-    let claims = match verify_zeroth_access_token(
-        &bearer_token,
-        &config,
-        &material.verification_keys,
-        now,
-    ) {
+    let claims = match verify_zeroth_access_token(&bearer_token, &config, &material.jwks, now) {
         Ok(claims) => claims,
         Err(error) => return oauth_error_json("invalid_token", error, 401),
     };
@@ -2203,7 +3063,10 @@ async fn sessions(request: Request, env: Env) -> worker::Result<Response> {
 
             let response = json(&serde_json::json!({ "ok": true }))?;
             let response = if session_id == current.session.id {
-                with_set_cookie(response, &clear_session_cookie(&config.cookie_name))?
+                with_set_cookie(
+                    response,
+                    &clear_session_cookie(&config.cookie_name, config.cookie_domain.as_deref()),
+                )?
             } else {
                 response
             };
@@ -2316,13 +3179,24 @@ async fn identities(request: Request, env: Env) -> worker::Result<Response> {
                 return oauth_error_json("invalid_request", "cannot unlink the last identity", 400);
             }
 
-            delete_user_identity(
+            if !delete_user_identity(
                 &db,
                 &current.user.id,
                 &identity.provider_id,
                 &identity.provider_subject,
             )
-            .await?;
+            .await?
+            {
+                return oauth_error_json("invalid_request", "identity could not be unlinked", 409);
+            }
+            if identity.provider_id == "passkey" {
+                disable_passkey_credential(
+                    &db,
+                    &identity.provider_subject,
+                    unix_timestamp_seconds(),
+                )
+                .await?;
+            }
             record_audit_event(
                 &db,
                 &request,
@@ -2339,6 +3213,699 @@ async fn identities(request: Request, env: Env) -> worker::Result<Response> {
         }
         _ => json_status(&serde_json::json!({ "error": "method_not_allowed" }), 405),
     }
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn passkey_register_options(mut request: Request, env: Env) -> worker::Result<Response> {
+    let url = request.url()?;
+    let config = server_config(&env, &url);
+    let db = env.d1(D1_BINDING)?;
+    let now = unix_timestamp_seconds();
+    let body = match passkey_json_from_request::<PasskeyRegisterOptionsRequest>(&mut request).await
+    {
+        Ok(body) => body,
+        Err(error) => return oauth_error_json("invalid_request", error, 400),
+    };
+
+    let current = current_session_from_request(&request, &db, &config, now).await?;
+    if current.is_none() {
+        if let Err(error) = validate_admin_request(&request, &env, &db, &config, now).await {
+            return client_management_error_json(&error);
+        }
+    }
+    let (user_id, email, display_name) = match passkey_registration_subject(current.as_ref(), &body)
+    {
+        Ok(subject) => subject,
+        Err(error) => return oauth_error_json("invalid_request", error, 400),
+    };
+    let client_id = match passkey_client_id_from_request(&env, body.client_id.as_deref()) {
+        Ok(client_id) => client_id,
+        Err(error) => return oauth_error_json("invalid_request", error.to_string(), 400),
+    };
+    let client = match get_client(&db, &client_id).await? {
+        Some(client) => client,
+        None => {
+            return oauth_error_json(
+                "invalid_request",
+                "passkey session client is not registered",
+                400,
+            )
+        }
+    };
+    let return_to = match passkey_return_to(&url, body.return_to.as_deref(), &client, &config) {
+        Ok(return_to) => return_to,
+        Err(error) => return oauth_error_json("invalid_request", error.to_string(), 400),
+    };
+    let label = match validate_passkey_label(body.label.as_deref()) {
+        Ok(label) => label,
+        Err(error) => return oauth_error_json("invalid_request", error, 400),
+    };
+    let challenge = random_token()?;
+
+    cleanup_expired_passkey_challenges(&db, now).await?;
+    put_passkey_challenge(
+        &db,
+        &challenge,
+        "registration",
+        user_id.as_deref(),
+        Some(&client_id),
+        Some(&return_to),
+        Some(&email),
+        display_name.as_deref(),
+        label.as_deref(),
+        now,
+    )
+    .await?;
+
+    let exclude_credentials = if let Some(user_id) = user_id.as_deref() {
+        list_passkey_credentials_for_user(&db, user_id)
+            .await?
+            .into_iter()
+            .map(|credential| PasskeyCredentialDescriptor {
+                credential_type: "public-key",
+                id: credential.credential_id,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let options = match passkey_creation_options(
+        &config,
+        &challenge,
+        user_id.as_deref().unwrap_or(&email),
+        &email,
+        display_name.as_deref().unwrap_or(&email),
+        exclude_credentials,
+    ) {
+        Ok(options) => options,
+        Err(error) => return oauth_error_json("invalid_request", error, 400),
+    };
+
+    json(&PasskeyOptionsResponse {
+        public_key: options,
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn passkey_register_verify(mut request: Request, env: Env) -> worker::Result<Response> {
+    let url = request.url()?;
+    let config = server_config(&env, &url);
+    let db = env.d1(D1_BINDING)?;
+    let now = unix_timestamp_seconds();
+    let body = match passkey_json_from_request::<PasskeyRegisterVerifyRequest>(&mut request).await {
+        Ok(body) => body,
+        Err(error) => return oauth_error_json("invalid_request", error, 400),
+    };
+    let validation = match validate_passkey_registration_response(&config, &body) {
+        Ok(validation) => validation,
+        Err(error) => return oauth_error_json("invalid_request", error, 400),
+    };
+    let admin_authorization = authorize_admin_request(&request, &env, &db, &config, now)
+        .await
+        .ok();
+    let challenge_hash =
+        match passkey_challenge_hash_from_client_data(&body.response.client_data_json) {
+            Ok(challenge_hash) => challenge_hash,
+            Err(error) => return oauth_error_json("invalid_request", error, 400),
+        };
+    let Some(challenge) = get_passkey_challenge_by_hash(&db, &challenge_hash).await? else {
+        return oauth_error_json("invalid_request", "passkey challenge was not found", 400);
+    };
+    if let Err(error) = validate_passkey_challenge(&challenge, "registration", now) {
+        return oauth_error_json("invalid_request", error, 400);
+    }
+    if !passkey_challenge_matches_client_data(
+        &challenge.challenge_hash,
+        &body.response.client_data_json,
+    ) {
+        return oauth_error_json("invalid_request", "passkey challenge did not match", 400);
+    }
+    if !consume_passkey_challenge(&db, &challenge.challenge_hash, now).await? {
+        return oauth_error_json("invalid_request", "passkey challenge was already used", 400);
+    }
+
+    let (user_id, email, display_name) =
+        ensure_passkey_registration_user(&db, &challenge, now).await?;
+    put_passkey_credential(&db, &validation, &user_id, challenge.label.as_deref(), now).await?;
+    upsert_passkey_identity(
+        &db,
+        &user_id,
+        &validation.credential_id,
+        Some(&email),
+        display_name.as_deref(),
+        now,
+    )
+    .await?;
+    if let Some(admin_authorization) = admin_authorization {
+        let granted_by = admin_authorization_granted_by(&admin_authorization);
+        upsert_admin_membership(&db, &user_id, &granted_by, now).await?;
+        record_audit_event(
+            &db,
+            &request,
+            "admin.membership.grant",
+            Some(&user_id),
+            challenge.client_id.as_deref(),
+            Some("passkey"),
+            serde_json::json!({
+                "grantedBy": granted_by,
+                "mode": "passkey_registration"
+            }),
+            now,
+        )
+        .await;
+    }
+    record_audit_event(
+        &db,
+        &request,
+        "passkey.register",
+        Some(&user_id),
+        challenge.client_id.as_deref(),
+        Some("passkey"),
+        serde_json::json!({
+            "credentialIdHash": hash_secret(&validation.credential_id),
+            "label": challenge.label.as_deref().unwrap_or("")
+        }),
+        now,
+    )
+    .await;
+
+    let Some(user) = get_user(&db, &user_id).await? else {
+        return oauth_error_json("invalid_request", "passkey user was not found", 400);
+    };
+    json(&serde_json::json!({
+        "ok": true,
+        "user": userinfo_response(&user, Some("email profile"))
+    }))
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn passkey_authenticate_options(mut request: Request, env: Env) -> worker::Result<Response> {
+    let url = request.url()?;
+    let config = server_config(&env, &url);
+    let body =
+        match passkey_json_from_request::<PasskeyAuthenticateOptionsRequest>(&mut request).await {
+            Ok(body) => body,
+            Err(error) => return oauth_error_json("invalid_request", error, 400),
+        };
+    let db = env.d1(D1_BINDING)?;
+    let client_id = match passkey_client_id_from_request(&env, body.client_id.as_deref()) {
+        Ok(client_id) => client_id,
+        Err(error) => return oauth_error_json("invalid_request", error.to_string(), 400),
+    };
+    let client = match get_client(&db, &client_id).await? {
+        Some(client) => client,
+        None => {
+            return oauth_error_json(
+                "invalid_request",
+                "passkey session client is not registered",
+                400,
+            )
+        }
+    };
+    let return_to = match passkey_return_to(&url, body.return_to.as_deref(), &client, &config) {
+        Ok(return_to) => return_to,
+        Err(error) => return oauth_error_json("invalid_request", error.to_string(), 400),
+    };
+    let now = unix_timestamp_seconds();
+    let challenge = random_token()?;
+    cleanup_expired_passkey_challenges(&db, now).await?;
+    put_passkey_challenge(
+        &db,
+        &challenge,
+        "authentication",
+        None,
+        Some(&client_id),
+        Some(&return_to),
+        None,
+        None,
+        None,
+        now,
+    )
+    .await?;
+    let allow_credentials = list_active_passkey_credentials(&db)
+        .await?
+        .into_iter()
+        .map(|credential| PasskeyCredentialDescriptor {
+            credential_type: "public-key",
+            id: credential.credential_id,
+        })
+        .collect();
+    let options = match passkey_request_options(&config, &challenge, allow_credentials) {
+        Ok(options) => options,
+        Err(error) => return oauth_error_json("invalid_request", error, 400),
+    };
+
+    json(&PasskeyOptionsResponse {
+        public_key: options,
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn passkey_authenticate_verify(mut request: Request, env: Env) -> worker::Result<Response> {
+    let url = request.url()?;
+    let config = server_config(&env, &url);
+    let db = env.d1(D1_BINDING)?;
+    let now = unix_timestamp_seconds();
+    let body =
+        match passkey_json_from_request::<PasskeyAuthenticateVerifyRequest>(&mut request).await {
+            Ok(body) => body,
+            Err(error) => return oauth_error_json("invalid_request", error, 400),
+        };
+    let challenge_hash =
+        match passkey_challenge_hash_from_client_data(&body.response.client_data_json) {
+            Ok(challenge_hash) => challenge_hash,
+            Err(error) => return oauth_error_json("invalid_request", error, 400),
+        };
+    let Some(challenge) = get_passkey_challenge_by_hash(&db, &challenge_hash).await? else {
+        return oauth_error_json("invalid_request", "passkey challenge was not found", 400);
+    };
+    if let Err(error) = validate_passkey_challenge(&challenge, "authentication", now) {
+        return oauth_error_json("invalid_request", error, 400);
+    }
+    let credential_id = match passkey_raw_id(&body.raw_id) {
+        Ok(credential_id) => credential_id,
+        Err(error) => return oauth_error_json("invalid_request", error, 400),
+    };
+    let Some(credential) = get_passkey_credential(&db, &credential_id).await? else {
+        return oauth_error_json("invalid_request", "passkey credential was not found", 400);
+    };
+    if credential.disabled_at.is_some() {
+        return oauth_error_json("invalid_request", "passkey credential is disabled", 400);
+    }
+    if let Err(error) =
+        validate_passkey_authentication_response(&config, &body, &credential, &challenge)
+    {
+        return oauth_error_json("invalid_request", error, 400);
+    }
+    if !consume_passkey_challenge(&db, &challenge.challenge_hash, now).await? {
+        return oauth_error_json("invalid_request", "passkey challenge was already used", 400);
+    }
+    update_passkey_credential_use(
+        &db,
+        &credential.credential_id,
+        passkey_authenticator_sign_count(&body.response.authenticator_data)?,
+        now,
+    )
+    .await?;
+    let Some(user) = get_user(&db, &credential.user_id).await? else {
+        return oauth_error_json("invalid_request", "passkey user was not found", 400);
+    };
+    if user.disabled_at.is_some() {
+        return oauth_error_json("invalid_request", "passkey user is disabled", 400);
+    }
+    let client_id = challenge
+        .client_id
+        .as_deref()
+        .ok_or_else(|| worker_error("passkey challenge did not include a client_id".to_owned()))?;
+    let session_id = format!("sess_{}", random_token()?);
+    let audit_context = audit_request_context(&request).unwrap_or_default();
+    put_session(
+        &db,
+        &session_id,
+        &user.id,
+        client_id,
+        now,
+        audit_context.user_agent.as_deref(),
+        audit_context.ip_hash.as_deref(),
+    )
+    .await?;
+    record_audit_event(
+        &db,
+        &request,
+        "session.login",
+        Some(&user.id),
+        Some(client_id),
+        Some("passkey"),
+        serde_json::json!({
+            "mode": "passkey",
+            "credentialIdHash": hash_secret(&credential.credential_id)
+        }),
+        now,
+    )
+    .await;
+
+    let return_to = challenge
+        .return_to
+        .unwrap_or_else(|| format!("{}/admin", config.issuer().issuer));
+    let response = json(&PasskeyVerifyResponse {
+        ok: true,
+        return_to,
+        user: userinfo_response(&user, Some("email profile")),
+    })?;
+    with_set_cookie(
+        response,
+        &session_cookie(
+            &config.cookie_name,
+            &session_id,
+            SESSION_TTL_SECONDS,
+            config.cookie_domain.as_deref(),
+        ),
+    )
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn password_register(mut request: Request, env: Env) -> worker::Result<Response> {
+    let url = request.url()?;
+    let config = server_config(&env, &url);
+    let db = env.d1(D1_BINDING)?;
+    let now = unix_timestamp_seconds();
+    let body = match local_auth_body_from_request::<PasswordRegisterRequest>(&mut request).await {
+        Ok(body) => body,
+        Err(error) => return oauth_error_json("invalid_request", error, 400),
+    };
+    let email = match validate_local_auth_email(&body.email) {
+        Ok(email) => email,
+        Err(error) => return oauth_error_json("invalid_request", error, 400),
+    };
+    if let Err(error) = validate_local_auth_password(&body.password) {
+        return oauth_error_json("invalid_request", error, 400);
+    }
+    let display_name = match body
+        .display_name
+        .as_deref()
+        .map(validate_passkey_display_name)
+        .transpose()
+    {
+        Ok(display_name) => display_name,
+        Err(error) => return oauth_error_json("invalid_request", error, 400),
+    };
+    let (client, return_to) = match local_auth_client_and_return_to(
+        &env,
+        &url,
+        &db,
+        body.client_id.as_deref(),
+        body.return_to.as_deref(),
+        &config,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => return oauth_error_json("invalid_request", error, 400),
+    };
+    if let Err(error) = validate_local_auth_origin(&request, &db, &client, &config).await? {
+        return oauth_error_json("invalid_request", error, 403);
+    }
+    if let Err(error) = validate_local_auth_client_email_policy(&client, &email) {
+        return oauth_error_json(&error.code, &error.description, 403);
+    }
+
+    let current = current_session_from_request(&request, &db, &config, now).await?;
+    let existing_user = get_user_by_primary_email(&db, &email).await?;
+    let user_id =
+        match local_auth_registration_user_id(current.as_ref(), existing_user.as_ref(), &email) {
+            Ok(Some(user_id)) => user_id,
+            Ok(None) => {
+                let user_id = format!("usr_{}", random_token()?);
+                insert_passkey_user(&db, &user_id, &email, display_name.as_deref(), now).await?;
+                user_id
+            }
+            Err(error) => return oauth_error_json("invalid_request", error, 409),
+        };
+    if let Some(user) = get_user(&db, &user_id).await? {
+        if user.disabled_at.is_some() {
+            return oauth_error_json("invalid_request", "user is disabled", 403);
+        }
+    }
+
+    let salt = random_token()?;
+    let iterations = password_iterations_from_env(&env).map_err(worker_error)?;
+    let password_hash = password_hash(&body.password, &salt, iterations).await?;
+    upsert_local_credential(
+        &db,
+        &email,
+        &user_id,
+        &password_hash,
+        &salt,
+        iterations,
+        now,
+    )
+    .await?;
+    upsert_local_auth_identity(
+        &db,
+        &user_id,
+        &email,
+        display_name.as_deref(),
+        "password",
+        now,
+    )
+    .await?;
+    let response = issue_local_auth_session_response(
+        &request,
+        &db,
+        &config,
+        &client.id.0,
+        &user_id,
+        &return_to,
+        "password.register",
+        "password_register",
+        now,
+    )
+    .await?;
+    Ok(response)
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn password_login(mut request: Request, env: Env) -> worker::Result<Response> {
+    let url = request.url()?;
+    let config = server_config(&env, &url);
+    let db = env.d1(D1_BINDING)?;
+    let now = unix_timestamp_seconds();
+    let body = match local_auth_body_from_request::<PasswordLoginRequest>(&mut request).await {
+        Ok(body) => body,
+        Err(error) => return oauth_error_json("invalid_request", error, 400),
+    };
+    let email = match validate_local_auth_email(&body.email) {
+        Ok(email) => email,
+        Err(_) => return oauth_error_json("invalid_grant", "invalid email or password", 401),
+    };
+    let (client, return_to) = match local_auth_client_and_return_to(
+        &env,
+        &url,
+        &db,
+        body.client_id.as_deref(),
+        body.return_to.as_deref(),
+        &config,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => return oauth_error_json("invalid_request", error, 400),
+    };
+    if let Err(error) = validate_local_auth_origin(&request, &db, &client, &config).await? {
+        return oauth_error_json("invalid_request", error, 403);
+    }
+    if let Err(error) = validate_local_auth_client_email_policy(&client, &email) {
+        return oauth_error_json(&error.code, &error.description, 403);
+    }
+
+    let Some(credential) = get_local_credential(&db, &email).await? else {
+        return oauth_error_json("invalid_grant", "invalid email or password", 401);
+    };
+    let password_valid = local_auth_password_matches(&credential, &body.password).await?;
+    if credential.disabled_at.is_some() || !password_valid {
+        return oauth_error_json("invalid_grant", "invalid email or password", 401);
+    }
+    let Some(user) = get_user(&db, &credential.user_id).await? else {
+        return oauth_error_json("invalid_grant", "invalid email or password", 401);
+    };
+    if user.disabled_at.is_some() {
+        return oauth_error_json("invalid_grant", "invalid email or password", 401);
+    }
+    mark_local_credential_used(&db, &credential.email, now).await?;
+    let response = issue_local_auth_session_response(
+        &request,
+        &db,
+        &config,
+        &client.id.0,
+        &user.id,
+        &return_to,
+        "session.login",
+        "password",
+        now,
+    )
+    .await?;
+    Ok(response)
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn magic_link_request(mut request: Request, env: Env) -> worker::Result<Response> {
+    let url = request.url()?;
+    let config = server_config(&env, &url);
+    let db = env.d1(D1_BINDING)?;
+    let now = unix_timestamp_seconds();
+    let body = match local_auth_body_from_request::<MagicLinkRequest>(&mut request).await {
+        Ok(body) => body,
+        Err(error) => return oauth_error_json("invalid_request", error, 400),
+    };
+    let email = match validate_local_auth_email(&body.email) {
+        Ok(email) => email,
+        Err(error) => return oauth_error_json("invalid_request", error, 400),
+    };
+    let (client, return_to) = match local_auth_client_and_return_to(
+        &env,
+        &url,
+        &db,
+        body.client_id.as_deref(),
+        body.return_to.as_deref(),
+        &config,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => return oauth_error_json("invalid_request", error, 400),
+    };
+    if let Err(error) = validate_local_auth_origin(&request, &db, &client, &config).await? {
+        return oauth_error_json("invalid_request", error, 403);
+    }
+    if let Err(error) = validate_local_auth_client_email_policy(&client, &email) {
+        return oauth_error_json(&error.code, &error.description, 403);
+    }
+
+    cleanup_expired_magic_links(&db, now).await?;
+    let user_id = get_user_by_primary_email(&db, &email)
+        .await?
+        .and_then(|user| user.disabled_at.is_none().then_some(user.id));
+    let token = random_token()?;
+    let token_hash = hash_secret(&token);
+    let audit_context = audit_request_context(&request).unwrap_or_default();
+    put_magic_link(
+        &db,
+        &token_hash,
+        &email,
+        user_id.as_deref(),
+        &client.id.0,
+        &return_to,
+        now,
+        audit_context.user_agent.as_deref(),
+        audit_context.ip_hash.as_deref(),
+    )
+    .await?;
+    let link = magic_link_url(&config, &token)?;
+    let sent = match send_magic_link_email(&env, &email, &link).await {
+        Ok(sent) => sent,
+        Err(error) => {
+            let error_class = classify_magic_link_email_error(&error);
+            record_audit_event(
+                &db,
+                &request,
+                "magic_link.email.failed",
+                user_id.as_deref(),
+                Some(&client.id.0),
+                Some(LOCAL_AUTH_PROVIDER_ID),
+                magic_link_email_failed_details(error_class, &error),
+                now,
+            )
+            .await;
+            false
+        }
+    };
+    record_audit_event(
+        &db,
+        &request,
+        "magic_link.issue",
+        user_id.as_deref(),
+        Some(&client.id.0),
+        Some(LOCAL_AUTH_PROVIDER_ID),
+        serde_json::json!({ "sent": sent }),
+        now,
+    )
+    .await;
+    let dev_link = magic_link_dev_echo_enabled(&env).then_some(link);
+    json_status(
+        &MagicLinkResponse {
+            ok: true,
+            sent,
+            dev_link,
+        },
+        202,
+    )
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn magic_link_consume(mut request: Request, env: Env) -> worker::Result<Response> {
+    let url = request.url()?;
+    let config = server_config(&env, &url);
+    let db = env.d1(D1_BINDING)?;
+    let now = unix_timestamp_seconds();
+    let token = match request.method() {
+        Method::Get => query_param(&url, "token"),
+        Method::Post => {
+            match local_auth_body_from_request::<MagicLinkConsumeRequest>(&mut request).await {
+                Ok(body) => Some(body.token),
+                Err(error) => return oauth_error_json("invalid_request", error, 400),
+            }
+        }
+        _ => None,
+    };
+    let Some(token) = token.filter(|token| !token.trim().is_empty()) else {
+        return oauth_error_json("invalid_request", "missing magic link token", 400);
+    };
+    let token_hash = hash_secret(token.trim());
+    let Some(row) = get_magic_link(&db, &token_hash).await? else {
+        return oauth_error_json("invalid_request", "magic link is invalid or expired", 400);
+    };
+    if let Err(error) = validate_magic_link(&row, now) {
+        return oauth_error_json("invalid_request", error, 400);
+    }
+    if !consume_magic_link(&db, &token_hash, now).await? {
+        return oauth_error_json("invalid_request", "magic link is invalid or expired", 400);
+    }
+    let Some(client) = get_client(&db, &row.client_id).await? else {
+        return oauth_error_json(
+            "invalid_request",
+            "magic link client is not registered",
+            400,
+        );
+    };
+    if let Err(error) = validate_local_auth_client_email_policy(&client, &row.email) {
+        return oauth_error_json(&error.code, &error.description, 403);
+    }
+    let user_id = ensure_magic_link_user(&db, &row, now).await?;
+    if let Some(user) = get_user(&db, &user_id).await? {
+        if user.disabled_at.is_some() {
+            return oauth_error_json("invalid_request", "user is disabled", 403);
+        }
+    }
+    upsert_local_auth_identity(&db, &user_id, &row.email, None, "magic_link", now).await?;
+    let issue = issue_local_auth_session(
+        &request,
+        &db,
+        &row.client_id,
+        &user_id,
+        &row.return_to,
+        "session.login",
+        "magic_link",
+        now,
+    )
+    .await?;
+    if request.method() == Method::Get {
+        let target = url::Url::parse(&row.return_to)
+            .map_err(|error| worker_error(format!("invalid magic link return_to: {error}")))?;
+        let response = Response::redirect(target)?;
+        return with_set_cookie(
+            response,
+            &session_cookie(
+                &config.cookie_name,
+                &issue.session_id,
+                SESSION_TTL_SECONDS,
+                config.cookie_domain.as_deref(),
+            ),
+        );
+    }
+    let response = json(&LocalAuthResponse {
+        ok: true,
+        return_to: issue.return_to,
+        user: userinfo_response(&issue.user, Some("email profile")),
+    })?;
+    with_set_cookie(
+        response,
+        &session_cookie(
+            &config.cookie_name,
+            &issue.session_id,
+            SESSION_TTL_SECONDS,
+            config.cookie_domain.as_deref(),
+        ),
+    )
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -2402,12 +3969,14 @@ async fn identity_link(request: Request, env: Env) -> worker::Result<Response> {
     let provider = provider_from_env(&env, &provider_id)?;
     let provider_redirect_uri = config.issuer().provider_callback_endpoint();
     let provider_state = random_token()?;
+    let provider_nonce = random_token()?;
     let now = unix_timestamp_seconds();
     cleanup_expired_auth_transactions(&db, now).await?;
     let transaction = auth_transaction_from_link_request(
         &client,
         &provider_id,
         provider_state,
+        provider_nonce,
         provider_redirect_uri,
         return_to,
         query_param(&request_url, "state"),
@@ -2421,7 +3990,7 @@ async fn identity_link(request: Request, env: Env) -> worker::Result<Response> {
         .authorize_url(ProviderAuthorizeRequest {
             redirect_uri: &transaction.provider_redirect_uri,
             state: &transaction.provider_state,
-            nonce: None,
+            nonce: provider_authorize_nonce(&transaction),
             code_challenge: None,
             scopes: None,
         })
@@ -2455,12 +4024,7 @@ async fn validate(request: Request, env: Env) -> worker::Result<Response> {
         let material = signing_material_from_env(&env)?;
         let config = server_config(&env, &request_url);
         let now = unix_timestamp_seconds();
-        let claims = match verify_zeroth_access_token(
-            &bearer_token,
-            &config,
-            &material.verification_keys,
-            now,
-        ) {
+        let claims = match verify_zeroth_access_token(&bearer_token, &config, &material.jwks, now) {
             Ok(claims) => claims,
             Err(error) => return oauth_error_json("invalid_token", error, 401),
         };
@@ -2550,11 +4114,17 @@ async fn logout(request: Request, env: Env) -> worker::Result<Response> {
 
     if let Some(target) = redirect_target {
         let response = Response::redirect(target)?;
-        return with_set_cookie(response, &clear_session_cookie(&config.cookie_name));
+        return with_set_cookie(
+            response,
+            &clear_session_cookie(&config.cookie_name, config.cookie_domain.as_deref()),
+        );
     }
 
     let response = json(&serde_json::json!({ "ok": true }))?;
-    let response = with_set_cookie(response, &clear_session_cookie(&config.cookie_name))?;
+    let response = with_set_cookie(
+        response,
+        &clear_session_cookie(&config.cookie_name, config.cookie_domain.as_deref()),
+    )?;
     with_cors_actual_headers(response, origin.as_deref())
 }
 
@@ -2568,7 +4138,9 @@ async fn cors_preflight(request: Request, env: Env) -> worker::Result<Response> 
     let requested_method = request_header(&request, "Access-Control-Request-Method")?
         .unwrap_or_default()
         .to_ascii_uppercase();
-    if !cors_method_allowed(url.path(), &requested_method) {
+    let canonical_path = canonical_route_path(url.path());
+    let route_path = compatibility_route_path(canonical_path.as_ref());
+    if !cors_method_allowed(route_path.as_ref(), &requested_method) {
         return Response::empty().map(|response| response.with_status(405));
     }
 
@@ -2609,6 +4181,360 @@ fn apple_app_site_association(env: Env) -> worker::Result<Response> {
         .headers()
         .set("Cache-Control", "public, max-age=3600")?;
     Ok(response)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn favicon() -> worker::Result<Response> {
+    let response = Response::ok(ZEROTH_FAVICON_SVG)?;
+    response
+        .headers()
+        .set("Content-Type", "image/svg+xml; charset=utf-8")?;
+    response
+        .headers()
+        .set("Cache-Control", "public, max-age=86400")?;
+    Ok(response)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn empty_cached_asset() -> worker::Result<Response> {
+    let response = Response::empty()?.with_status(204);
+    response
+        .headers()
+        .set("Cache-Control", "public, max-age=86400")?;
+    Ok(response)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn web_manifest(env: &Env) -> worker::Result<Response> {
+    let name = env
+        .var("PRODUCT_NAME")
+        .map(|value| value.to_string())
+        .unwrap_or_else(|_| "Zeroth".to_owned());
+    let payload = serde_json::json!({
+        "name": name,
+        "short_name": "Zeroth",
+        "start_url": "/admin",
+        "display": "standalone",
+        "background_color": "#f8fafc",
+        "theme_color": "#111827",
+        "icons": [
+            {
+                "src": "/favicon.svg",
+                "sizes": "any",
+                "type": "image/svg+xml"
+            }
+        ]
+    });
+    let response = Response::ok(payload.to_string())?;
+    response
+        .headers()
+        .set("Content-Type", "application/manifest+json; charset=utf-8")?;
+    response
+        .headers()
+        .set("Cache-Control", "public, max-age=3600")?;
+    Ok(response)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn browserconfig_xml() -> worker::Result<Response> {
+    let response = Response::ok(
+        r#"<?xml version="1.0" encoding="utf-8"?><browserconfig><msapplication><tile><TileColor>#111827</TileColor></tile></msapplication></browserconfig>"#,
+    )?;
+    response
+        .headers()
+        .set("Content-Type", "application/xml; charset=utf-8")?;
+    response
+        .headers()
+        .set("Cache-Control", "public, max-age=86400")?;
+    Ok(response)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn robots_txt() -> worker::Result<Response> {
+    let response = Response::ok("User-agent: *\nDisallow:\n")?;
+    response
+        .headers()
+        .set("Content-Type", "text/plain; charset=utf-8")?;
+    response
+        .headers()
+        .set("Cache-Control", "public, max-age=3600")?;
+    Ok(response)
+}
+
+fn canonical_route_path(path: &str) -> Cow<'_, str> {
+    if path == "/" || !path.ends_with('/') {
+        return Cow::Borrowed(path);
+    }
+
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        Cow::Borrowed("/")
+    } else {
+        Cow::Owned(trimmed.to_owned())
+    }
+}
+
+fn compatibility_route_path(path: &str) -> Cow<'_, str> {
+    match path {
+        "/api/health" => Cow::Borrowed("/health"),
+        "/status" | "/api/status" | "/api/ready" => Cow::Borrowed("/ready"),
+        "/api/providers" => Cow::Borrowed("/providers"),
+        "/api/providers/status" => Cow::Borrowed("/providers/status"),
+        "/api/local-auth/status" => Cow::Borrowed("/local-auth/status"),
+        "/api/clients" => Cow::Borrowed("/clients"),
+        "/api/users" => Cow::Borrowed("/users"),
+        "/api/events" => Cow::Borrowed("/events"),
+        "/api/routes" => Cow::Borrowed("/routes"),
+        "/api/__zeroth/db/status" => Cow::Borrowed("/__zeroth/db/status"),
+        "/api/authorize" => Cow::Borrowed("/authorize"),
+        "/api/oauth/token" => Cow::Borrowed("/oauth/token"),
+        "/api/oauth/revoke" => Cow::Borrowed("/oauth/revoke"),
+        "/api/oauth/introspect" => Cow::Borrowed("/oauth/introspect"),
+        "/api/userinfo" => Cow::Borrowed("/userinfo"),
+        "/api/session" => Cow::Borrowed("/session"),
+        "/api/sessions" => Cow::Borrowed("/sessions"),
+        "/api/profile" => Cow::Borrowed("/profile"),
+        "/api/identities/link" => Cow::Borrowed("/identities/link"),
+        "/api/identities" => Cow::Borrowed("/identities"),
+        "/api/validate" => Cow::Borrowed("/validate"),
+        "/api/logout" => Cow::Borrowed("/logout"),
+        "/auth/password/register"
+        | "/api/auth/password/register"
+        | "/api/password/register"
+        | "/api/local-auth/password/register"
+        | "/local-auth/password/register" => Cow::Borrowed("/password/register"),
+        "/auth/password/login"
+        | "/api/auth/password/login"
+        | "/api/password/login"
+        | "/api/local-auth/password/login"
+        | "/local-auth/password/login" => Cow::Borrowed("/password/login"),
+        "/magic-link"
+        | "/magic_link"
+        | "/magic-links/request"
+        | "/magic-link/request"
+        | "/magic_link/request"
+        | "/magic-links/send"
+        | "/magic-link/send"
+        | "/magic_link/send"
+        | "/auth/magic-links"
+        | "/auth/magic-link"
+        | "/auth/magic_link"
+        | "/auth/magic-links/request"
+        | "/auth/magic-link/request"
+        | "/auth/magic_link/request"
+        | "/auth/magic-links/send"
+        | "/auth/magic-link/send"
+        | "/auth/magic_link/send"
+        | "/api/auth/magic-links"
+        | "/api/auth/magic-link"
+        | "/api/auth/magic_link"
+        | "/api/auth/magic-links/request"
+        | "/api/auth/magic-link/request"
+        | "/api/auth/magic_link/request"
+        | "/api/auth/magic-links/send"
+        | "/api/auth/magic-link/send"
+        | "/api/auth/magic_link/send"
+        | "/api/magic-links"
+        | "/api/magic-link"
+        | "/api/magic_link"
+        | "/api/magic-links/request"
+        | "/api/magic-link/request"
+        | "/api/magic_link/request"
+        | "/api/magic-links/send"
+        | "/api/magic-link/send"
+        | "/api/magic_link/send"
+        | "/api/local-auth/magic-links"
+        | "/api/local-auth/magic-link"
+        | "/api/local-auth/magic_link"
+        | "/api/local-auth/magic-links/request"
+        | "/api/local-auth/magic-link/request"
+        | "/api/local-auth/magic_link/request"
+        | "/api/local-auth/magic-links/send"
+        | "/api/local-auth/magic-link/send"
+        | "/api/local-auth/magic_link/send"
+        | "/local-auth/magic-links"
+        | "/local-auth/magic-link"
+        | "/local-auth/magic_link"
+        | "/local-auth/magic-links/request"
+        | "/local-auth/magic-link/request"
+        | "/local-auth/magic_link/request"
+        | "/local-auth/magic-links/send"
+        | "/local-auth/magic-link/send"
+        | "/local-auth/magic_link/send" => Cow::Borrowed("/magic-links"),
+        "/magic-link/consume"
+        | "/magic_link/consume"
+        | "/magic-links/verify"
+        | "/magic-link/verify"
+        | "/magic_link/verify"
+        | "/magic-links/login"
+        | "/magic-link/login"
+        | "/magic_link/login"
+        | "/auth/magic-links/consume"
+        | "/auth/magic-link/consume"
+        | "/auth/magic_link/consume"
+        | "/auth/magic-links/verify"
+        | "/auth/magic-link/verify"
+        | "/auth/magic_link/verify"
+        | "/auth/magic-links/login"
+        | "/auth/magic-link/login"
+        | "/auth/magic_link/login"
+        | "/api/auth/magic-links/consume"
+        | "/api/auth/magic-link/consume"
+        | "/api/auth/magic_link/consume"
+        | "/api/auth/magic-links/verify"
+        | "/api/auth/magic-link/verify"
+        | "/api/auth/magic_link/verify"
+        | "/api/auth/magic-links/login"
+        | "/api/auth/magic-link/login"
+        | "/api/auth/magic_link/login"
+        | "/api/magic-links/consume"
+        | "/api/magic-link/consume"
+        | "/api/magic_link/consume"
+        | "/api/magic-links/verify"
+        | "/api/magic-link/verify"
+        | "/api/magic_link/verify"
+        | "/api/magic-links/login"
+        | "/api/magic-link/login"
+        | "/api/magic_link/login"
+        | "/api/local-auth/magic-links/consume"
+        | "/api/local-auth/magic-link/consume"
+        | "/api/local-auth/magic_link/consume"
+        | "/api/local-auth/magic-links/verify"
+        | "/api/local-auth/magic-link/verify"
+        | "/api/local-auth/magic_link/verify"
+        | "/api/local-auth/magic-links/login"
+        | "/api/local-auth/magic-link/login"
+        | "/api/local-auth/magic_link/login"
+        | "/local-auth/magic-links/consume"
+        | "/local-auth/magic-link/consume"
+        | "/local-auth/magic_link/consume"
+        | "/local-auth/magic-links/verify"
+        | "/local-auth/magic-link/verify"
+        | "/local-auth/magic_link/verify"
+        | "/local-auth/magic-links/login"
+        | "/local-auth/magic-link/login"
+        | "/local-auth/magic_link/login" => Cow::Borrowed("/magic-links/consume"),
+        "/api/passkeys/register/options" => Cow::Borrowed("/passkeys/register/options"),
+        "/api/passkeys/registration/options" => Cow::Borrowed("/passkeys/registration/options"),
+        "/api/passkeys/register/verify" | "/api/passkeys/registration/verify" => {
+            Cow::Borrowed("/passkeys/register/verify")
+        }
+        "/api/passkeys/register/finish" | "/api/passkeys/registration/finish" => {
+            Cow::Borrowed("/passkeys/register/finish")
+        }
+        "/api/passkeys/authenticate/options" => Cow::Borrowed("/passkeys/authenticate/options"),
+        "/api/passkeys/authentication/options" => Cow::Borrowed("/passkeys/authentication/options"),
+        "/api/passkeys/authenticate/verify" | "/api/passkeys/authentication/verify" => {
+            Cow::Borrowed("/passkeys/authenticate/verify")
+        }
+        "/api/passkeys/authenticate/finish" | "/api/passkeys/authentication/finish" => {
+            Cow::Borrowed("/passkeys/authenticate/finish")
+        }
+        "/api/passkeys/login/options" | "/passkeys/login/options" => {
+            Cow::Borrowed("/passkeys/authenticate/options")
+        }
+        "/api/passkeys/login/verify" | "/passkeys/login/verify" => {
+            Cow::Borrowed("/passkeys/authenticate/verify")
+        }
+        "/api/passkeys/login/finish" | "/passkeys/login/finish" => {
+            Cow::Borrowed("/passkeys/authenticate/finish")
+        }
+        _ if admin_console_alias_path(path) => Cow::Borrowed("/admin"),
+        _ if provider_callback_alias_path(path) => Cow::Borrowed("/oauth2/callback"),
+        _ => Cow::Borrowed(path),
+    }
+}
+
+fn quiet_browser_asset_path(path: &str) -> bool {
+    apple_touch_icon_path(path)
+        || matches!(
+            path,
+            "/.well-known/assetlinks.json" | "/.well-known/appspecific/com.chrome.devtools.json"
+        )
+}
+
+fn apple_touch_icon_path(path: &str) -> bool {
+    if matches!(
+        path,
+        "/apple-touch-icon.png" | "/apple-touch-icon-precomposed.png"
+    ) {
+        return true;
+    }
+
+    let Some(sized) = path.strip_prefix("/apple-touch-icon-") else {
+        return false;
+    };
+    let Some(stem) = sized.strip_suffix(".png") else {
+        return false;
+    };
+    let dimensions = stem.strip_suffix("-precomposed").unwrap_or(stem);
+    let Some((width, height)) = dimensions.split_once('x') else {
+        return false;
+    };
+
+    !width.is_empty()
+        && !height.is_empty()
+        && width.bytes().all(|byte| byte.is_ascii_digit())
+        && height.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn known_route_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/health"
+            | "/ready"
+            | "/providers"
+            | "/providers/status"
+            | "/local-auth/status"
+            | "/clients"
+            | "/users"
+            | "/events"
+            | "/routes"
+            | "/.well-known/openid-configuration"
+            | "/.well-known/oauth-authorization-server"
+            | "/.well-known/jwks.json"
+            | "/.well-known/apple-app-site-association"
+            | "/favicon.ico"
+            | "/favicon.svg"
+            | "/site.webmanifest"
+            | "/manifest.json"
+            | "/browserconfig.xml"
+            | "/robots.txt"
+            | "/login"
+            | "/account"
+            | "/admin"
+            | "/authorize"
+            | "/__zeroth/db/status"
+            | "/__zeroth/db/ensure"
+            | "/oauth2/callback"
+            | "/oauth/token"
+            | "/oauth/revoke"
+            | "/oauth/introspect"
+            | "/userinfo"
+            | "/session"
+            | "/sessions"
+            | "/profile"
+            | "/identities/link"
+            | "/identities"
+            | "/passkeys/register/options"
+            | "/passkeys/registration/options"
+            | "/passkeys/register/verify"
+            | "/passkeys/register/finish"
+            | "/passkeys/registration/finish"
+            | "/passkeys/authenticate/options"
+            | "/passkeys/authentication/options"
+            | "/passkeys/authenticate/verify"
+            | "/passkeys/authenticate/finish"
+            | "/passkeys/authentication/finish"
+            | "/password/register"
+            | "/password/login"
+            | "/magic-links"
+            | "/magic-links/consume"
+            | "/validate"
+            | "/logout"
+    ) || provider_authorize_alias_path(path)
+        || provider_callback_alias_path(path)
+        || quiet_browser_asset_path(path)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -2663,7 +4589,7 @@ async fn hosted_session_login(request: Request, env: Env) -> worker::Result<Resp
             )
         }
     };
-    let return_to = match client_return_to_from_url(&url, &client, Some(&config.public_base_url)) {
+    let return_to = match session_login_return_to_from_url(&url, &client, &config.public_base_url) {
         Ok(return_to) => return_to,
         Err(error) => {
             return auth_error_json(&AuthorizationRequestError::invalid_request(error), 400)
@@ -2685,12 +4611,14 @@ async fn hosted_session_login(request: Request, env: Env) -> worker::Result<Resp
     let provider = provider_from_env(&env, &provider_id)?;
     let provider_redirect_uri = config.issuer().provider_callback_endpoint();
     let provider_state = random_token()?;
+    let provider_nonce = random_token()?;
     let now = unix_timestamp_seconds();
     cleanup_expired_auth_transactions(&db, now).await?;
     let transaction = auth_transaction_from_session_login_request(
         &client,
         &provider_id,
         provider_state,
+        provider_nonce,
         provider_redirect_uri,
         return_to,
         query_param(&url, "state"),
@@ -2702,7 +4630,7 @@ async fn hosted_session_login(request: Request, env: Env) -> worker::Result<Resp
         .authorize_url(ProviderAuthorizeRequest {
             redirect_uri: &transaction.provider_redirect_uri,
             state: &transaction.provider_state,
-            nonce: None,
+            nonce: provider_authorize_nonce(&transaction),
             code_challenge: None,
             scopes: None,
         })
@@ -2790,29 +4718,45 @@ async fn hosted_clients_admin(request: Request, env: Env) -> worker::Result<Resp
     let config = server_config(&env, &url);
     let mut state = ClientsAdminUiState::new(config.issuer().issuer)
         .with_product_name(product_name_from_env(&env));
-    state.providers = provider_admin_ui_rows(&env);
+    state.providers = provider_admin_ui_rows(&env, &config, &[]);
+    state.local_auth = local_auth_admin_ui_rows(&env, None);
     let db = env.d1(D1_BINDING)?;
+    let now = unix_timestamp_seconds();
 
-    if validate_admin_request(&request, &env, &db, &config, unix_timestamp_seconds())
-        .await
-        .is_ok()
-    {
-        let rows = list_client_rows_for_admin(&db).await?;
-        state.clients = rows
-            .into_iter()
-            .map(client_admin_ui_from_row)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(worker_error)?;
-        state.users = list_admin_user_rows(&db, unix_timestamp_seconds())
-            .await?
-            .into_iter()
-            .map(user_admin_ui_from_row)
-            .collect();
-        state.events = list_audit_event_rows(&db, &AuditEventFilter::default())
-            .await?
-            .into_iter()
-            .map(audit_event_admin_ui_from_row)
-            .collect();
+    match authorize_admin_request(&request, &env, &db, &config, now).await {
+        Ok(_) => {
+            let provider_failures = provider_failure_statuses(&db).await?;
+            state.providers = provider_admin_ui_rows(&env, &config, &provider_failures);
+            state.local_auth =
+                local_auth_admin_ui_rows(&env, magic_link_delivery_status(&db).await?);
+            let rows = list_client_rows_for_admin(&db).await?;
+            state.clients = rows
+                .into_iter()
+                .map(client_admin_ui_from_row)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(worker_error)?;
+            state.users = list_admin_user_rows(&db, now)
+                .await?
+                .into_iter()
+                .map(user_admin_ui_from_row)
+                .collect();
+            state.events = list_audit_event_rows(&db, &AuditEventFilter::default())
+                .await?
+                .into_iter()
+                .map(audit_event_admin_ui_from_row)
+                .collect();
+        }
+        Err(error) => {
+            let current = current_session_from_request(&request, &db, &config, now).await?;
+            if current.is_none()
+                && error.status == 401
+                && provider_configured_for_login(&env, well_known::APPLE)
+            {
+                return redirect_to_hosted_admin_login(&config, url.path());
+            }
+
+            return client_management_error_json(&error);
+        }
     }
 
     html(render_clients_admin_document(state))
@@ -2936,12 +4880,14 @@ async fn authorize(request: Request, env: Env) -> worker::Result<Response> {
     let provider = provider_from_env(&env, &provider_id)?;
     let provider_redirect_uri = config.issuer().provider_callback_endpoint();
     let provider_state = random_token()?;
+    let provider_nonce = random_token()?;
     let now = unix_timestamp_seconds();
     cleanup_expired_auth_transactions(&db, now).await?;
     let transaction = auth_transaction_from_request(
         &authorization_request,
         &provider_id,
         provider_state,
+        provider_nonce,
         provider_redirect_uri,
         now,
     );
@@ -2951,7 +4897,7 @@ async fn authorize(request: Request, env: Env) -> worker::Result<Response> {
         .authorize_url(ProviderAuthorizeRequest {
             redirect_uri: &transaction.provider_redirect_uri,
             state: &transaction.provider_state,
-            nonce: transaction.nonce.as_deref(),
+            nonce: provider_authorize_nonce(&transaction),
             code_challenge: None,
             scopes: None,
         })
@@ -3091,10 +5037,32 @@ fn provider_ui_rows(
             identities,
         ),
     ];
+    providers.retain(|provider| !provider_disabled(env, &provider.id));
     for provider in &mut providers {
         provider.enabled = actions_enabled && provider_configured_for_login(env, &provider.id);
     }
     providers
+}
+
+#[cfg(target_arch = "wasm32")]
+fn provider_responses(env: &Env) -> Vec<ProviderResponse> {
+    [
+        ProviderResponse {
+            id: well_known::APPLE,
+            kind: "oidc",
+        },
+        ProviderResponse {
+            id: well_known::GOOGLE,
+            kind: "oidc",
+        },
+        ProviderResponse {
+            id: well_known::SPOTIFY,
+            kind: "oauth2",
+        },
+    ]
+    .into_iter()
+    .filter(|provider| !provider_disabled(env, provider.id))
+    .collect()
 }
 
 fn provider_ui(
@@ -3130,24 +5098,36 @@ fn provider_client_id_binding(provider_id: &str) -> Option<&'static str> {
 
 #[cfg(target_arch = "wasm32")]
 fn provider_configured_for_login(env: &Env, provider_id: &str) -> bool {
-    provider_status_row(env, provider_id)
-        .map(|status| status.enabled)
-        .unwrap_or(false)
+    !provider_disabled(env, provider_id)
+        && provider_client_id_configured(env, provider_id)
+        && provider_client_secret_configured(env, provider_id)
 }
 
 #[cfg(target_arch = "wasm32")]
-fn provider_status_rows(env: &Env) -> Vec<ProviderStatus> {
+fn provider_status_rows(
+    env: &Env,
+    config: &ZerothServerConfig,
+    include_disabled: bool,
+    provider_failures: &[(String, ProviderFailureStatus)],
+) -> Vec<ProviderStatus> {
     [well_known::APPLE, well_known::GOOGLE, well_known::SPOTIFY]
         .into_iter()
-        .filter_map(|provider_id| provider_status_row(env, provider_id))
+        .filter(|provider_id| include_disabled || !provider_disabled(env, provider_id))
+        .filter_map(|provider_id| provider_status_row(env, config, provider_id, provider_failures))
         .collect()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn provider_disabled(env: &Env, provider_id: &str) -> bool {
+    binding_value_from_env(env, "DISABLED_PROVIDERS")
+        .is_some_and(|values| token_list_contains(Some(&values), provider_id, true))
 }
 
 #[cfg(target_arch = "wasm32")]
 fn readiness_response(env: &Env, config: &ZerothServerConfig) -> ReadinessResponse {
     let issuer_check = issuer_readiness(config);
     let signing = signing_readiness(env);
-    let providers = provider_readiness_rows(env);
+    let providers = provider_readiness_rows(env, config);
     let apple_app_site_association = apple_app_site_association_readiness(env);
     let ready = readiness_is_ready(&issuer_check, &signing, &providers);
     let mut notes = Vec::new();
@@ -3228,8 +5208,8 @@ fn signing_readiness(env: &Env) -> ReadinessCheck {
 }
 
 #[cfg(target_arch = "wasm32")]
-fn provider_readiness_rows(env: &Env) -> Vec<ProviderReadiness> {
-    provider_status_rows(env)
+fn provider_readiness_rows(env: &Env, config: &ZerothServerConfig) -> Vec<ProviderReadiness> {
+    provider_status_rows(env, config, false, &[])
         .into_iter()
         .map(|status| ProviderReadiness {
             id: status.id,
@@ -3300,18 +5280,28 @@ fn config_value_is_placeholder(value: &str) -> bool {
 }
 
 #[cfg(target_arch = "wasm32")]
-fn provider_status_row(env: &Env, provider_id: &str) -> Option<ProviderStatus> {
+fn provider_status_row(
+    env: &Env,
+    config: &ZerothServerConfig,
+    provider_id: &str,
+    provider_failures: &[(String, ProviderFailureStatus)],
+) -> Option<ProviderStatus> {
     let (id, label, kind) = match provider_id {
         well_known::APPLE => (well_known::APPLE, "Apple", "oidc"),
         well_known::GOOGLE => (well_known::GOOGLE, "Google", "oidc"),
         well_known::SPOTIFY => (well_known::SPOTIFY, "Spotify", "oauth2"),
         _ => return None,
     };
-    let client_id_value =
-        provider_client_id_binding(provider_id).and_then(|name| binding_value_from_env(env, name));
+    let client_id_binding = provider_client_id_binding(provider_id)?;
+    let client_id_value = binding_value_from_env(env, client_id_binding);
     let client_id_configured = config_value_configured(client_id_value.as_deref());
     let client_secret_configured = provider_client_secret_configured(env, provider_id);
+    let disabled = provider_disabled(env, provider_id);
     let mut notes = Vec::new();
+    if disabled {
+        notes.push("disabled_by_deployment");
+        notes.extend(provider_disabled_notes(provider_id));
+    }
     if let Some(note) = config_value_note(
         client_id_value.as_deref(),
         "missing_client_id",
@@ -3327,11 +5317,321 @@ fn provider_status_row(env: &Env, provider_id: &str) -> Option<ProviderStatus> {
         id,
         label,
         kind,
-        enabled: client_id_configured && client_secret_configured,
+        enabled: provider_status_enabled(client_id_configured, client_secret_configured, disabled),
         client_id_configured,
         client_secret_configured,
+        client_id_binding,
+        secret_binding_sets: provider_secret_binding_sets(provider_id),
+        callback_url: config.issuer().provider_callback_endpoint(),
+        web_domain: provider_web_domain(provider_id, config),
         notes,
+        activation_requirements: provider_activation_requirements(provider_id, disabled),
+        last_failure: provider_failure_for_provider(provider_id, provider_failures),
     })
+}
+
+fn provider_disabled_notes(provider_id: &str) -> Vec<&'static str> {
+    match provider_id {
+        well_known::SPOTIFY => vec![
+            "spotify_development_mode_owner_premium_required",
+            "spotify_development_mode_users_must_be_allowlisted",
+        ],
+        _ => Vec::new(),
+    }
+}
+
+fn provider_activation_requirements(provider_id: &str, disabled: bool) -> Vec<&'static str> {
+    if !disabled {
+        return Vec::new();
+    }
+    match provider_id {
+        well_known::SPOTIFY => vec![
+            "Spotify app owner account has Premium while the app is in development mode",
+            "Spotify test login user is allowlisted in the Spotify app Users Management tab",
+            "Spotify current-user profile endpoint /v1/me returns HTTP 200 for an authorized user",
+        ],
+        _ => Vec::new(),
+    }
+}
+
+fn provider_failure_for_provider(
+    provider_id: &str,
+    provider_failures: &[(String, ProviderFailureStatus)],
+) -> Option<ProviderFailureStatus> {
+    provider_failures
+        .iter()
+        .find(|(id, _)| id == provider_id)
+        .map(|(_, failure)| failure.clone())
+}
+
+fn provider_status_enabled(
+    client_id_configured: bool,
+    client_secret_configured: bool,
+    disabled: bool,
+) -> bool {
+    !disabled && client_id_configured && client_secret_configured
+}
+
+fn provider_secret_binding_sets(provider_id: &str) -> Vec<Vec<&'static str>> {
+    match provider_id {
+        well_known::APPLE => vec![
+            vec!["APPLE_CLIENT_SECRET"],
+            vec!["APPLE_TEAM_ID", "APPLE_KEY_ID", "APPLE_PRIVATE_KEY"],
+            vec!["APPLE_TEAM_ID", "APPLE_KEY_ID", "APPLE_PRIVATE_KEY_PEM"],
+        ],
+        well_known::GOOGLE => vec![vec!["GOOGLE_CLIENT_SECRET"]],
+        well_known::SPOTIFY => vec![vec!["SPOTIFY_CLIENT_SECRET"]],
+        _ => Vec::new(),
+    }
+}
+
+fn provider_web_domain(provider_id: &str, config: &ZerothServerConfig) -> Option<String> {
+    if provider_id != well_known::APPLE {
+        return None;
+    }
+    url::Url::parse(&config.issuer().issuer)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn local_auth_status_rows(
+    env: &Env,
+    magic_link_delivery: Option<LocalAuthDeliveryStatus>,
+) -> Vec<LocalAuthStatus> {
+    let password_ready = password_iterations_from_env(env).is_ok();
+    let magic_link_delivery_config = magic_link_delivery_config_from_env(env);
+
+    local_auth_status_rows_from_config(
+        password_ready,
+        magic_link_delivery_config,
+        magic_link_dev_echo_enabled(env),
+        magic_link_delivery,
+    )
+}
+
+#[cfg(target_arch = "wasm32")]
+fn magic_link_delivery_config_from_env(env: &Env) -> MagicLinkDeliveryConfig {
+    let magic_link_from_note = config_value_note(
+        binding_value_from_env(env, "MAGIC_LINK_FROM").as_deref(),
+        "missing_magic_link_from",
+        "placeholder_magic_link_from",
+    );
+    let webhook_url_note = magic_link_webhook_url_note(
+        binding_value_from_env(env, "MAGIC_LINK_WEBHOOK_URL").as_deref(),
+    );
+
+    magic_link_delivery_config_from_values(
+        binding_value_from_env(env, "MAGIC_LINK_DELIVERY").as_deref(),
+        magic_link_from_note,
+        env.send_email("EMAIL").is_ok(),
+        webhook_url_note,
+        config_value_note(
+            magic_link_resend_api_key_from_env(env).as_deref(),
+            "missing_resend_api_key",
+            "placeholder_resend_api_key",
+        ),
+        config_value_note(
+            magic_link_mailchannels_api_key_from_env(env).as_deref(),
+            "missing_mailchannels_api_key",
+            "placeholder_mailchannels_api_key",
+        ),
+    )
+}
+
+fn local_auth_status_rows_from_config(
+    password_ready: bool,
+    magic_link_delivery_config: MagicLinkDeliveryConfig,
+    magic_link_dev_echo_enabled: bool,
+    magic_link_delivery: Option<LocalAuthDeliveryStatus>,
+) -> Vec<LocalAuthStatus> {
+    let mut password_notes = Vec::new();
+    if !password_ready {
+        password_notes.push("invalid_password_iterations");
+    }
+
+    let mut magic_link_notes = magic_link_delivery_config.notes.clone();
+    if magic_link_delivery_config.enabled {
+        let delivery_proven = magic_link_delivery
+            .as_ref()
+            .and_then(|status| status.last_sent_at)
+            .is_some();
+        if !delivery_proven {
+            magic_link_notes.push("delivery_not_proven");
+        }
+        let recent_failure = magic_link_delivery
+            .as_ref()
+            .and_then(|status| status.last_failed_at)
+            .is_some_and(|failed_at| {
+                match magic_link_delivery
+                    .as_ref()
+                    .and_then(|status| status.last_sent_at)
+                {
+                    Some(sent_at) => failed_at >= sent_at,
+                    None => true,
+                }
+            });
+        if recent_failure {
+            magic_link_notes.push("delivery_failed_recently");
+        }
+    }
+    if magic_link_dev_echo_enabled {
+        magic_link_notes.push("dev_echo_enabled");
+    }
+
+    vec![
+        LocalAuthStatus {
+            id: "password",
+            label: "Password",
+            enabled: password_ready,
+            credential_storage: "zeroth_local_credentials",
+            delivery: "none",
+            notes: password_notes,
+            delivery_status: None,
+        },
+        LocalAuthStatus {
+            id: "passkey",
+            label: "Passkey",
+            enabled: true,
+            credential_storage: "zeroth_passkey_credentials",
+            delivery: "browser_webauthn",
+            notes: vec!["requires_webauthn_browser"],
+            delivery_status: None,
+        },
+        LocalAuthStatus {
+            id: "magic_link",
+            label: "Magic link",
+            enabled: magic_link_delivery_config.enabled,
+            credential_storage: "zeroth_magic_links",
+            delivery: magic_link_delivery_config.transport,
+            notes: magic_link_notes,
+            delivery_status: magic_link_delivery,
+        },
+    ]
+}
+
+fn magic_link_delivery_config_from_values(
+    transport_value: Option<&str>,
+    magic_link_from_note: Option<&'static str>,
+    email_binding_configured: bool,
+    webhook_url_note: Option<&'static str>,
+    resend_api_key_note: Option<&'static str>,
+    mailchannels_api_key_note: Option<&'static str>,
+) -> MagicLinkDeliveryConfig {
+    match magic_link_delivery_transport_from_value(transport_value) {
+        Ok(MagicLinkDeliveryTransport::CloudflareEmail) => {
+            let mut notes = Vec::new();
+            if let Some(note) = magic_link_from_note {
+                notes.push(note);
+            }
+            if !email_binding_configured {
+                notes.push("missing_email_binding");
+            }
+            let enabled = magic_link_from_note.is_none() && email_binding_configured;
+            if enabled {
+                notes.push("cloudflare_email_sending_must_be_enabled");
+            }
+            MagicLinkDeliveryConfig {
+                transport: MAGIC_LINK_DELIVERY_CLOUDFLARE_EMAIL,
+                enabled,
+                notes,
+            }
+        }
+        Ok(MagicLinkDeliveryTransport::Webhook) => {
+            let mut notes = Vec::new();
+            if let Some(note) = magic_link_from_note {
+                notes.push(note);
+            }
+            if let Some(note) = webhook_url_note {
+                notes.push(note);
+            }
+            let enabled = magic_link_from_note.is_none() && webhook_url_note.is_none();
+            if enabled {
+                notes.push("magic_link_webhook_must_send_email");
+            }
+            MagicLinkDeliveryConfig {
+                transport: MAGIC_LINK_DELIVERY_WEBHOOK,
+                enabled,
+                notes,
+            }
+        }
+        Ok(MagicLinkDeliveryTransport::Resend) => {
+            let mut notes = Vec::new();
+            if let Some(note) = magic_link_from_note {
+                notes.push(note);
+            }
+            if let Some(note) = resend_api_key_note {
+                notes.push(note);
+            }
+            let enabled = magic_link_from_note.is_none() && resend_api_key_note.is_none();
+            if enabled {
+                notes.push("resend_domain_must_be_verified");
+            }
+            MagicLinkDeliveryConfig {
+                transport: MAGIC_LINK_DELIVERY_RESEND,
+                enabled,
+                notes,
+            }
+        }
+        Ok(MagicLinkDeliveryTransport::MailChannels) => {
+            let mut notes = Vec::new();
+            if let Some(note) = magic_link_from_note {
+                notes.push(note);
+            }
+            if let Some(note) = mailchannels_api_key_note {
+                notes.push(note);
+            }
+            let enabled = magic_link_from_note.is_none() && mailchannels_api_key_note.is_none();
+            if enabled {
+                notes.push("mailchannels_domain_lockdown_must_be_configured");
+            }
+            MagicLinkDeliveryConfig {
+                transport: MAGIC_LINK_DELIVERY_MAILCHANNELS,
+                enabled,
+                notes,
+            }
+        }
+        Err(note) => MagicLinkDeliveryConfig {
+            transport: MAGIC_LINK_DELIVERY_UNSUPPORTED,
+            enabled: false,
+            notes: vec![note],
+        },
+    }
+}
+
+fn magic_link_delivery_transport_from_value(
+    value: Option<&str>,
+) -> Result<MagicLinkDeliveryTransport, &'static str> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(MagicLinkDeliveryTransport::CloudflareEmail);
+    };
+    match value.to_ascii_lowercase().as_str() {
+        "cloudflare" | "cloudflare_email" => Ok(MagicLinkDeliveryTransport::CloudflareEmail),
+        "webhook" => Ok(MagicLinkDeliveryTransport::Webhook),
+        "resend" => Ok(MagicLinkDeliveryTransport::Resend),
+        "mailchannels" | "mail_channels" => Ok(MagicLinkDeliveryTransport::MailChannels),
+        _ => Err("unsupported_magic_link_delivery"),
+    }
+}
+
+fn magic_link_webhook_url_note(value: Option<&str>) -> Option<&'static str> {
+    config_value_note(
+        value,
+        "missing_magic_link_webhook_url",
+        "placeholder_magic_link_webhook_url",
+    )
+    .or_else(|| {
+        value.and_then(|value| {
+            (!magic_link_webhook_url_valid(value)).then_some("invalid_magic_link_webhook_url")
+        })
+    })
+}
+
+fn magic_link_webhook_url_valid(value: &str) -> bool {
+    let Ok(url) = url::Url::parse(value.trim()) else {
+        return false;
+    };
+    url.scheme() == "https" && url.host_str().is_some()
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -3360,8 +5660,12 @@ fn provider_secret_binding_configured(env: &Env, name: &str) -> bool {
 }
 
 #[cfg(target_arch = "wasm32")]
-fn provider_admin_ui_rows(env: &Env) -> Vec<ProviderAdminUi> {
-    provider_status_rows(env)
+fn provider_admin_ui_rows(
+    env: &Env,
+    config: &ZerothServerConfig,
+    provider_failures: &[(String, ProviderFailureStatus)],
+) -> Vec<ProviderAdminUi> {
+    provider_status_rows(env, config, true, provider_failures)
         .into_iter()
         .map(|status| ProviderAdminUi {
             id: status.id.to_owned(),
@@ -3370,9 +5674,63 @@ fn provider_admin_ui_rows(env: &Env) -> Vec<ProviderAdminUi> {
             enabled: status.enabled,
             client_id_configured: status.client_id_configured,
             client_secret_configured: status.client_secret_configured,
+            client_id_binding: status.client_id_binding.to_owned(),
+            secret_binding_sets: status
+                .secret_binding_sets
+                .iter()
+                .map(|set| set.iter().map(|name| (*name).to_owned()).collect())
+                .collect(),
+            callback_url: status.callback_url,
+            web_domain: status.web_domain,
+            notes: status.notes.iter().map(|note| (*note).to_owned()).collect(),
+            activation_requirements: status
+                .activation_requirements
+                .iter()
+                .map(|requirement| (*requirement).to_owned())
+                .collect(),
+            last_failure: status.last_failure.map(provider_failure_admin_ui),
+        })
+        .collect()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn provider_failure_admin_ui(status: ProviderFailureStatus) -> ProviderFailureAdminUi {
+    ProviderFailureAdminUi {
+        event_type: status.event_type,
+        created_at: status.created_at.to_string(),
+        code: status.code,
+        description: status.description,
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn local_auth_admin_ui_rows(
+    env: &Env,
+    magic_link_delivery: Option<LocalAuthDeliveryStatus>,
+) -> Vec<LocalAuthAdminUi> {
+    local_auth_status_rows(env, magic_link_delivery)
+        .into_iter()
+        .map(|status| LocalAuthAdminUi {
+            id: status.id.to_owned(),
+            label: status.label.to_owned(),
+            enabled: status.enabled,
+            credential_storage: status.credential_storage.to_owned(),
+            delivery: status.delivery.to_owned(),
+            delivery_status: status.delivery_status.map(local_auth_delivery_admin_ui),
             notes: status.notes.iter().map(|note| (*note).to_owned()).collect(),
         })
         .collect()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn local_auth_delivery_admin_ui(status: LocalAuthDeliveryStatus) -> LocalAuthDeliveryAdminUi {
+    LocalAuthDeliveryAdminUi {
+        last_issue_at: status.last_issue_at.map(|value| value.to_string()),
+        last_sent_at: status.last_sent_at.map(|value| value.to_string()),
+        last_failed_at: status.last_failed_at.map(|value| value.to_string()),
+        last_error: status.last_error,
+        last_error_detail: status.last_error_detail,
+    }
 }
 
 fn profile_ui_from_user(user: &UserRow, identities: &[IdentityRow]) -> ProfileUi {
@@ -3425,6 +5783,7 @@ fn application_ui_from_client(client: &Client) -> ApplicationUi {
         public_client: !client.confidential,
         redirect_uris: client.redirect_uris.clone(),
         allowed_origins: client.allowed_origins.clone(),
+        allowed_email_domains: client.allowed_email_domains.clone(),
     }
 }
 
@@ -3436,9 +5795,78 @@ fn client_admin_ui_from_row(row: ClientRow) -> Result<ClientAdminUi, String> {
         confidential: response.confidential,
         redirect_uris: response.redirect_uris,
         allowed_origins: response.allowed_origins,
+        allowed_email_domains: response.allowed_email_domains,
         disabled: response.disabled,
         has_secret: response.has_secret,
     })
+}
+
+fn provider_authorize_alias_path(path: &str) -> bool {
+    provider_segment_alias(path, "/providers/", "/authorize").is_some()
+}
+
+fn admin_console_alias_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/ui"
+            | "/dashboard"
+            | "/console"
+            | "/admin/users"
+            | "/admin/events"
+            | "/admin/providers"
+            | "/admin/local-auth"
+            | "/admin/database"
+    )
+}
+
+fn provider_callback_alias_path(path: &str) -> bool {
+    provider_segment_alias(path, "/oauth/callback/", "").is_some()
+        || provider_segment_alias(path, "/oauth2/callback/", "").is_some()
+        || provider_segment_alias(path, "/callback/", "").is_some()
+        || provider_segment_alias(path, "/auth/callback/", "").is_some()
+        || provider_segment_alias(path, "/api/callback/", "").is_some()
+        || provider_segment_alias(path, "/api/auth/callback/", "").is_some()
+        || path == "/callback"
+        || path == "/auth/callback"
+        || path == "/api/callback"
+        || path == "/api/auth/callback"
+}
+
+fn provider_authorize_alias_url(request_url: &url::Url) -> Option<url::Url> {
+    let provider_id = provider_segment_alias(request_url.path(), "/providers/", "/authorize")?;
+    let query_pairs = request_url
+        .query_pairs()
+        .filter(|(key, _)| key != "provider")
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect::<Vec<_>>();
+    let mut target = request_url.clone();
+    target.set_path("/authorize");
+    target.set_query(None);
+    target.set_fragment(None);
+    {
+        let mut pairs = target.query_pairs_mut();
+        for (key, value) in query_pairs {
+            pairs.append_pair(&key, &value);
+        }
+        pairs.append_pair("provider", provider_id);
+    }
+    Some(target)
+}
+
+fn provider_segment_alias<'a>(path: &'a str, prefix: &str, suffix: &str) -> Option<&'a str> {
+    let provider_id = path.strip_prefix(prefix)?.strip_suffix(suffix)?;
+    if provider_alias_id_valid(provider_id) {
+        Some(provider_id)
+    } else {
+        None
+    }
+}
+
+fn provider_alias_id_valid(provider_id: &str) -> bool {
+    !provider_id.is_empty()
+        && provider_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -3454,6 +5882,22 @@ fn html(document: String) -> worker::Result<Response> {
 }
 
 #[cfg(target_arch = "wasm32")]
+fn redirect_to_path(request_url: &url::Url, path: &str) -> worker::Result<Response> {
+    let mut target = request_url.clone();
+    target.set_path(path);
+    target.set_query(None);
+    target.set_fragment(None);
+    Response::redirect(target)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn redirect_to_provider_authorize_alias(request_url: &url::Url) -> worker::Result<Response> {
+    let target = provider_authorize_alias_url(request_url)
+        .ok_or_else(|| worker::Error::RustError("invalid provider authorize alias".to_owned()))?;
+    Response::redirect(target)
+}
+
+#[cfg(target_arch = "wasm32")]
 async fn provider_callback_from_request(
     request: &mut Request,
     url: &url::Url,
@@ -3464,6 +5908,7 @@ async fn provider_callback_from_request(
             query_param(url, "state"),
             query_param(url, "error"),
             query_param(url, "error_description"),
+            None,
         ),
         Method::Post => {
             let form = request.form_data().await.map_err(|error| {
@@ -3476,6 +5921,7 @@ async fn provider_callback_from_request(
                 form.get_field("state"),
                 form.get_field("error"),
                 form.get_field("error_description"),
+                form.get_field("user"),
             )
         }
         _ => Err(ProviderCallbackError::invalid_request(
@@ -3489,6 +5935,7 @@ fn provider_callback_from_values(
     state: Option<String>,
     error: Option<String>,
     error_description: Option<String>,
+    apple_user_json: Option<String>,
 ) -> Result<ProviderCallback, ProviderCallbackError> {
     if let Some(error) = error {
         if error.is_empty() {
@@ -3506,6 +5953,7 @@ fn provider_callback_from_values(
                 description: error_description
                     .unwrap_or_else(|| "provider returned an authorization error".to_owned()),
             }),
+            apple_user_json: None,
         });
     }
 
@@ -3522,6 +5970,7 @@ fn provider_callback_from_values(
         state,
         code: Some(code),
         provider_error: None,
+        apple_user_json: apple_user_json.filter(|value| !value.trim().is_empty()),
     })
 }
 
@@ -3544,6 +5993,7 @@ async fn get_registered_client(
     let row = db
         .prepare(
             "SELECT id, name, secret_hash, redirect_uris_json, allowed_origins_json,
+                    allowed_email_domains_json,
                     confidential, disabled_at
              FROM zeroth_clients
              WHERE id = ?
@@ -3567,6 +6017,7 @@ async fn get_client_row_for_admin(
     let args = [worker::d1::D1Type::Text(client_id)];
     db.prepare(
         "SELECT id, name, secret_hash, redirect_uris_json, allowed_origins_json,
+                allowed_email_domains_json,
                 confidential, disabled_at
          FROM zeroth_clients
          WHERE id = ?
@@ -3582,6 +6033,7 @@ async fn list_client_rows_for_admin(db: &worker::d1::D1Database) -> worker::Resu
     let args = [worker::d1::D1Type::Integer(CLIENT_LIST_LIMIT)];
     db.prepare(
         "SELECT id, name, secret_hash, redirect_uris_json, allowed_origins_json,
+                allowed_email_domains_json,
                 confidential, disabled_at
          FROM zeroth_clients
          ORDER BY id
@@ -3605,6 +6057,12 @@ async fn upsert_client(
     let allowed_origins_json = serde_json::to_string(&client.allowed_origins).map_err(|error| {
         worker::Error::RustError(format!("could not serialize allowed origins: {error}"))
     })?;
+    let allowed_email_domains_json =
+        serde_json::to_string(&client.allowed_email_domains).map_err(|error| {
+            worker::Error::RustError(format!(
+                "could not serialize allowed email domains: {error}"
+            ))
+        })?;
     let secret_hash = d1_optional_text(client.secret_hash.as_deref());
     let disabled_at = if client.disabled {
         worker::d1::D1Type::Integer(now)
@@ -3619,6 +6077,7 @@ async fn upsert_client(
         worker::d1::D1Type::Integer(confidential),
         worker::d1::D1Type::Text(&redirect_uris_json),
         worker::d1::D1Type::Text(&allowed_origins_json),
+        worker::d1::D1Type::Text(&allowed_email_domains_json),
         worker::d1::D1Type::Integer(now),
         worker::d1::D1Type::Integer(now),
         disabled_at,
@@ -3627,8 +6086,9 @@ async fn upsert_client(
     db.prepare(
         "INSERT INTO zeroth_clients (
              id, name, secret_hash, confidential, redirect_uris_json,
-             allowed_origins_json, created_at, updated_at, disabled_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             allowed_origins_json, allowed_email_domains_json, created_at, updated_at,
+             disabled_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
              name = excluded.name,
              secret_hash = CASE
@@ -3639,6 +6099,7 @@ async fn upsert_client(
              confidential = excluded.confidential,
              redirect_uris_json = excluded.redirect_uris_json,
              allowed_origins_json = excluded.allowed_origins_json,
+             allowed_email_domains_json = excluded.allowed_email_domains_json,
              updated_at = excluded.updated_at,
              disabled_at = excluded.disabled_at",
     )
@@ -3711,7 +6172,7 @@ async fn get_auth_transaction(
     let row = db
         .prepare(
             "SELECT provider_state, client_id, provider_id, redirect_uri, provider_redirect_uri,
-                    app_state, nonce, code_challenge, code_challenge_method, scope,
+                    app_state, nonce, provider_nonce, code_challenge, code_challenge_method, scope,
                     link_user_id, link_session_id, session_return_to, created_at, expires_at,
                     consumed_at
              FROM zeroth_auth_transactions
@@ -3906,17 +6367,624 @@ async fn delete_user_identity(
     user_id: &str,
     provider_id: &str,
     provider_subject: &str,
-) -> worker::Result<()> {
+) -> worker::Result<bool> {
     let args = [
         worker::d1::D1Type::Text(user_id),
         worker::d1::D1Type::Text(provider_id),
         worker::d1::D1Type::Text(provider_subject),
         worker::d1::D1Type::Text(user_id),
     ];
-    db.prepare(
-        "DELETE FROM zeroth_identities
+    let result = db
+        .prepare(
+            "DELETE FROM zeroth_identities
          WHERE user_id = ? AND provider_id = ? AND provider_subject = ?
            AND (SELECT COUNT(*) FROM zeroth_identities WHERE user_id = ?) > 1",
+        )
+        .bind_refs(&args)?
+        .run()
+        .await?;
+    d1_result_changed_one(result)
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn get_user_by_primary_email(
+    db: &worker::d1::D1Database,
+    email: &str,
+) -> worker::Result<Option<UserRow>> {
+    let args = [worker::d1::D1Type::Text(email)];
+    db.prepare(
+        "SELECT id, primary_email, display_name, picture_url, disabled_at
+         FROM zeroth_users
+         WHERE lower(primary_email) = lower(?)
+         ORDER BY updated_at DESC
+         LIMIT 1",
+    )
+    .bind_refs(&args)?
+    .first::<UserRow>(None)
+    .await
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn insert_passkey_user(
+    db: &worker::d1::D1Database,
+    user_id: &str,
+    email: &str,
+    display_name: Option<&str>,
+    now: i32,
+) -> worker::Result<()> {
+    let display_name = d1_optional_text(display_name);
+    let args = [
+        worker::d1::D1Type::Text(user_id),
+        worker::d1::D1Type::Text(email),
+        display_name,
+        worker::d1::D1Type::Integer(now),
+        worker::d1::D1Type::Integer(now),
+    ];
+    db.prepare(
+        "INSERT INTO zeroth_users (
+             id, primary_email, display_name, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind_refs(&args)?
+    .run()
+    .await?;
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn ensure_passkey_registration_user(
+    db: &worker::d1::D1Database,
+    challenge: &PasskeyChallengeRow,
+    now: i32,
+) -> worker::Result<(String, String, Option<String>)> {
+    if let Some(user_id) = challenge.user_id.as_deref() {
+        let Some(user) = get_user(db, user_id).await? else {
+            return Err(worker_error(
+                "passkey registration user was not found".to_owned(),
+            ));
+        };
+        let email = user
+            .primary_email
+            .or_else(|| challenge.email.clone())
+            .ok_or_else(|| worker_error("passkey registration user has no email".to_owned()))?;
+        let display_name = challenge.display_name.clone().or(user.display_name);
+        return Ok((user_id.to_owned(), email, display_name));
+    }
+
+    let email = challenge
+        .email
+        .as_deref()
+        .ok_or_else(|| worker_error("passkey registration challenge has no email".to_owned()))?;
+    if let Some(user) = get_user_by_primary_email(db, email).await? {
+        return Ok((user.id, email.to_owned(), challenge.display_name.clone()));
+    }
+
+    let user_id = format!("usr_{}", random_token()?);
+    insert_passkey_user(db, &user_id, email, challenge.display_name.as_deref(), now).await?;
+    Ok((user_id, email.to_owned(), challenge.display_name.clone()))
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn upsert_passkey_identity(
+    db: &worker::d1::D1Database,
+    user_id: &str,
+    credential_id: &str,
+    email: Option<&str>,
+    display_name: Option<&str>,
+    now: i32,
+) -> worker::Result<()> {
+    let email = d1_optional_text(email);
+    let display_name = d1_optional_text(display_name);
+    let raw_profile_json = serde_json::json!({
+        "kind": "passkey",
+        "credentialIdHash": hash_secret(credential_id)
+    })
+    .to_string();
+    let args = [
+        worker::d1::D1Type::Text("passkey"),
+        worker::d1::D1Type::Text(credential_id),
+        worker::d1::D1Type::Text(user_id),
+        email,
+        worker::d1::D1Type::Integer(1),
+        display_name,
+        worker::d1::D1Type::Text(&raw_profile_json),
+        worker::d1::D1Type::Integer(now),
+        worker::d1::D1Type::Integer(now),
+    ];
+    db.prepare(
+        "INSERT INTO zeroth_identities (
+             provider_id, provider_subject, user_id, email, email_verified,
+             display_name, raw_profile_json, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(provider_id, provider_subject) DO UPDATE SET
+             email = excluded.email,
+             email_verified = excluded.email_verified,
+             display_name = excluded.display_name,
+             raw_profile_json = excluded.raw_profile_json,
+             updated_at = excluded.updated_at
+         WHERE zeroth_identities.user_id = excluded.user_id",
+    )
+    .bind_refs(&args)?
+    .run()
+    .await?;
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn get_local_credential(
+    db: &worker::d1::D1Database,
+    email: &str,
+) -> worker::Result<Option<LocalCredentialRow>> {
+    let args = [worker::d1::D1Type::Text(email)];
+    db.prepare(
+        "SELECT email, user_id, password_hash, password_salt, password_alg,
+                password_iterations, created_at, updated_at, last_used_at, disabled_at
+         FROM zeroth_local_credentials
+         WHERE lower(email) = lower(?)
+         LIMIT 1",
+    )
+    .bind_refs(&args)?
+    .first::<LocalCredentialRow>(None)
+    .await
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn upsert_local_credential(
+    db: &worker::d1::D1Database,
+    email: &str,
+    user_id: &str,
+    password_hash: &str,
+    password_salt: &str,
+    password_iterations: u32,
+    now: i32,
+) -> worker::Result<()> {
+    let password_iterations = i32::try_from(password_iterations)
+        .map_err(|_| worker_error("password iteration count is too large".to_owned()))?;
+    let args = [
+        worker::d1::D1Type::Text(email),
+        worker::d1::D1Type::Text(user_id),
+        worker::d1::D1Type::Text(password_hash),
+        worker::d1::D1Type::Text(password_salt),
+        worker::d1::D1Type::Text(PASSWORD_PBKDF2_ALG),
+        worker::d1::D1Type::Integer(password_iterations),
+        worker::d1::D1Type::Integer(now),
+        worker::d1::D1Type::Integer(now),
+    ];
+    db.prepare(
+        "INSERT INTO zeroth_local_credentials (
+             email, user_id, password_hash, password_salt, password_alg,
+             password_iterations, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(email) DO UPDATE SET
+             password_hash = excluded.password_hash,
+             password_salt = excluded.password_salt,
+             password_alg = excluded.password_alg,
+             password_iterations = excluded.password_iterations,
+             updated_at = excluded.updated_at,
+             disabled_at = NULL
+         WHERE zeroth_local_credentials.user_id = excluded.user_id",
+    )
+    .bind_refs(&args)?
+    .run()
+    .await?;
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn mark_local_credential_used(
+    db: &worker::d1::D1Database,
+    email: &str,
+    now: i32,
+) -> worker::Result<()> {
+    let args = [
+        worker::d1::D1Type::Integer(now),
+        worker::d1::D1Type::Text(email),
+    ];
+    db.prepare(
+        "UPDATE zeroth_local_credentials
+         SET last_used_at = ?
+         WHERE lower(email) = lower(?)",
+    )
+    .bind_refs(&args)?
+    .run()
+    .await?;
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn upsert_local_auth_identity(
+    db: &worker::d1::D1Database,
+    user_id: &str,
+    email: &str,
+    display_name: Option<&str>,
+    mode: &str,
+    now: i32,
+) -> worker::Result<()> {
+    let profile = local_auth_profile(email, display_name, mode == "magic_link");
+    let raw_profile_json = serde_json::json!({
+        "kind": "local_auth",
+        "mode": mode
+    })
+    .to_string();
+    upsert_identity_from_profile(db, user_id, &profile, Some(&raw_profile_json), now).await
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn put_magic_link(
+    db: &worker::d1::D1Database,
+    token_hash: &str,
+    email: &str,
+    user_id: Option<&str>,
+    client_id: &str,
+    return_to: &str,
+    now: i32,
+    user_agent: Option<&str>,
+    ip_hash: Option<&str>,
+) -> worker::Result<()> {
+    let user_id = d1_optional_text(user_id);
+    let user_agent = d1_optional_text(user_agent);
+    let ip_hash = d1_optional_text(ip_hash);
+    let args = [
+        worker::d1::D1Type::Text(token_hash),
+        worker::d1::D1Type::Text(email),
+        user_id,
+        worker::d1::D1Type::Text(client_id),
+        worker::d1::D1Type::Text(return_to),
+        worker::d1::D1Type::Integer(now),
+        worker::d1::D1Type::Integer(now + MAGIC_LINK_TTL_SECONDS),
+        ip_hash,
+        user_agent,
+    ];
+    db.prepare(
+        "INSERT INTO zeroth_magic_links (
+             token_hash, email, user_id, client_id, return_to, created_at,
+             expires_at, ip_hash, user_agent
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind_refs(&args)?
+    .run()
+    .await?;
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn get_magic_link(
+    db: &worker::d1::D1Database,
+    token_hash: &str,
+) -> worker::Result<Option<MagicLinkRow>> {
+    let args = [worker::d1::D1Type::Text(token_hash)];
+    db.prepare(
+        "SELECT token_hash, email, user_id, client_id, return_to, created_at,
+                expires_at, consumed_at, ip_hash, user_agent
+         FROM zeroth_magic_links
+         WHERE token_hash = ?
+         LIMIT 1",
+    )
+    .bind_refs(&args)?
+    .first::<MagicLinkRow>(None)
+    .await
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn consume_magic_link(
+    db: &worker::d1::D1Database,
+    token_hash: &str,
+    now: i32,
+) -> worker::Result<bool> {
+    let args = [
+        worker::d1::D1Type::Integer(now),
+        worker::d1::D1Type::Text(token_hash),
+        worker::d1::D1Type::Integer(now),
+    ];
+    let result = db
+        .prepare(
+            "UPDATE zeroth_magic_links
+             SET consumed_at = ?
+             WHERE token_hash = ? AND consumed_at IS NULL AND expires_at > ?",
+        )
+        .bind_refs(&args)?
+        .run()
+        .await?;
+    d1_result_changed_one(result)
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn cleanup_expired_magic_links(db: &worker::d1::D1Database, now: i32) -> worker::Result<()> {
+    let args = [
+        worker::d1::D1Type::Integer(now),
+        worker::d1::D1Type::Integer(MAGIC_LINK_CLEANUP_LIMIT),
+    ];
+    db.prepare(
+        "DELETE FROM zeroth_magic_links
+         WHERE token_hash IN (
+             SELECT token_hash FROM zeroth_magic_links
+             WHERE expires_at <= ? OR consumed_at IS NOT NULL
+             ORDER BY expires_at
+             LIMIT ?
+         )",
+    )
+    .bind_refs(&args)?
+    .run()
+    .await?;
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn ensure_magic_link_user(
+    db: &worker::d1::D1Database,
+    row: &MagicLinkRow,
+    now: i32,
+) -> worker::Result<String> {
+    if let Some(user_id) = row.user_id.as_deref() {
+        return Ok(user_id.to_owned());
+    }
+    if let Some(user) = get_user_by_primary_email(db, &row.email).await? {
+        return Ok(user.id);
+    }
+    let user_id = format!("usr_{}", random_token()?);
+    insert_passkey_user(db, &user_id, &row.email, None, now).await?;
+    Ok(user_id)
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn put_passkey_challenge(
+    db: &worker::d1::D1Database,
+    challenge: &str,
+    kind: &str,
+    user_id: Option<&str>,
+    client_id: Option<&str>,
+    return_to: Option<&str>,
+    email: Option<&str>,
+    display_name: Option<&str>,
+    label: Option<&str>,
+    now: i32,
+) -> worker::Result<()> {
+    let challenge_hash = hash_secret(challenge);
+    let user_id = d1_optional_text(user_id);
+    let client_id = d1_optional_text(client_id);
+    let return_to = d1_optional_text(return_to);
+    let email = d1_optional_text(email);
+    let display_name = d1_optional_text(display_name);
+    let label = d1_optional_text(label);
+    let args = [
+        worker::d1::D1Type::Text(&challenge_hash),
+        worker::d1::D1Type::Text(kind),
+        user_id,
+        client_id,
+        return_to,
+        email,
+        display_name,
+        label,
+        worker::d1::D1Type::Integer(now),
+        worker::d1::D1Type::Integer(now + PASSKEY_CHALLENGE_TTL_SECONDS),
+    ];
+    db.prepare(
+        "INSERT INTO zeroth_passkey_challenges (
+             challenge_hash, kind, user_id, client_id, return_to, email,
+             display_name, label, created_at, expires_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind_refs(&args)?
+    .run()
+    .await?;
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn get_passkey_challenge_by_hash(
+    db: &worker::d1::D1Database,
+    challenge_hash: &str,
+) -> worker::Result<Option<PasskeyChallengeRow>> {
+    let args = [worker::d1::D1Type::Text(challenge_hash)];
+    db.prepare(
+        "SELECT challenge_hash, kind, user_id, client_id, return_to, email,
+                display_name, label, created_at, expires_at, consumed_at
+         FROM zeroth_passkey_challenges
+         WHERE challenge_hash = ?
+         LIMIT 1",
+    )
+    .bind_refs(&args)?
+    .first::<PasskeyChallengeRow>(None)
+    .await
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn consume_passkey_challenge(
+    db: &worker::d1::D1Database,
+    challenge_hash: &str,
+    consumed_at: i32,
+) -> worker::Result<bool> {
+    let args = [
+        worker::d1::D1Type::Integer(consumed_at),
+        worker::d1::D1Type::Text(challenge_hash),
+    ];
+    let result = db
+        .prepare(
+            "UPDATE zeroth_passkey_challenges
+             SET consumed_at = ?
+             WHERE challenge_hash = ? AND consumed_at IS NULL",
+        )
+        .bind_refs(&args)?
+        .run()
+        .await?;
+    d1_result_changed_one(result)
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn cleanup_expired_passkey_challenges(
+    db: &worker::d1::D1Database,
+    now: i32,
+) -> worker::Result<()> {
+    let args = [
+        worker::d1::D1Type::Integer(now),
+        worker::d1::D1Type::Integer(PASSKEY_CHALLENGE_CLEANUP_LIMIT),
+    ];
+    db.prepare(
+        "DELETE FROM zeroth_passkey_challenges
+         WHERE challenge_hash IN (
+             SELECT challenge_hash
+             FROM zeroth_passkey_challenges
+             WHERE expires_at <= ?
+             LIMIT ?
+         )",
+    )
+    .bind_refs(&args)?
+    .run()
+    .await?;
+    Ok(())
+}
+
+fn validate_passkey_challenge(
+    challenge: &PasskeyChallengeRow,
+    expected_kind: &str,
+    now: i32,
+) -> Result<(), String> {
+    if challenge.kind != expected_kind {
+        return Err("passkey challenge kind did not match".to_owned());
+    }
+    if challenge.consumed_at.is_some() {
+        return Err("passkey challenge has already been consumed".to_owned());
+    }
+    if challenge.expires_at <= now {
+        return Err("passkey challenge has expired".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn put_passkey_credential(
+    db: &worker::d1::D1Database,
+    credential: &ValidatedPasskeyRegistration,
+    user_id: &str,
+    label: Option<&str>,
+    now: i32,
+) -> worker::Result<()> {
+    let label = d1_optional_text(label);
+    let args = [
+        worker::d1::D1Type::Text(&credential.credential_id),
+        worker::d1::D1Type::Text(user_id),
+        label,
+        worker::d1::D1Type::Text(&credential.public_key_x),
+        worker::d1::D1Type::Text(&credential.public_key_y),
+        worker::d1::D1Type::Integer(credential.sign_count),
+        worker::d1::D1Type::Integer(now),
+        worker::d1::D1Type::Integer(now),
+    ];
+    db.prepare(
+        "INSERT INTO zeroth_passkey_credentials (
+             credential_id, user_id, label, public_key_x, public_key_y,
+             sign_count, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind_refs(&args)?
+    .run()
+    .await?;
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn get_passkey_credential(
+    db: &worker::d1::D1Database,
+    credential_id: &str,
+) -> worker::Result<Option<PasskeyCredentialRow>> {
+    let args = [worker::d1::D1Type::Text(credential_id)];
+    db.prepare(
+        "SELECT credential_id, user_id, label, public_key_x, public_key_y,
+                sign_count, created_at, updated_at, last_used_at, disabled_at
+         FROM zeroth_passkey_credentials
+         WHERE credential_id = ?
+         LIMIT 1",
+    )
+    .bind_refs(&args)?
+    .first::<PasskeyCredentialRow>(None)
+    .await
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn list_active_passkey_credentials(
+    db: &worker::d1::D1Database,
+) -> worker::Result<Vec<PasskeyCredentialRow>> {
+    let args = [worker::d1::D1Type::Integer(PASSKEY_CREDENTIAL_LIST_LIMIT)];
+    db.prepare(
+        "SELECT credential_id, user_id, label, public_key_x, public_key_y,
+                sign_count, created_at, updated_at, last_used_at, disabled_at
+         FROM zeroth_passkey_credentials
+         WHERE disabled_at IS NULL
+         ORDER BY created_at DESC
+         LIMIT ?",
+    )
+    .bind_refs(&args)?
+    .all()
+    .await?
+    .results::<PasskeyCredentialRow>()
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn list_passkey_credentials_for_user(
+    db: &worker::d1::D1Database,
+    user_id: &str,
+) -> worker::Result<Vec<PasskeyCredentialRow>> {
+    let args = [
+        worker::d1::D1Type::Text(user_id),
+        worker::d1::D1Type::Integer(PASSKEY_CREDENTIAL_LIST_LIMIT),
+    ];
+    db.prepare(
+        "SELECT credential_id, user_id, label, public_key_x, public_key_y,
+                sign_count, created_at, updated_at, last_used_at, disabled_at
+         FROM zeroth_passkey_credentials
+         WHERE user_id = ? AND disabled_at IS NULL
+         ORDER BY created_at DESC
+         LIMIT ?",
+    )
+    .bind_refs(&args)?
+    .all()
+    .await?
+    .results::<PasskeyCredentialRow>()
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn update_passkey_credential_use(
+    db: &worker::d1::D1Database,
+    credential_id: &str,
+    sign_count: i32,
+    now: i32,
+) -> worker::Result<()> {
+    let args = [
+        worker::d1::D1Type::Integer(sign_count),
+        worker::d1::D1Type::Integer(sign_count),
+        worker::d1::D1Type::Integer(now),
+        worker::d1::D1Type::Integer(now),
+        worker::d1::D1Type::Text(credential_id),
+    ];
+    db.prepare(
+        "UPDATE zeroth_passkey_credentials
+         SET sign_count = CASE WHEN ? > sign_count THEN ? ELSE sign_count END,
+             last_used_at = ?,
+             updated_at = ?
+         WHERE credential_id = ?",
+    )
+    .bind_refs(&args)?
+    .run()
+    .await?;
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn disable_passkey_credential(
+    db: &worker::d1::D1Database,
+    credential_id: &str,
+    disabled_at: i32,
+) -> worker::Result<()> {
+    let args = [
+        worker::d1::D1Type::Integer(disabled_at),
+        worker::d1::D1Type::Integer(disabled_at),
+        worker::d1::D1Type::Text(credential_id),
+    ];
+    db.prepare(
+        "UPDATE zeroth_passkey_credentials
+         SET disabled_at = COALESCE(disabled_at, ?),
+             updated_at = ?
+         WHERE credential_id = ?",
     )
     .bind_refs(&args)?
     .run()
@@ -3953,7 +7021,14 @@ async fn get_user_token_claims(
                       AND i.email = u.primary_email
                       AND i.email_verified != 0
                     LIMIT 1
-                ) AS email_verified
+                ) AS email_verified,
+                EXISTS (
+                    SELECT 1
+                    FROM zeroth_admin_memberships am
+                    WHERE am.user_id = u.id
+                      AND am.disabled_at IS NULL
+                    LIMIT 1
+                ) AS admin_membership_active
          FROM zeroth_users u
          WHERE u.id = ?
          LIMIT 1",
@@ -3991,7 +7066,14 @@ async fn get_admin_user_row(
                       AND i.email = u.primary_email
                       AND i.email_verified != 0
                     LIMIT 1
-                ) AS email_verified
+                ) AS email_verified,
+                EXISTS (
+                    SELECT 1
+                    FROM zeroth_admin_memberships am
+                    WHERE am.user_id = u.id
+                      AND am.disabled_at IS NULL
+                    LIMIT 1
+                ) AS admin_membership_active
            FROM zeroth_users u
           WHERE u.id = ?
           LIMIT 1",
@@ -4028,7 +7110,14 @@ async fn list_admin_user_rows(
                       AND i.email = u.primary_email
                       AND i.email_verified != 0
                     LIMIT 1
-                ) AS email_verified
+                ) AS email_verified,
+                EXISTS (
+                    SELECT 1
+                    FROM zeroth_admin_memberships am
+                    WHERE am.user_id = u.id
+                      AND am.disabled_at IS NULL
+                    LIMIT 1
+                ) AS admin_membership_active
            FROM zeroth_users u
           ORDER BY u.updated_at DESC, u.id
           LIMIT ?",
@@ -4037,6 +7126,78 @@ async fn list_admin_user_rows(
     .all()
     .await?
     .results::<AdminUserRow>()
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn user_has_active_admin_membership(
+    db: &worker::d1::D1Database,
+    user_id: &str,
+) -> worker::Result<bool> {
+    let args = [worker::d1::D1Type::Text(user_id)];
+    Ok(db
+        .prepare(
+            "SELECT user_id
+             FROM zeroth_admin_memberships
+             WHERE user_id = ? AND disabled_at IS NULL
+             LIMIT 1",
+        )
+        .bind_refs(&args)?
+        .first::<AdminMembershipProbeRow>(None)
+        .await?
+        .is_some())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn upsert_admin_membership(
+    db: &worker::d1::D1Database,
+    user_id: &str,
+    granted_by: &str,
+    now: i32,
+) -> worker::Result<()> {
+    let args = [
+        worker::d1::D1Type::Text(user_id),
+        worker::d1::D1Type::Text("admin"),
+        worker::d1::D1Type::Text(granted_by),
+        worker::d1::D1Type::Integer(now),
+        worker::d1::D1Type::Integer(now),
+    ];
+    db.prepare(
+        "INSERT INTO zeroth_admin_memberships (
+             user_id, role, granted_by, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(user_id) DO UPDATE SET
+             role = excluded.role,
+             granted_by = excluded.granted_by,
+             updated_at = excluded.updated_at,
+             disabled_at = NULL",
+    )
+    .bind_refs(&args)?
+    .run()
+    .await?;
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn disable_admin_membership(
+    db: &worker::d1::D1Database,
+    user_id: &str,
+    now: i32,
+) -> worker::Result<()> {
+    let args = [
+        worker::d1::D1Type::Integer(now),
+        worker::d1::D1Type::Integer(now),
+        worker::d1::D1Type::Text(user_id),
+    ];
+    db.prepare(
+        "UPDATE zeroth_admin_memberships
+         SET disabled_at = COALESCE(disabled_at, ?),
+             updated_at = ?
+         WHERE user_id = ?",
+    )
+    .bind_refs(&args)?
+    .run()
+    .await?;
+    Ok(())
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -4177,6 +7338,297 @@ async fn list_audit_event_rows(
 }
 
 #[cfg(target_arch = "wasm32")]
+async fn magic_link_delivery_status(
+    db: &worker::d1::D1Database,
+) -> worker::Result<Option<LocalAuthDeliveryStatus>> {
+    let rows = db
+        .prepare(
+            "SELECT event_type, created_at, details_json
+               FROM zeroth_audit_events
+              WHERE event_type IN ('magic_link.issue', 'magic_link.email.failed')
+              ORDER BY created_at DESC, id DESC
+              LIMIT 20",
+        )
+        .all()
+        .await?
+        .results::<MagicLinkDeliveryEventRow>()?;
+    Ok(magic_link_delivery_status_from_events(&rows))
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn provider_failure_statuses(
+    db: &worker::d1::D1Database,
+) -> worker::Result<Vec<(String, ProviderFailureStatus)>> {
+    let args = [worker::d1::D1Type::Integer(
+        PROVIDER_FAILURE_EVENT_LIST_LIMIT,
+    )];
+    let rows = db
+        .prepare(
+            "SELECT provider_id, event_type, created_at, details_json
+               FROM zeroth_audit_events
+              WHERE provider_id IS NOT NULL
+                AND event_type IN ('provider.token_exchange.failed', 'provider.profile.failed')
+              ORDER BY created_at DESC, id DESC
+              LIMIT ?",
+        )
+        .bind_refs(&args)?
+        .all()
+        .await?
+        .results::<ProviderFailureEventRow>()?;
+    Ok(provider_failure_statuses_from_events(&rows))
+}
+
+fn provider_failure_statuses_from_events(
+    rows: &[ProviderFailureEventRow],
+) -> Vec<(String, ProviderFailureStatus)> {
+    let mut failures = Vec::new();
+    for row in rows {
+        if failures.iter().any(|(id, _)| id == &row.provider_id) {
+            continue;
+        }
+        failures.push((
+            row.provider_id.clone(),
+            provider_failure_status_from_event(row),
+        ));
+    }
+    failures
+}
+
+fn provider_failure_status_from_event(row: &ProviderFailureEventRow) -> ProviderFailureStatus {
+    ProviderFailureStatus {
+        event_type: provider_failure_string(
+            row.event_type.as_str(),
+            PROVIDER_FAILURE_CODE_MAX_CHARS,
+        ),
+        created_at: row.created_at,
+        code: provider_failure_details_string(
+            &row.details_json,
+            &["code", "error"],
+            PROVIDER_FAILURE_CODE_MAX_CHARS,
+        ),
+        description: provider_failure_details_string(
+            &row.details_json,
+            &["description", "errorDescription", "error_description"],
+            PROVIDER_FAILURE_DESCRIPTION_MAX_CHARS,
+        ),
+    }
+}
+
+fn provider_failure_details_string(
+    details_json: &str,
+    keys: &[&str],
+    max_chars: usize,
+) -> Option<String> {
+    let details = serde_json::from_str::<serde_json::Value>(details_json).ok()?;
+    keys.iter()
+        .find_map(|key| details.get(*key).and_then(serde_json::Value::as_str))
+        .map(|value| provider_failure_string(value, max_chars))
+        .filter(|value| !value.is_empty())
+}
+
+fn provider_failure_string(value: &str, max_chars: usize) -> String {
+    let value = value.trim();
+    if value.chars().count() <= max_chars {
+        return value.to_owned();
+    }
+    if max_chars <= 3 {
+        return value.chars().take(max_chars).collect();
+    }
+    let mut truncated = value.chars().take(max_chars - 3).collect::<String>();
+    truncated.push_str("...");
+    truncated
+}
+
+fn magic_link_delivery_status_from_events(
+    rows: &[MagicLinkDeliveryEventRow],
+) -> Option<LocalAuthDeliveryStatus> {
+    if rows.is_empty() {
+        return None;
+    }
+
+    let mut status = LocalAuthDeliveryStatus::default();
+    for row in rows {
+        match row.event_type.as_str() {
+            "magic_link.issue" => {
+                status.last_issue_at.get_or_insert(row.created_at);
+                if magic_link_issue_sent(&row.details_json) {
+                    status.last_sent_at.get_or_insert(row.created_at);
+                }
+            }
+            "magic_link.email.failed" => {
+                status.last_failed_at.get_or_insert(row.created_at);
+                if status.last_error.is_none() {
+                    status.last_error = Some(magic_link_email_error_class(&row.details_json));
+                }
+                if status.last_error_detail.is_none() {
+                    status.last_error_detail = magic_link_email_error_detail(&row.details_json);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Some(status)
+}
+
+fn magic_link_email_failed_details(error_class: &str, error: &str) -> serde_json::Value {
+    let mut details = serde_json::Map::new();
+    details.insert(
+        "errorClass".to_owned(),
+        serde_json::Value::String(error_class.to_owned()),
+    );
+    if let Some(error_detail) = sanitize_magic_link_email_error_detail(error) {
+        details.insert(
+            "errorDetail".to_owned(),
+            serde_json::Value::String(error_detail),
+        );
+    }
+    serde_json::Value::Object(details)
+}
+
+fn magic_link_issue_sent(details_json: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(details_json)
+        .ok()
+        .and_then(|details| details.get("sent").and_then(serde_json::Value::as_bool))
+        .unwrap_or(false)
+}
+
+fn magic_link_email_error_class(details_json: &str) -> String {
+    let error = serde_json::from_str::<serde_json::Value>(details_json)
+        .ok()
+        .and_then(|details| {
+            details
+                .get("errorClass")
+                .or_else(|| details.get("error"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_default();
+    classify_magic_link_email_error(&error).to_owned()
+}
+
+fn magic_link_email_error_detail(details_json: &str) -> Option<String> {
+    let detail = serde_json::from_str::<serde_json::Value>(details_json)
+        .ok()
+        .and_then(|details| {
+            details
+                .get("errorDetail")
+                .or_else(|| details.get("errorDescription"))
+                .or_else(|| details.get("error_description"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })?;
+    sanitize_magic_link_email_error_detail(&detail)
+}
+
+fn sanitize_magic_link_email_error_detail(error: &str) -> Option<String> {
+    let mut sanitized = error
+        .trim()
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect::<String>()
+        .split_whitespace()
+        .map(redact_magic_link_email_error_token)
+        .collect::<Vec<_>>()
+        .join(" ");
+    if sanitized.is_empty() {
+        return None;
+    }
+    if sanitized.chars().count() > MAGIC_LINK_EMAIL_ERROR_DETAIL_MAX_CHARS {
+        sanitized = sanitized
+            .chars()
+            .take(MAGIC_LINK_EMAIL_ERROR_DETAIL_MAX_CHARS.saturating_sub(3))
+            .collect::<String>();
+        sanitized.push_str("...");
+    }
+    Some(sanitized)
+}
+
+fn redact_magic_link_email_error_token(token: &str) -> Cow<'_, str> {
+    let probe =
+        token.trim_matches(|ch: char| ch.is_ascii_punctuation() && !matches!(ch, '_' | '-' | '.'));
+    if magic_link_error_token_is_url(probe) {
+        Cow::Borrowed("[url]")
+    } else if magic_link_error_token_is_email(probe) {
+        Cow::Borrowed("[email]")
+    } else {
+        Cow::Borrowed(token)
+    }
+}
+
+fn magic_link_error_token_is_url(token: &str) -> bool {
+    let lower = token.to_ascii_lowercase();
+    lower.starts_with("https://") || lower.starts_with("http://")
+}
+
+fn magic_link_error_token_is_email(token: &str) -> bool {
+    let Some((local, domain)) = token.split_once('@') else {
+        return false;
+    };
+    !local.is_empty()
+        && domain.contains('.')
+        && !domain.contains('/')
+        && token.bytes().all(|byte| {
+            byte.is_ascii()
+                && !byte.is_ascii_whitespace()
+                && !matches!(byte, b'<' | b'>' | b'"' | b'\'')
+        })
+}
+
+fn classify_magic_link_email_error(error: &str) -> &'static str {
+    let lower = error.trim().to_ascii_lowercase();
+    match lower.as_str() {
+        "email_unauthorized"
+        | "email_sender_rejected"
+        | "email_validation_error"
+        | "email_internal_server_error"
+        | "email_webhook_failed"
+        | "email_resend_failed"
+        | "email_mailchannels_failed"
+        | "email_send_failed" => return matching_magic_link_email_error_class(&lower),
+        _ => {}
+    }
+    if lower.is_empty() {
+        return "email_send_failed";
+    }
+    if lower.contains("unauthorized") || lower.contains("forbidden") {
+        return "email_unauthorized";
+    }
+    if lower.contains("sender") || lower.contains("from") || lower.contains("address") {
+        return "email_sender_rejected";
+    }
+    if lower.contains("validation") || lower.contains("invalid") || lower.contains("field") {
+        return "email_validation_error";
+    }
+    if lower.contains("internal server error") {
+        return "email_internal_server_error";
+    }
+    if lower.contains("email_webhook_failed") {
+        return "email_webhook_failed";
+    }
+    if lower.contains("email_resend_failed") {
+        return "email_resend_failed";
+    }
+    if lower.contains("email_mailchannels_failed") {
+        return "email_mailchannels_failed";
+    }
+    "email_send_failed"
+}
+
+fn matching_magic_link_email_error_class(error: &str) -> &'static str {
+    match error {
+        "email_unauthorized" => "email_unauthorized",
+        "email_sender_rejected" => "email_sender_rejected",
+        "email_validation_error" => "email_validation_error",
+        "email_internal_server_error" => "email_internal_server_error",
+        "email_webhook_failed" => "email_webhook_failed",
+        "email_resend_failed" => "email_resend_failed",
+        "email_mailchannels_failed" => "email_mailchannels_failed",
+        _ => "email_send_failed",
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
 async fn put_audit_event(
     db: &worker::d1::D1Database,
     context: &AuditRequestContext,
@@ -4263,7 +7715,22 @@ async fn upsert_provider_profile(
     };
 
     upsert_identity_from_profile(db, &user_id, profile, raw_profile_json, now).await?;
+    let identity_user_id = get_identity_user_id(db, profile).await?;
+    validate_provider_identity_attached_to_user(identity_user_id.as_deref(), &user_id)
+        .map_err(worker_error)?;
     Ok(user_id)
+}
+
+#[cfg(any(test, target_arch = "wasm32"))]
+fn validate_provider_identity_attached_to_user(
+    actual_user_id: Option<&str>,
+    expected_user_id: &str,
+) -> Result<(), String> {
+    match actual_user_id {
+        Some(actual_user_id) if actual_user_id == expected_user_id => Ok(()),
+        Some(_) => Err("provider identity is already linked to another user".to_owned()),
+        None => Err("provider identity could not be linked to the user".to_owned()),
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -4927,6 +8394,7 @@ async fn put_auth_transaction(
     let expires_at = system_time_to_d1_integer(transaction.expires_at)?;
     let app_state = d1_optional_text(transaction.app_state.as_deref());
     let nonce = d1_optional_text(transaction.nonce.as_deref());
+    let provider_nonce = d1_optional_text(transaction.provider_nonce.as_deref());
     let code_challenge = d1_optional_text(transaction.code_challenge.as_deref());
     let code_challenge_method = d1_optional_text(transaction.code_challenge_method.as_deref());
     let link_user_id = d1_optional_text(
@@ -4945,6 +8413,7 @@ async fn put_auth_transaction(
         worker::d1::D1Type::Text(&transaction.provider_redirect_uri),
         app_state,
         nonce,
+        provider_nonce,
         code_challenge,
         code_challenge_method,
         worker::d1::D1Type::Text(&scope),
@@ -4958,9 +8427,9 @@ async fn put_auth_transaction(
     db.prepare(
         "INSERT INTO zeroth_auth_transactions (
              provider_state, client_id, provider_id, redirect_uri, provider_redirect_uri,
-             app_state, nonce, code_challenge, code_challenge_method, scope, link_user_id,
+             app_state, nonce, provider_nonce, code_challenge, code_challenge_method, scope, link_user_id,
              link_session_id, session_return_to, created_at, expires_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind_refs(&args)?
     .run()
@@ -5246,6 +8715,7 @@ fn auth_transaction_from_request(
     request: &AuthorizationRequest,
     provider_id: &str,
     provider_state: String,
+    provider_nonce: String,
     provider_redirect_uri: String,
     created_at: i32,
 ) -> AuthTransaction {
@@ -5257,6 +8727,7 @@ fn auth_transaction_from_request(
         provider_redirect_uri,
         app_state: request.state.clone(),
         nonce: request.nonce.clone(),
+        provider_nonce: Some(provider_nonce),
         code_challenge: request.code_challenge.clone(),
         code_challenge_method: request
             .code_challenge_method
@@ -5275,6 +8746,7 @@ fn auth_transaction_from_session_login_request(
     client: &Client,
     provider_id: &str,
     provider_state: String,
+    provider_nonce: String,
     provider_redirect_uri: String,
     return_to: String,
     app_state: Option<String>,
@@ -5288,6 +8760,7 @@ fn auth_transaction_from_session_login_request(
         provider_redirect_uri,
         app_state,
         nonce: None,
+        provider_nonce: Some(provider_nonce),
         code_challenge: None,
         code_challenge_method: None,
         scope: ScopeSet::new(["openid", "email", "profile"]),
@@ -5303,6 +8776,7 @@ fn auth_transaction_from_link_request(
     client: &Client,
     provider_id: &str,
     provider_state: String,
+    provider_nonce: String,
     provider_redirect_uri: String,
     return_to: String,
     app_state: Option<String>,
@@ -5318,6 +8792,7 @@ fn auth_transaction_from_link_request(
         provider_redirect_uri,
         app_state,
         nonce: None,
+        provider_nonce: Some(provider_nonce),
         code_challenge: None,
         code_challenge_method: None,
         scope: ScopeSet::new(["openid", "email", "profile"]),
@@ -5339,6 +8814,7 @@ fn auth_transaction_from_row(row: AuthTransactionRow) -> Result<StoredAuthTransa
             provider_redirect_uri: row.provider_redirect_uri,
             app_state: row.app_state,
             nonce: row.nonce,
+            provider_nonce: row.provider_nonce,
             code_challenge: row.code_challenge,
             code_challenge_method: row.code_challenge_method,
             scope: ScopeSet::new(row.scope.split_whitespace()),
@@ -5413,6 +8889,16 @@ fn redirect_to_session_login_return(transaction: &AuthTransaction) -> worker::Re
     let return_url =
         session_login_return_url(transaction).map_err(|error| worker::Error::RustError(error))?;
     Response::redirect(return_url)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn redirect_to_hosted_admin_login(
+    config: &ZerothServerConfig,
+    return_to_path: &str,
+) -> worker::Result<Response> {
+    let login_url = hosted_admin_login_url(&config.issuer().issuer, return_to_path)
+        .map_err(worker::Error::RustError)?;
+    Response::redirect(login_url)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -5535,6 +9021,42 @@ fn provider_callback_error_return_url(
     Ok(return_url)
 }
 
+fn hosted_admin_login_url(issuer_base_url: &str, return_to_path: &str) -> Result<url::Url, String> {
+    let base = issuer_base_url.trim_end_matches('/');
+    let mut login_url = url::Url::parse(&format!("{base}/login"))
+        .map_err(|error| format!("invalid issuer URL: {error}"))?;
+    let return_to = format!("{base}{return_to_path}");
+    login_url
+        .query_pairs_mut()
+        .append_pair("return_to", &return_to);
+    Ok(login_url)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn redirect_local_auth_get_to_login(request: Request, env: Env) -> worker::Result<Response> {
+    let request_url = request.url()?;
+    let config = server_config(&env, &request_url);
+    let mut login_url = url::Url::parse(&format!(
+        "{}/login",
+        config.public_base_url.trim_end_matches('/')
+    ))
+    .map_err(|error| worker_error(format!("invalid issuer URL: {error}")))?;
+    {
+        let mut pairs = login_url.query_pairs_mut();
+        if let Some(client_id) =
+            query_param(&request_url, "client_id").or_else(|| query_param(&request_url, "clientId"))
+        {
+            pairs.append_pair("client_id", &client_id);
+        }
+        if let Some(return_to) =
+            query_param(&request_url, "return_to").or_else(|| query_param(&request_url, "returnTo"))
+        {
+            pairs.append_pair("return_to", &return_to);
+        }
+    }
+    Response::redirect(login_url)
+}
+
 fn client_return_to_from_url(
     url: &url::Url,
     client: &Client,
@@ -5546,6 +9068,19 @@ fn client_return_to_from_url(
         .ok_or_else(|| "missing return_to".to_owned())?;
 
     validate_client_return_to(&return_to, client, issuer_base_url)?;
+    Ok(return_to)
+}
+
+fn session_login_return_to_from_url(
+    url: &url::Url,
+    client: &Client,
+    issuer_base_url: &str,
+) -> Result<String, String> {
+    let return_to = query_param(url, "return_to")
+        .or_else(|| query_param(url, "redirect_uri"))
+        .unwrap_or_else(|| format!("{}/admin", issuer_base_url.trim_end_matches('/')));
+
+    validate_client_return_to(&return_to, client, Some(issuer_base_url))?;
     Ok(return_to)
 }
 
@@ -5584,8 +9119,7 @@ async fn logout_redirect_target(
         client_id
     } else if let Some(id_token_hint) = query_param(url, "id_token_hint") {
         let material = signing_material_from_env(env)?;
-        match verify_zeroth_id_token_hint(&id_token_hint, config, &material.verification_keys, now)
-        {
+        match verify_zeroth_id_token_hint(&id_token_hint, config, &material.jwks, now) {
             Ok(claims) => claims.aud,
             Err(error) => return Ok(Err(error)),
         }
@@ -5745,6 +9279,15 @@ async fn token_exchange_form_from_request(
         code: optional_form_field(&form, "code"),
         code_verifier: optional_form_field(&form, "code_verifier"),
         refresh_token: optional_form_field(&form, "refresh_token"),
+        scope: optional_form_field(&form, "scope"),
+        subject_token: optional_form_field(&form, "subject_token")
+            .or_else(|| optional_form_field(&form, "identity_token"))
+            .or_else(|| optional_form_field(&form, "access_token")),
+        subject_token_type: optional_form_field(&form, "subject_token_type"),
+        provider: optional_form_field(&form, "provider"),
+        provider_client_id: optional_form_field(&form, "provider_client_id")
+            .or_else(|| optional_form_field(&form, "apple_client_id")),
+        nonce: optional_form_field(&form, "nonce"),
     })
 }
 
@@ -6068,9 +9611,12 @@ fn validate_token_exchange_form(form: &TokenExchangeForm) -> Result<(), TokenExc
         "refresh_token" => {
             refresh_token_field(form)?;
         }
+        TOKEN_EXCHANGE_GRANT_TYPE => {
+            native_provider_token_fields(form)?;
+        }
         _ => {
             return Err(TokenExchangeError::unsupported_grant_type(
-                "grant_type must be authorization_code or refresh_token",
+                "grant_type must be authorization_code, refresh_token, or token exchange",
             ))
         }
     }
@@ -6205,6 +9751,51 @@ fn authorization_code_fields(
         code: required_token_form_value(form.code.as_deref(), "code")?,
         code_verifier: form.code_verifier.as_deref(),
     })
+}
+
+fn native_provider_token_fields(
+    form: &TokenExchangeForm,
+) -> Result<NativeProviderTokenFields<'_>, TokenExchangeError> {
+    let provider_id = form.provider.as_deref().unwrap_or(well_known::APPLE);
+    if !is_native_token_exchange_provider(provider_id) {
+        return Err(TokenExchangeError::invalid_request(
+            "token exchange provider must be apple, google, or spotify",
+        ));
+    }
+    let subject_token_type = match (provider_id, form.subject_token_type.as_deref()) {
+        (well_known::APPLE | well_known::GOOGLE, Some(ID_TOKEN_SUBJECT_TOKEN_TYPE) | None) => {
+            ID_TOKEN_SUBJECT_TOKEN_TYPE
+        }
+        (well_known::APPLE | well_known::GOOGLE, Some(_)) => {
+            return Err(TokenExchangeError::invalid_request(
+                "subject_token_type must be urn:ietf:params:oauth:token-type:id_token",
+            ))
+        }
+        (well_known::SPOTIFY, Some(ACCESS_TOKEN_SUBJECT_TOKEN_TYPE)) => {
+            ACCESS_TOKEN_SUBJECT_TOKEN_TYPE
+        }
+        (well_known::SPOTIFY, _) => {
+            return Err(TokenExchangeError::invalid_request(
+                "subject_token_type must be urn:ietf:params:oauth:token-type:access_token",
+            ))
+        }
+        _ => unreachable!("native provider was checked above"),
+    };
+    Ok(NativeProviderTokenFields {
+        provider_id,
+        scope: form.scope.as_deref(),
+        subject_token: required_token_form_value(form.subject_token.as_deref(), "subject_token")?,
+        subject_token_type,
+        provider_client_id: form.provider_client_id.as_deref(),
+        nonce: form.nonce.as_deref(),
+    })
+}
+
+fn is_native_token_exchange_provider(provider_id: &str) -> bool {
+    matches!(
+        provider_id,
+        well_known::APPLE | well_known::GOOGLE | well_known::SPOTIFY
+    )
 }
 
 fn refresh_token_field(form: &TokenExchangeForm) -> Result<&str, TokenExchangeError> {
@@ -6344,6 +9935,7 @@ fn token_response(
         email_verified: None,
         name: None,
         picture: None,
+        roles: issue.roles.clone(),
     };
     let id_claims = JwtClaims {
         iss: config.issuer().issuer,
@@ -6361,6 +9953,7 @@ fn token_response(
         email_verified: issue.email_verified,
         name: issue.name.clone(),
         picture: issue.picture.clone(),
+        roles: issue.roles.clone(),
     };
 
     Ok(TokenResponse {
@@ -6376,122 +9969,110 @@ fn token_response(
 fn verify_zeroth_access_token(
     token: &str,
     config: &ZerothServerConfig,
-    verification_keys: &[Es256VerificationKey],
+    jwks: &JwksResponse,
     now: i32,
 ) -> Result<JwtClaims, String> {
-    let claims = verify_zeroth_signed_jwt(token, config, verification_keys, now, "access token")?;
-    validate_zeroth_access_token_claims(&claims)?;
-    Ok(claims)
+    let claims = zeroth_oidc::verify_zeroth_token(
+        token,
+        &zeroth_jwks_from_response(jwks),
+        &ZerothTokenValidation::issuer_token(
+            config.issuer().issuer,
+            ZerothTokenUse::Access,
+            now as i64,
+        ),
+    )
+    .map_err(|error| zeroth_token_error_description(error, Some("access")))?;
+    jwt_claims_from_zeroth(claims)
 }
 
 fn verify_zeroth_id_token_hint(
     token: &str,
     config: &ZerothServerConfig,
-    verification_keys: &[Es256VerificationKey],
+    jwks: &JwksResponse,
     now: i32,
 ) -> Result<JwtClaims, String> {
-    let claims = verify_zeroth_signed_jwt(token, config, verification_keys, now, "id_token_hint")?;
-    validate_zeroth_id_token_hint_claims(&claims)?;
-    Ok(claims)
+    let claims = zeroth_oidc::verify_zeroth_token(
+        token,
+        &zeroth_jwks_from_response(jwks),
+        &ZerothTokenValidation::issuer_token(
+            config.issuer().issuer,
+            ZerothTokenUse::Id,
+            now as i64,
+        ),
+    )
+    .map_err(|error| zeroth_token_error_description(error, Some("id")))?;
+    jwt_claims_from_zeroth(claims)
 }
 
-fn verify_zeroth_signed_jwt(
-    token: &str,
-    config: &ZerothServerConfig,
-    verification_keys: &[Es256VerificationKey],
-    now: i32,
-    token_label: &str,
-) -> Result<JwtClaims, String> {
-    let segments = token.split('.').collect::<Vec<_>>();
-    if segments.len() != 3 || segments.iter().any(|segment| segment.is_empty()) {
-        return Err(format!(
-            "{token_label} must have three non-empty JWT segments"
-        ));
+fn zeroth_jwks_from_response(jwks: &JwksResponse) -> ZerothJwks {
+    ZerothJwks {
+        keys: jwks
+            .keys
+            .iter()
+            .map(|key| ZerothJwk {
+                kty: key.kty.clone(),
+                key_use: key.key_use.clone(),
+                kid: key.kid.clone(),
+                alg: key.alg.clone(),
+                crv: key.crv.clone(),
+                x: key.x.clone(),
+                y: key.y.clone(),
+            })
+            .collect(),
     }
-
-    let header = decode_zeroth_jwt_segment::<SignedJwtHeader>(segments[0])?;
-    if header.alg != "ES256" {
-        return Err(format!("unsupported {token_label} alg: {}", header.alg));
-    }
-    let Some(kid) = header.kid.as_deref() else {
-        return Err(format!("{token_label} kid is missing"));
-    };
-    let Some(verification_key) = verification_keys.iter().find(|key| key.kid == kid) else {
-        return Err(format!(
-            "{token_label} kid did not match configured verification keys"
-        ));
-    };
-
-    let signature_bytes = decode_zeroth_jwt_segment_bytes(segments[2])?;
-    let signature = Signature::try_from(signature_bytes.as_slice())
-        .map_err(|error| format!("invalid ES256 {token_label} signature: {error}"))?;
-    let signing_input = format!("{}.{}", segments[0], segments[1]);
-    verification_key
-        .verifying_key
-        .verify(signing_input.as_bytes(), &signature)
-        .map_err(|_| format!("{token_label} signature did not verify"))?;
-
-    let claims = decode_zeroth_jwt_segment::<JwtClaims>(segments[1])?;
-    if claims.iss != config.issuer().issuer {
-        return Err(format!("{token_label} issuer did not match Zeroth issuer"));
-    }
-    if claims.exp <= now {
-        return Err(format!("{token_label} has expired"));
-    }
-    Ok(claims)
 }
 
-fn decode_zeroth_jwt_segment<T: serde::de::DeserializeOwned>(segment: &str) -> Result<T, String> {
-    let bytes = decode_zeroth_jwt_segment_bytes(segment)?;
-    serde_json::from_slice(&bytes).map_err(|error| format!("invalid Zeroth JWT JSON: {error}"))
+fn jwt_claims_from_zeroth(claims: ZerothJwtClaims) -> Result<JwtClaims, String> {
+    Ok(JwtClaims {
+        iss: claims.iss,
+        sub: claims.sub,
+        aud: claims.aud,
+        exp: jwt_i32_claim(claims.exp, "exp")?,
+        iat: jwt_i32_claim(claims.iat, "iat")?,
+        auth_time: claims
+            .auth_time
+            .map(|value| jwt_i32_claim(value, "auth_time"))
+            .transpose()?,
+        sid: claims.sid,
+        nonce: claims.nonce,
+        scope: claims.scope,
+        client_id: claims.client_id,
+        token_use: claims.token_use,
+        email: claims.email,
+        email_verified: claims.email_verified,
+        name: claims.name,
+        picture: claims.picture,
+        roles: claims.roles,
+    })
 }
 
-fn decode_zeroth_jwt_segment_bytes(segment: &str) -> Result<Vec<u8>, String> {
-    URL_SAFE_NO_PAD
-        .decode(segment)
-        .or_else(|_| URL_SAFE.decode(segment))
-        .map_err(|error| format!("invalid Zeroth JWT base64url segment: {error}"))
+fn jwt_i32_claim(value: i64, name: &str) -> Result<i32, String> {
+    i32::try_from(value).map_err(|_| format!("JWT {name} claim is outside supported range"))
 }
 
-fn validate_zeroth_access_token_claims(claims: &JwtClaims) -> Result<(), String> {
-    if claims.token_use != "access" {
-        return Err("token is not an access token".to_owned());
+fn zeroth_token_error_description(
+    error: zeroth_oidc::ZerothTokenError,
+    token_use: Option<&str>,
+) -> String {
+    match (token_use, error.description.as_str()) {
+        (Some("access"), "JWT token_use was not access") => {
+            "token is not an access token".to_owned()
+        }
+        (Some("id"), "JWT token_use was not id") => "id_token_hint is not an ID token".to_owned(),
+        _ => error.description,
     }
-    if claims.sub.is_empty() {
-        return Err("access token subject is empty".to_owned());
-    }
-    if claims.client_id.as_deref() != Some(&claims.aud) {
-        return Err("access token client_id did not match audience".to_owned());
-    }
-
-    Ok(())
-}
-
-fn validate_zeroth_id_token_hint_claims(claims: &JwtClaims) -> Result<(), String> {
-    if claims.token_use != "id" {
-        return Err("id_token_hint is not an ID token".to_owned());
-    }
-    if claims.sub.is_empty() {
-        return Err("id_token_hint subject is empty".to_owned());
-    }
-    if claims.aud.is_empty() {
-        return Err("id_token_hint audience is empty".to_owned());
-    }
-
-    Ok(())
 }
 
 #[cfg(target_arch = "wasm32")]
 async fn introspection_response_for_token(
     db: &worker::d1::D1Database,
     config: &ZerothServerConfig,
-    verification_keys: &[Es256VerificationKey],
+    jwks: &JwksResponse,
     form: &TokenIntrospectionForm,
     now: i32,
 ) -> worker::Result<TokenIntrospectionResponse> {
     if form.token_type_hint.as_deref() != Some("refresh_token") {
-        if let Ok(claims) = verify_zeroth_access_token(&form.token, config, verification_keys, now)
-        {
+        if let Ok(claims) = verify_zeroth_access_token(&form.token, config, jwks, now) {
             return introspection_response_for_access_token_claims(db, &claims, now).await;
         }
     }
@@ -6687,6 +10268,7 @@ fn validate_client_upsert_request(
     let name = validate_client_name(&request.name)?;
     let redirect_uris = validate_redirect_uris(&request.redirect_uris)?;
     let allowed_origins = validate_allowed_origins(&request.allowed_origins)?;
+    let allowed_email_domains = validate_allowed_email_domains(&request.allowed_email_domains)?;
     let secret_hash = validated_client_secret_hash(
         request.confidential,
         request.client_secret.as_deref(),
@@ -6698,6 +10280,7 @@ fn validate_client_upsert_request(
         name,
         redirect_uris,
         allowed_origins,
+        allowed_email_domains,
         confidential: request.confidential,
         secret_hash,
         disabled: request.disabled,
@@ -6894,6 +10477,273 @@ fn validate_allowed_origins(raw: &[String]) -> Result<Vec<String>, ClientManagem
     Ok(origins)
 }
 
+fn validate_allowed_email_domains(raw: &[String]) -> Result<Vec<String>, ClientManagementError> {
+    if raw.len() > CLIENT_URI_LIST_LIMIT {
+        return Err(ClientManagementError::invalid_request(format!(
+            "client can register at most {CLIENT_URI_LIST_LIMIT} allowed email domains"
+        )));
+    }
+
+    let mut domains = Vec::with_capacity(raw.len());
+    for raw_domain in raw {
+        push_unique(&mut domains, normalize_allowed_email_domain(raw_domain)?);
+    }
+    Ok(domains)
+}
+
+fn normalize_allowed_email_domain(raw: &str) -> Result<String, ClientManagementError> {
+    let value = raw.trim().strip_prefix('@').unwrap_or_else(|| raw.trim());
+    if value.is_empty() {
+        return Err(ClientManagementError::invalid_request(
+            "allowed email domain must not be empty",
+        ));
+    }
+    if value.len() > CLIENT_EMAIL_DOMAIN_MAX_BYTES {
+        return Err(ClientManagementError::invalid_request(format!(
+            "allowed email domain must be at most {CLIENT_EMAIL_DOMAIN_MAX_BYTES} bytes"
+        )));
+    }
+    if !value.is_ascii() {
+        return Err(ClientManagementError::invalid_request(
+            "allowed email domain must use ASCII",
+        ));
+    }
+    if !value.contains('.') {
+        return Err(ClientManagementError::invalid_request(
+            "allowed email domain must include a dot",
+        ));
+    }
+    if value.starts_with('.') || value.ends_with('.') {
+        return Err(ClientManagementError::invalid_request(
+            "allowed email domain must not start or end with a dot",
+        ));
+    }
+    for label in value.split('.') {
+        if label.is_empty() {
+            return Err(ClientManagementError::invalid_request(
+                "allowed email domain must not contain empty labels",
+            ));
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err(ClientManagementError::invalid_request(
+                "allowed email domain labels must not start or end with a hyphen",
+            ));
+        }
+        if !label
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return Err(ClientManagementError::invalid_request(
+                "allowed email domain contains unsupported characters",
+            ));
+        }
+    }
+    Ok(value.to_ascii_lowercase())
+}
+
+fn validate_client_email_domain_policy(
+    client: &Client,
+    profile: &ProviderProfile,
+) -> Result<(), ProviderCallbackError> {
+    if client.allowed_email_domains.is_empty() {
+        return Ok(());
+    }
+    if !profile.email_verified {
+        return Err(ProviderCallbackError::access_denied(
+            "verified email is required for this client",
+        ));
+    }
+
+    let email_domain = provider_profile_email_domain(profile)?;
+    if client
+        .allowed_email_domains
+        .iter()
+        .any(|allowed_domain| allowed_domain.eq_ignore_ascii_case(&email_domain))
+    {
+        return Ok(());
+    }
+
+    Err(ProviderCallbackError::access_denied(
+        "email domain is not allowed for this client",
+    ))
+}
+
+fn provider_profile_email_domain(
+    profile: &ProviderProfile,
+) -> Result<String, ProviderCallbackError> {
+    let email = profile
+        .email
+        .as_deref()
+        .map(str::trim)
+        .filter(|email| !email.is_empty())
+        .ok_or_else(|| ProviderCallbackError::access_denied("email is required for this client"))?;
+    let (_, domain) = email.rsplit_once('@').ok_or_else(|| {
+        ProviderCallbackError::access_denied("email domain is required for this client")
+    })?;
+    let domain = domain.trim();
+    if domain.is_empty() {
+        return Err(ProviderCallbackError::access_denied(
+            "email domain is required for this client",
+        ));
+    }
+    Ok(domain.to_ascii_lowercase())
+}
+
+fn native_token_scope(scope: Option<&str>) -> Result<String, TokenExchangeError> {
+    let raw = scope.unwrap_or(DEFAULT_NATIVE_TOKEN_SCOPE);
+    let mut scopes = Vec::new();
+    for scope in raw.split_whitespace() {
+        if scope.len() > 64
+            || !scope.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':')
+            })
+        {
+            return Err(TokenExchangeError::invalid_request(
+                "scope contains unsupported characters",
+            ));
+        }
+        push_unique(&mut scopes, scope.to_owned());
+    }
+    if scopes.is_empty() {
+        return Err(TokenExchangeError::invalid_request(
+            "scope must not be empty",
+        ));
+    }
+    if !scopes.iter().any(|scope| scope == "openid") {
+        return Err(TokenExchangeError::invalid_request(
+            "scope must include openid",
+        ));
+    }
+    Ok(scopes.join(" "))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn native_provider_client_id(
+    env: &Env,
+    provider_id: &str,
+    requested_client_id: Option<&str>,
+) -> Result<String, TokenExchangeError> {
+    let configured = native_provider_client_ids_from_env(env, provider_id);
+    native_provider_client_id_from_list(provider_id, &configured, requested_client_id)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn native_provider_client_ids_from_env(env: &Env, provider_id: &str) -> Vec<String> {
+    let (native_binding, fallback_binding) = match provider_id {
+        well_known::APPLE => ("APPLE_NATIVE_CLIENT_IDS", "APPLE_BUNDLE_ID"),
+        well_known::GOOGLE => ("GOOGLE_NATIVE_CLIENT_IDS", "GOOGLE_CLIENT_ID"),
+        well_known::SPOTIFY => ("SPOTIFY_NATIVE_CLIENT_IDS", "SPOTIFY_CLIENT_ID"),
+        _ => return Vec::new(),
+    };
+    binding_value_from_env(env, native_binding)
+        .filter(|value| config_value_configured(Some(value)))
+        .or_else(|| provider_client_id_from_env(env, fallback_binding))
+        .map(|value| split_token_list(&value))
+        .unwrap_or_default()
+}
+
+#[cfg(any(test, not(target_arch = "wasm32")))]
+fn native_apple_provider_client_id_from_list(
+    configured: &[String],
+    requested_client_id: Option<&str>,
+) -> Result<String, TokenExchangeError> {
+    native_provider_client_id_from_list(well_known::APPLE, configured, requested_client_id)
+}
+
+fn native_provider_client_id_from_list(
+    provider_id: &str,
+    configured: &[String],
+    requested_client_id: Option<&str>,
+) -> Result<String, TokenExchangeError> {
+    if configured.is_empty() {
+        return Err(TokenExchangeError::invalid_request(format!(
+            "{} is not configured",
+            native_provider_client_ids_binding(provider_id)
+        )));
+    }
+    if let Some(requested_client_id) = requested_client_id {
+        if token_list_slice_contains(configured, requested_client_id, false) {
+            return Ok(requested_client_id.to_owned());
+        }
+        return Err(TokenExchangeError::invalid_request(
+            "provider_client_id is not allowed",
+        ));
+    }
+    if configured.len() == 1 {
+        return Ok(configured[0].clone());
+    }
+    Err(TokenExchangeError::invalid_request(format!(
+        "provider_client_id is required when multiple {} native client IDs are configured",
+        provider_label(provider_id)
+    )))
+}
+
+fn native_provider_client_ids_binding(provider_id: &str) -> &'static str {
+    match provider_id {
+        well_known::APPLE => "APPLE_NATIVE_CLIENT_IDS",
+        well_known::GOOGLE => "GOOGLE_NATIVE_CLIENT_IDS",
+        well_known::SPOTIFY => "SPOTIFY_NATIVE_CLIENT_IDS",
+        _ => "PROVIDER_NATIVE_CLIENT_IDS",
+    }
+}
+
+fn provider_label(provider_id: &str) -> &'static str {
+    match provider_id {
+        well_known::APPLE => "Apple",
+        well_known::GOOGLE => "Google",
+        well_known::SPOTIFY => "Spotify",
+        _ => "provider",
+    }
+}
+
+fn split_token_list(value: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    for token in value
+        .split(|ch: char| ch == ',' || ch == ';' || ch.is_whitespace())
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+    {
+        push_unique(&mut values, token.to_owned());
+    }
+    values
+}
+
+fn token_list_slice_contains(
+    values: &[String],
+    needle: &str,
+    ascii_case_insensitive: bool,
+) -> bool {
+    let needle = needle.trim();
+    if needle.is_empty() {
+        return false;
+    }
+    values.iter().any(|value| {
+        if ascii_case_insensitive {
+            value.eq_ignore_ascii_case(needle)
+        } else {
+            value == needle
+        }
+    })
+}
+
+fn native_oidc_profile_from_verified_token(
+    provider_id: &str,
+    verified: VerifiedProviderIdToken,
+) -> ResolvedProviderProfile {
+    let claims = verified.claims;
+    ResolvedProviderProfile {
+        profile: ProviderProfile {
+            provider_id: ProviderId(provider_id.to_owned()),
+            subject: Subject(claims.sub),
+            email: claims.email,
+            email_verified: boolish_claim(claims.email_verified.as_ref()).unwrap_or(false),
+            display_name: claims.name,
+            picture_url: claims.picture,
+        },
+        raw_profile_json: Some(verified.raw_claims_json),
+    }
+}
+
 fn validated_client_secret_hash(
     confidential: bool,
     client_secret: Option<&str>,
@@ -6977,6 +10827,10 @@ fn client_response_from_row(row: ClientRow) -> Result<ClientResponse, String> {
             &row.allowed_origins_json,
             "allowed_origins_json",
         )?,
+        allowed_email_domains: parse_string_array_json(
+            &row.allowed_email_domains_json,
+            "allowed_email_domains_json",
+        )?,
         confidential: row.confidential != 0,
         disabled: row.disabled_at.is_some(),
         has_secret: row
@@ -6995,6 +10849,7 @@ fn admin_user_response_from_row(row: AdminUserRow) -> AdminUserResponse {
         created_at: row.created_at,
         updated_at: row.updated_at,
         disabled: row.disabled_at.is_some(),
+        admin: row.admin_membership_active != 0,
         identity_count: row.identity_count,
         active_session_count: row.active_session_count,
     }
@@ -7048,6 +10903,7 @@ fn user_admin_ui_from_row(row: AdminUserRow) -> UserAdminUi {
         email: row.primary_email,
         display_name: row.display_name,
         disabled: row.disabled_at.is_some(),
+        admin: row.admin_membership_active != 0,
         identity_count: row.identity_count,
         active_session_count: row.active_session_count,
         created_at: Some(row.created_at.to_string()),
@@ -7077,6 +10933,13 @@ fn content_type_is_json(content_type: Option<&str>) -> bool {
         .and_then(|value| value.split(';').next())
         .map(str::trim)
         .is_some_and(|value| value.eq_ignore_ascii_case("application/json"))
+}
+
+fn content_type_is_form_urlencoded(content_type: Option<&str>) -> bool {
+    content_type
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .is_some_and(|value| value.eq_ignore_ascii_case("application/x-www-form-urlencoded"))
 }
 
 fn userinfo_response(user: &UserRow, scope: Option<&str>) -> UserInfoResponse {
@@ -7135,6 +10998,1344 @@ fn identities_response(identities: &[IdentityRow]) -> IdentitiesResponse {
                 updated_at: identity.updated_at,
             })
             .collect(),
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn passkey_json_from_request<T: serde::de::DeserializeOwned>(
+    request: &mut Request,
+) -> Result<T, String> {
+    let content_type = request
+        .headers()
+        .get("Content-Type")
+        .map_err(|error| format!("could not read Content-Type header: {error}"))?;
+    if !content_type_is_json(content_type.as_deref()) {
+        return Err("Content-Type must be application/json".to_owned());
+    }
+    let body = request
+        .bytes()
+        .await
+        .map_err(|error| format!("could not read passkey body: {error}"))?;
+    if body.len() > PASSKEY_BODY_LIMIT {
+        return Err("passkey JSON body is too large".to_owned());
+    }
+    serde_json::from_slice::<T>(&body).map_err(|error| format!("invalid passkey JSON: {error}"))
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn local_auth_body_from_request<T: serde::de::DeserializeOwned>(
+    request: &mut Request,
+) -> Result<T, String> {
+    let content_type = request_header(request, "Content-Type")
+        .map_err(|error| format!("could not read Content-Type header: {error}"))?;
+    let body = request
+        .bytes()
+        .await
+        .map_err(|error| format!("could not read local auth body: {error}"))?;
+    if content_type_is_json(content_type.as_deref()) {
+        if body.len() > LOCAL_AUTH_BODY_LIMIT {
+            return Err("local auth JSON body is too large".to_owned());
+        }
+        return serde_json::from_slice::<T>(&body)
+            .map_err(|error| format!("invalid local auth JSON: {error}"));
+    }
+    if content_type_is_form_urlencoded(content_type.as_deref()) {
+        if body.len() > LOCAL_AUTH_BODY_LIMIT {
+            return Err("local auth form body is too large".to_owned());
+        }
+        return serde_urlencoded::from_bytes::<T>(&body)
+            .map_err(|error| format!("invalid local auth form: {error}"));
+    }
+    Err("Content-Type must be application/json or application/x-www-form-urlencoded".to_owned())
+}
+
+fn validate_local_auth_email(value: &str) -> Result<String, String> {
+    validate_passkey_email(value)
+}
+
+fn validate_local_auth_password(value: &str) -> Result<(), String> {
+    let len = value.as_bytes().len();
+    if len < PASSWORD_MIN_BYTES {
+        return Err(format!(
+            "password must be at least {PASSWORD_MIN_BYTES} bytes"
+        ));
+    }
+    if len > PASSWORD_MAX_BYTES {
+        return Err(format!(
+            "password must be at most {PASSWORD_MAX_BYTES} bytes"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn local_auth_client_and_return_to(
+    env: &Env,
+    request_url: &url::Url,
+    db: &worker::d1::D1Database,
+    client_id: Option<&str>,
+    return_to: Option<&str>,
+    config: &ZerothServerConfig,
+) -> Result<(Client, String), String> {
+    let client_id =
+        passkey_client_id_from_request(env, client_id).map_err(|error| error.to_string())?;
+    let client = get_client(db, &client_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "local auth client is not registered".to_owned())?;
+    let return_to = passkey_return_to(request_url, return_to, &client, config)
+        .map_err(|error| error.to_string())?;
+    Ok((client, return_to))
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn validate_local_auth_origin(
+    request: &Request,
+    _db: &worker::d1::D1Database,
+    client: &Client,
+    config: &ZerothServerConfig,
+) -> worker::Result<Result<(), String>> {
+    let origin = request_origin_for_config(request, config)?;
+    Ok(validate_cors_origin(
+        origin.as_deref(),
+        &client.allowed_origins,
+    ))
+}
+
+fn validate_local_auth_client_email_policy(
+    client: &Client,
+    email: &str,
+) -> Result<(), ProviderCallbackError> {
+    let profile = local_auth_profile(email, None, true);
+    validate_client_email_domain_policy(client, &profile)
+}
+
+fn local_auth_profile(
+    email: &str,
+    display_name: Option<&str>,
+    email_verified: bool,
+) -> ProviderProfile {
+    ProviderProfile {
+        provider_id: ProviderId(LOCAL_AUTH_PROVIDER_ID.to_owned()),
+        subject: Subject(email.to_owned()),
+        email: Some(email.to_owned()),
+        email_verified,
+        display_name: display_name.map(str::to_owned),
+        picture_url: None,
+    }
+}
+
+fn local_auth_registration_user_id(
+    current: Option<&CurrentSession>,
+    existing_user: Option<&UserRow>,
+    email: &str,
+) -> Result<Option<String>, String> {
+    if let Some(current) = current {
+        if current.user.disabled_at.is_some() {
+            return Err("current user is disabled".to_owned());
+        }
+        if let Some(primary_email) = current.user.primary_email.as_deref() {
+            if !primary_email.eq_ignore_ascii_case(email) {
+                return Err("password email must match the signed-in user".to_owned());
+            }
+        }
+        if let Some(existing_user) = existing_user {
+            if existing_user.id != current.user.id {
+                return Err("email is already attached to another user".to_owned());
+            }
+        }
+        return Ok(Some(current.user.id.clone()));
+    }
+
+    if existing_user.is_some() {
+        return Err("sign in before adding a password to an existing user".to_owned());
+    }
+    Ok(None)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn password_iterations_from_env(env: &Env) -> Result<u32, String> {
+    let Some(value) = binding_value_from_env(env, "PASSWORD_PBKDF2_ITERATIONS") else {
+        return Ok(PASSWORD_PBKDF2_DEFAULT_ITERATIONS);
+    };
+    let iterations = value
+        .trim()
+        .parse::<u32>()
+        .map_err(|error| format!("PASSWORD_PBKDF2_ITERATIONS must be an integer: {error}"))?;
+    if !(PASSWORD_PBKDF2_MIN_ITERATIONS..=PASSWORD_PBKDF2_MAX_ITERATIONS).contains(&iterations) {
+        return Err(format!(
+            "PASSWORD_PBKDF2_ITERATIONS must be between {PASSWORD_PBKDF2_MIN_ITERATIONS} and {PASSWORD_PBKDF2_MAX_ITERATIONS}"
+        ));
+    }
+    Ok(iterations)
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn password_hash(password: &str, salt: &str, iterations: u32) -> worker::Result<String> {
+    let digest = pbkdf2_sha256(password.as_bytes(), salt.as_bytes(), iterations, 32).await?;
+    Ok(bytes_to_hex(&digest))
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn local_auth_password_matches(
+    credential: &LocalCredentialRow,
+    password: &str,
+) -> worker::Result<bool> {
+    if credential.password_alg != PASSWORD_PBKDF2_ALG {
+        return Ok(false);
+    }
+    let Ok(iterations) = u32::try_from(credential.password_iterations) else {
+        return Ok(false);
+    };
+    if !(PASSWORD_PBKDF2_MIN_ITERATIONS..=PASSWORD_PBKDF2_MAX_ITERATIONS).contains(&iterations) {
+        return Ok(false);
+    }
+    let actual = password_hash(password, &credential.password_salt, iterations).await?;
+    Ok(constant_time_eq(&credential.password_hash, &actual))
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn pbkdf2_sha256(
+    password: &[u8],
+    salt: &[u8],
+    iterations: u32,
+    output_len: usize,
+) -> worker::Result<Vec<u8>> {
+    let subtle = worker_global_subtle().map_err(worker_error)?;
+    let password_bytes = worker::js_sys::Uint8Array::from(password);
+    let key_usages = single_js_string_array("deriveBits");
+    let key_value = JsFuture::from(
+        subtle
+            .import_key_with_str(
+                "raw",
+                password_bytes.unchecked_ref(),
+                "PBKDF2",
+                false,
+                &key_usages,
+            )
+            .map_err(js_worker_error)?,
+    )
+    .await
+    .map_err(js_worker_error)?;
+    let key = key_value
+        .dyn_into::<worker::web_sys::CryptoKey>()
+        .map_err(js_worker_error)?;
+
+    let params = worker::js_sys::Object::new();
+    set_js_value_property_for_worker(&params, "name", &JsValue::from_str("PBKDF2"))?;
+    let salt = worker::js_sys::Uint8Array::from(salt);
+    set_js_value_property_for_worker(&params, "salt", salt.as_ref())?;
+    set_js_value_property_for_worker(&params, "iterations", &JsValue::from_f64(iterations as f64))?;
+    set_js_value_property_for_worker(&params, "hash", &JsValue::from_str("SHA-256"))?;
+    let bit_len = u32::try_from(output_len)
+        .ok()
+        .and_then(|len| len.checked_mul(8))
+        .ok_or_else(|| worker_error("password hash output length is too large".to_owned()))?;
+    let bits = JsFuture::from(
+        subtle
+            .derive_bits_with_object(&params, &key, bit_len)
+            .map_err(js_worker_error)?,
+    )
+    .await
+    .map_err(js_worker_error)?;
+    let array = worker::js_sys::Uint8Array::new(&bits);
+    Ok(array.to_vec())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn worker_global_subtle() -> Result<worker::web_sys::SubtleCrypto, String> {
+    let global: worker::web_sys::WorkerGlobalScope = worker::js_sys::global().unchecked_into();
+    let crypto = global
+        .crypto()
+        .map_err(|error| js_error_string("could not access Worker crypto", error))?;
+    Ok(crypto.subtle())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn set_js_value_property_for_worker(
+    target: &worker::js_sys::Object,
+    name: &str,
+    value: &JsValue,
+) -> worker::Result<()> {
+    let ok = worker::js_sys::Reflect::set(target, &JsValue::from_str(name), value)
+        .map_err(js_worker_error)?;
+    if ok {
+        Ok(())
+    } else {
+        Err(worker_error(format!(
+            "could not set JavaScript property: {name}"
+        )))
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn js_worker_error(error: JsValue) -> worker::Error {
+    worker_error(js_error_string("JavaScript error", error))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn js_error_string(context: &str, error: JsValue) -> String {
+    let detail = error
+        .dyn_ref::<worker::js_sys::Error>()
+        .map(|error| error.message().into())
+        .or_else(|| error.as_string())
+        .unwrap_or_else(|| "unknown error".to_owned());
+    format!("{context}: {detail}")
+}
+
+fn html_escape_text(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn issue_local_auth_session(
+    request: &Request,
+    db: &worker::d1::D1Database,
+    client_id: &str,
+    user_id: &str,
+    return_to: &str,
+    event_type: &str,
+    mode: &str,
+    now: i32,
+) -> worker::Result<LocalAuthSessionIssue> {
+    let session_id = format!("sess_{}", random_token()?);
+    let audit_context = audit_request_context(request).unwrap_or_default();
+    put_session(
+        db,
+        &session_id,
+        user_id,
+        client_id,
+        now,
+        audit_context.user_agent.as_deref(),
+        audit_context.ip_hash.as_deref(),
+    )
+    .await?;
+    record_audit_event(
+        db,
+        request,
+        event_type,
+        Some(user_id),
+        Some(client_id),
+        Some(LOCAL_AUTH_PROVIDER_ID),
+        serde_json::json!({ "mode": mode }),
+        now,
+    )
+    .await;
+    let user = get_user(db, user_id)
+        .await?
+        .ok_or_else(|| worker_error("local auth user was not found".to_owned()))?;
+    Ok(LocalAuthSessionIssue {
+        session_id,
+        return_to: return_to.to_owned(),
+        user,
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn issue_local_auth_session_response(
+    request: &Request,
+    db: &worker::d1::D1Database,
+    config: &ZerothServerConfig,
+    client_id: &str,
+    user_id: &str,
+    return_to: &str,
+    event_type: &str,
+    mode: &str,
+    now: i32,
+) -> worker::Result<Response> {
+    let issue = issue_local_auth_session(
+        request, db, client_id, user_id, return_to, event_type, mode, now,
+    )
+    .await?;
+    let response = json(&LocalAuthResponse {
+        ok: true,
+        return_to: issue.return_to,
+        user: userinfo_response(&issue.user, Some("email profile")),
+    })?;
+    with_set_cookie(
+        response,
+        &session_cookie(
+            &config.cookie_name,
+            &issue.session_id,
+            SESSION_TTL_SECONDS,
+            config.cookie_domain.as_deref(),
+        ),
+    )
+}
+
+#[cfg(target_arch = "wasm32")]
+fn magic_link_url(config: &ZerothServerConfig, token: &str) -> worker::Result<String> {
+    let mut url = url::Url::parse(&format!(
+        "{}/magic-links/consume",
+        config.public_base_url.trim_end_matches('/')
+    ))
+    .map_err(|error| worker_error(format!("invalid magic link base URL: {error}")))?;
+    url.query_pairs_mut().append_pair("token", token);
+    Ok(url.to_string())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn send_magic_link_email(env: &Env, email: &str, link: &str) -> Result<bool, String> {
+    let transport = match magic_link_delivery_transport_from_value(
+        binding_value_from_env(env, "MAGIC_LINK_DELIVERY").as_deref(),
+    ) {
+        Ok(transport) => transport,
+        Err(_) => return Ok(false),
+    };
+    let Some(from) = magic_link_from_env(env) else {
+        return Ok(false);
+    };
+    let content = magic_link_email_content(env, &from, link);
+    match transport {
+        MagicLinkDeliveryTransport::CloudflareEmail => {
+            send_magic_link_cloudflare_email(env, email, &content).await
+        }
+        MagicLinkDeliveryTransport::Webhook => {
+            send_magic_link_webhook_email(env, email, link, &content).await
+        }
+        MagicLinkDeliveryTransport::Resend => {
+            send_magic_link_resend_email(env, email, &content).await
+        }
+        MagicLinkDeliveryTransport::MailChannels => {
+            send_magic_link_mailchannels_email(env, email, &content).await
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+struct MagicLinkEmailContent {
+    from: String,
+    product_name: String,
+    subject: String,
+    text: String,
+    html: String,
+}
+
+#[cfg(target_arch = "wasm32")]
+fn magic_link_from_env(env: &Env) -> Option<String> {
+    binding_value_from_env(env, "MAGIC_LINK_FROM")
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn magic_link_email_content(env: &Env, from: &str, link: &str) -> MagicLinkEmailContent {
+    let product_name = env_string(env, "PRODUCT_NAME").unwrap_or_else(|| "Zeroth".to_owned());
+    let subject = format!("Sign in to {product_name}");
+    let text = format!("Sign in to {product_name}:\n\n{link}\n\nThis link expires in 10 minutes.");
+    let html = format!(
+        r#"<p>Sign in to {}:</p><p><a href="{}">{}</a></p><p>This link expires in 10 minutes.</p>"#,
+        html_escape_text(&product_name),
+        html_escape_text(link),
+        html_escape_text(link)
+    );
+    MagicLinkEmailContent {
+        from: from.to_owned(),
+        product_name,
+        subject,
+        text,
+        html,
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn send_magic_link_cloudflare_email(
+    env: &Env,
+    email: &str,
+    content: &MagicLinkEmailContent,
+) -> Result<bool, String> {
+    let Ok(sender) = env.send_email("EMAIL") else {
+        return Ok(false);
+    };
+    let from_address = worker::email::EmailAddress::new(&content.product_name, &content.from);
+    let builder = worker::email::SendEmailBuilder::builder_with_email_address_and_str(
+        &from_address,
+        email,
+        &content.subject,
+    )
+    .text(&content.text)
+    .html(&content.html)
+    .build();
+    sender
+        .send_with_builder(&builder)
+        .await
+        .map(|_| true)
+        .map_err(|error| String::from(error.message()))
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MagicLinkWebhookPayload<'a> {
+    kind: &'static str,
+    to: &'a str,
+    from: &'a str,
+    from_name: &'a str,
+    subject: &'a str,
+    text: &'a str,
+    html: &'a str,
+    link: &'a str,
+    product_name: &'a str,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Serialize)]
+struct ResendEmailPayload<'a> {
+    from: String,
+    to: [&'a str; 1],
+    subject: &'a str,
+    text: &'a str,
+    html: &'a str,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Serialize)]
+struct MailChannelsEmailAddress<'a> {
+    email: &'a str,
+    name: &'a str,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Serialize)]
+struct MailChannelsPersonalization<'a> {
+    to: [MailChannelsEmailAddress<'a>; 1],
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Serialize)]
+struct MailChannelsEmailContent<'a> {
+    #[serde(rename = "type")]
+    content_type: &'a str,
+    value: &'a str,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Serialize)]
+struct MailChannelsEmailPayload<'a> {
+    personalizations: [MailChannelsPersonalization<'a>; 1],
+    from: MailChannelsEmailAddress<'a>,
+    subject: &'a str,
+    content: [MailChannelsEmailContent<'a>; 2],
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn send_magic_link_webhook_email(
+    env: &Env,
+    email: &str,
+    link: &str,
+    content: &MagicLinkEmailContent,
+) -> Result<bool, String> {
+    let Some(endpoint) = magic_link_webhook_url_from_env(env) else {
+        return Ok(false);
+    };
+    let payload = MagicLinkWebhookPayload {
+        kind: "magic_link",
+        to: email,
+        from: &content.from,
+        from_name: &content.product_name,
+        subject: &content.subject,
+        text: &content.text,
+        html: &content.html,
+        link,
+        product_name: &content.product_name,
+    };
+    let body = serde_json::to_string(&payload)
+        .map_err(|error| format!("email_webhook_failed JSON serialization: {error}"))?;
+    let headers = Headers::new();
+    headers
+        .set("Content-Type", "application/json")
+        .map_err(|error| format!("email_webhook_failed header: {error}"))?;
+    headers
+        .set("Accept", "application/json")
+        .map_err(|error| format!("email_webhook_failed header: {error}"))?;
+    if let Some(bearer) = magic_link_webhook_bearer_from_env(env) {
+        headers
+            .set("Authorization", &format!("Bearer {bearer}"))
+            .map_err(|error| format!("email_webhook_failed header: {error}"))?;
+    }
+
+    let mut init = RequestInit::new();
+    init.with_method(Method::Post)
+        .with_headers(headers)
+        .with_body(Some(worker::wasm_bindgen::JsValue::from_str(&body)));
+    let outbound = Request::new_with_init(&endpoint, &init)
+        .map_err(|error| format!("email_webhook_failed request: {error}"))?;
+    let response = Fetch::Request(outbound)
+        .send()
+        .await
+        .map_err(|error| format!("email_webhook_failed fetch: {error}"))?;
+    let status = response.status_code();
+    if !(200..300).contains(&status) {
+        return Err(format!("email_webhook_failed HTTP {status}"));
+    }
+    Ok(true)
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn send_magic_link_resend_email(
+    env: &Env,
+    email: &str,
+    content: &MagicLinkEmailContent,
+) -> Result<bool, String> {
+    let Some(api_key) = magic_link_resend_api_key_from_env(env) else {
+        return Ok(false);
+    };
+    let payload = ResendEmailPayload {
+        from: friendly_sender_address(&content.product_name, &content.from),
+        to: [email],
+        subject: &content.subject,
+        text: &content.text,
+        html: &content.html,
+    };
+    let body = serde_json::to_string(&payload)
+        .map_err(|error| format!("email_resend_failed JSON serialization: {error}"))?;
+    let headers = Headers::new();
+    headers
+        .set("Content-Type", "application/json")
+        .map_err(|error| format!("email_resend_failed header: {error}"))?;
+    headers
+        .set("Accept", "application/json")
+        .map_err(|error| format!("email_resend_failed header: {error}"))?;
+    headers
+        .set("Authorization", &format!("Bearer {api_key}"))
+        .map_err(|error| format!("email_resend_failed header: {error}"))?;
+
+    post_magic_link_email_json(
+        "https://api.resend.com/emails",
+        Method::Post,
+        headers,
+        body,
+        "email_resend_failed",
+    )
+    .await
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn send_magic_link_mailchannels_email(
+    env: &Env,
+    email: &str,
+    content: &MagicLinkEmailContent,
+) -> Result<bool, String> {
+    let Some(api_key) = magic_link_mailchannels_api_key_from_env(env) else {
+        return Ok(false);
+    };
+    let payload = MailChannelsEmailPayload {
+        personalizations: [MailChannelsPersonalization {
+            to: [MailChannelsEmailAddress { email, name: "" }],
+        }],
+        from: MailChannelsEmailAddress {
+            email: &content.from,
+            name: &content.product_name,
+        },
+        subject: &content.subject,
+        content: [
+            MailChannelsEmailContent {
+                content_type: "text/plain",
+                value: &content.text,
+            },
+            MailChannelsEmailContent {
+                content_type: "text/html",
+                value: &content.html,
+            },
+        ],
+    };
+    let body = serde_json::to_string(&payload)
+        .map_err(|error| format!("email_mailchannels_failed JSON serialization: {error}"))?;
+    let headers = Headers::new();
+    headers
+        .set("Content-Type", "application/json")
+        .map_err(|error| format!("email_mailchannels_failed header: {error}"))?;
+    headers
+        .set("Accept", "application/json")
+        .map_err(|error| format!("email_mailchannels_failed header: {error}"))?;
+    headers
+        .set("X-Api-Key", &api_key)
+        .map_err(|error| format!("email_mailchannels_failed header: {error}"))?;
+
+    post_magic_link_email_json(
+        "https://api.mailchannels.net/tx/v1/send",
+        Method::Post,
+        headers,
+        body,
+        "email_mailchannels_failed",
+    )
+    .await
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn post_magic_link_email_json(
+    endpoint: &str,
+    method: Method,
+    headers: Headers,
+    body: String,
+    error_class: &str,
+) -> Result<bool, String> {
+    let mut init = RequestInit::new();
+    init.with_method(method)
+        .with_headers(headers)
+        .with_body(Some(worker::wasm_bindgen::JsValue::from_str(&body)));
+    let outbound = Request::new_with_init(endpoint, &init)
+        .map_err(|error| format!("{error_class} request: {error}"))?;
+    let response = Fetch::Request(outbound)
+        .send()
+        .await
+        .map_err(|error| format!("{error_class} fetch: {error}"))?;
+    let status = response.status_code();
+    if !(200..300).contains(&status) {
+        return Err(format!("{error_class} HTTP {status}"));
+    }
+    Ok(true)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn magic_link_webhook_url_from_env(env: &Env) -> Option<String> {
+    binding_value_from_env(env, "MAGIC_LINK_WEBHOOK_URL")
+        .map(|value| value.trim().to_owned())
+        .filter(|value| magic_link_webhook_url_valid(value))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn magic_link_webhook_bearer_from_env(env: &Env) -> Option<String> {
+    ["MAGIC_LINK_WEBHOOK_BEARER", "MAGIC_LINK_WEBHOOK_TOKEN"]
+        .into_iter()
+        .find_map(|name| {
+            binding_value_from_env(env, name)
+                .map(|value| value.trim().to_owned())
+                .filter(|value| config_value_configured(Some(value)))
+        })
+}
+
+#[cfg(target_arch = "wasm32")]
+fn magic_link_resend_api_key_from_env(env: &Env) -> Option<String> {
+    ["MAGIC_LINK_RESEND_API_KEY", "RESEND_API_KEY"]
+        .into_iter()
+        .find_map(|name| {
+            binding_value_from_env(env, name)
+                .map(|value| value.trim().to_owned())
+                .filter(|value| config_value_configured(Some(value)))
+        })
+}
+
+#[cfg(target_arch = "wasm32")]
+fn magic_link_mailchannels_api_key_from_env(env: &Env) -> Option<String> {
+    ["MAGIC_LINK_MAILCHANNELS_API_KEY", "MAILCHANNELS_API_KEY"]
+        .into_iter()
+        .find_map(|name| {
+            binding_value_from_env(env, name)
+                .map(|value| value.trim().to_owned())
+                .filter(|value| config_value_configured(Some(value)))
+        })
+}
+
+#[cfg(target_arch = "wasm32")]
+fn friendly_sender_address(name: &str, email: &str) -> String {
+    let name = name.trim();
+    if name.is_empty()
+        || name
+            .chars()
+            .any(|character| matches!(character, '\r' | '\n' | '<' | '>' | '"'))
+    {
+        email.to_owned()
+    } else {
+        format!("{name} <{email}>")
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn magic_link_dev_echo_enabled(env: &Env) -> bool {
+    binding_value_from_env(env, "MAGIC_LINK_DEV_ECHO")
+        .as_deref()
+        .is_some_and(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn validate_magic_link(row: &MagicLinkRow, now: i32) -> Result<(), String> {
+    if row.consumed_at.is_some() || row.expires_at <= now {
+        return Err("magic link is invalid or expired".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn passkey_registration_subject(
+    current: Option<&CurrentSession>,
+    body: &PasskeyRegisterOptionsRequest,
+) -> Result<(Option<String>, String, Option<String>), String> {
+    if let Some(current) = current {
+        let email = current
+            .user
+            .primary_email
+            .as_deref()
+            .or(body.email.as_deref())
+            .ok_or_else(|| "current user has no email; provide email".to_owned())
+            .and_then(validate_passkey_email)?;
+        let display_name = body
+            .display_name
+            .as_deref()
+            .or(current.user.display_name.as_deref())
+            .map(validate_passkey_display_name)
+            .transpose()?;
+        return Ok((Some(current.user.id.clone()), email, display_name));
+    }
+
+    let email = body
+        .email
+        .as_deref()
+        .ok_or_else(|| "email is required to register the first passkey".to_owned())
+        .and_then(validate_passkey_email)?;
+    let display_name = body
+        .display_name
+        .as_deref()
+        .map(validate_passkey_display_name)
+        .transpose()?;
+    Ok((None, email, display_name))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn passkey_client_id_from_request(env: &Env, client_id: Option<&str>) -> worker::Result<String> {
+    client_id
+        .map(str::trim)
+        .filter(|client_id| !client_id.is_empty())
+        .map(str::to_owned)
+        .or_else(|| env_string(env, "DEFAULT_LOGIN_CLIENT_ID"))
+        .filter(|client_id| !client_id.is_empty())
+        .ok_or_else(|| {
+            worker_error(
+                "missing client_id and DEFAULT_LOGIN_CLIENT_ID is not configured".to_owned(),
+            )
+        })
+}
+
+#[cfg(target_arch = "wasm32")]
+fn passkey_return_to(
+    request_url: &url::Url,
+    return_to: Option<&str>,
+    client: &Client,
+    config: &ZerothServerConfig,
+) -> worker::Result<String> {
+    let value = return_to
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("{}/admin", config.issuer().issuer));
+    let value = if value.starts_with('/') {
+        let mut target = request_url.clone();
+        target.set_path(&value);
+        target.set_query(None);
+        target.set_fragment(None);
+        target.to_string()
+    } else {
+        value
+    };
+    validate_client_return_to(&value, client, Some(&config.public_base_url))
+        .map_err(|error| worker_error(format!("invalid passkey return_to: {error}")))?;
+    Ok(value)
+}
+
+fn validate_passkey_email(value: &str) -> Result<String, String> {
+    let email = value.trim().to_ascii_lowercase();
+    if email.is_empty() {
+        return Err("email must not be empty".to_owned());
+    }
+    if email.len() > PASSKEY_EMAIL_MAX_BYTES {
+        return Err("email is too long".to_owned());
+    }
+    if email.bytes().any(|byte| byte.is_ascii_whitespace()) || !email.contains('@') {
+        return Err("email is not valid".to_owned());
+    }
+    Ok(email)
+}
+
+fn validate_passkey_display_name(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("displayName must not be empty".to_owned());
+    }
+    if value.chars().count() > PROFILE_NAME_MAX_CHARS {
+        return Err(format!(
+            "displayName must be at most {PROFILE_NAME_MAX_CHARS} characters"
+        ));
+    }
+    Ok(value.to_owned())
+}
+
+fn validate_passkey_label(value: Option<&str>) -> Result<Option<String>, String> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    if value.chars().count() > PASSKEY_LABEL_MAX_CHARS {
+        return Err(format!(
+            "label must be at most {PASSKEY_LABEL_MAX_CHARS} characters"
+        ));
+    }
+    Ok(Some(value.to_owned()))
+}
+
+fn passkey_creation_options(
+    config: &ZerothServerConfig,
+    challenge: &str,
+    user_id: &str,
+    email: &str,
+    display_name: &str,
+    exclude_credentials: Vec<PasskeyCredentialDescriptor>,
+) -> Result<PasskeyPublicKeyCredentialCreationOptions, String> {
+    Ok(PasskeyPublicKeyCredentialCreationOptions {
+        challenge: passkey_challenge_for_browser(challenge),
+        rp: PasskeyRpEntity {
+            id: passkey_rp_id(config)?,
+            name: passkey_rp_name(config),
+        },
+        user: PasskeyUserEntity {
+            id: URL_SAFE_NO_PAD.encode(user_id.as_bytes()),
+            name: email.to_owned(),
+            display_name: display_name.to_owned(),
+        },
+        pub_key_cred_params: vec![PasskeyPubKeyCredParam {
+            credential_type: "public-key",
+            alg: -7,
+        }],
+        timeout: 300_000,
+        authenticator_selection: PasskeyAuthenticatorSelection {
+            resident_key: "required",
+            require_resident_key: true,
+            user_verification: "required",
+        },
+        attestation: "none",
+        exclude_credentials,
+    })
+}
+
+fn passkey_request_options(
+    config: &ZerothServerConfig,
+    challenge: &str,
+    allow_credentials: Vec<PasskeyCredentialDescriptor>,
+) -> Result<PasskeyPublicKeyCredentialRequestOptions, String> {
+    Ok(PasskeyPublicKeyCredentialRequestOptions {
+        challenge: passkey_challenge_for_browser(challenge),
+        rp_id: passkey_rp_id(config)?,
+        timeout: 300_000,
+        user_verification: "required",
+        allow_credentials,
+    })
+}
+
+fn passkey_challenge_for_browser(challenge: &str) -> String {
+    URL_SAFE_NO_PAD.encode(challenge.as_bytes())
+}
+
+fn passkey_challenge_from_browser(value: &str) -> Result<String, String> {
+    let bytes = decode_base64url(value)?;
+    String::from_utf8(bytes).map_err(|error| format!("challenge was not UTF-8: {error}"))
+}
+
+fn passkey_challenge_hash_from_client_data(client_data_json: &str) -> Result<String, String> {
+    let client_data = decode_passkey_client_data(client_data_json)?;
+    let challenge = passkey_challenge_from_browser(&client_data.challenge)?;
+    Ok(hash_secret(&challenge))
+}
+
+fn passkey_challenge_matches_client_data(challenge_hash: &str, client_data_json: &str) -> bool {
+    passkey_challenge_hash_from_client_data(client_data_json)
+        .is_ok_and(|actual| actual == challenge_hash)
+}
+
+fn passkey_rp_id(config: &ZerothServerConfig) -> Result<String, String> {
+    let url = url::Url::parse(&config.public_base_url)
+        .map_err(|error| format!("PUBLIC_BASE_URL is invalid: {error}"))?;
+    url.host_str()
+        .map(str::to_owned)
+        .ok_or_else(|| "PUBLIC_BASE_URL must include a host".to_owned())
+}
+
+fn passkey_rp_name(config: &ZerothServerConfig) -> String {
+    url::Url::parse(&config.public_base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .unwrap_or_else(|| "Zeroth".to_owned())
+}
+
+fn passkey_expected_origin(config: &ZerothServerConfig) -> Result<String, String> {
+    let url = url::Url::parse(&config.public_base_url)
+        .map_err(|error| format!("PUBLIC_BASE_URL is invalid: {error}"))?;
+    Ok(url.origin().ascii_serialization())
+}
+
+fn validate_passkey_client_data(
+    config: &ZerothServerConfig,
+    client_data_json: &str,
+    expected_type: &str,
+) -> Result<WebAuthnClientData, String> {
+    let client_data = decode_passkey_client_data(client_data_json)?;
+    if client_data.ceremony_type != expected_type {
+        return Err(format!("passkey client data type must be {expected_type}"));
+    }
+    let expected_origin = passkey_expected_origin(config)?;
+    if client_data.origin != expected_origin {
+        return Err("passkey origin did not match Zeroth issuer".to_owned());
+    }
+    if client_data.cross_origin.unwrap_or(false) {
+        return Err("cross-origin passkey ceremonies are not accepted".to_owned());
+    }
+    Ok(client_data)
+}
+
+fn decode_passkey_client_data(client_data_json: &str) -> Result<WebAuthnClientData, String> {
+    let bytes = decode_base64url(client_data_json)?;
+    serde_json::from_slice::<WebAuthnClientData>(&bytes)
+        .map_err(|error| format!("invalid passkey clientDataJSON: {error}"))
+}
+
+fn validate_passkey_registration_response(
+    config: &ZerothServerConfig,
+    body: &PasskeyRegisterVerifyRequest,
+) -> Result<ValidatedPasskeyRegistration, String> {
+    let raw_id = passkey_raw_id(&body.raw_id)?;
+    if passkey_raw_id(&body.id)? != raw_id {
+        return Err("passkey id and rawId did not match".to_owned());
+    }
+    validate_passkey_client_data(config, &body.response.client_data_json, "webauthn.create")?;
+    let attestation_object = decode_base64url(&body.response.attestation_object)?;
+    let auth_data = parse_passkey_attestation_object(&attestation_object)?;
+    validate_passkey_authenticator_data(config, &auth_data, true)?;
+    let credential_id = auth_data
+        .credential_id
+        .ok_or_else(|| "passkey registration did not include credential data".to_owned())
+        .map(|credential_id| URL_SAFE_NO_PAD.encode(credential_id))?;
+    if credential_id != raw_id {
+        return Err("passkey authenticator credential id did not match rawId".to_owned());
+    }
+    let public_key = auth_data
+        .public_key
+        .ok_or_else(|| "passkey registration did not include a public key".to_owned())?;
+    Ok(ValidatedPasskeyRegistration {
+        credential_id,
+        public_key_x: URL_SAFE_NO_PAD.encode(public_key.x),
+        public_key_y: URL_SAFE_NO_PAD.encode(public_key.y),
+        sign_count: auth_data.sign_count,
+    })
+}
+
+fn validate_passkey_authentication_response(
+    config: &ZerothServerConfig,
+    body: &PasskeyAuthenticateVerifyRequest,
+    credential: &PasskeyCredentialRow,
+    challenge: &PasskeyChallengeRow,
+) -> Result<(), String> {
+    let raw_id = passkey_raw_id(&body.raw_id)?;
+    if passkey_raw_id(&body.id)? != raw_id || raw_id != credential.credential_id {
+        return Err("passkey credential id did not match".to_owned());
+    }
+    let client_data =
+        validate_passkey_client_data(config, &body.response.client_data_json, "webauthn.get")?;
+    let challenge_value = passkey_challenge_from_browser(&client_data.challenge)?;
+    if hash_secret(&challenge_value) != challenge.challenge_hash {
+        return Err("passkey challenge did not match".to_owned());
+    }
+    let authenticator_data_bytes = decode_base64url(&body.response.authenticator_data)?;
+    let auth_data = parse_passkey_authenticator_data(&authenticator_data_bytes)?;
+    validate_passkey_authenticator_data(config, &auth_data, false)?;
+    validate_passkey_sign_count(credential.sign_count, auth_data.sign_count)?;
+    let client_data_bytes = decode_base64url(&body.response.client_data_json)?;
+    let mut signed_data = authenticator_data_bytes;
+    signed_data.extend_from_slice(&Sha256::digest(&client_data_bytes));
+    let signature = decode_base64url(&body.response.signature)?;
+    verify_passkey_es256_signature(credential, &signed_data, &signature)
+}
+
+fn validate_passkey_authenticator_data(
+    config: &ZerothServerConfig,
+    auth_data: &ParsedAuthenticatorData,
+    require_attested_credential: bool,
+) -> Result<(), String> {
+    let rp_id = passkey_rp_id(config)?;
+    let expected_hash = Sha256::digest(rp_id.as_bytes()).to_vec();
+    if auth_data.rp_id_hash != expected_hash {
+        return Err("passkey relying-party id hash did not match".to_owned());
+    }
+    if auth_data.flags & 0x01 == 0 {
+        return Err("passkey user-present flag was not set".to_owned());
+    }
+    if auth_data.flags & 0x04 == 0 {
+        return Err("passkey user-verified flag was not set".to_owned());
+    }
+    if require_attested_credential && auth_data.flags & 0x40 == 0 {
+        return Err("passkey attested-credential flag was not set".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_passkey_sign_count(stored: i32, incoming: i32) -> Result<(), String> {
+    if stored > 0 && incoming > 0 && incoming <= stored {
+        return Err("passkey sign counter did not increase".to_owned());
+    }
+    Ok(())
+}
+
+fn verify_passkey_es256_signature(
+    credential: &PasskeyCredentialRow,
+    signed_data: &[u8],
+    signature: &[u8],
+) -> Result<(), String> {
+    let x = decode_base64url(&credential.public_key_x)?;
+    let y = decode_base64url(&credential.public_key_y)?;
+    if x.len() != 32 || y.len() != 32 {
+        return Err("stored passkey public key is not P-256".to_owned());
+    }
+    let mut sec1 = Vec::with_capacity(65);
+    sec1.push(0x04);
+    sec1.extend_from_slice(&x);
+    sec1.extend_from_slice(&y);
+    let verifying_key = VerifyingKey::from_sec1_bytes(&sec1)
+        .map_err(|error| format!("invalid passkey public key: {error}"))?;
+    let signature = Signature::from_der(signature)
+        .map_err(|error| format!("invalid passkey signature: {error}"))?;
+    verifying_key
+        .verify(signed_data, &signature)
+        .map_err(|_| "passkey signature did not verify".to_owned())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn passkey_authenticator_sign_count(authenticator_data: &str) -> worker::Result<i32> {
+    let authenticator_data = decode_base64url(authenticator_data).map_err(worker_error)?;
+    parse_passkey_authenticator_data(&authenticator_data)
+        .map(|data| data.sign_count)
+        .map_err(worker_error)
+}
+
+fn passkey_raw_id(value: &str) -> Result<String, String> {
+    decode_base64url(value).map(|bytes| URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn decode_base64url(value: &str) -> Result<Vec<u8>, String> {
+    URL_SAFE_NO_PAD
+        .decode(value)
+        .or_else(|_| URL_SAFE.decode(value))
+        .map_err(|error| format!("invalid base64url value: {error}"))
+}
+
+fn parse_passkey_attestation_object(bytes: &[u8]) -> Result<ParsedAuthenticatorData, String> {
+    let value = CborReader::new(bytes).read_single()?;
+    let CborValue::Map(entries) = value else {
+        return Err("passkey attestationObject must be a CBOR map".to_owned());
+    };
+    let auth_data = cbor_map_text_bytes(&entries, "authData")
+        .ok_or_else(|| "passkey attestationObject is missing authData".to_owned())?;
+    parse_passkey_authenticator_data(auth_data)
+}
+
+fn parse_passkey_authenticator_data(bytes: &[u8]) -> Result<ParsedAuthenticatorData, String> {
+    if bytes.len() < 37 {
+        return Err("passkey authenticatorData is too short".to_owned());
+    }
+    let rp_id_hash = bytes[0..32].to_vec();
+    let flags = bytes[32];
+    let sign_count = i32::from_be_bytes([bytes[33], bytes[34], bytes[35], bytes[36]]);
+    let mut credential_id = None;
+    let mut public_key = None;
+
+    if flags & 0x40 != 0 {
+        if bytes.len() < 55 {
+            return Err("passkey attested credential data is too short".to_owned());
+        }
+        let credential_id_len = u16::from_be_bytes([bytes[53], bytes[54]]) as usize;
+        let credential_start = 55;
+        let credential_end = credential_start + credential_id_len;
+        if bytes.len() <= credential_end {
+            return Err("passkey credential public key is missing".to_owned());
+        }
+        credential_id = Some(bytes[credential_start..credential_end].to_vec());
+        public_key = Some(parse_passkey_cose_public_key(&bytes[credential_end..])?);
+    }
+
+    Ok(ParsedAuthenticatorData {
+        rp_id_hash,
+        flags,
+        sign_count,
+        credential_id,
+        public_key,
+    })
+}
+
+fn parse_passkey_cose_public_key(bytes: &[u8]) -> Result<PasskeyCredentialPublicKey, String> {
+    let value = CborReader::new(bytes).read_single()?;
+    let CborValue::Map(entries) = value else {
+        return Err("passkey public key must be a COSE_Key map".to_owned());
+    };
+    if cbor_map_int_i64(&entries, 1) != Some(2) {
+        return Err("passkey public key must be EC2".to_owned());
+    }
+    if cbor_map_int_i64(&entries, 3) != Some(-7) {
+        return Err("passkey public key must use ES256".to_owned());
+    }
+    if cbor_map_int_i64(&entries, -1) != Some(1) {
+        return Err("passkey public key must use P-256".to_owned());
+    }
+    let x = cbor_map_int_bytes(&entries, -2)
+        .ok_or_else(|| "passkey public key is missing x coordinate".to_owned())?
+        .to_vec();
+    let y = cbor_map_int_bytes(&entries, -3)
+        .ok_or_else(|| "passkey public key is missing y coordinate".to_owned())?
+        .to_vec();
+    if x.len() != 32 || y.len() != 32 {
+        return Err("passkey public key coordinates must be 32 bytes".to_owned());
+    }
+    Ok(PasskeyCredentialPublicKey { x, y })
+}
+
+fn cbor_map_text_bytes<'a>(entries: &'a [(CborValue, CborValue)], key: &str) -> Option<&'a [u8]> {
+    entries
+        .iter()
+        .find_map(|(entry_key, value)| match (entry_key, value) {
+            (CborValue::Text(entry_key), CborValue::Bytes(value)) if entry_key == key => {
+                Some(value.as_slice())
+            }
+            _ => None,
+        })
+}
+
+fn cbor_map_int_i64(entries: &[(CborValue, CborValue)], key: i64) -> Option<i64> {
+    entries.iter().find_map(|(entry_key, value)| {
+        if cbor_int(entry_key)? != key {
+            return None;
+        }
+        cbor_int(value)
+    })
+}
+
+fn cbor_map_int_bytes<'a>(entries: &'a [(CborValue, CborValue)], key: i64) -> Option<&'a [u8]> {
+    entries.iter().find_map(|(entry_key, value)| {
+        if cbor_int(entry_key)? != key {
+            return None;
+        }
+        match value {
+            CborValue::Bytes(bytes) => Some(bytes.as_slice()),
+            _ => None,
+        }
+    })
+}
+
+fn cbor_int(value: &CborValue) -> Option<i64> {
+    match value {
+        CborValue::Unsigned(value) => i64::try_from(*value).ok(),
+        CborValue::Negative(value) => Some(*value),
+        _ => None,
+    }
+}
+
+struct CborReader<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> CborReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn read_single(mut self) -> Result<CborValue, String> {
+        let value = self.read_value()?;
+        if self.offset != self.bytes.len() {
+            return Err("CBOR value had trailing bytes".to_owned());
+        }
+        Ok(value)
+    }
+
+    fn read_value(&mut self) -> Result<CborValue, String> {
+        let initial = self.read_u8()?;
+        let major = initial >> 5;
+        let additional = initial & 0x1f;
+        match major {
+            0 => Ok(CborValue::Unsigned(self.read_len(additional)?)),
+            1 => {
+                let value = self.read_len(additional)?;
+                let value = i64::try_from(value)
+                    .map_err(|_| "CBOR negative integer is too large".to_owned())?;
+                Ok(CborValue::Negative(-1 - value))
+            }
+            2 => {
+                let len = self.read_len_usize(additional)?;
+                Ok(CborValue::Bytes(self.read_exact(len)?.to_vec()))
+            }
+            3 => {
+                let len = self.read_len_usize(additional)?;
+                let bytes = self.read_exact(len)?;
+                let text = std::str::from_utf8(bytes)
+                    .map_err(|error| format!("CBOR text was not UTF-8: {error}"))?;
+                Ok(CborValue::Text(text.to_owned()))
+            }
+            4 => {
+                let len = self.read_len_usize(additional)?;
+                let mut values = Vec::with_capacity(len);
+                for _ in 0..len {
+                    values.push(self.read_value()?);
+                }
+                Ok(CborValue::Array(values))
+            }
+            5 => {
+                let len = self.read_len_usize(additional)?;
+                let mut entries = Vec::with_capacity(len);
+                for _ in 0..len {
+                    let key = self.read_value()?;
+                    let value = self.read_value()?;
+                    entries.push((key, value));
+                }
+                Ok(CborValue::Map(entries))
+            }
+            7 => match additional {
+                20 => Ok(CborValue::Bool(false)),
+                21 => Ok(CborValue::Bool(true)),
+                22 => Ok(CborValue::Null),
+                _ => Err("unsupported CBOR simple value".to_owned()),
+            },
+            _ => Err("unsupported CBOR major type".to_owned()),
+        }
+    }
+
+    fn read_len_usize(&mut self, additional: u8) -> Result<usize, String> {
+        let len = self.read_len(additional)?;
+        usize::try_from(len).map_err(|_| "CBOR length is too large".to_owned())
+    }
+
+    fn read_len(&mut self, additional: u8) -> Result<u64, String> {
+        match additional {
+            value @ 0..=23 => Ok(u64::from(value)),
+            24 => Ok(u64::from(self.read_u8()?)),
+            25 => Ok(u64::from(u16::from_be_bytes(self.read_array()?))),
+            26 => Ok(u64::from(u32::from_be_bytes(self.read_array()?))),
+            27 => Ok(u64::from_be_bytes(self.read_array()?)),
+            _ => Err("indefinite or reserved CBOR length is not supported".to_owned()),
+        }
+    }
+
+    fn read_u8(&mut self) -> Result<u8, String> {
+        let Some(byte) = self.bytes.get(self.offset).copied() else {
+            return Err("unexpected end of CBOR data".to_owned());
+        };
+        self.offset += 1;
+        Ok(byte)
+    }
+
+    fn read_array<const N: usize>(&mut self) -> Result<[u8; N], String> {
+        let bytes = self.read_exact(N)?;
+        let mut out = [0u8; N];
+        out.copy_from_slice(bytes);
+        Ok(out)
+    }
+
+    fn read_exact(&mut self, len: usize) -> Result<&'a [u8], String> {
+        let end = self
+            .offset
+            .checked_add(len)
+            .ok_or_else(|| "CBOR length overflow".to_owned())?;
+        if end > self.bytes.len() {
+            return Err("unexpected end of CBOR data".to_owned());
+        }
+        let slice = &self.bytes[self.offset..end];
+        self.offset = end;
+        Ok(slice)
     }
 }
 
@@ -7297,6 +12498,30 @@ fn cors_path(path: &str) -> bool {
             | "/profile"
             | "/identities/link"
             | "/identities"
+            | "/passkeys/register/options"
+            | "/passkeys/registration/options"
+            | "/passkeys/register/verify"
+            | "/passkeys/register/finish"
+            | "/passkeys/registration/finish"
+            | "/passkeys/authenticate/options"
+            | "/passkeys/authentication/options"
+            | "/passkeys/login/options"
+            | "/passkeys/authenticate/verify"
+            | "/passkeys/authenticate/finish"
+            | "/passkeys/authentication/finish"
+            | "/passkeys/login/verify"
+            | "/passkeys/login/finish"
+            | "/password/register"
+            | "/password/login"
+            | "/magic-links"
+            | "/magic-link"
+            | "/magic_link"
+            | "/magic-links/request"
+            | "/magic-link/request"
+            | "/magic_link/request"
+            | "/magic-links/consume"
+            | "/magic-link/consume"
+            | "/magic_link/consume"
             | "/validate"
             | "/logout"
     )
@@ -7309,6 +12534,30 @@ fn cors_method_allowed(path: &str, method: &str) -> bool {
         "/profile" => method == "GET" || method == "PATCH",
         "/identities/link" => method == "GET",
         "/identities" => method == "GET" || method == "DELETE",
+        "/passkeys/register/options"
+        | "/passkeys/registration/options"
+        | "/passkeys/register/verify"
+        | "/passkeys/register/finish"
+        | "/passkeys/registration/finish"
+        | "/passkeys/authenticate/options"
+        | "/passkeys/authentication/options"
+        | "/passkeys/login/options"
+        | "/passkeys/authenticate/verify"
+        | "/passkeys/authenticate/finish"
+        | "/passkeys/authentication/finish"
+        | "/passkeys/login/verify"
+        | "/passkeys/login/finish" => method == "POST",
+        "/password/register" => method == "POST",
+        "/password/login" => method == "POST",
+        "/magic-links"
+        | "/magic-link"
+        | "/magic_link"
+        | "/magic-links/request"
+        | "/magic-link/request"
+        | "/magic_link/request" => method == "POST",
+        "/magic-links/consume" | "/magic-link/consume" | "/magic_link/consume" => {
+            method == "GET" || method == "POST"
+        }
         "/sessions" => method == "GET" || method == "DELETE",
         "/logout" => method == "GET" || method == "POST",
         _ => false,
@@ -7333,7 +12582,7 @@ fn authorization_request_may_reuse_session(
     session: &SessionRow,
     now: i32,
 ) -> bool {
-    request.prompt != AuthorizationPrompt::Login
+    request.prompt.allows_session_reuse()
         && authorization_request_session_is_fresh(request, session, now)
 }
 
@@ -7348,20 +12597,46 @@ fn authorization_request_session_is_fresh(
         .unwrap_or(true)
 }
 
-fn session_cookie(name: &str, value: &str, max_age_seconds: i32) -> String {
-    format!("{name}={value}; Path=/; Max-Age={max_age_seconds}; HttpOnly; Secure; SameSite=Lax")
+fn session_cookie(name: &str, value: &str, max_age_seconds: i32, domain: Option<&str>) -> String {
+    let domain = cookie_domain_attribute(domain);
+    format!(
+        "{name}={value}; Path=/; Max-Age={max_age_seconds};{domain} HttpOnly; Secure; SameSite=Lax"
+    )
 }
 
-fn clear_session_cookie(name: &str) -> String {
-    format!("{name}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax")
+fn clear_session_cookie(name: &str, domain: Option<&str>) -> String {
+    let domain = cookie_domain_attribute(domain);
+    format!("{name}=; Path=/; Max-Age=0;{domain} HttpOnly; Secure; SameSite=Lax")
 }
 
 fn transaction_cookie(name: &str, value: &str, max_age_seconds: i32) -> String {
-    format!("{name}={value}; Path=/oauth2/callback; Max-Age={max_age_seconds}; HttpOnly; Secure; SameSite=None")
+    format!("{name}={value}; Path=/; Max-Age={max_age_seconds}; HttpOnly; Secure; SameSite=None")
 }
 
 fn clear_transaction_cookie(name: &str) -> String {
-    format!("{name}=; Path=/oauth2/callback; Max-Age=0; HttpOnly; Secure; SameSite=None")
+    format!("{name}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=None")
+}
+
+fn cookie_domain_attribute(domain: Option<&str>) -> String {
+    let Some(domain) = domain.and_then(valid_cookie_domain) else {
+        return String::new();
+    };
+    format!(" Domain={domain};")
+}
+
+fn valid_cookie_domain(domain: &str) -> Option<&str> {
+    let domain = domain.trim();
+    if domain.is_empty() {
+        return None;
+    }
+    if domain
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+    {
+        Some(domain)
+    } else {
+        None
+    }
 }
 
 fn cookie_value(cookie_header: Option<&str>, name: &str) -> Option<String> {
@@ -7406,6 +12681,23 @@ impl TokenIssue {
             email_verified: None,
             name: None,
             picture: None,
+            roles: Vec::new(),
+        }
+    }
+
+    fn from_native_provider(client_id: &str, user_id: &str, scope: &str, auth_time: i32) -> Self {
+        Self {
+            client_id: client_id.to_owned(),
+            user_id: user_id.to_owned(),
+            session_id: None,
+            scope: scope.to_owned(),
+            auth_time: Some(auth_time),
+            nonce: None,
+            email: None,
+            email_verified: None,
+            name: None,
+            picture: None,
+            roles: Vec::new(),
         }
     }
 
@@ -7421,10 +12713,12 @@ impl TokenIssue {
             email_verified: None,
             name: None,
             picture: None,
+            roles: Vec::new(),
         }
     }
 
     fn with_user_claims(mut self, user: &UserTokenClaimsRow) -> Self {
+        self.roles = user_token_roles(user);
         if scope_contains(Some(&self.scope), "email") {
             self.email = user.primary_email.clone();
             self.email_verified = user
@@ -7438,6 +12732,14 @@ impl TokenIssue {
         }
         self
     }
+}
+
+fn user_token_roles(user: &UserTokenClaimsRow) -> Vec<String> {
+    let mut roles = vec!["user".to_owned()];
+    if user.admin_membership_active != 0 {
+        roles.push("admin".to_owned());
+    }
+    roles
 }
 
 fn sign_jwt<T: Serialize>(signing_key: &Es256SigningKey, claims: &T) -> Result<String, String> {
@@ -7600,32 +12902,6 @@ fn decode_public_jwk_coordinate(
         })
 }
 
-fn es256_verification_keys_from_jwks(
-    jwks: &JwksResponse,
-) -> Result<Vec<Es256VerificationKey>, String> {
-    let mut keys = Vec::with_capacity(jwks.keys.len());
-    for key in &jwks.keys {
-        keys.push(es256_verification_key_from_jwk(key)?);
-    }
-    Ok(keys)
-}
-
-fn es256_verification_key_from_jwk(key: &JwkKey) -> Result<Es256VerificationKey, String> {
-    validate_es256_public_jwk(key, "ES256 public JWK")?;
-    let x = decode_public_jwk_coordinate(&key.x, "x", "ES256 public JWK")?;
-    let y = decode_public_jwk_coordinate(&key.y, "y", "ES256 public JWK")?;
-    let mut point = Vec::with_capacity(65);
-    point.push(0x04);
-    point.extend_from_slice(&x);
-    point.extend_from_slice(&y);
-    let verifying_key = VerifyingKey::from_sec1_bytes(&point)
-        .map_err(|error| format!("invalid ES256 public key {}: {error}", key.kid))?;
-    Ok(Es256VerificationKey {
-        kid: key.kid.clone(),
-        verifying_key,
-    })
-}
-
 #[cfg(target_arch = "wasm32")]
 fn signing_key_from_env(env: &Env) -> worker::Result<Es256SigningKey> {
     Ok(signing_material_from_env(env)?.signing_key)
@@ -7654,13 +12930,11 @@ fn signing_material_from_env(env: &Env) -> worker::Result<CachedSigningMaterial>
             es256_signing_key_from_config(kid.clone(), &private_key).map_err(worker_error)?;
         let jwks =
             jwks_response(&signing_key, previous_public_jwks.as_deref()).map_err(worker_error)?;
-        let verification_keys = es256_verification_keys_from_jwks(&jwks).map_err(worker_error)?;
         let material = CachedSigningMaterial {
             kid,
             private_key,
             previous_public_jwks,
             signing_key,
-            verification_keys,
             jwks,
         };
         *cache.borrow_mut() = Some(material.clone());
@@ -7742,7 +13016,11 @@ fn discovery_response(config: &ZerothServerConfig) -> DiscoveryResponse {
         response_types_supported: vec!["code"],
         response_modes_supported: vec!["query"],
         prompt_values_supported: vec!["none", "login", "consent", "select_account"],
-        grant_types_supported: vec!["authorization_code", "refresh_token"],
+        grant_types_supported: vec![
+            "authorization_code",
+            "refresh_token",
+            TOKEN_EXCHANGE_GRANT_TYPE,
+        ],
         scopes_supported: vec!["openid", "profile", "email", "offline_access"],
         code_challenge_methods_supported: vec!["S256"],
         token_endpoint_auth_methods_supported: vec![
@@ -7774,6 +13052,7 @@ fn discovery_response(config: &ZerothServerConfig) -> DiscoveryResponse {
             "email_verified",
             "name",
             "picture",
+            "roles",
         ],
         authorization_response_iss_parameter_supported: true,
     }
@@ -7800,6 +13079,10 @@ fn client_from_row(row: ClientRow) -> Result<Option<Client>, String> {
             &row.allowed_origins_json,
             "allowed_origins_json",
         )?,
+        allowed_email_domains: parse_string_array_json(
+            &row.allowed_email_domains_json,
+            "allowed_email_domains_json",
+        )?,
         confidential: row.confidential != 0,
     }))
 }
@@ -7816,6 +13099,8 @@ fn server_config(env: &Env, request_url: &url::Url) -> ZerothServerConfig {
             .unwrap_or_else(|| request_url.origin().ascii_serialization()),
         cookie_name: env_string(env, "SESSION_COOKIE_NAME")
             .unwrap_or_else(|| ZerothServerConfig::default().cookie_name),
+        cookie_domain: env_string(env, "SESSION_COOKIE_DOMAIN")
+            .and_then(|value| valid_cookie_domain(&value).map(str::to_owned)),
         transaction_cookie_name: env_string(env, "TX_COOKIE_NAME")
             .unwrap_or_else(|| ZerothServerConfig::default().transaction_cookie_name),
     }
@@ -7845,6 +13130,20 @@ fn is_supported_provider_id(provider_id: &str) -> bool {
         provider_id,
         well_known::APPLE | well_known::GOOGLE | well_known::SPOTIFY
     )
+}
+
+fn provider_authorize_nonce(transaction: &AuthTransaction) -> Option<&str> {
+    if !provider_uses_oidc_nonce(&transaction.provider_id.0) {
+        return None;
+    }
+    transaction
+        .provider_nonce
+        .as_deref()
+        .or(transaction.nonce.as_deref())
+}
+
+fn provider_uses_oidc_nonce(provider_id: &str) -> bool {
+    matches!(provider_id, well_known::APPLE | well_known::GOOGLE)
 }
 
 fn authorization_login_request_present(url: &url::Url) -> bool {
@@ -8082,8 +13381,9 @@ fn request_header(request: &Request, name: &str) -> worker::Result<Option<String
 
 #[cfg(target_arch = "wasm32")]
 fn with_set_cookie(response: Response, cookie: &str) -> worker::Result<Response> {
-    response.headers().append("Set-Cookie", cookie)?;
-    Ok(response)
+    let headers = response.headers().clone();
+    headers.append("Set-Cookie", cookie)?;
+    Ok(response.with_headers(headers))
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -8140,8 +13440,21 @@ async fn validate_admin_request(
     config: &ZerothServerConfig,
     now: i32,
 ) -> Result<(), ClientManagementError> {
+    authorize_admin_request(request, env, db, config, now)
+        .await
+        .map(|_| ())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn authorize_admin_request(
+    request: &Request,
+    env: &Env,
+    db: &worker::d1::D1Database,
+    config: &ZerothServerConfig,
+    now: i32,
+) -> Result<AdminAuthorization, ClientManagementError> {
     if validate_admin_bearer_request(request, env).is_ok() {
-        return Ok(());
+        return Ok(AdminAuthorization::BootstrapToken);
     }
 
     let Some(current) = current_session_from_request(request, db, config, now)
@@ -8167,8 +13480,18 @@ async fn validate_admin_request(
         ));
     };
 
-    if admin_user_allowed(env, &admin_user) {
-        Ok(())
+    if admin_user_allowed(env, &admin_user)
+        || user_has_active_admin_membership(db, &admin_user.id)
+            .await
+            .map_err(|error| {
+                ClientManagementError::server_error(format!(
+                    "could not load admin membership: {error}"
+                ))
+            })?
+    {
+        Ok(AdminAuthorization::Session {
+            user_id: current.user.id,
+        })
     } else {
         Err(ClientManagementError::unauthorized(
             "admin session user is not allowlisted",
@@ -8215,6 +13538,13 @@ fn admin_identity_allowed(
 ) -> bool {
     token_list_contains(allowed_user_ids, user_id, false)
         || verified_email.is_some_and(|email| token_list_contains(allowed_emails, email, true))
+}
+
+fn admin_authorization_granted_by(authorization: &AdminAuthorization) -> String {
+    match authorization {
+        AdminAuthorization::BootstrapToken => "bootstrap_token".to_owned(),
+        AdminAuthorization::Session { user_id } => format!("user:{user_id}"),
+    }
 }
 
 fn token_list_contains(values: Option<&str>, needle: &str, ascii_case_insensitive: bool) -> bool {
@@ -8284,14 +13614,6 @@ fn auth_error_json(error: &AuthorizationRequestError, status: u16) -> worker::Re
 #[cfg(target_arch = "wasm32")]
 fn provider_callback_error_json(
     error: &ProviderCallbackError,
-    status: u16,
-) -> worker::Result<Response> {
-    oauth_error_json(&error.code, &error.description, status)
-}
-
-#[cfg(target_arch = "wasm32")]
-fn provider_token_exchange_error_json(
-    error: &ProviderTokenExchangeError,
     status: u16,
 ) -> worker::Result<Response> {
     oauth_error_json(&error.code, &error.description, status)
@@ -8434,11 +13756,12 @@ async fn resolve_provider_profile(
     provider: &OAuthProvider,
     token_set: &ProviderTokenSet,
     transaction: &AuthTransaction,
+    callback: &ProviderCallback,
 ) -> Result<ResolvedProviderProfile, ProviderProfileError> {
     match provider.id().0.as_str() {
         well_known::SPOTIFY => fetch_spotify_profile(provider, token_set).await,
         well_known::APPLE | well_known::GOOGLE => {
-            resolve_oidc_provider_profile(provider, token_set, transaction).await
+            resolve_oidc_provider_profile(provider, token_set, transaction, callback).await
         }
         provider_id => Err(ProviderProfileError::invalid_response(format!(
             "unsupported provider profile source: {provider_id}"
@@ -8451,6 +13774,7 @@ async fn resolve_oidc_provider_profile(
     provider: &OAuthProvider,
     token_set: &ProviderTokenSet,
     transaction: &AuthTransaction,
+    callback: &ProviderCallback,
 ) -> Result<ResolvedProviderProfile, ProviderProfileError> {
     let id_token = token_set
         .id_token
@@ -8464,17 +13788,37 @@ async fn resolve_oidc_provider_profile(
         ProviderIdTokenValidation {
             provider_id: &provider.id().0,
             client_id: &provider.config().client_id,
-            nonce: transaction.nonce.as_deref(),
+            nonce: provider_authorize_nonce(transaction),
             now,
         },
     )
     .await?;
     let claims = verified.claims;
+    let apple_user = if provider.id().0 == well_known::APPLE {
+        callback
+            .apple_user_json
+            .as_deref()
+            .map(apple_callback_user_from_json)
+            .transpose()?
+    } else {
+        None
+    };
+    let display_name = claims.name.or_else(|| {
+        apple_user
+            .as_ref()
+            .and_then(apple_callback_user_display_name)
+    });
+    let raw_profile_json = merge_oidc_raw_profile_json(
+        &verified.raw_claims_json,
+        apple_user
+            .as_ref()
+            .and_then(|_| callback.apple_user_json.as_deref()),
+    );
     let source = ProviderProfileSource::OidcClaims {
         sub: claims.sub,
         email: claims.email,
         email_verified: boolish_claim(claims.email_verified.as_ref()).unwrap_or(false),
-        name: claims.name,
+        name: display_name,
         picture: claims.picture,
     };
     let profile = provider
@@ -8486,8 +13830,40 @@ async fn resolve_oidc_provider_profile(
 
     Ok(ResolvedProviderProfile {
         profile,
-        raw_profile_json: Some(verified.raw_claims_json),
+        raw_profile_json,
     })
+}
+
+fn apple_callback_user_from_json(value: &str) -> Result<AppleCallbackUser, ProviderProfileError> {
+    serde_json::from_str(value).map_err(|error| {
+        ProviderProfileError::invalid_response(format!("invalid Apple callback user JSON: {error}"))
+    })
+}
+
+fn apple_callback_user_display_name(user: &AppleCallbackUser) -> Option<String> {
+    let name = user.name.as_ref()?;
+    let first = name.first_name.as_deref().map(str::trim).unwrap_or("");
+    let last = name.last_name.as_deref().map(str::trim).unwrap_or("");
+    let display_name = match (first.is_empty(), last.is_empty()) {
+        (false, false) => format!("{first} {last}"),
+        (false, true) => first.to_owned(),
+        (true, false) => last.to_owned(),
+        (true, true) => String::new(),
+    };
+    (!display_name.is_empty()).then_some(display_name)
+}
+
+fn merge_oidc_raw_profile_json(claims_json: &str, apple_user_json: Option<&str>) -> Option<String> {
+    let Some(apple_user_json) = apple_user_json else {
+        return Some(claims_json.to_owned());
+    };
+    let claims = serde_json::from_str::<serde_json::Value>(claims_json).ok()?;
+    let apple_user = serde_json::from_str::<serde_json::Value>(apple_user_json).ok()?;
+    serde_json::to_string(&serde_json::json!({
+        "id_token_claims": claims,
+        "apple_user": apple_user,
+    }))
+    .ok()
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -8908,6 +14284,14 @@ fn boolish_claim(value: Option<&serde_json::Value>) -> Option<bool> {
     }
 }
 
+fn deserialize_default_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<Vec<T>>::deserialize(deserializer).map(Option::unwrap_or_default)
+}
+
 #[cfg(target_arch = "wasm32")]
 async fn fetch_spotify_profile(
     provider: &OAuthProvider,
@@ -8941,17 +14325,21 @@ async fn fetch_spotify_profile(
         .await
         .map_err(ProviderProfileError::worker)?;
     let status = response.status_code();
-    let spotify_profile = response
-        .json::<SpotifyApiProfile>()
+    let raw_profile_json = response
+        .text()
         .await
         .map_err(ProviderProfileError::worker)?;
     if !(200..300).contains(&status) {
         return Err(ProviderProfileError::invalid_response(format!(
-            "Spotify profile endpoint returned HTTP {status}"
+            "Spotify profile endpoint returned HTTP {status}: {}",
+            response_body_excerpt(&raw_profile_json)
         )));
     }
 
-    let raw_profile_json = serde_json::to_string(&spotify_profile).ok();
+    let spotify_profile =
+        serde_json::from_str::<SpotifyApiProfile>(&raw_profile_json).map_err(|error| {
+            ProviderProfileError::invalid_response(format!("invalid Spotify profile JSON: {error}"))
+        })?;
     let source = spotify_profile_source(spotify_profile)?;
     let profile = provider
         .normalize_profile(source)
@@ -8962,29 +14350,52 @@ async fn fetch_spotify_profile(
 
     Ok(ResolvedProviderProfile {
         profile,
-        raw_profile_json,
+        raw_profile_json: Some(raw_profile_json),
     })
 }
 
 fn spotify_profile_source(
     profile: SpotifyApiProfile,
 ) -> Result<ProviderProfileSource, ProviderProfileError> {
-    if profile.id.is_empty() {
-        return Err(ProviderProfileError::invalid_response(
-            "Spotify profile did not include an id",
-        ));
-    }
+    let subject = spotify_profile_subject(&profile)?;
 
     Ok(ProviderProfileSource::SpotifyProfile {
-        id: profile.id,
+        id: subject,
         email: profile.email,
         display_name: profile.display_name,
         image_url: spotify_profile_image_url(&profile.images),
     })
 }
 
+fn spotify_profile_subject(profile: &SpotifyApiProfile) -> Result<String, ProviderProfileError> {
+    profile
+        .account_id
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .or_else(|| (!profile.id.is_empty()).then_some(profile.id.as_str()))
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            ProviderProfileError::invalid_response(
+                "Spotify profile did not include an account_id or id",
+            )
+        })
+}
+
 fn spotify_profile_image_url(images: &[SpotifyApiImage]) -> Option<String> {
     images.iter().find_map(|image| image.url.clone())
+}
+
+fn response_body_excerpt(body: &str) -> String {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return "empty response body".to_owned();
+    }
+    let excerpt = trimmed.chars().take(512).collect::<String>();
+    if trimmed.chars().count() > 512 {
+        format!("{excerpt}...")
+    } else {
+        excerpt
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -9088,6 +14499,37 @@ impl ProviderCallbackError {
             code: "invalid_request".to_owned(),
             description: description.into(),
         }
+    }
+
+    fn access_denied(description: impl Into<String>) -> Self {
+        Self {
+            code: "access_denied".to_owned(),
+            description: description.into(),
+        }
+    }
+}
+
+fn provider_callback_error_from_token_exchange_error(
+    error: &ProviderTokenExchangeError,
+) -> ProviderCallbackError {
+    ProviderCallbackError {
+        code: "temporarily_unavailable".to_owned(),
+        description: format!(
+            "provider token exchange failed ({}): {}",
+            error.code, error.description
+        ),
+    }
+}
+
+fn provider_callback_error_from_profile_error(
+    error: &ProviderProfileError,
+) -> ProviderCallbackError {
+    ProviderCallbackError {
+        code: "temporarily_unavailable".to_owned(),
+        description: format!(
+            "provider profile lookup failed ({}): {}",
+            error.code, error.description
+        ),
     }
 }
 
@@ -9432,6 +14874,148 @@ mod tests {
     }
 
     #[test]
+    fn provider_status_enabled_requires_not_disabled() {
+        assert!(provider_status_enabled(true, true, false));
+        assert!(!provider_status_enabled(true, true, true));
+        assert!(!provider_status_enabled(true, false, false));
+        assert!(!provider_status_enabled(false, true, false));
+    }
+
+    #[test]
+    fn spotify_disabled_status_includes_activation_requirements() {
+        assert_eq!(
+            provider_disabled_notes(well_known::SPOTIFY),
+            vec![
+                "spotify_development_mode_owner_premium_required",
+                "spotify_development_mode_users_must_be_allowlisted",
+            ]
+        );
+        assert_eq!(
+            provider_activation_requirements(well_known::SPOTIFY, true),
+            vec![
+                "Spotify app owner account has Premium while the app is in development mode",
+                "Spotify test login user is allowlisted in the Spotify app Users Management tab",
+                "Spotify current-user profile endpoint /v1/me returns HTTP 200 for an authorized user",
+            ]
+        );
+        assert!(provider_activation_requirements(well_known::SPOTIFY, false).is_empty());
+        assert!(provider_activation_requirements(well_known::GOOGLE, true).is_empty());
+    }
+
+    #[test]
+    fn provider_failure_status_summarizes_latest_safe_details_per_provider() {
+        let long_description = "Spotify profile endpoint returned HTTP 403: ".to_owned()
+            + &"premium subscription required ".repeat(20);
+        let rows = vec![
+            ProviderFailureEventRow {
+                provider_id: well_known::SPOTIFY.to_owned(),
+                event_type: "provider.profile.failed".to_owned(),
+                created_at: 1_780_000_400,
+                details_json: serde_json::json!({
+                    "code": "invalid_response",
+                    "description": long_description,
+                    "accessToken": "must-not-appear"
+                })
+                .to_string(),
+            },
+            ProviderFailureEventRow {
+                provider_id: well_known::SPOTIFY.to_owned(),
+                event_type: "provider.token_exchange.failed".to_owned(),
+                created_at: 1_780_000_300,
+                details_json: serde_json::json!({
+                    "code": "invalid_grant",
+                    "description": "older failure"
+                })
+                .to_string(),
+            },
+            ProviderFailureEventRow {
+                provider_id: well_known::GOOGLE.to_owned(),
+                event_type: "provider.token_exchange.failed".to_owned(),
+                created_at: 1_780_000_200,
+                details_json: serde_json::json!({
+                    "error": "invalid_client",
+                    "error_description": "bad client secret"
+                })
+                .to_string(),
+            },
+        ];
+
+        let failures = provider_failure_statuses_from_events(&rows);
+
+        assert_eq!(failures.len(), 2);
+        assert_eq!(failures[0].0, well_known::SPOTIFY);
+        assert_eq!(failures[0].1.event_type, "provider.profile.failed");
+        assert_eq!(failures[0].1.created_at, 1_780_000_400);
+        assert_eq!(failures[0].1.code.as_deref(), Some("invalid_response"));
+        let description = failures[0].1.description.as_deref().unwrap();
+        assert!(description.starts_with("Spotify profile endpoint returned HTTP 403"));
+        assert!(description.len() <= PROVIDER_FAILURE_DESCRIPTION_MAX_CHARS);
+        assert!(!description.contains("must-not-appear"));
+        assert_eq!(failures[1].0, well_known::GOOGLE);
+        assert_eq!(failures[1].1.code.as_deref(), Some("invalid_client"));
+        assert_eq!(
+            failures[1].1.description.as_deref(),
+            Some("bad client secret")
+        );
+    }
+
+    #[test]
+    fn apple_touch_icon_path_matches_common_browser_probes() {
+        for path in [
+            "/apple-touch-icon.png",
+            "/apple-touch-icon-precomposed.png",
+            "/apple-touch-icon-120x120.png",
+            "/apple-touch-icon-180x180-precomposed.png",
+        ] {
+            assert!(apple_touch_icon_path(path), "{path}");
+        }
+
+        for path in [
+            "/apple-touch-icon.svg",
+            "/apple-touch-icon-180.png",
+            "/apple-touch-icon-180x.png",
+            "/apple-touch-icon-bigx180.png",
+            "/assets/apple-touch-icon-180x180.png",
+        ] {
+            assert!(!apple_touch_icon_path(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn quiet_browser_asset_path_matches_common_browser_probes() {
+        for path in [
+            "/apple-touch-icon.png",
+            "/apple-touch-icon-120x120.png",
+            "/.well-known/appspecific/com.chrome.devtools.json",
+        ] {
+            assert!(quiet_browser_asset_path(path), "{path}");
+        }
+
+        for path in [
+            "/.well-known/openid-configuration",
+            "/favicon.ico",
+            "/assets/com.chrome.devtools.json",
+        ] {
+            assert!(!quiet_browser_asset_path(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn canonical_route_path_trims_trailing_slashes_without_touching_root() {
+        assert_eq!(canonical_route_path("/").as_ref(), "/");
+        assert_eq!(canonical_route_path("/admin").as_ref(), "/admin");
+        assert_eq!(canonical_route_path("/admin/").as_ref(), "/admin");
+        assert_eq!(
+            canonical_route_path("/magic-links//").as_ref(),
+            "/magic-links"
+        );
+        assert_eq!(
+            canonical_route_path("/.well-known/openid-configuration/").as_ref(),
+            "/.well-known/openid-configuration"
+        );
+    }
+
+    #[test]
     fn issuer_readiness_requires_https_url_with_host() {
         let ready = issuer_readiness(&ZerothServerConfig {
             public_base_url: "https://id.example.com".to_owned(),
@@ -9473,6 +15057,404 @@ mod tests {
         let array = apple_app_site_association_readiness_from_payload(Some("[]"));
         assert!(!array.configured);
         assert_eq!(array.notes, vec!["apple_app_site_association_not_object"]);
+    }
+
+    #[test]
+    fn local_auth_status_reports_magic_link_delivery_dependencies() {
+        let methods = local_auth_status_rows_from_config(
+            true,
+            magic_link_delivery_config_from_values(None, None, true, None, None, None),
+            false,
+            None,
+        );
+        let password = methods
+            .iter()
+            .find(|method| method.id == "password")
+            .unwrap();
+        assert!(password.enabled);
+        assert_eq!(password.credential_storage, "zeroth_local_credentials");
+        assert!(password.notes.is_empty());
+
+        let magic_link = methods
+            .iter()
+            .find(|method| method.id == "magic_link")
+            .unwrap();
+        assert!(magic_link.enabled);
+        assert_eq!(magic_link.delivery, "cloudflare_email");
+        assert!(magic_link
+            .notes
+            .contains(&"cloudflare_email_sending_must_be_enabled"));
+        assert!(magic_link.notes.contains(&"delivery_not_proven"));
+
+        let missing = local_auth_status_rows_from_config(
+            true,
+            magic_link_delivery_config_from_values(
+                None,
+                Some("missing_magic_link_from"),
+                false,
+                None,
+                None,
+                None,
+            ),
+            false,
+            None,
+        );
+        let missing_magic_link = missing
+            .iter()
+            .find(|method| method.id == "magic_link")
+            .unwrap();
+        assert!(!missing_magic_link.enabled);
+        assert!(missing_magic_link
+            .notes
+            .contains(&"missing_magic_link_from"));
+        assert!(missing_magic_link.notes.contains(&"missing_email_binding"));
+    }
+
+    #[test]
+    fn local_auth_status_reports_magic_link_webhook_delivery_dependencies() {
+        let methods = local_auth_status_rows_from_config(
+            true,
+            magic_link_delivery_config_from_values(
+                Some("webhook"),
+                None,
+                false,
+                magic_link_webhook_url_note(Some("https://mail.example.com/zeroth")),
+                None,
+                None,
+            ),
+            false,
+            None,
+        );
+        let magic_link = methods
+            .iter()
+            .find(|method| method.id == "magic_link")
+            .unwrap();
+        assert!(magic_link.enabled);
+        assert_eq!(magic_link.delivery, "webhook");
+        assert!(magic_link
+            .notes
+            .contains(&"magic_link_webhook_must_send_email"));
+        assert!(magic_link.notes.contains(&"delivery_not_proven"));
+        assert!(!magic_link.notes.contains(&"missing_email_binding"));
+
+        let missing_url = local_auth_status_rows_from_config(
+            true,
+            magic_link_delivery_config_from_values(
+                Some("webhook"),
+                None,
+                true,
+                magic_link_webhook_url_note(None),
+                None,
+                None,
+            ),
+            false,
+            None,
+        );
+        let missing_magic_link = missing_url
+            .iter()
+            .find(|method| method.id == "magic_link")
+            .unwrap();
+        assert!(!missing_magic_link.enabled);
+        assert!(missing_magic_link
+            .notes
+            .contains(&"missing_magic_link_webhook_url"));
+
+        let invalid_url = magic_link_delivery_config_from_values(
+            Some("webhook"),
+            None,
+            true,
+            magic_link_webhook_url_note(Some("http://mail.example.com/zeroth")),
+            None,
+            None,
+        );
+        assert!(!invalid_url.enabled);
+        assert!(invalid_url
+            .notes
+            .contains(&"invalid_magic_link_webhook_url"));
+
+        let unsupported =
+            magic_link_delivery_config_from_values(Some("postmark"), None, true, None, None, None);
+        assert!(!unsupported.enabled);
+        assert_eq!(unsupported.transport, "unsupported");
+        assert!(unsupported
+            .notes
+            .contains(&"unsupported_magic_link_delivery"));
+    }
+
+    #[test]
+    fn local_auth_status_reports_direct_email_provider_dependencies() {
+        let resend = local_auth_status_rows_from_config(
+            true,
+            magic_link_delivery_config_from_values(Some("resend"), None, false, None, None, None),
+            false,
+            None,
+        );
+        let magic_link = resend
+            .iter()
+            .find(|method| method.id == "magic_link")
+            .unwrap();
+        assert!(magic_link.enabled);
+        assert_eq!(magic_link.delivery, "resend");
+        assert!(magic_link.notes.contains(&"resend_domain_must_be_verified"));
+        assert!(magic_link.notes.contains(&"delivery_not_proven"));
+        assert!(!magic_link.notes.contains(&"missing_email_binding"));
+
+        let missing_resend = magic_link_delivery_config_from_values(
+            Some("resend"),
+            None,
+            false,
+            None,
+            Some("missing_resend_api_key"),
+            None,
+        );
+        assert!(!missing_resend.enabled);
+        assert_eq!(missing_resend.transport, "resend");
+        assert!(missing_resend.notes.contains(&"missing_resend_api_key"));
+
+        let mailchannels = local_auth_status_rows_from_config(
+            true,
+            magic_link_delivery_config_from_values(
+                Some("mailchannels"),
+                None,
+                false,
+                None,
+                None,
+                None,
+            ),
+            false,
+            None,
+        );
+        let magic_link = mailchannels
+            .iter()
+            .find(|method| method.id == "magic_link")
+            .unwrap();
+        assert!(magic_link.enabled);
+        assert_eq!(magic_link.delivery, "mailchannels");
+        assert!(magic_link
+            .notes
+            .contains(&"mailchannels_domain_lockdown_must_be_configured"));
+        assert!(magic_link.notes.contains(&"delivery_not_proven"));
+
+        let missing_mailchannels = magic_link_delivery_config_from_values(
+            Some("mail_channels"),
+            None,
+            false,
+            None,
+            None,
+            Some("missing_mailchannels_api_key"),
+        );
+        assert!(!missing_mailchannels.enabled);
+        assert_eq!(missing_mailchannels.transport, "mailchannels");
+        assert!(missing_mailchannels
+            .notes
+            .contains(&"missing_mailchannels_api_key"));
+    }
+
+    #[test]
+    fn local_auth_status_uses_magic_link_delivery_evidence() {
+        let delivery = LocalAuthDeliveryStatus {
+            last_issue_at: Some(20),
+            last_sent_at: Some(18),
+            last_failed_at: Some(20),
+            last_error: Some("email_internal_server_error".to_owned()),
+            last_error_detail: Some("email.sending.error.internal_server [code: 10002]".to_owned()),
+        };
+        let methods = local_auth_status_rows_from_config(
+            true,
+            magic_link_delivery_config_from_values(None, None, true, None, None, None),
+            false,
+            Some(delivery),
+        );
+        let magic_link = methods
+            .iter()
+            .find(|method| method.id == "magic_link")
+            .unwrap();
+
+        assert!(!magic_link.notes.contains(&"delivery_not_proven"));
+        assert!(magic_link.notes.contains(&"delivery_failed_recently"));
+        assert_eq!(
+            magic_link.delivery_status.as_ref().unwrap().last_error,
+            Some("email_internal_server_error".to_owned())
+        );
+        assert_eq!(
+            magic_link
+                .delivery_status
+                .as_ref()
+                .unwrap()
+                .last_error_detail,
+            Some("email.sending.error.internal_server [code: 10002]".to_owned())
+        );
+    }
+
+    #[test]
+    fn magic_link_delivery_status_summarizes_recent_audit_events() {
+        let rows = vec![
+            MagicLinkDeliveryEventRow {
+                event_type: "magic_link.email.failed".to_owned(),
+                created_at: 30,
+                details_json: r#"{"errorClass":"email_internal_server_error","errorDetail":"email.sending.error.internal_server [code: 10002]"}"#.to_owned(),
+            },
+            MagicLinkDeliveryEventRow {
+                event_type: "magic_link.issue".to_owned(),
+                created_at: 30,
+                details_json: r#"{"sent":false}"#.to_owned(),
+            },
+            MagicLinkDeliveryEventRow {
+                event_type: "magic_link.issue".to_owned(),
+                created_at: 20,
+                details_json: r#"{"sent":true}"#.to_owned(),
+            },
+        ];
+
+        let status = magic_link_delivery_status_from_events(&rows).unwrap();
+
+        assert_eq!(status.last_issue_at, Some(30));
+        assert_eq!(status.last_sent_at, Some(20));
+        assert_eq!(status.last_failed_at, Some(30));
+        assert_eq!(
+            status.last_error,
+            Some("email_internal_server_error".to_owned())
+        );
+        assert_eq!(
+            status.last_error_detail,
+            Some("email.sending.error.internal_server [code: 10002]".to_owned())
+        );
+    }
+
+    #[test]
+    fn magic_link_email_error_classification_is_safe() {
+        assert_eq!(
+            classify_magic_link_email_error("Unauthorized"),
+            "email_unauthorized"
+        );
+        assert_eq!(
+            classify_magic_link_email_error("invalid from address"),
+            "email_sender_rejected"
+        );
+        assert_eq!(
+            classify_magic_link_email_error("internal server error"),
+            "email_internal_server_error"
+        );
+        assert_eq!(
+            classify_magic_link_email_error("email_webhook_failed HTTP 500"),
+            "email_webhook_failed"
+        );
+        assert_eq!(
+            classify_magic_link_email_error("email_resend_failed HTTP 422"),
+            "email_resend_failed"
+        );
+        assert_eq!(
+            classify_magic_link_email_error("email_mailchannels_failed HTTP 403"),
+            "email_mailchannels_failed"
+        );
+        assert_eq!(classify_magic_link_email_error(""), "email_send_failed");
+    }
+
+    #[test]
+    fn magic_link_email_error_detail_is_bounded_and_single_line() {
+        assert_eq!(
+            sanitize_magic_link_email_error_detail("  first\nsecond\tthird  "),
+            Some("first second third".to_owned())
+        );
+        assert_eq!(
+            sanitize_magic_link_email_error_detail(
+                "failed for jamie@wavey.ai at https://id.wavey.ai/magic-links/consume?token=secret"
+            ),
+            Some("failed for [email] at [url]".to_owned())
+        );
+        assert_eq!(sanitize_magic_link_email_error_detail(" \n\t "), None);
+
+        let long = "x".repeat(MAGIC_LINK_EMAIL_ERROR_DETAIL_MAX_CHARS + 10);
+        let sanitized = sanitize_magic_link_email_error_detail(&long).unwrap();
+        assert_eq!(
+            sanitized.chars().count(),
+            MAGIC_LINK_EMAIL_ERROR_DETAIL_MAX_CHARS
+        );
+        assert!(sanitized.ends_with("..."));
+    }
+
+    #[test]
+    fn passkey_challenge_round_trips_through_browser_encoding() {
+        let challenge = "0123456789abcdef";
+        let encoded = passkey_challenge_for_browser(challenge);
+
+        assert_eq!(passkey_challenge_from_browser(&encoded).unwrap(), challenge);
+        assert!(passkey_challenge_matches_client_data(
+            &hash_secret(challenge),
+            &test_passkey_client_data("webauthn.get", challenge, "https://id.example.com")
+        ));
+    }
+
+    #[test]
+    fn passkey_registration_response_extracts_es256_credential() {
+        let config = ZerothServerConfig {
+            public_base_url: "https://id.example.com".to_owned(),
+            ..ZerothServerConfig::default()
+        };
+        let credential_id = b"credential-1";
+        let x = [3u8; 32];
+        let y = [7u8; 32];
+        let auth_data = test_passkey_authenticator_data(
+            "id.example.com",
+            0x45,
+            9,
+            credential_id,
+            &test_passkey_cose_key(&x, &y),
+        );
+        let body = PasskeyRegisterVerifyRequest {
+            id: URL_SAFE_NO_PAD.encode(credential_id),
+            raw_id: URL_SAFE_NO_PAD.encode(credential_id),
+            response: PasskeyRegisterCredentialResponse {
+                client_data_json: test_passkey_client_data(
+                    "webauthn.create",
+                    "challenge-1",
+                    "https://id.example.com",
+                ),
+                attestation_object: URL_SAFE_NO_PAD
+                    .encode(test_passkey_attestation_object(&auth_data)),
+                transports: Vec::new(),
+            },
+        };
+
+        let validated = validate_passkey_registration_response(&config, &body).unwrap();
+
+        assert_eq!(
+            validated.credential_id,
+            URL_SAFE_NO_PAD.encode(credential_id)
+        );
+        assert_eq!(validated.public_key_x, URL_SAFE_NO_PAD.encode(x));
+        assert_eq!(validated.public_key_y, URL_SAFE_NO_PAD.encode(y));
+        assert_eq!(validated.sign_count, 9);
+    }
+
+    #[test]
+    fn passkey_es256_signature_verifies_signed_authenticator_payload() {
+        let signing_key = SigningKey::from_slice(&[11u8; 32]).unwrap();
+        let verifying_key = signing_key.verifying_key();
+        let point = verifying_key.to_encoded_point(false);
+        let x = point.x().unwrap();
+        let y = point.y().unwrap();
+        let credential = PasskeyCredentialRow {
+            credential_id: "cred_1".to_owned(),
+            user_id: "usr_1".to_owned(),
+            label: None,
+            public_key_x: URL_SAFE_NO_PAD.encode(x),
+            public_key_y: URL_SAFE_NO_PAD.encode(y),
+            sign_count: 0,
+            created_at: 1,
+            updated_at: 1,
+            last_used_at: None,
+            disabled_at: None,
+        };
+        let signed_data = b"authenticator-data-and-client-data-hash";
+        let signature: Signature = signing_key.sign(signed_data);
+        let der = signature.to_der();
+
+        verify_passkey_es256_signature(&credential, signed_data, der.as_bytes()).unwrap();
+
+        let error =
+            verify_passkey_es256_signature(&credential, b"tampered", der.as_bytes()).unwrap_err();
+        assert_eq!(error, "passkey signature did not verify");
     }
 
     #[test]
@@ -9677,6 +15659,7 @@ mod tests {
             secret_hash: None,
             redirect_uris_json: r#"["wavey://auth/callback"]"#.to_owned(),
             allowed_origins_json: "[]".to_owned(),
+            allowed_email_domains_json: "[]".to_owned(),
             confidential: 0,
             disabled_at: None,
         })
@@ -9696,6 +15679,7 @@ mod tests {
             secret_hash: Some(format!("sha256:{}", hash_secret("web-secret"))),
             redirect_uris_json: r#"["https://app.example.com/callback"]"#.to_owned(),
             allowed_origins_json: "[]".to_owned(),
+            allowed_email_domains_json: "[]".to_owned(),
             confidential: 1,
             disabled_at: Some(1_780_000_000),
         })
@@ -9744,8 +15728,26 @@ mod tests {
             upsert.allowed_origins,
             vec!["https://app.example.com".to_owned()]
         );
+        assert_eq!(upsert.allowed_email_domains, Vec::<String>::new());
         assert!(!upsert.confidential);
         assert_eq!(upsert.secret_hash, None);
+    }
+
+    #[test]
+    fn client_upsert_accepts_normalized_allowed_email_domains() {
+        let upsert = client_upsert_from_value(serde_json::json!({
+            "id": "wavey-admin",
+            "name": "Wavey Admin",
+            "redirectUris": ["https://id.example.com/admin"],
+            "allowedEmailDomains": [" @Wavey.ai ", "wavey.ai", "example.com"],
+            "confidential": false
+        }))
+        .unwrap();
+
+        assert_eq!(
+            upsert.allowed_email_domains,
+            vec!["wavey.ai".to_owned(), "example.com".to_owned()]
+        );
     }
 
     #[test]
@@ -9824,6 +15826,70 @@ mod tests {
     }
 
     #[test]
+    fn client_upsert_rejects_invalid_allowed_email_domains() {
+        let error = client_upsert_from_value(serde_json::json!({
+            "id": "wavey-admin",
+            "name": "Wavey Admin",
+            "redirectUris": ["https://id.example.com/admin"],
+            "allowedEmailDomains": ["wavey"],
+            "confidential": false
+        }))
+        .unwrap_err();
+
+        assert_eq!(error.description, "allowed email domain must include a dot");
+    }
+
+    #[test]
+    fn client_email_domain_policy_requires_verified_allowed_domain() {
+        let client = Client {
+            id: ClientId("admin".to_owned()),
+            name: "Admin".to_owned(),
+            redirect_uris: vec!["https://id.example.com/admin".to_owned()],
+            allowed_origins: vec![],
+            allowed_email_domains: vec!["wavey.ai".to_owned()],
+            confidential: false,
+        };
+        let mut profile = ProviderProfile {
+            provider_id: ProviderId(well_known::GOOGLE.to_owned()),
+            subject: zeroth_core::Subject("google-sub".to_owned()),
+            email: Some("Admin@Wavey.ai".to_owned()),
+            email_verified: true,
+            display_name: None,
+            picture_url: None,
+        };
+
+        validate_client_email_domain_policy(&client, &profile).unwrap();
+
+        profile.email_verified = false;
+        let error = validate_client_email_domain_policy(&client, &profile).unwrap_err();
+        assert_eq!(error.code, "access_denied");
+        assert_eq!(
+            error.description,
+            "verified email is required for this client"
+        );
+
+        profile.email_verified = true;
+        profile.email = Some("admin@example.com".to_owned());
+        let error = validate_client_email_domain_policy(&client, &profile).unwrap_err();
+        assert_eq!(
+            error.description,
+            "email domain is not allowed for this client"
+        );
+    }
+
+    #[test]
+    fn provider_identity_attachment_validation_rejects_missing_or_conflicting_identity() {
+        validate_provider_identity_attached_to_user(Some("usr_123"), "usr_123").unwrap();
+
+        let error = validate_provider_identity_attached_to_user(None, "usr_123").unwrap_err();
+        assert_eq!(error, "provider identity could not be linked to the user");
+
+        let error =
+            validate_provider_identity_attached_to_user(Some("usr_other"), "usr_123").unwrap_err();
+        assert_eq!(error, "provider identity is already linked to another user");
+    }
+
+    #[test]
     fn client_response_marks_disabled_and_secret_state() {
         let response = client_response_from_row(ClientRow {
             id: "web".to_owned(),
@@ -9831,6 +15897,7 @@ mod tests {
             secret_hash: Some(format!("sha256:{}", hash_secret("web-secret"))),
             redirect_uris_json: r#"["https://app.example.com/callback"]"#.to_owned(),
             allowed_origins_json: r#"["https://app.example.com"]"#.to_owned(),
+            allowed_email_domains_json: r#"["example.com"]"#.to_owned(),
             confidential: 1,
             disabled_at: Some(1_780_000_000),
         })
@@ -9861,6 +15928,7 @@ mod tests {
             updated_at: 1_780_000_100,
             disabled_at: Some(1_780_000_200),
             email_verified: 1,
+            admin_membership_active: 1,
             identity_count: 2,
             active_session_count: 3,
         });
@@ -9868,6 +15936,7 @@ mod tests {
         assert_eq!(response.id, "usr_123");
         assert_eq!(response.email.as_deref(), Some("user@example.com"));
         assert!(response.disabled);
+        assert!(response.admin);
         assert_eq!(response.identity_count, 2);
         assert_eq!(response.active_session_count, 3);
     }
@@ -9905,6 +15974,20 @@ mod tests {
             None,
             Some("admin@wavey.ai"),
         ));
+    }
+
+    #[test]
+    fn admin_authorization_granted_by_records_source() {
+        assert_eq!(
+            admin_authorization_granted_by(&AdminAuthorization::BootstrapToken),
+            "bootstrap_token"
+        );
+        assert_eq!(
+            admin_authorization_granted_by(&AdminAuthorization::Session {
+                user_id: "usr_admin".to_owned()
+            }),
+            "user:usr_admin"
+        );
     }
 
     #[test]
@@ -9966,6 +16049,7 @@ mod tests {
             secret_hash: Some(format!("sha256:{}", hash_secret("web-secret"))),
             redirect_uris_json: r#"["https://app.example.com/callback"]"#.to_owned(),
             allowed_origins_json: r#"["https://app.example.com"]"#.to_owned(),
+            allowed_email_domains_json: r#"["example.com"]"#.to_owned(),
             confidential: 1,
             disabled_at: Some(1_780_000_000),
         })
@@ -10019,11 +16103,17 @@ mod tests {
             &request,
             well_known::APPLE,
             "provider-state".to_owned(),
+            "provider-nonce".to_owned(),
             "https://id.example.com/oauth2/callback".to_owned(),
             1_780_000_000,
         );
 
         assert_eq!(transaction.provider_state, "provider-state");
+        assert_eq!(transaction.nonce, Some("nonce-1".to_owned()));
+        assert_eq!(
+            transaction.provider_nonce,
+            Some("provider-nonce".to_owned())
+        );
         assert_eq!(transaction.app_state, Some("app-state".to_owned()));
         assert_eq!(transaction.redirect_uri, "wavey://auth/callback");
         assert_eq!(
@@ -10043,6 +16133,7 @@ mod tests {
             name: "Wavey Web".to_owned(),
             redirect_uris: vec!["https://app.example.com/auth/callback".to_owned()],
             allowed_origins: vec!["https://app.example.com".to_owned()],
+            allowed_email_domains: vec![],
             confidential: false,
         };
 
@@ -10050,6 +16141,7 @@ mod tests {
             &client,
             well_known::SPOTIFY,
             "provider-state".to_owned(),
+            "provider-nonce".to_owned(),
             "https://id.example.com/oauth2/callback".to_owned(),
             "https://app.example.com/settings".to_owned(),
             Some("app-state".to_owned()),
@@ -10059,6 +16151,10 @@ mod tests {
         );
 
         assert_eq!(transaction.client_id, ClientId("web".to_owned()));
+        assert_eq!(
+            transaction.provider_nonce,
+            Some("provider-nonce".to_owned())
+        );
         assert_eq!(transaction.redirect_uri, "https://app.example.com/settings");
         assert_eq!(transaction.app_state, Some("app-state".to_owned()));
         assert_eq!(transaction.link_user_id, Some(UserId("usr_123".to_owned())));
@@ -10074,6 +16170,7 @@ mod tests {
             name: "Browser SSO".to_owned(),
             redirect_uris: vec!["https://app.example.com/auth/callback".to_owned()],
             allowed_origins: vec!["https://app.example.com".to_owned()],
+            allowed_email_domains: vec![],
             confidential: false,
         };
 
@@ -10081,6 +16178,7 @@ mod tests {
             &client,
             well_known::GOOGLE,
             "provider-state".to_owned(),
+            "provider-nonce".to_owned(),
             "https://id.example.com/oauth2/callback".to_owned(),
             "https://app.example.com/dashboard".to_owned(),
             Some("app-state".to_owned()),
@@ -10088,6 +16186,10 @@ mod tests {
         );
 
         assert_eq!(transaction.client_id, ClientId("browser".to_owned()));
+        assert_eq!(
+            transaction.provider_nonce,
+            Some("provider-nonce".to_owned())
+        );
         assert_eq!(
             transaction.redirect_uri,
             "https://app.example.com/dashboard"
@@ -10102,12 +16204,51 @@ mod tests {
     }
 
     #[test]
+    fn provider_authorize_nonce_prefers_provider_nonce_for_oidc() {
+        let client = Client {
+            id: ClientId("browser".to_owned()),
+            name: "Browser SSO".to_owned(),
+            redirect_uris: vec!["https://app.example.com/auth/callback".to_owned()],
+            allowed_origins: vec!["https://app.example.com".to_owned()],
+            allowed_email_domains: vec![],
+            confidential: false,
+        };
+        let google_transaction = auth_transaction_from_session_login_request(
+            &client,
+            well_known::GOOGLE,
+            "provider-state".to_owned(),
+            "provider-nonce".to_owned(),
+            "https://id.example.com/oauth2/callback".to_owned(),
+            "https://app.example.com/dashboard".to_owned(),
+            None,
+            1_780_000_000,
+        );
+        let spotify_transaction = auth_transaction_from_session_login_request(
+            &client,
+            well_known::SPOTIFY,
+            "provider-state".to_owned(),
+            "provider-nonce".to_owned(),
+            "https://id.example.com/oauth2/callback".to_owned(),
+            "https://app.example.com/dashboard".to_owned(),
+            None,
+            1_780_000_000,
+        );
+
+        assert_eq!(
+            provider_authorize_nonce(&google_transaction),
+            Some("provider-nonce")
+        );
+        assert_eq!(provider_authorize_nonce(&spotify_transaction), None);
+    }
+
+    #[test]
     fn identity_link_return_to_is_client_bounded() {
         let client = Client {
             id: ClientId("web".to_owned()),
             name: "Wavey Web".to_owned(),
             redirect_uris: vec!["wavey://auth/callback".to_owned()],
             allowed_origins: vec!["https://app.example.com".to_owned()],
+            allowed_email_domains: vec![],
             confidential: false,
         };
 
@@ -10188,6 +16329,7 @@ mod tests {
             name: "Wavey Web".to_owned(),
             redirect_uris: vec!["wavey://auth/callback".to_owned()],
             allowed_origins: vec!["https://app.example.com".to_owned()],
+            allowed_email_domains: vec![],
             confidential: false,
         };
 
@@ -10235,10 +16377,12 @@ mod tests {
                 name: "Wavey Web".to_owned(),
                 redirect_uris: vec!["https://app.example.com/auth/callback".to_owned()],
                 allowed_origins: vec!["https://app.example.com".to_owned()],
+                allowed_email_domains: vec![],
                 confidential: false,
             },
             well_known::GOOGLE,
             "provider-state".to_owned(),
+            "provider-nonce".to_owned(),
             "https://id.example.com/oauth2/callback".to_owned(),
             "https://app.example.com/settings?tab=login".to_owned(),
             Some("app-state".to_owned()),
@@ -10278,12 +16422,14 @@ mod tests {
             name: "Browser SSO".to_owned(),
             redirect_uris: vec!["https://app.example.com/auth/callback".to_owned()],
             allowed_origins: vec!["https://app.example.com".to_owned()],
+            allowed_email_domains: vec![],
             confidential: false,
         };
         let transaction = auth_transaction_from_session_login_request(
             &client,
             well_known::GOOGLE,
             "provider-state".to_owned(),
+            "provider-nonce".to_owned(),
             "https://id.example.com/oauth2/callback".to_owned(),
             "https://app.example.com/dashboard?existing=1".to_owned(),
             Some("app-state".to_owned()),
@@ -10314,6 +16460,7 @@ mod tests {
             provider_redirect_uri: "https://id.example.com/oauth2/callback".to_owned(),
             app_state: Some("app-state".to_owned()),
             nonce: None,
+            provider_nonce: Some("provider-nonce".to_owned()),
             code_challenge: Some("challenge".to_owned()),
             code_challenge_method: Some("S256".to_owned()),
             scope: zeroth_core::ScopeSet::new(["openid", "email"]),
@@ -10354,12 +16501,14 @@ mod tests {
             name: "Browser SSO".to_owned(),
             redirect_uris: vec!["https://app.example.com/auth/callback".to_owned()],
             allowed_origins: vec!["https://app.example.com".to_owned()],
+            allowed_email_domains: vec![],
             confidential: false,
         };
         let transaction = auth_transaction_from_session_login_request(
             &client,
             well_known::GOOGLE,
             "provider-state".to_owned(),
+            "provider-nonce".to_owned(),
             "https://id.example.com/oauth2/callback".to_owned(),
             "https://app.example.com/dashboard?existing=1".to_owned(),
             Some("app-state".to_owned()),
@@ -10389,6 +16538,32 @@ mod tests {
     }
 
     #[test]
+    fn provider_upstream_failures_map_to_oauth_callback_errors() {
+        let token_error = provider_callback_error_from_token_exchange_error(
+            &ProviderTokenExchangeError::invalid_response("provider token endpoint returned 502"),
+        );
+        assert_eq!(token_error.code, "temporarily_unavailable");
+        assert!(token_error
+            .description
+            .contains("provider token exchange failed"));
+        assert!(token_error
+            .description
+            .contains("provider token endpoint returned 502"));
+
+        let profile_error =
+            provider_callback_error_from_profile_error(&ProviderProfileError::invalid_response(
+                "Spotify profile endpoint returned HTTP 403: premium required",
+            ));
+        assert_eq!(profile_error.code, "temporarily_unavailable");
+        assert!(profile_error
+            .description
+            .contains("provider profile lookup failed"));
+        assert!(profile_error
+            .description
+            .contains("Spotify profile endpoint returned HTTP 403"));
+    }
+
+    #[test]
     fn client_redirect_url_includes_auth_code_and_app_state() {
         let transaction = AuthTransaction {
             provider_state: "provider-state".to_owned(),
@@ -10398,6 +16573,7 @@ mod tests {
             provider_redirect_uri: "https://id.example.com/oauth2/callback".to_owned(),
             app_state: Some("app-state".to_owned()),
             nonce: None,
+            provider_nonce: Some("provider-nonce".to_owned()),
             code_challenge: Some("challenge".to_owned()),
             code_challenge_method: Some("S256".to_owned()),
             scope: zeroth_core::ScopeSet::new(["openid", "email"]),
@@ -10475,12 +16651,87 @@ mod tests {
     }
 
     #[test]
+    fn hosted_admin_login_url_targets_hosted_login_chooser() {
+        let url = hosted_admin_login_url("https://id.example.com", "/admin").unwrap();
+        let query_pairs = url
+            .query_pairs()
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            url.as_str(),
+            "https://id.example.com/login?return_to=https%3A%2F%2Fid.example.com%2Fadmin"
+        );
+        assert!(!query_pairs.iter().any(|(key, _)| key == "provider"));
+        assert!(query_pairs.contains(&(
+            "return_to".to_owned(),
+            "https://id.example.com/admin".to_owned()
+        )));
+
+        let clients_url =
+            hosted_admin_login_url("https://id.example.com/", "/admin/clients").unwrap();
+        assert_eq!(
+            clients_url.as_str(),
+            "https://id.example.com/login?return_to=https%3A%2F%2Fid.example.com%2Fadmin%2Fclients"
+        );
+    }
+
+    #[test]
+    fn session_login_return_to_defaults_to_hosted_admin() {
+        let client = Client {
+            id: ClientId("wavey-browser".to_owned()),
+            name: "Wavey Browser SSO".to_owned(),
+            redirect_uris: vec!["https://wavey.ai/auth/callback".to_owned()],
+            allowed_origins: vec!["https://wavey.ai".to_owned()],
+            allowed_email_domains: vec![],
+            confidential: false,
+        };
+        let url = url::Url::parse("https://id.example.com/login").unwrap();
+
+        assert_eq!(
+            session_login_return_to_from_url(&url, &client, "https://id.example.com").unwrap(),
+            "https://id.example.com/admin"
+        );
+    }
+
+    #[test]
+    fn session_login_return_to_keeps_explicit_product_target() {
+        let client = Client {
+            id: ClientId("wavey-browser".to_owned()),
+            name: "Wavey Browser SSO".to_owned(),
+            redirect_uris: vec!["https://wavey.ai/auth/callback".to_owned()],
+            allowed_origins: vec!["https://wavey.ai".to_owned()],
+            allowed_email_domains: vec![],
+            confidential: false,
+        };
+        let url = url::Url::parse(
+            "https://id.example.com/login?return_to=https%3A%2F%2Fwavey.ai%2Fsettings",
+        )
+        .unwrap();
+
+        assert_eq!(
+            session_login_return_to_from_url(&url, &client, "https://id.example.com").unwrap(),
+            "https://wavey.ai/settings"
+        );
+
+        let url = url::Url::parse(
+            "https://id.example.com/login?redirect_uri=https%3A%2F%2Fwavey.ai%2Fauth%2Fcallback",
+        )
+        .unwrap();
+        assert_eq!(
+            session_login_return_to_from_url(&url, &client, "https://id.example.com").unwrap(),
+            "https://wavey.ai/auth/callback"
+        );
+    }
+
+    #[test]
     fn authorization_request_errors_redirect_only_for_registered_redirect_uri() {
         let client = Client {
             id: ClientId("ios".to_owned()),
             name: "Wavey iOS".to_owned(),
             redirect_uris: vec!["wavey://auth/callback".to_owned()],
             allowed_origins: vec![],
+            allowed_email_domains: vec![],
             confidential: false,
         };
         let request = AuthorizationRequest {
@@ -10588,9 +16839,164 @@ mod tests {
             code: None,
             code_verifier: None,
             refresh_token: Some("refresh-token".to_owned()),
+            scope: None,
+            subject_token: None,
+            subject_token_type: None,
+            provider: None,
+            provider_client_id: None,
+            nonce: None,
         };
 
         validate_token_exchange_form(&form).unwrap();
+    }
+
+    #[test]
+    fn token_exchange_form_accepts_native_apple_id_token_grant() {
+        let form = valid_native_apple_token_exchange_form();
+
+        let fields = native_provider_token_fields(&form).unwrap();
+
+        assert_eq!(fields.provider_id, well_known::APPLE);
+        assert_eq!(fields.subject_token, "apple.id.token");
+        assert_eq!(fields.provider_client_id, Some("ai.wavey.id"));
+        assert_eq!(fields.subject_token_type, ID_TOKEN_SUBJECT_TOKEN_TYPE);
+        assert_eq!(
+            native_token_scope(fields.scope).unwrap(),
+            DEFAULT_NATIVE_TOKEN_SCOPE
+        );
+        validate_token_exchange_form(&form).unwrap();
+    }
+
+    #[test]
+    fn token_exchange_form_accepts_native_google_id_token_grant() {
+        let mut form = valid_native_apple_token_exchange_form();
+        form.provider = Some(well_known::GOOGLE.to_owned());
+        form.subject_token = Some("google.id.token".to_owned());
+        form.provider_client_id = Some("google-ios-client".to_owned());
+
+        let fields = native_provider_token_fields(&form).unwrap();
+
+        assert_eq!(fields.provider_id, well_known::GOOGLE);
+        assert_eq!(fields.subject_token, "google.id.token");
+        assert_eq!(fields.provider_client_id, Some("google-ios-client"));
+        assert_eq!(fields.subject_token_type, ID_TOKEN_SUBJECT_TOKEN_TYPE);
+        validate_token_exchange_form(&form).unwrap();
+    }
+
+    #[test]
+    fn token_exchange_form_accepts_native_spotify_access_token_grant() {
+        let mut form = valid_native_apple_token_exchange_form();
+        form.provider = Some(well_known::SPOTIFY.to_owned());
+        form.subject_token = Some("spotify.access.token".to_owned());
+        form.subject_token_type = Some(ACCESS_TOKEN_SUBJECT_TOKEN_TYPE.to_owned());
+        form.provider_client_id = Some("spotify-ios-client".to_owned());
+
+        let fields = native_provider_token_fields(&form).unwrap();
+
+        assert_eq!(fields.provider_id, well_known::SPOTIFY);
+        assert_eq!(fields.subject_token, "spotify.access.token");
+        assert_eq!(fields.provider_client_id, Some("spotify-ios-client"));
+        assert_eq!(fields.subject_token_type, ACCESS_TOKEN_SUBJECT_TOKEN_TYPE);
+        validate_token_exchange_form(&form).unwrap();
+    }
+
+    #[test]
+    fn native_provider_token_grant_rejects_unsupported_provider() {
+        let mut form = valid_native_apple_token_exchange_form();
+        form.provider = Some("github".to_owned());
+
+        let error = validate_token_exchange_form(&form).unwrap_err();
+
+        assert_eq!(error.code, "invalid_request");
+        assert_eq!(
+            error.description,
+            "token exchange provider must be apple, google, or spotify"
+        );
+    }
+
+    #[test]
+    fn native_spotify_token_grant_requires_access_token_type() {
+        let mut form = valid_native_apple_token_exchange_form();
+        form.provider = Some(well_known::SPOTIFY.to_owned());
+
+        let error = validate_token_exchange_form(&form).unwrap_err();
+
+        assert_eq!(error.code, "invalid_request");
+        assert_eq!(
+            error.description,
+            "subject_token_type must be urn:ietf:params:oauth:token-type:access_token"
+        );
+    }
+
+    #[test]
+    fn native_apple_client_id_selects_single_configured_audience() {
+        let configured = vec!["ai.wavey.id".to_owned()];
+
+        assert_eq!(
+            native_apple_provider_client_id_from_list(&configured, None).unwrap(),
+            "ai.wavey.id"
+        );
+        assert_eq!(
+            native_apple_provider_client_id_from_list(&configured, Some("ai.wavey.id")).unwrap(),
+            "ai.wavey.id"
+        );
+    }
+
+    #[test]
+    fn native_apple_client_id_requires_allowed_requested_audience() {
+        let configured = vec!["ai.wavey.id".to_owned(), "ai.bitneedle.app".to_owned()];
+
+        let missing = native_apple_provider_client_id_from_list(&configured, None).unwrap_err();
+        assert_eq!(
+            missing.description,
+            "provider_client_id is required when multiple Apple native client IDs are configured"
+        );
+
+        let denied =
+            native_apple_provider_client_id_from_list(&configured, Some("evil.app")).unwrap_err();
+        assert_eq!(denied.description, "provider_client_id is not allowed");
+    }
+
+    #[test]
+    fn native_google_client_id_selects_allowed_audience() {
+        let configured = vec!["google-ios-client".to_owned()];
+
+        assert_eq!(
+            native_provider_client_id_from_list(well_known::GOOGLE, &configured, None).unwrap(),
+            "google-ios-client"
+        );
+        assert_eq!(
+            native_provider_client_id_from_list(
+                well_known::GOOGLE,
+                &configured,
+                Some("google-ios-client")
+            )
+            .unwrap(),
+            "google-ios-client"
+        );
+    }
+
+    #[test]
+    fn native_spotify_client_id_requires_configured_audience() {
+        let error =
+            native_provider_client_id_from_list(well_known::SPOTIFY, &[], None).unwrap_err();
+
+        assert_eq!(error.code, "invalid_request");
+        assert_eq!(
+            error.description,
+            "SPOTIFY_NATIVE_CLIENT_IDS is not configured"
+        );
+    }
+
+    #[test]
+    fn native_token_scope_defaults_to_openid_profile_email() {
+        assert_eq!(
+            native_token_scope(None).unwrap(),
+            DEFAULT_NATIVE_TOKEN_SCOPE.to_owned()
+        );
+
+        let error = native_token_scope(Some("email profile")).unwrap_err();
+        assert_eq!(error.description, "scope must include openid");
     }
 
     #[test]
@@ -10705,6 +17111,12 @@ mod tests {
             code: Some("zeroth-code".to_owned()),
             code_verifier: None,
             refresh_token: None,
+            scope: None,
+            subject_token: None,
+            subject_token_type: None,
+            provider: None,
+            provider_client_id: None,
+            nonce: None,
         };
         let fields = authorization_code_fields(&form).unwrap();
 
@@ -10937,6 +17349,7 @@ mod tests {
             email_verified: None,
             name: None,
             picture: None,
+            roles: vec!["user".to_owned(), "admin".to_owned()],
         };
 
         let value =
@@ -10953,6 +17366,8 @@ mod tests {
         assert_eq!(value["iat"], 1_780_000_000);
         assert_eq!(value["exp"], 1_780_003_600);
         assert_eq!(value["sid"], "sess_123");
+        assert_eq!(value["roles"][0], "user");
+        assert_eq!(value["roles"][1], "admin");
         assert!(value.get("clientId").is_none());
     }
 
@@ -11062,6 +17477,7 @@ mod tests {
             email_verified: None,
             name: None,
             picture: None,
+            roles: Vec::new(),
         };
 
         let jwt = sign_jwt(&signing_key, &claims).unwrap();
@@ -11189,16 +17605,37 @@ mod tests {
         );
         assert_eq!(access_claims["client_id"], "ios");
         assert_eq!(access_claims["sid"], "sess_123");
+        assert_eq!(access_claims["roles"][0], "user");
         assert!(access_claims.get("email").is_none());
         assert!(access_claims.get("name").is_none());
         assert_eq!(id_claims["token_use"], "id");
         assert_eq!(id_claims["nonce"], "nonce-1");
         assert_eq!(id_claims["auth_time"], 1_780_000_000);
         assert_eq!(id_claims["sid"], "sess_123");
+        assert_eq!(id_claims["roles"][0], "user");
         assert_eq!(id_claims["email"], "user@example.com");
         assert_eq!(id_claims["email_verified"], true);
         assert_eq!(id_claims["name"], "Example User");
         assert_eq!(id_claims["picture"], "https://example.com/avatar.png");
+    }
+
+    #[test]
+    fn token_response_includes_admin_role_for_admin_memberships() {
+        let config = ZerothServerConfig {
+            public_base_url: "https://id.example.com".to_owned(),
+            ..ZerothServerConfig::default()
+        };
+        let signing_key = test_signing_key();
+        let code = valid_auth_code_row("challenge".to_owned());
+        let mut user_claims = valid_user_token_claims_row();
+        user_claims.admin_membership_active = 1;
+        let issue = TokenIssue::from_auth_code(&code).with_user_claims(&user_claims);
+
+        let response = token_response(&config, &signing_key, &issue, None, 1_780_000_000).unwrap();
+        let access_claims = decode_jwt_claims(&response.access_token);
+
+        assert_eq!(access_claims["roles"][0], "user");
+        assert_eq!(access_claims["roles"][1], "admin");
     }
 
     #[test]
@@ -11241,17 +17678,14 @@ mod tests {
             email_verified: None,
             name: None,
             picture: None,
+            roles: vec!["user".to_owned()],
         };
         let response = token_response(&config, &signing_key, &issue, None, 1_780_000_100).unwrap();
-        let verification_keys = test_verification_keys(&signing_key);
+        let jwks = jwks_response(&signing_key, None).unwrap();
 
-        let claims = verify_zeroth_access_token(
-            &response.access_token,
-            &config,
-            &verification_keys,
-            1_780_000_200,
-        )
-        .unwrap();
+        let claims =
+            verify_zeroth_access_token(&response.access_token, &config, &jwks, 1_780_000_200)
+                .unwrap();
 
         assert_eq!(claims.sub, "usr_123");
         assert_eq!(claims.token_use, "access");
@@ -11273,7 +17707,6 @@ mod tests {
         let previous_jwks = jwks_response(&previous_signing_key, None).unwrap();
         let previous_json = serde_json::to_string(&previous_jwks).unwrap();
         let jwks = jwks_response(&active_signing_key, Some(&previous_json)).unwrap();
-        let verification_keys = es256_verification_keys_from_jwks(&jwks).unwrap();
         let issue = TokenIssue {
             client_id: "ios".to_owned(),
             user_id: "usr_123".to_owned(),
@@ -11285,17 +17718,14 @@ mod tests {
             email_verified: None,
             name: None,
             picture: None,
+            roles: vec!["user".to_owned()],
         };
         let response =
             token_response(&config, &previous_signing_key, &issue, None, 1_780_000_100).unwrap();
 
-        let claims = verify_zeroth_access_token(
-            &response.access_token,
-            &config,
-            &verification_keys,
-            1_780_000_200,
-        )
-        .unwrap();
+        let claims =
+            verify_zeroth_access_token(&response.access_token, &config, &jwks, 1_780_000_200)
+                .unwrap();
 
         assert_eq!(claims.sub, "usr_123");
         assert_eq!(claims.token_use, "access");
@@ -11319,17 +17749,13 @@ mod tests {
             email_verified: None,
             name: None,
             picture: None,
+            roles: vec!["user".to_owned()],
         };
         let response = token_response(&config, &signing_key, &issue, None, 1_780_000_100).unwrap();
-        let verification_keys = test_verification_keys(&signing_key);
+        let jwks = jwks_response(&signing_key, None).unwrap();
 
-        let error = verify_zeroth_access_token(
-            &response.id_token,
-            &config,
-            &verification_keys,
-            1_780_000_200,
-        )
-        .unwrap_err();
+        let error = verify_zeroth_access_token(&response.id_token, &config, &jwks, 1_780_000_200)
+            .unwrap_err();
 
         assert_eq!(error, "token is not an access token");
     }
@@ -11346,26 +17772,17 @@ mod tests {
         let issue =
             TokenIssue::from_auth_code(&code).with_user_claims(&valid_user_token_claims_row());
         let response = token_response(&config, &signing_key, &issue, None, 1_780_000_100).unwrap();
-        let verification_keys = test_verification_keys(&signing_key);
+        let jwks = jwks_response(&signing_key, None).unwrap();
 
-        let claims = verify_zeroth_id_token_hint(
-            &response.id_token,
-            &config,
-            &verification_keys,
-            1_780_000_200,
-        )
-        .unwrap();
+        let claims =
+            verify_zeroth_id_token_hint(&response.id_token, &config, &jwks, 1_780_000_200).unwrap();
         assert_eq!(claims.token_use, "id");
         assert_eq!(claims.aud, "ios");
         assert_eq!(claims.sub, "usr_123");
 
-        let error = verify_zeroth_id_token_hint(
-            &response.access_token,
-            &config,
-            &verification_keys,
-            1_780_000_200,
-        )
-        .unwrap_err();
+        let error =
+            verify_zeroth_id_token_hint(&response.access_token, &config, &jwks, 1_780_000_200)
+                .unwrap_err();
         assert_eq!(error, "id_token_hint is not an ID token");
     }
 
@@ -11409,6 +17826,7 @@ mod tests {
             email_verified: None,
             name: None,
             picture: None,
+            roles: vec!["user".to_owned()],
         };
 
         let value = serde_json::to_value(validate_access_token_response(&claims, &user)).unwrap();
@@ -11497,10 +17915,26 @@ mod tests {
 
     #[test]
     fn session_cookie_is_secure_http_only_and_lax() {
-        let cookie = session_cookie("zeroth_session", "sess_123", SESSION_TTL_SECONDS);
+        let cookie = session_cookie("zeroth_session", "sess_123", SESSION_TTL_SECONDS, None);
 
         assert!(cookie.starts_with("zeroth_session=sess_123; Path=/;"));
         assert!(cookie.contains("Max-Age=2592000"));
+        assert!(cookie.contains("HttpOnly"));
+        assert!(cookie.contains("Secure"));
+        assert!(cookie.contains("SameSite=Lax"));
+        assert!(!cookie.contains("Domain="));
+    }
+
+    #[test]
+    fn session_cookie_can_target_parent_domain() {
+        let cookie = session_cookie(
+            "zeroth_session",
+            "sess_123",
+            SESSION_TTL_SECONDS,
+            Some(".wavey.ai"),
+        );
+
+        assert!(cookie.contains("Domain=.wavey.ai"));
         assert!(cookie.contains("HttpOnly"));
         assert!(cookie.contains("Secure"));
         assert!(cookie.contains("SameSite=Lax"));
@@ -11508,7 +17942,7 @@ mod tests {
 
     #[test]
     fn clear_session_cookie_expires_browser_cookie() {
-        let cookie = clear_session_cookie("zeroth_session");
+        let cookie = clear_session_cookie("zeroth_session", None);
 
         assert_eq!(
             cookie,
@@ -11517,11 +17951,31 @@ mod tests {
     }
 
     #[test]
-    fn transaction_cookie_is_callback_scoped_and_cross_site_post_safe() {
+    fn clear_session_cookie_uses_parent_domain_when_configured() {
+        let cookie = clear_session_cookie("zeroth_session", Some(".wavey.ai"));
+
+        assert_eq!(
+            cookie,
+            "zeroth_session=; Path=/; Max-Age=0; Domain=.wavey.ai; HttpOnly; Secure; SameSite=Lax"
+        );
+    }
+
+    #[test]
+    fn cookie_domain_attribute_rejects_header_delimiters() {
+        assert_eq!(
+            cookie_domain_attribute(Some(".wavey.ai")),
+            " Domain=.wavey.ai;"
+        );
+        assert_eq!(cookie_domain_attribute(Some("bad.example; Secure")), "");
+        assert_eq!(cookie_domain_attribute(Some("bad.example\r\nX: y")), "");
+    }
+
+    #[test]
+    fn transaction_cookie_is_host_scoped_and_cross_site_post_safe() {
         let cookie =
             transaction_cookie("zeroth_tx", "provider-state", AUTH_TRANSACTION_TTL_SECONDS);
 
-        assert!(cookie.starts_with("zeroth_tx=provider-state; Path=/oauth2/callback;"));
+        assert!(cookie.starts_with("zeroth_tx=provider-state; Path=/;"));
         assert!(cookie.contains("Max-Age=600"));
         assert!(cookie.contains("HttpOnly"));
         assert!(cookie.contains("Secure"));
@@ -11529,13 +17983,220 @@ mod tests {
     }
 
     #[test]
-    fn clear_transaction_cookie_expires_callback_cookie() {
+    fn clear_transaction_cookie_expires_host_scoped_cookie() {
         let cookie = clear_transaction_cookie("zeroth_tx");
 
         assert_eq!(
             cookie,
-            "zeroth_tx=; Path=/oauth2/callback; Max-Age=0; HttpOnly; Secure; SameSite=None"
+            "zeroth_tx=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=None"
         );
+    }
+
+    #[test]
+    fn provider_authorize_alias_rewrites_to_canonical_authorize_url() {
+        let url = url::Url::parse(
+            "https://id.example.com/providers/apple/authorize?client_id=browser&provider=google&state=one#frag",
+        )
+        .unwrap();
+
+        let alias = provider_authorize_alias_url(&url).unwrap();
+
+        assert_eq!(
+            alias.as_str(),
+            "https://id.example.com/authorize?client_id=browser&state=one&provider=apple"
+        );
+    }
+
+    #[test]
+    fn provider_alias_paths_reject_nested_provider_segments() {
+        assert!(provider_authorize_alias_path("/providers/google/authorize"));
+        assert!(provider_callback_alias_path("/oauth/callback/apple"));
+        assert!(provider_callback_alias_path("/oauth2/callback/apple"));
+        assert!(provider_callback_alias_path("/callback"));
+        assert!(provider_callback_alias_path("/callback/apple"));
+        assert!(provider_callback_alias_path("/auth/callback"));
+        assert!(provider_callback_alias_path("/auth/callback/apple"));
+        assert!(provider_callback_alias_path("/api/callback"));
+        assert!(provider_callback_alias_path("/api/auth/callback/google"));
+        assert!(!provider_authorize_alias_path(
+            "/providers/google/extra/authorize"
+        ));
+        assert!(!provider_callback_alias_path("/oauth/callback/apple/extra"));
+        assert!(!provider_callback_alias_path("/auth/callback/apple/extra"));
+        assert!(!provider_callback_alias_path("/callback/apple/extra"));
+    }
+
+    #[test]
+    fn admin_console_alias_paths_are_bounded() {
+        assert!(admin_console_alias_path("/ui"));
+        assert!(admin_console_alias_path("/dashboard"));
+        assert!(admin_console_alias_path("/console"));
+        assert!(admin_console_alias_path("/admin/users"));
+        assert!(admin_console_alias_path("/admin/events"));
+        assert!(admin_console_alias_path("/admin/providers"));
+        assert!(admin_console_alias_path("/admin/local-auth"));
+        assert!(admin_console_alias_path("/admin/database"));
+        assert!(!admin_console_alias_path("/admin"));
+        assert!(!admin_console_alias_path("/admin/users/export"));
+    }
+
+    #[test]
+    fn compatibility_route_path_maps_bounded_aliases_to_canonical_routes() {
+        assert_eq!(compatibility_route_path("/status").as_ref(), "/ready");
+        assert_eq!(compatibility_route_path("/api/status").as_ref(), "/ready");
+        assert_eq!(compatibility_route_path("/ui").as_ref(), "/admin");
+        assert_eq!(compatibility_route_path("/dashboard").as_ref(), "/admin");
+        assert_eq!(
+            compatibility_route_path("/callback/apple").as_ref(),
+            "/oauth2/callback"
+        );
+        assert_eq!(
+            compatibility_route_path("/auth/callback/apple").as_ref(),
+            "/oauth2/callback"
+        );
+        assert_eq!(
+            compatibility_route_path("/api/auth/callback").as_ref(),
+            "/oauth2/callback"
+        );
+        assert_eq!(compatibility_route_path("/admin/users").as_ref(), "/admin");
+        assert_eq!(compatibility_route_path("/api/health").as_ref(), "/health");
+        assert_eq!(compatibility_route_path("/api/ready").as_ref(), "/ready");
+        assert_eq!(
+            compatibility_route_path("/api/clients").as_ref(),
+            "/clients"
+        );
+        assert_eq!(compatibility_route_path("/api/routes").as_ref(), "/routes");
+        assert_eq!(
+            compatibility_route_path("/api/local-auth/status").as_ref(),
+            "/local-auth/status"
+        );
+        assert_eq!(
+            compatibility_route_path("/api/profile").as_ref(),
+            "/profile"
+        );
+        assert_eq!(
+            compatibility_route_path("/api/session").as_ref(),
+            "/session"
+        );
+        assert_eq!(compatibility_route_path("/api/logout").as_ref(), "/logout");
+        assert_eq!(
+            compatibility_route_path("/local-auth/magic-links").as_ref(),
+            "/magic-links"
+        );
+        assert_eq!(
+            compatibility_route_path("/api/local-auth/magic-links").as_ref(),
+            "/magic-links"
+        );
+        assert_eq!(
+            compatibility_route_path("/api/magic_link").as_ref(),
+            "/magic-links"
+        );
+        assert_eq!(
+            compatibility_route_path("/api/magic-links/request").as_ref(),
+            "/magic-links"
+        );
+        assert_eq!(
+            compatibility_route_path("/magic-link/request").as_ref(),
+            "/magic-links"
+        );
+        assert_eq!(
+            compatibility_route_path("/auth/magic-link/request").as_ref(),
+            "/magic-links"
+        );
+        assert_eq!(
+            compatibility_route_path("/api/auth/magic-link/request").as_ref(),
+            "/magic-links"
+        );
+        assert_eq!(
+            compatibility_route_path("/local-auth/magic-link/request").as_ref(),
+            "/magic-links"
+        );
+        assert_eq!(
+            compatibility_route_path("/api/magic-links/send").as_ref(),
+            "/magic-links"
+        );
+        assert_eq!(
+            compatibility_route_path("/auth/magic-link/send").as_ref(),
+            "/magic-links"
+        );
+        assert_eq!(
+            compatibility_route_path("/api/auth/magic-link/send").as_ref(),
+            "/magic-links"
+        );
+        assert_eq!(
+            compatibility_route_path("/local-auth/magic-links/consume").as_ref(),
+            "/magic-links/consume"
+        );
+        assert_eq!(
+            compatibility_route_path("/auth/magic-link/verify").as_ref(),
+            "/magic-links/consume"
+        );
+        assert_eq!(
+            compatibility_route_path("/api/local-auth/magic-link/consume").as_ref(),
+            "/magic-links/consume"
+        );
+        assert_eq!(
+            compatibility_route_path("/magic-link/verify").as_ref(),
+            "/magic-links/consume"
+        );
+        assert_eq!(
+            compatibility_route_path("/local-auth/magic_link/consume").as_ref(),
+            "/magic-links/consume"
+        );
+        assert_eq!(
+            compatibility_route_path("/api/password/login").as_ref(),
+            "/password/login"
+        );
+        assert_eq!(
+            compatibility_route_path("/auth/password/login").as_ref(),
+            "/password/login"
+        );
+        assert_eq!(
+            compatibility_route_path("/api/passkeys/registration/options").as_ref(),
+            "/passkeys/registration/options"
+        );
+        assert_eq!(
+            compatibility_route_path("/api/passkeys/registration/verify").as_ref(),
+            "/passkeys/register/verify"
+        );
+        assert_eq!(
+            compatibility_route_path("/api/passkeys/authentication/options").as_ref(),
+            "/passkeys/authentication/options"
+        );
+        assert_eq!(
+            compatibility_route_path("/api/passkeys/authentication/finish").as_ref(),
+            "/passkeys/authenticate/finish"
+        );
+        assert_eq!(
+            compatibility_route_path("/api/passkeys/login/options").as_ref(),
+            "/passkeys/authenticate/options"
+        );
+        assert_eq!(
+            compatibility_route_path("/admin/users/export").as_ref(),
+            "/admin/users/export"
+        );
+    }
+
+    #[test]
+    fn known_route_path_covers_aliases_after_normalization() {
+        assert!(known_route_path(
+            compatibility_route_path("/status").as_ref()
+        ));
+        assert!(known_route_path(compatibility_route_path("/ui").as_ref()));
+        assert!(known_route_path(
+            compatibility_route_path("/callback/apple").as_ref()
+        ));
+        assert!(known_route_path(
+            compatibility_route_path("/auth/callback/apple").as_ref()
+        ));
+        assert!(known_route_path(
+            compatibility_route_path("/api/passkeys/login/options").as_ref()
+        ));
+        assert!(known_route_path(
+            compatibility_route_path("/api/magic_link").as_ref()
+        ));
+        assert!(known_route_path("/.well-known/assetlinks.json"));
+        assert!(!known_route_path("/admin/users/export"));
     }
 
     #[test]
@@ -11616,6 +18277,20 @@ mod tests {
             &session,
             1_780_000_100
         ));
+
+        request.prompt = AuthorizationPrompt::SelectAccount;
+        assert!(!authorization_request_may_reuse_session(
+            &request,
+            &session,
+            1_780_000_100
+        ));
+
+        request.prompt = AuthorizationPrompt::Consent;
+        assert!(authorization_request_may_reuse_session(
+            &request,
+            &session,
+            1_780_000_100
+        ));
     }
 
     #[test]
@@ -11671,6 +18346,57 @@ mod tests {
         let error = profile_patch_from_value(serde_json::json!({ "picture": "ftp://x.test/a" }))
             .unwrap_err();
         assert_eq!(error.description, "picture must use http or https");
+    }
+
+    #[test]
+    fn local_auth_forms_accept_snake_case_field_aliases() {
+        let magic_link: MagicLinkRequest = serde_urlencoded::from_str(
+            "email=user%40example.com&client_id=ios&return_to=https%3A%2F%2Fapp.example.com%2Fhome",
+        )
+        .unwrap();
+
+        assert_eq!(magic_link.email, "user@example.com");
+        assert_eq!(magic_link.client_id.as_deref(), Some("ios"));
+        assert_eq!(
+            magic_link.return_to.as_deref(),
+            Some("https://app.example.com/home")
+        );
+
+        let login: PasswordLoginRequest = serde_urlencoded::from_str(
+            "email=user%40example.com&password=correct-horse&client_id=ios&return_to=wavey%3A%2F%2Fauth%2Fcallback",
+        )
+        .unwrap();
+
+        assert_eq!(login.client_id.as_deref(), Some("ios"));
+        assert_eq!(login.return_to.as_deref(), Some("wavey://auth/callback"));
+    }
+
+    #[test]
+    fn passkey_json_accepts_snake_case_field_aliases() {
+        let register: PasskeyRegisterOptionsRequest = serde_json::from_value(serde_json::json!({
+            "email": "user@example.com",
+            "display_name": "Example User",
+            "client_id": "ios",
+            "return_to": "wavey://auth/callback"
+        }))
+        .unwrap();
+
+        assert_eq!(register.display_name.as_deref(), Some("Example User"));
+        assert_eq!(register.client_id.as_deref(), Some("ios"));
+        assert_eq!(register.return_to.as_deref(), Some("wavey://auth/callback"));
+
+        let authenticate: PasskeyAuthenticateOptionsRequest =
+            serde_json::from_value(serde_json::json!({
+                "client_id": "ios",
+                "return_to": "wavey://auth/callback"
+            }))
+            .unwrap();
+
+        assert_eq!(authenticate.client_id.as_deref(), Some("ios"));
+        assert_eq!(
+            authenticate.return_to.as_deref(),
+            Some("wavey://auth/callback")
+        );
     }
 
     #[test]
@@ -11755,6 +18481,20 @@ mod tests {
         assert!(cors_path("/sessions"));
         assert!(cors_path("/profile"));
         assert!(cors_path("/identities"));
+        assert!(cors_path("/passkeys/register/options"));
+        assert!(cors_path("/passkeys/authenticate/options"));
+        assert!(cors_path("/passkeys/login/options"));
+        assert!(cors_path("/password/register"));
+        assert!(cors_path("/password/login"));
+        assert!(cors_path("/magic-links"));
+        assert!(cors_path("/magic-link"));
+        assert!(cors_path("/magic_link"));
+        assert!(cors_path("/magic-links/request"));
+        assert!(cors_path("/magic-link/request"));
+        assert!(cors_path("/magic_link/request"));
+        assert!(cors_path("/magic-links/consume"));
+        assert!(cors_path("/magic-link/consume"));
+        assert!(cors_path("/magic_link/consume"));
         assert!(cors_path("/validate"));
         assert!(cors_path("/logout"));
         assert!(!cors_path("/authorize"));
@@ -11775,10 +18515,48 @@ mod tests {
         assert!(cors_method_allowed("/identities", "GET"));
         assert!(cors_method_allowed("/identities", "DELETE"));
         assert!(!cors_method_allowed("/identities", "POST"));
+        assert!(cors_method_allowed("/passkeys/register/options", "POST"));
+        assert!(cors_method_allowed(
+            "/passkeys/authenticate/options",
+            "POST"
+        ));
+        assert!(cors_method_allowed("/passkeys/login/options", "POST"));
+        assert!(!cors_method_allowed("/passkeys/login/options", "GET"));
+        assert!(cors_method_allowed("/password/register", "POST"));
+        assert!(!cors_method_allowed("/password/register", "GET"));
+        assert!(cors_method_allowed("/password/login", "POST"));
+        assert!(!cors_method_allowed("/password/login", "GET"));
+        assert!(cors_method_allowed("/magic-links", "POST"));
+        assert!(cors_method_allowed("/magic-link", "POST"));
+        assert!(cors_method_allowed("/magic_link", "POST"));
+        assert!(cors_method_allowed("/magic-links/request", "POST"));
+        assert!(cors_method_allowed("/magic-link/request", "POST"));
+        assert!(cors_method_allowed("/magic_link/request", "POST"));
+        assert!(!cors_method_allowed("/magic-links", "GET"));
+        let magic_links_trailing_slash = canonical_route_path("/magic-links/");
+        assert!(cors_path(magic_links_trailing_slash.as_ref()));
+        assert!(cors_method_allowed(
+            magic_links_trailing_slash.as_ref(),
+            "POST"
+        ));
+        assert!(cors_method_allowed("/magic-links/consume", "GET"));
+        assert!(cors_method_allowed("/magic-links/consume", "POST"));
+        assert!(!cors_method_allowed("/magic-links/consume", "DELETE"));
+        assert!(cors_method_allowed("/magic-link/consume", "GET"));
+        assert!(cors_method_allowed("/magic-link/consume", "POST"));
+        assert!(cors_method_allowed("/magic_link/consume", "GET"));
+        assert!(cors_method_allowed("/magic_link/consume", "POST"));
         assert!(cors_method_allowed("/validate", "GET"));
         assert!(cors_method_allowed("/logout", "GET"));
         assert!(cors_method_allowed("/logout", "POST"));
         assert!(!cors_method_allowed("/logout", "PUT"));
+
+        let local_auth_magic_links = compatibility_route_path("/local-auth/magic-links");
+        assert!(cors_path(local_auth_magic_links.as_ref()));
+        assert!(cors_method_allowed(local_auth_magic_links.as_ref(), "POST"));
+        let auth_magic_link_send = compatibility_route_path("/auth/magic-link/send");
+        assert!(cors_path(auth_magic_link_send.as_ref()));
+        assert!(cors_method_allowed(auth_magic_link_send.as_ref(), "POST"));
     }
 
     #[test]
@@ -11954,12 +18732,31 @@ mod tests {
             Some("provider-state".to_owned()),
             None,
             None,
+            None,
         )
         .unwrap();
 
         assert_eq!(callback.state, "provider-state");
         assert_eq!(callback.code, Some("provider-code".to_owned()));
         assert_eq!(callback.provider_error, None);
+        assert_eq!(callback.apple_user_json, None);
+    }
+
+    #[test]
+    fn callback_values_preserve_apple_user_json() {
+        let callback = provider_callback_from_values(
+            Some("provider-code".to_owned()),
+            Some("provider-state".to_owned()),
+            None,
+            None,
+            Some(r#"{"name":{"firstName":"Ada","lastName":"Lovelace"}}"#.to_owned()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            callback.apple_user_json.as_deref(),
+            Some(r#"{"name":{"firstName":"Ada","lastName":"Lovelace"}}"#)
+        );
     }
 
     #[test]
@@ -11969,6 +18766,7 @@ mod tests {
             Some("provider-state".to_owned()),
             Some("access_denied".to_owned()),
             Some("User cancelled".to_owned()),
+            Some(r#"{"name":{"firstName":"Ada"}}"#.to_owned()),
         )
         .unwrap();
         let error = callback.provider_error.unwrap();
@@ -11986,11 +18784,53 @@ mod tests {
             None,
             Some("access_denied".to_owned()),
             Some("User cancelled".to_owned()),
+            None,
         )
         .unwrap_err();
 
         assert_eq!(error.code, "invalid_request");
         assert_eq!(error.description, "missing state");
+    }
+
+    #[test]
+    fn apple_callback_user_display_name_joins_name_parts() {
+        let user = apple_callback_user_from_json(
+            r#"{"name":{"firstName":"  Ada ","lastName":" Lovelace "},"email":"ada@example.com"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            apple_callback_user_display_name(&user),
+            Some("Ada Lovelace".to_owned())
+        );
+    }
+
+    #[test]
+    fn apple_callback_user_display_name_accepts_single_name_part() {
+        let user = apple_callback_user_from_json(r#"{"name":{"firstName":"Ada"}}"#).unwrap();
+        assert_eq!(
+            apple_callback_user_display_name(&user),
+            Some("Ada".to_owned())
+        );
+
+        let user = apple_callback_user_from_json(r#"{"name":{"lastName":"Lovelace"}}"#).unwrap();
+        assert_eq!(
+            apple_callback_user_display_name(&user),
+            Some("Lovelace".to_owned())
+        );
+    }
+
+    #[test]
+    fn oidc_raw_profile_json_preserves_apple_callback_user() {
+        let raw = merge_oidc_raw_profile_json(
+            r#"{"sub":"apple-sub","email":"ada@example.com"}"#,
+            Some(r#"{"name":{"firstName":"Ada","lastName":"Lovelace"}}"#),
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+
+        assert_eq!(value["id_token_claims"]["sub"], "apple-sub");
+        assert_eq!(value["apple_user"]["name"]["firstName"], "Ada");
     }
 
     #[test]
@@ -12003,6 +18843,7 @@ mod tests {
             provider_redirect_uri: "https://id.example.com/oauth2/callback".to_owned(),
             app_state: Some("app-state".to_owned()),
             nonce: Some("nonce-1".to_owned()),
+            provider_nonce: Some("provider-nonce".to_owned()),
             code_challenge: Some("challenge".to_owned()),
             code_challenge_method: Some("S256".to_owned()),
             scope: "openid email".to_owned(),
@@ -12021,6 +18862,10 @@ mod tests {
             ProviderId(well_known::GOOGLE.to_owned())
         );
         assert!(record.transaction.scope.contains("email"));
+        assert_eq!(
+            record.transaction.provider_nonce,
+            Some("provider-nonce".to_owned())
+        );
         assert_eq!(
             record.transaction.link_user_id,
             Some(UserId("usr_123".to_owned()))
@@ -12046,6 +18891,7 @@ mod tests {
             provider_redirect_uri: "https://id.example.com/oauth2/callback".to_owned(),
             app_state: None,
             nonce: None,
+            provider_nonce: Some("provider-nonce".to_owned()),
             code_challenge: Some("challenge".to_owned()),
             code_challenge_method: Some("S256".to_owned()),
             scope: "openid".to_owned(),
@@ -12074,6 +18920,7 @@ mod tests {
             provider_redirect_uri: "https://id.example.com/oauth2/callback".to_owned(),
             app_state: None,
             nonce: None,
+            provider_nonce: Some("provider-nonce".to_owned()),
             code_challenge: Some("challenge".to_owned()),
             code_challenge_method: Some("S256".to_owned()),
             scope: "openid".to_owned(),
@@ -12157,6 +19004,7 @@ mod tests {
     #[test]
     fn spotify_profile_source_uses_first_image() {
         let source = spotify_profile_source(SpotifyApiProfile {
+            account_id: Some("spotify-account".to_owned()),
             id: "spotify-user".to_owned(),
             email: Some("listener@example.com".to_owned()),
             display_name: Some("Listener".to_owned()),
@@ -12174,7 +19022,7 @@ mod tests {
         assert_eq!(
             source,
             ProviderProfileSource::SpotifyProfile {
-                id: "spotify-user".to_owned(),
+                id: "spotify-account".to_owned(),
                 email: Some("listener@example.com".to_owned()),
                 display_name: Some("Listener".to_owned()),
                 image_url: Some("https://i.scdn.co/image/1".to_owned()),
@@ -12183,8 +19031,61 @@ mod tests {
     }
 
     #[test]
+    fn spotify_profile_json_allows_null_images() {
+        let profile = serde_json::from_str::<SpotifyApiProfile>(
+            r#"{
+                "account_id": "spotify-account",
+                "id": "spotify-user",
+                "email": "listener@example.com",
+                "display_name": "Listener",
+                "images": null
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(profile.account_id.as_deref(), Some("spotify-account"));
+        assert_eq!(profile.id, "spotify-user");
+        assert_eq!(profile.email.as_deref(), Some("listener@example.com"));
+        assert!(profile.images.is_empty());
+    }
+
+    #[test]
+    fn spotify_profile_source_falls_back_to_legacy_id() {
+        let source = spotify_profile_source(SpotifyApiProfile {
+            account_id: None,
+            id: "spotify-user".to_owned(),
+            email: None,
+            display_name: None,
+            images: vec![],
+        })
+        .unwrap();
+
+        assert_eq!(
+            source,
+            ProviderProfileSource::SpotifyProfile {
+                id: "spotify-user".to_owned(),
+                email: None,
+                display_name: None,
+                image_url: None,
+            }
+        );
+    }
+
+    #[test]
+    fn response_body_excerpt_bounds_provider_error_details() {
+        assert_eq!(response_body_excerpt(" \n "), "empty response body");
+        assert_eq!(response_body_excerpt(" short body "), "short body");
+
+        let long = "a".repeat(600);
+        let excerpt = response_body_excerpt(&long);
+        assert_eq!(excerpt.chars().count(), 515);
+        assert!(excerpt.ends_with("..."));
+    }
+
+    #[test]
     fn spotify_profile_source_requires_id() {
         let error = spotify_profile_source(SpotifyApiProfile {
+            account_id: None,
             id: String::new(),
             email: None,
             display_name: None,
@@ -12193,7 +19094,10 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error.code, "invalid_response");
-        assert_eq!(error.description, "Spotify profile did not include an id");
+        assert_eq!(
+            error.description,
+            "Spotify profile did not include an account_id or id"
+        );
     }
 
     fn valid_token_exchange_form() -> TokenExchangeForm {
@@ -12205,6 +19109,30 @@ mod tests {
             code: Some("zeroth-code".to_owned()),
             code_verifier: Some("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk".to_owned()),
             refresh_token: None,
+            scope: None,
+            subject_token: None,
+            subject_token_type: None,
+            provider: None,
+            provider_client_id: None,
+            nonce: None,
+        }
+    }
+
+    fn valid_native_apple_token_exchange_form() -> TokenExchangeForm {
+        TokenExchangeForm {
+            grant_type: TOKEN_EXCHANGE_GRANT_TYPE.to_owned(),
+            client_id: "wavey-ios".to_owned(),
+            client_auth: ClientAuth::None,
+            redirect_uri: None,
+            code: None,
+            code_verifier: None,
+            refresh_token: None,
+            scope: None,
+            subject_token: Some("apple.id.token".to_owned()),
+            subject_token_type: Some(ID_TOKEN_SUBJECT_TOKEN_TYPE.to_owned()),
+            provider: Some(well_known::APPLE.to_owned()),
+            provider_client_id: Some("ai.wavey.id".to_owned()),
+            nonce: None,
         }
     }
 
@@ -12229,6 +19157,7 @@ mod tests {
                 name: "Wavey iOS".to_owned(),
                 redirect_uris: vec!["wavey://auth/callback".to_owned()],
                 allowed_origins: vec![],
+                allowed_email_domains: vec![],
                 confidential: false,
             },
             secret_hash: None,
@@ -12242,6 +19171,7 @@ mod tests {
                 name: "Wavey Web".to_owned(),
                 redirect_uris: vec!["https://app.example.com/auth/callback".to_owned()],
                 allowed_origins: vec!["https://app.example.com".to_owned()],
+                allowed_email_domains: vec![],
                 confidential: true,
             },
             secret_hash: Some(format!("sha256:{}", hash_secret(secret))),
@@ -12325,6 +19255,7 @@ mod tests {
             picture_url: Some("https://example.com/avatar.png".to_owned()),
             disabled_at: None,
             email_verified: 1,
+            admin_membership_active: 0,
         }
     }
 
@@ -12345,6 +19276,7 @@ mod tests {
             email_verified: None,
             name: None,
             picture: None,
+            roles: vec!["user".to_owned()],
         }
     }
 
@@ -12354,11 +19286,6 @@ mod tests {
             "0000000000000000000000000000000000000000000000000000000000000001",
         )
         .unwrap()
-    }
-
-    fn test_verification_keys(signing_key: &Es256SigningKey) -> Vec<Es256VerificationKey> {
-        let jwks = jwks_response(signing_key, None).unwrap();
-        es256_verification_keys_from_jwks(&jwks).unwrap()
     }
 
     fn decode_jwt_claims(jwt: &str) -> serde_json::Value {
@@ -12440,6 +19367,87 @@ mod tests {
                 n: Some("n".to_owned()),
                 e: Some("e".to_owned()),
             }],
+        }
+    }
+
+    fn test_passkey_client_data(ceremony_type: &str, challenge: &str, origin: &str) -> String {
+        URL_SAFE_NO_PAD.encode(
+            serde_json::json!({
+                "type": ceremony_type,
+                "challenge": passkey_challenge_for_browser(challenge),
+                "origin": origin,
+                "crossOrigin": false
+            })
+            .to_string()
+            .as_bytes(),
+        )
+    }
+
+    fn test_passkey_authenticator_data(
+        rp_id: &str,
+        flags: u8,
+        sign_count: i32,
+        credential_id: &[u8],
+        cose_key: &[u8],
+    ) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&Sha256::digest(rp_id.as_bytes()));
+        data.push(flags);
+        data.extend_from_slice(&sign_count.to_be_bytes());
+        data.extend_from_slice(&[0u8; 16]);
+        data.extend_from_slice(&(credential_id.len() as u16).to_be_bytes());
+        data.extend_from_slice(credential_id);
+        data.extend_from_slice(cose_key);
+        data
+    }
+
+    fn test_passkey_attestation_object(auth_data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.push(0xa3);
+        cbor_text(&mut out, "fmt");
+        cbor_text(&mut out, "none");
+        cbor_text(&mut out, "authData");
+        cbor_bytes(&mut out, auth_data);
+        cbor_text(&mut out, "attStmt");
+        out.push(0xa0);
+        out
+    }
+
+    fn test_passkey_cose_key(x: &[u8; 32], y: &[u8; 32]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.push(0xa5);
+        out.push(0x01);
+        out.push(0x02);
+        out.push(0x03);
+        out.push(0x26);
+        out.push(0x20);
+        out.push(0x01);
+        out.push(0x21);
+        cbor_bytes(&mut out, x);
+        out.push(0x22);
+        cbor_bytes(&mut out, y);
+        out
+    }
+
+    fn cbor_text(out: &mut Vec<u8>, value: &str) {
+        cbor_len(out, 0x60, value.len());
+        out.extend_from_slice(value.as_bytes());
+    }
+
+    fn cbor_bytes(out: &mut Vec<u8>, value: &[u8]) {
+        cbor_len(out, 0x40, value.len());
+        out.extend_from_slice(value);
+    }
+
+    fn cbor_len(out: &mut Vec<u8>, major: u8, len: usize) {
+        if len < 24 {
+            out.push(major | (len as u8));
+        } else if len <= u8::MAX as usize {
+            out.push(major | 24);
+            out.push(len as u8);
+        } else {
+            out.push(major | 25);
+            out.extend_from_slice(&(len as u16).to_be_bytes());
         }
     }
 

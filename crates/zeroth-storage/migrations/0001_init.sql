@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS zeroth_clients (
     confidential INTEGER NOT NULL DEFAULT 0,
     redirect_uris_json TEXT NOT NULL,
     allowed_origins_json TEXT NOT NULL DEFAULT '[]',
+    allowed_email_domains_json TEXT NOT NULL DEFAULT '[]',
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     disabled_at INTEGER
@@ -64,6 +65,7 @@ CREATE TABLE IF NOT EXISTS zeroth_auth_transactions (
     provider_redirect_uri TEXT NOT NULL,
     app_state TEXT,
     nonce TEXT,
+    provider_nonce TEXT,
     code_challenge TEXT,
     code_challenge_method TEXT,
     scope TEXT NOT NULL,

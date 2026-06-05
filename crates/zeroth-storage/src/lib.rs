@@ -89,7 +89,25 @@ pub mod migrations {
         sql: include_str!("../migrations/0001_init.sql"),
     };
 
-    pub const ALL: &[Migration] = &[INIT];
+    pub const PASSKEYS: Migration = Migration {
+        version: 2,
+        name: "passkeys",
+        sql: include_str!("../migrations/0002_passkeys.sql"),
+    };
+
+    pub const ADMIN_MEMBERSHIPS: Migration = Migration {
+        version: 3,
+        name: "admin_memberships",
+        sql: include_str!("../migrations/0003_admin_memberships.sql"),
+    };
+
+    pub const LOCAL_AUTH: Migration = Migration {
+        version: 4,
+        name: "local_auth",
+        sql: include_str!("../migrations/0004_local_auth.sql"),
+    };
+
+    pub const ALL: &[Migration] = &[INIT, PASSKEYS, ADMIN_MEMBERSHIPS, LOCAL_AUTH];
 }
 
 pub const REQUIRED_TABLES: &[&str] = &[
@@ -101,6 +119,11 @@ pub const REQUIRED_TABLES: &[&str] = &[
     "zeroth_auth_codes",
     "zeroth_refresh_tokens",
     "zeroth_sessions",
+    "zeroth_passkey_credentials",
+    "zeroth_passkey_challenges",
+    "zeroth_admin_memberships",
+    "zeroth_local_credentials",
+    "zeroth_magic_links",
     "zeroth_signing_keys",
     "zeroth_audit_events",
 ];
@@ -123,6 +146,11 @@ pub mod compatibility {
         name: "session_return_to",
         definition: "TEXT",
     };
+    pub const AUTH_TRANSACTION_PROVIDER_NONCE: CompatibilityColumn = CompatibilityColumn {
+        table: "zeroth_auth_transactions",
+        name: "provider_nonce",
+        definition: "TEXT",
+    };
     pub const AUTH_CODE_SESSION_ID: CompatibilityColumn = CompatibilityColumn {
         table: "zeroth_auth_codes",
         name: "session_id",
@@ -138,14 +166,22 @@ pub mod compatibility {
         name: "auth_time",
         definition: "INTEGER",
     };
+    pub const CLIENT_ALLOWED_EMAIL_DOMAINS: CompatibilityColumn = CompatibilityColumn {
+        table: "zeroth_clients",
+        name: "allowed_email_domains_json",
+        definition: "TEXT NOT NULL DEFAULT '[]'",
+    };
 
     pub const TABLES: &[&str] = &[
+        "zeroth_clients",
         "zeroth_auth_transactions",
         "zeroth_auth_codes",
         "zeroth_refresh_tokens",
     ];
 
     pub const ALL: &[CompatibilityColumn] = &[
+        CLIENT_ALLOWED_EMAIL_DOMAINS,
+        AUTH_TRANSACTION_PROVIDER_NONCE,
         AUTH_TRANSACTION_LINK_USER_ID,
         AUTH_TRANSACTION_LINK_SESSION_ID,
         AUTH_TRANSACTION_SESSION_RETURN_TO,
@@ -162,9 +198,45 @@ mod tests {
     #[test]
     fn init_migration_contains_auth_tables() {
         let sql = migrations::INIT.sql;
-        for table in super::REQUIRED_TABLES {
+        for table in super::REQUIRED_TABLES.iter().copied().filter(|table| {
+            !table.starts_with("zeroth_passkey_")
+                && *table != "zeroth_admin_memberships"
+                && *table != "zeroth_local_credentials"
+                && *table != "zeroth_magic_links"
+        }) {
             assert!(sql.contains(table), "missing table {table}");
         }
+    }
+
+    #[test]
+    fn passkey_migration_contains_passkey_tables() {
+        let sql = migrations::PASSKEYS.sql;
+
+        for table in ["zeroth_passkey_credentials", "zeroth_passkey_challenges"] {
+            assert!(sql.contains(table), "missing table {table}");
+        }
+        assert_eq!(migrations::ALL.len(), 4);
+        assert_eq!(migrations::ALL[1].version, 2);
+    }
+
+    #[test]
+    fn admin_membership_migration_contains_admin_table() {
+        let sql = migrations::ADMIN_MEMBERSHIPS.sql;
+
+        assert!(sql.contains("zeroth_admin_memberships"));
+        assert!(sql.contains("granted_by TEXT NOT NULL"));
+        assert_eq!(migrations::ALL[2].version, 3);
+    }
+
+    #[test]
+    fn local_auth_migration_contains_password_and_magic_link_tables() {
+        let sql = migrations::LOCAL_AUTH.sql;
+
+        assert!(sql.contains("zeroth_local_credentials"));
+        assert!(sql.contains("password_iterations INTEGER NOT NULL"));
+        assert!(sql.contains("zeroth_magic_links"));
+        assert!(sql.contains("token_hash TEXT PRIMARY KEY"));
+        assert_eq!(migrations::ALL[3].version, 4);
     }
 
     #[test]
@@ -219,8 +291,11 @@ mod tests {
         assert!(compatibility::TABLES.contains(&"zeroth_auth_transactions"));
         assert!(compatibility::TABLES.contains(&"zeroth_auth_codes"));
         assert!(compatibility::TABLES.contains(&"zeroth_refresh_tokens"));
+        assert!(compatibility::TABLES.contains(&"zeroth_clients"));
 
         for column in [
+            "allowed_email_domains_json",
+            "provider_nonce",
             "link_user_id",
             "link_session_id",
             "session_return_to",

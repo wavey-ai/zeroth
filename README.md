@@ -95,10 +95,17 @@ Implemented so far:
   with D1 transaction lookup, browser transaction-cookie binding, conditional
   one-time transaction consumption before provider token exchange, and replay
   rejection
+- Zeroth-owned upstream OIDC provider nonces for Apple/Google callbacks,
+  separate from downstream app nonces that are preserved only for Zeroth-issued
+  ID tokens
+- Apple `form_post` callback `user` JSON preservation for first-consent name
+  capture, merged with verified Apple ID-token claims before D1 user/identity
+  upsert
 - Provider-side callback errors such as user cancellation redirect back to the
   stored OIDC, browser-login, or identity-link return URL with error details and
   original app state
-- Spotify profile fetch and D1 user/identity upsert
+- Spotify profile fetch and D1 user/identity upsert using Spotify `account_id`
+  as the stable account-linking subject when present, with legacy `id` fallback
 - Google/Apple RS256 ID-token verification against provider JWKS and D1
   user/identity upsert from verified OIDC claims
 - provider callback completion that either creates a D1-backed browser session
@@ -113,19 +120,33 @@ Implemented so far:
   verification, code lookup, expiry/reuse checks, redirect URI matching, S256
   `code_verifier` validation when the authorization code used PKCE, and
   conditional one-time D1 code consumption before credentials are minted
+- Worker `/oauth/token` native provider token exchange for Swift/mobile apps:
+  Apple and Google ID tokens are verified against provider JWKS and configured
+  native client-ID allowlists, Spotify access tokens are validated through
+  Spotify's profile endpoint, Spotify profile `account_id` is used as the
+  stable account-linking subject when present, and all three persist the
+  provider identity in D1, apply the registered Zeroth client's email-domain
+  policy, and return Zeroth-owned access/ID tokens
 - registered-client CORS/preflight support for browser calls to token,
   revocation, introspection, userinfo, session, sessions, profile, identities,
   validate, and logout
   endpoints
 - ES256 Zeroth-owned access/ID token issuance, standard scoped OIDC ID-token
-  claims for `email`/`profile`, session-bound `sid` claims, refresh-token
-  persistence for `offline_access`, and Worker `/.well-known/jwks.json`
+  claims for `email`/`profile`, conservative `roles` claims (`user`, plus
+  `admin` for active Zeroth admin memberships), session-bound `sid` claims,
+  refresh-token persistence for `offline_access`, and Worker
+  `/.well-known/jwks.json`
+- `zeroth-oidc` relying-party helpers for sub-10 ms product gating: match
+  multiple exact/prefix protected paths locally, verify the Zeroth access token
+  from cached JWKS, and check role/scope claims without calling Zeroth on every
+  request
 - OIDC discovery metadata for query-mode code responses, rejection of
   unsupported downstream `response_mode` values, the
   `authorization_response_iss_parameter_supported` flag, Zeroth-owned
   issuer/JWKS endpoints for native and browser clients, OAuth Authorization
-  Server metadata at `/.well-known/oauth-authorization-server`, and `auth_time`
-  claims for clients that use `max_age`
+  Server metadata at `/.well-known/oauth-authorization-server`, explicit
+  `prompt` parsing for `none`, `login`, `consent`, and `select_account`, and
+  `auth_time` claims for clients that use `max_age`
 - refresh-token grant exchange with rotation and fresh Zeroth token issuance;
   auth-code-issued refresh tokens are bound to the browser session that created
   the code, preserve original `auth_time`, require conditional D1 rotation to
@@ -144,8 +165,10 @@ Implemented so far:
   rejected from D1 before profile data is returned, and session-bound access
   tokens require the referenced browser session to still be active
 - Worker browser sessions with D1 persistence, secure session cookies,
-  `/session`, `/sessions`, `/profile`, `/identities`, and `/logout`; session
-  revocation also revokes that session's refresh-token family
+  optional deployment-controlled parent-domain session cookies for same-site SSO
+  across first-party subdomains, `/session`, `/sessions`, `/profile`,
+  `/identities`, and `/logout`; session revocation also revokes that session's
+  refresh-token family
 - Worker OIDC `end_session_endpoint` metadata and bounded post-logout redirects
   through `/logout`
 - Worker `PATCH /profile` for bounded local display-name and picture updates

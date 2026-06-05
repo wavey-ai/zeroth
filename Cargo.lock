@@ -2594,6 +2594,11 @@ version = "0.1.0"
 name = "zeroth-oidc"
 version = "0.1.0"
 dependencies = [
+ "base64",
+ "p256",
+ "serde",
+ "serde_json",
+ "sha2",
  "url",
  "zeroth-core",
 ]
@@ -2643,6 +2648,7 @@ dependencies = [
  "rsa",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "sha2",
  "url",
  "urlencoding",

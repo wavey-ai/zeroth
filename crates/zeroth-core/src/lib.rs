@@ -41,6 +41,7 @@ pub struct Client {
     pub name: String,
     pub redirect_uris: Vec<String>,
     pub allowed_origins: Vec<String>,
+    pub allowed_email_domains: Vec<String>,
     pub confidential: bool,
 }
 
@@ -73,6 +74,7 @@ pub struct AuthTransaction {
     pub provider_redirect_uri: String,
     pub app_state: Option<String>,
     pub nonce: Option<String>,
+    pub provider_nonce: Option<String>,
     pub code_challenge: Option<String>,
     pub code_challenge_method: Option<String>,
     pub scope: ScopeSet,

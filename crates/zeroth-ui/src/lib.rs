@@ -7,6 +7,9 @@ use leptos::prelude::*;
 use url::{form_urlencoded, Url};
 use zeroth_providers::well_known;
 
+const TRANSPARENT_PIXEL_DATA_URI: &str =
+    "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==";
+
 /// Stylesheet for the default Zeroth account UI.
 pub const ZEROTH_UI_CSS: &str = r#"
 :root {
@@ -80,6 +83,206 @@ a:hover {
   background: var(--z-ink);
   color: #ffffff;
   font-weight: 800;
+}
+
+.zeroth-hidden {
+  display: none !important;
+}
+
+.zeroth-login-mode {
+  grid-template-columns: 1fr;
+  background:
+    linear-gradient(180deg, #ffffff 0%, #f6f8fa 54%, #eef7f1 100%);
+}
+
+.zeroth-login-mode .zeroth-sidebar {
+  display: flex;
+  justify-content: center;
+  border-right: 0;
+  border-bottom: 1px solid var(--z-line);
+  background: rgba(255, 255, 255, 0.92);
+}
+
+.zeroth-login-mode .zeroth-brand {
+  margin-bottom: 0;
+}
+
+.zeroth-login-mode .zeroth-mark {
+  width: 34px;
+  height: 34px;
+  border-radius: 8px;
+  background: linear-gradient(145deg, #1f2328 0%, #0550ae 100%);
+  box-shadow: 0 8px 24px rgba(9, 105, 218, 0.22);
+}
+
+.zeroth-login-mode .zeroth-nav,
+.zeroth-login-mode .zeroth-topbar {
+  display: none;
+}
+
+.zeroth-login-mode .zeroth-main {
+  width: min(680px, 100%);
+  margin: 0 auto;
+  padding: 38px 20px 28px;
+}
+
+.zeroth-login-intro {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 18px;
+  margin: 0 auto 18px;
+  width: min(680px, 100%);
+}
+
+.zeroth-hero-mark {
+  display: grid;
+  place-items: center;
+  width: 88px;
+  height: 88px;
+  border-radius: 20px;
+  background:
+    linear-gradient(145deg, #1f2328 0%, #0550ae 55%, #1a7f37 100%);
+  color: #ffffff;
+  font-size: 50px;
+  line-height: 1;
+  font-weight: 900;
+  box-shadow: 0 20px 50px rgba(9, 105, 218, 0.2);
+}
+
+.zeroth-kicker {
+  color: var(--z-green);
+  font-size: 12px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.zeroth-login-title {
+  margin: 1px 0 0;
+  color: var(--z-ink);
+  font-size: 34px;
+  line-height: 1.1;
+  letter-spacing: 0;
+}
+
+.zeroth-login-subtitle {
+  margin-top: 5px;
+  color: var(--z-muted);
+  font-size: 14px;
+}
+
+.zeroth-login-mode .zeroth-grid {
+  grid-template-columns: 1fr;
+}
+
+.zeroth-login-mode .zeroth-panel {
+  border-color: var(--z-line-strong);
+  box-shadow: 0 20px 54px rgba(31, 35, 40, 0.1);
+}
+
+.zeroth-login-card {
+  margin: 0 auto;
+  width: min(440px, 100%);
+}
+
+.zeroth-login-card .zeroth-panel-header {
+  padding: 16px 18px;
+}
+
+.zeroth-login-card .zeroth-panel-title {
+  font-size: 18px;
+}
+
+.zeroth-login-card .zeroth-panel-body {
+  padding: 18px;
+}
+
+.zeroth-local-auth {
+  display: grid;
+  gap: 12px;
+}
+
+.zeroth-login-actions {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px;
+  align-items: end;
+}
+
+.zeroth-divider {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  gap: 10px;
+  color: var(--z-muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.zeroth-divider::before,
+.zeroth-divider::after {
+  content: "";
+  height: 1px;
+  background: var(--z-line);
+}
+
+.zeroth-login-mode .zeroth-provider {
+  grid-template-columns: 38px minmax(0, 1fr);
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid var(--z-line-strong);
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.zeroth-login-mode .zeroth-provider-badge {
+  width: 34px;
+  height: 34px;
+  border-radius: 8px;
+}
+
+.zeroth-login-mode .zeroth-action {
+  min-height: 36px;
+  min-width: 94px;
+}
+
+.zeroth-login-mode .zeroth-provider-list {
+  gap: 10px;
+}
+
+.zeroth-login-mode .zeroth-provider > div {
+  display: none;
+}
+
+.zeroth-login-mode .zeroth-provider .zeroth-action {
+  border-color: var(--z-line-strong);
+  grid-column: 2;
+  justify-content: center;
+  min-width: 0;
+  width: 100%;
+  font-weight: 700;
+}
+
+.zeroth-login-mode .provider-apple .zeroth-action {
+  border-color: #1f2328;
+  background: #1f2328;
+  color: #ffffff;
+}
+
+.zeroth-login-mode .provider-apple .zeroth-action:hover {
+  border-color: #424a53;
+  background: #424a53;
+  color: #ffffff;
+}
+
+.zeroth-login-mode .provider-google .zeroth-action {
+  background: #ffffff;
+  color: #1f2328;
+}
+
+.zeroth-login-mode .provider-google .zeroth-action:hover {
+  border-color: #0969da;
+  color: #0969da;
 }
 
 .zeroth-nav {
@@ -535,6 +738,26 @@ a:hover {
   .zeroth-filter-grid {
     grid-template-columns: 1fr;
   }
+
+  .zeroth-login-intro {
+    grid-template-columns: 1fr;
+    justify-items: start;
+  }
+
+  .zeroth-login-actions {
+    grid-template-columns: 1fr;
+  }
+
+  .zeroth-hero-mark {
+    width: 68px;
+    height: 68px;
+    border-radius: 14px;
+    font-size: 40px;
+  }
+
+  .zeroth-login-title {
+    font-size: 28px;
+  }
 }
 "#;
 
@@ -669,6 +892,7 @@ pub struct ApplicationUi {
     pub public_client: bool,
     pub redirect_uris: Vec<String>,
     pub allowed_origins: Vec<String>,
+    pub allowed_email_domains: Vec<String>,
 }
 
 /// Registered client row shown in the Zeroth management UI.
@@ -679,6 +903,7 @@ pub struct ClientAdminUi {
     pub confidential: bool,
     pub redirect_uris: Vec<String>,
     pub allowed_origins: Vec<String>,
+    pub allowed_email_domains: Vec<String>,
     pub disabled: bool,
     pub has_secret: bool,
 }
@@ -692,7 +917,44 @@ pub struct ProviderAdminUi {
     pub enabled: bool,
     pub client_id_configured: bool,
     pub client_secret_configured: bool,
+    pub client_id_binding: String,
+    pub secret_binding_sets: Vec<Vec<String>>,
+    pub callback_url: String,
+    pub web_domain: Option<String>,
     pub notes: Vec<String>,
+    pub activation_requirements: Vec<String>,
+    pub last_failure: Option<ProviderFailureAdminUi>,
+}
+
+/// Bounded provider failure evidence shown in the management UI.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderFailureAdminUi {
+    pub event_type: String,
+    pub created_at: String,
+    pub code: Option<String>,
+    pub description: Option<String>,
+}
+
+/// First-party/local auth method readiness row shown in the management UI.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalAuthAdminUi {
+    pub id: String,
+    pub label: String,
+    pub enabled: bool,
+    pub credential_storage: String,
+    pub delivery: String,
+    pub delivery_status: Option<LocalAuthDeliveryAdminUi>,
+    pub notes: Vec<String>,
+}
+
+/// Bounded delivery evidence for a local auth method.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalAuthDeliveryAdminUi {
+    pub last_issue_at: Option<String>,
+    pub last_sent_at: Option<String>,
+    pub last_failed_at: Option<String>,
+    pub last_error: Option<String>,
+    pub last_error_detail: Option<String>,
 }
 
 /// User row shown in the Zeroth management UI.
@@ -702,6 +964,7 @@ pub struct UserAdminUi {
     pub email: Option<String>,
     pub display_name: Option<String>,
     pub disabled: bool,
+    pub admin: bool,
     pub identity_count: i32,
     pub active_session_count: i32,
     pub created_at: Option<String>,
@@ -728,6 +991,7 @@ pub struct ClientsAdminUiState {
     pub admin_login_url: String,
     pub clients: Vec<ClientAdminUi>,
     pub providers: Vec<ProviderAdminUi>,
+    pub local_auth: Vec<LocalAuthAdminUi>,
     pub users: Vec<UserAdminUi>,
     pub events: Vec<EventAdminUi>,
 }
@@ -742,6 +1006,7 @@ impl ClientsAdminUiState {
             admin_login_url,
             clients: Vec::new(),
             providers: Vec::new(),
+            local_auth: Vec::new(),
             users: Vec::new(),
             events: Vec::new(),
         }
@@ -814,6 +1079,7 @@ pub fn render_account_document(state: ZerothUiState) -> String {
         concat!(
             "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">",
             "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">",
+            "<link rel=\"icon\" href=\"/favicon.svg\" type=\"image/svg+xml\">",
             "<title>{}</title><style>{}</style></head><body>{}<script>{}</script></body></html>"
         ),
         escape_text(&state.product_name),
@@ -834,6 +1100,7 @@ pub fn render_clients_admin_document(state: ClientsAdminUiState) -> String {
         concat!(
             "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">",
             "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">",
+            "<link rel=\"icon\" href=\"/favicon.svg\" type=\"image/svg+xml\">",
             "<title>{} Clients</title><style>{}</style></head><body>{}<script>{}</script></body></html>"
         ),
         escape_text(&state.product_name),
@@ -903,6 +1170,11 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
     } else {
         ""
     };
+    let avatar_src = if profile_picture.is_empty() {
+        TRANSPARENT_PIXEL_DATA_URI.to_owned()
+    } else {
+        profile_picture.clone()
+    };
     let avatar_text_class = if profile_picture.is_empty() {
         ""
     } else {
@@ -911,6 +1183,45 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
     let profile_action = endpoint_url(&config, "/profile");
     let logout_action = endpoint_url(&config, "/logout");
     let csrf_token = config.csrf_token.clone().unwrap_or_default();
+    let login_mode = !signed_in && !config.link_identities;
+    let shell_class = if login_mode {
+        "zeroth-shell zeroth-login-mode"
+    } else {
+        "zeroth-shell"
+    };
+    let login_intro_class = if login_mode {
+        "zeroth-login-intro"
+    } else {
+        "zeroth-login-intro zeroth-hidden"
+    };
+    let account_panel_class = if login_mode {
+        "zeroth-panel zeroth-hidden"
+    } else {
+        "zeroth-panel"
+    };
+    let login_panel_class = if login_mode {
+        "zeroth-panel zeroth-login-card"
+    } else {
+        "zeroth-panel"
+    };
+    let login_client_status_class = if login_mode {
+        "zeroth-status zeroth-hidden"
+    } else {
+        "zeroth-status"
+    };
+    let passkey_register_class = if signed_in {
+        "zeroth-form zeroth-passkey-register-form"
+    } else {
+        "zeroth-form zeroth-passkey-register-form zeroth-hidden"
+    };
+    let login_panel_title = if login_mode { "Sign in" } else { "Login" };
+    let login_return_to = config
+        .return_to
+        .clone()
+        .unwrap_or(config.redirect_uri.clone());
+    let password_login_action = endpoint_url(&config, "/password/login");
+    let password_register_action = endpoint_url(&config, "/password/register");
+    let magic_link_action = endpoint_url(&config, "/magic-links");
 
     let provider_rows = providers
         .into_iter()
@@ -927,7 +1238,7 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
     let application_rows = applications.into_iter().map(application_row).collect_view();
 
     view! {
-        <div class="zeroth-shell">
+        <div class=shell_class>
             <aside class="zeroth-sidebar">
                 <div class="zeroth-brand">
                     <span class="zeroth-mark">"Z"</span>
@@ -942,6 +1253,15 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
             </aside>
 
             <main class="zeroth-main">
+                <section class=login_intro_class aria-label="Zeroth sign in">
+                    <span class="zeroth-hero-mark">"Z"</span>
+                    <div>
+                        <div class="zeroth-kicker">"SSO"</div>
+                        <h1 class="zeroth-login-title">{product_name.clone()}</h1>
+                        <div class="zeroth-login-subtitle">{config.issuer_base_url.clone()}</div>
+                    </div>
+                </section>
+
                 <header class="zeroth-topbar">
                     <div>
                         <h1 class="zeroth-title">{product_name}</h1>
@@ -952,17 +1272,78 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
 
                 <div class="zeroth-grid">
                     <div class="zeroth-stack">
-                        <section id="login" class="zeroth-panel">
+                        <section id="login" class=login_panel_class>
                             <div class="zeroth-panel-header">
-                                <h2 class="zeroth-panel-title">"Login"</h2>
-                                <span class="zeroth-status">{config.client_id.clone()}</span>
+                                <h2 class="zeroth-panel-title">{login_panel_title}</h2>
+                                <span class=login_client_status_class>{config.client_id.clone()}</span>
                             </div>
-                            <div class="zeroth-panel-body">
+                            <div class="zeroth-panel-body zeroth-local-auth">
                                 <div class="zeroth-provider-list">{provider_rows}</div>
+
+                                <div class="zeroth-divider">"Email"</div>
+                                <form class="zeroth-form zeroth-login-form" method="post" action=password_login_action data-zeroth-local-auth="password-login">
+                                    <input type="hidden" name="clientId" value=config.client_id.clone() />
+                                    <input type="hidden" name="returnTo" value=login_return_to.clone() />
+                                    <div class="zeroth-field">
+                                        <label for="zeroth-login-email">"Email"</label>
+                                        <input id="zeroth-login-email" name="email" type="email" autocomplete="email" />
+                                    </div>
+                                    <div class="zeroth-login-actions">
+                                        <div class="zeroth-field">
+                                            <label for="zeroth-login-password">"Password"</label>
+                                            <input id="zeroth-login-password" name="password" type="password" autocomplete="current-password" />
+                                        </div>
+                                        <button class="zeroth-action zeroth-primary" type="submit">"Sign in"</button>
+                                    </div>
+                                    <div class="zeroth-form-actions">
+                                        <button class="zeroth-action" type="submit" formaction=password_register_action data-zeroth-local-mode="password-register">"Create password"</button>
+                                    </div>
+                                </form>
+
+                                <div class="zeroth-divider">"Magic link"</div>
+                                <form class="zeroth-form zeroth-login-form" method="post" action=magic_link_action data-zeroth-local-auth="magic-link">
+                                    <input type="hidden" name="clientId" value=config.client_id.clone() />
+                                    <input type="hidden" name="returnTo" value=login_return_to.clone() />
+                                    <div class="zeroth-login-actions">
+                                        <div class="zeroth-field">
+                                            <label for="zeroth-magic-email">"Magic link"</label>
+                                            <input id="zeroth-magic-email" name="email" type="email" autocomplete="email" />
+                                        </div>
+                                        <button class="zeroth-action" type="submit">"Send link"</button>
+                                    </div>
+                                </form>
+
+                                <div class="zeroth-divider">"Passkey"</div>
+                                <div class="zeroth-login-actions">
+                                    <div>
+                                        <div class="zeroth-row-title">"Passkey"</div>
+                                        <div class="zeroth-row-meta" id="zeroth-account-passkey-status">"Ready"</div>
+                                    </div>
+                                    <button
+                                        class="zeroth-action"
+                                        id="zeroth-account-passkey-login"
+                                        type="button"
+                                        data-client-id=config.client_id.clone()
+                                        data-return-to=login_return_to.clone()
+                                    >
+                                        "Use passkey"
+                                    </button>
+                                </div>
+                                <form class=passkey_register_class id="zeroth-account-passkey-register-form">
+                                    <input type="hidden" name="clientId" value=config.client_id.clone() />
+                                    <input type="hidden" name="returnTo" value=login_return_to />
+                                    <div class="zeroth-login-actions">
+                                        <div class="zeroth-field">
+                                            <label for="zeroth-account-passkey-label">"New passkey"</label>
+                                            <input id="zeroth-account-passkey-label" name="label" type="text" autocomplete="off" />
+                                        </div>
+                                        <button class="zeroth-action" type="submit">"Save passkey"</button>
+                                    </div>
+                                </form>
                             </div>
                         </section>
 
-                        <section id="sessions" class="zeroth-panel">
+                        <section id="sessions" class=account_panel_class>
                             <div class="zeroth-panel-header">
                                 <h2 class="zeroth-panel-title">"Sessions"</h2>
                                 <span class="zeroth-status">{profile_subject.clone()}</span>
@@ -974,7 +1355,7 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
                     </div>
 
                     <div class="zeroth-stack">
-                        <section id="profile" class="zeroth-panel">
+                        <section id="profile" class=account_panel_class>
                             <div class="zeroth-panel-header">
                                 <h2 class="zeroth-panel-title">"Profile"</h2>
                                 <span class=email_status_class>{email_status}</span>
@@ -982,7 +1363,7 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
                             <div class="zeroth-panel-body zeroth-stack">
                                 <div class="zeroth-profile">
                                     <div class="zeroth-avatar">
-                                        <img class=avatar_image_class src=profile_picture.clone() alt="" />
+                                        <img class=avatar_image_class src=avatar_src alt="" />
                                         <span class=avatar_text_class>{avatar_initial}</span>
                                     </div>
                                     <div>
@@ -1013,7 +1394,7 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
                             </div>
                         </section>
 
-                        <section id="identities" class="zeroth-panel">
+                        <section id="identities" class=account_panel_class>
                             <div class="zeroth-panel-header">
                                 <h2 class="zeroth-panel-title">"Identities"</h2>
                                 <span class="zeroth-status">"Linked providers"</span>
@@ -1023,7 +1404,7 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
                             </div>
                         </section>
 
-                        <section id="applications" class="zeroth-panel">
+                        <section id="applications" class=account_panel_class>
                             <div class="zeroth-panel-header">
                                 <h2 class="zeroth-panel-title">"Applications"</h2>
                                 <span class="zeroth-status">"OIDC"</span>
@@ -1035,6 +1416,7 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
                                         <th>"Type"</th>
                                         <th>"Redirect URIs"</th>
                                         <th>"Origins"</th>
+                                        <th>"Email domains"</th>
                                     </tr>
                                 </thead>
                                 <tbody>{application_rows}</tbody>
@@ -1056,6 +1438,7 @@ pub fn ClientsAdminApp(state: ClientsAdminUiState) -> impl IntoView {
         admin_login_url,
         clients,
         providers,
+        local_auth,
         users,
         events,
     } = state;
@@ -1063,6 +1446,10 @@ pub fn ClientsAdminApp(state: ClientsAdminUiState) -> impl IntoView {
     let user_count = users.len().to_string();
     let event_count = events.len().to_string();
     let provider_rows = providers.into_iter().map(provider_admin_row).collect_view();
+    let local_auth_rows = local_auth
+        .into_iter()
+        .map(local_auth_admin_row)
+        .collect_view();
     let user_rows = users.into_iter().map(user_admin_row).collect_view();
     let event_rows = events.into_iter().map(event_admin_row).collect_view();
     let client_rows = clients.into_iter().map(client_admin_row).collect_view();
@@ -1077,6 +1464,7 @@ pub fn ClientsAdminApp(state: ClientsAdminUiState) -> impl IntoView {
                 <nav class="zeroth-nav" aria-label="Management sections">
                     <a href="#database">"Database"</a>
                     <a href="#providers">"Providers"</a>
+                    <a href="#local-auth">"Local auth"</a>
                     <a href="#users">"Users"</a>
                     <a href="#events">"Events"</a>
                     <a href="#clients" aria-current="page">"Clients"</a>
@@ -1117,6 +1505,33 @@ pub fn ClientsAdminApp(state: ClientsAdminUiState) -> impl IntoView {
                             </div>
                         </section>
 
+                        <section class="zeroth-panel">
+                            <div class="zeroth-panel-header">
+                                <h2 class="zeroth-panel-title">"Passkey"</h2>
+                                <span class="zeroth-status" id="zeroth-passkey-status">"Ready"</span>
+                            </div>
+                            <div class="zeroth-panel-body zeroth-stack">
+                                <form class="zeroth-form" id="zeroth-passkey-register-form">
+                                    <div class="zeroth-field">
+                                        <label for="zeroth-passkey-email">"Email"</label>
+                                        <input id="zeroth-passkey-email" name="email" type="email" autocomplete="email" />
+                                    </div>
+                                    <div class="zeroth-field">
+                                        <label for="zeroth-passkey-display-name">"Name"</label>
+                                        <input id="zeroth-passkey-display-name" name="displayName" type="text" autocomplete="name" />
+                                    </div>
+                                    <div class="zeroth-field">
+                                        <label for="zeroth-passkey-label">"Label"</label>
+                                        <input id="zeroth-passkey-label" name="label" type="text" autocomplete="off" />
+                                    </div>
+                                    <div class="zeroth-form-actions">
+                                        <button class="zeroth-action" id="zeroth-passkey-login" type="button">"Sign in"</button>
+                                        <button class="zeroth-action zeroth-primary" type="submit">"Register"</button>
+                                    </div>
+                                </form>
+                            </div>
+                        </section>
+
                         <section id="database" class="zeroth-panel">
                             <div class="zeroth-panel-header">
                                 <h2 class="zeroth-panel-title">"Database"</h2>
@@ -1150,10 +1565,32 @@ pub fn ClientsAdminApp(state: ClientsAdminUiState) -> impl IntoView {
                                         <th>"Status"</th>
                                         <th>"Client ID"</th>
                                         <th>"Client secret"</th>
+                                        <th>"Setup"</th>
+                                        <th>"Last failure"</th>
                                         <th>"Notes"</th>
                                     </tr>
                                 </thead>
                                 <tbody id="zeroth-provider-rows">{provider_rows}</tbody>
+                            </table>
+                        </section>
+
+                        <section id="local-auth" class="zeroth-panel">
+                            <div class="zeroth-panel-header">
+                                <h2 class="zeroth-panel-title">"Local auth"</h2>
+                                <button class="zeroth-action" id="zeroth-local-auth-refresh" type="button">"Refresh"</button>
+                            </div>
+                            <table class="zeroth-table">
+                                <thead>
+                                    <tr>
+                                        <th>"Method"</th>
+                                        <th>"Status"</th>
+                                        <th>"Storage"</th>
+                                        <th>"Delivery"</th>
+                                        <th>"Evidence"</th>
+                                        <th>"Notes"</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="zeroth-local-auth-rows">{local_auth_rows}</tbody>
                             </table>
                         </section>
 
@@ -1167,6 +1604,7 @@ pub fn ClientsAdminApp(state: ClientsAdminUiState) -> impl IntoView {
                                     <tr>
                                         <th>"User"</th>
                                         <th>"Status"</th>
+                                        <th>"Admin"</th>
                                         <th>"Identities"</th>
                                         <th>"Sessions"</th>
                                         <th>"Updated"</th>
@@ -1233,6 +1671,7 @@ pub fn ClientsAdminApp(state: ClientsAdminUiState) -> impl IntoView {
                                         <th>"Status"</th>
                                         <th>"Redirect URIs"</th>
                                         <th>"Origins"</th>
+                                        <th>"Email domains"</th>
                                         <th>"Actions"</th>
                                     </tr>
                                 </thead>
@@ -1273,6 +1712,10 @@ pub fn ClientsAdminApp(state: ClientsAdminUiState) -> impl IntoView {
                                         <textarea id="zeroth-client-origins" name="allowedOrigins" spellcheck="false"></textarea>
                                     </div>
                                     <div class="zeroth-field">
+                                        <label for="zeroth-client-email-domains">"Email domains"</label>
+                                        <textarea id="zeroth-client-email-domains" name="allowedEmailDomains" spellcheck="false"></textarea>
+                                    </div>
+                                    <div class="zeroth-field">
                                         <label for="zeroth-client-secret">"Client secret"</label>
                                         <input id="zeroth-client-secret" name="clientSecret" type="password" autocomplete="new-password" />
                                     </div>
@@ -1297,6 +1740,7 @@ pub fn ClientsAdminApp(state: ClientsAdminUiState) -> impl IntoView {
 
 fn provider_row(config: &ZerothUiConfig, provider: ProviderUi, signed_in: bool) -> impl IntoView {
     let linking = signed_in && config.link_identities;
+    let login_mode = !signed_in && !config.link_identities;
     let href = if !provider.enabled || (provider.connected && linking) {
         "#".to_owned()
     } else if linking {
@@ -1305,11 +1749,13 @@ fn provider_row(config: &ZerothUiConfig, provider: ProviderUi, signed_in: bool) 
         provider_authorize_url(config, &provider.id)
     };
     let action = if provider.connected && linking {
-        "Connected"
+        "Connected".to_owned()
     } else if linking {
-        "Link"
+        "Link".to_owned()
+    } else if login_mode {
+        format!("Continue with {}", provider.label)
     } else {
-        "Continue"
+        "Continue".to_owned()
     };
     let status = if provider.connected {
         "Connected"
@@ -1396,6 +1842,7 @@ fn application_row(application: ApplicationUi) -> impl IntoView {
     };
     let redirects = join_or_dash(application.redirect_uris);
     let origins = join_or_dash(application.allowed_origins);
+    let email_domains = join_or_dash(application.allowed_email_domains);
 
     view! {
         <tr>
@@ -1406,12 +1853,19 @@ fn application_row(application: ApplicationUi) -> impl IntoView {
             <td>{kind}</td>
             <td>{redirects}</td>
             <td>{origins}</td>
+            <td>{email_domains}</td>
         </tr>
     }
 }
 
 fn provider_admin_row(provider: ProviderAdminUi) -> impl IntoView {
-    let status = if provider.enabled {
+    let disabled = provider
+        .notes
+        .iter()
+        .any(|note| note == "disabled_by_deployment");
+    let status = if disabled {
+        "Disabled"
+    } else if provider.enabled {
         "Ready"
     } else {
         "Missing config"
@@ -1431,8 +1885,15 @@ fn provider_admin_row(provider: ProviderAdminUi) -> impl IntoView {
     } else {
         "Missing"
     };
-    let notes = join_or_dash(provider.notes);
+    let notes = provider_notes_text(&provider.notes, &provider.activation_requirements);
+    let last_failure = provider_failure_text(provider.last_failure.as_ref());
     let initial = provider_initial_by_id(&provider.id);
+    let setup = provider_setup_text(
+        provider.web_domain.as_deref(),
+        &provider.callback_url,
+        &provider.client_id_binding,
+        &provider.secret_binding_sets,
+    );
 
     view! {
         <tr>
@@ -1443,6 +1904,8 @@ fn provider_admin_row(provider: ProviderAdminUi) -> impl IntoView {
             <td><span class=status_class>{status}</span></td>
             <td>{client_id}</td>
             <td>{client_secret}</td>
+            <td class="zeroth-code">{setup}</td>
+            <td>{last_failure}</td>
             <td>
                 <span class="zeroth-provider-badge">{initial}</span>
                 " "
@@ -1452,12 +1915,160 @@ fn provider_admin_row(provider: ProviderAdminUi) -> impl IntoView {
     }
 }
 
+fn provider_notes_text(notes: &[String], activation_requirements: &[String]) -> String {
+    let mut parts = notes.to_vec();
+    parts.extend(
+        activation_requirements
+            .iter()
+            .filter(|requirement| !requirement.is_empty())
+            .map(|requirement| format!("requires: {requirement}")),
+    );
+    join_or_dash(parts)
+}
+
+fn provider_failure_text(failure: Option<&ProviderFailureAdminUi>) -> String {
+    let Some(failure) = failure else {
+        return "-".to_owned();
+    };
+
+    let mut parts = Vec::new();
+    if !failure.created_at.is_empty() {
+        parts.push(failure.created_at.as_str());
+    }
+    if !failure.event_type.is_empty() {
+        parts.push(failure.event_type.as_str());
+    }
+    if let Some(code) = failure.code.as_deref().filter(|code| !code.is_empty()) {
+        parts.push(code);
+    }
+    if let Some(description) = failure
+        .description
+        .as_deref()
+        .filter(|description| !description.is_empty())
+    {
+        parts.push(description);
+    }
+
+    if parts.is_empty() {
+        "-".to_owned()
+    } else {
+        parts.join(" · ")
+    }
+}
+
+fn local_auth_admin_row(method: LocalAuthAdminUi) -> impl IntoView {
+    let degraded = local_auth_delivery_degraded(&method.notes);
+    let status = if !method.enabled {
+        "Needs setup"
+    } else if degraded {
+        "Needs attention"
+    } else {
+        "Ready"
+    };
+    let status_class = if method.enabled && !degraded {
+        "zeroth-status zeroth-status-ok"
+    } else {
+        "zeroth-status zeroth-status-warn"
+    };
+    let notes = join_or_dash(method.notes);
+    let evidence = local_auth_delivery_evidence(method.delivery_status.as_ref());
+
+    view! {
+        <tr>
+            <td>
+                <div class="zeroth-row-title">{method.label}</div>
+                <div class="zeroth-row-meta zeroth-code">{method.id}</div>
+            </td>
+            <td><span class=status_class>{status}</span></td>
+            <td class="zeroth-code">{method.credential_storage}</td>
+            <td>{method.delivery}</td>
+            <td class="zeroth-code">{evidence}</td>
+            <td>{notes}</td>
+        </tr>
+    }
+}
+
+fn local_auth_delivery_degraded(notes: &[String]) -> bool {
+    notes.iter().any(|note| {
+        matches!(
+            note.as_str(),
+            "delivery_failed_recently" | "delivery_not_proven"
+        )
+    })
+}
+
+fn local_auth_delivery_evidence(status: Option<&LocalAuthDeliveryAdminUi>) -> String {
+    let Some(status) = status else {
+        return "-".to_owned();
+    };
+    let mut parts = Vec::new();
+    if let Some(value) = status.last_issue_at.as_deref() {
+        parts.push(format!("issued {value}"));
+    }
+    if let Some(value) = status.last_sent_at.as_deref() {
+        parts.push(format!("sent {value}"));
+    }
+    if let Some(value) = status.last_failed_at.as_deref() {
+        parts.push(format!("failed {value}"));
+    }
+    if let Some(value) = status.last_error.as_deref() {
+        parts.push(format!("error {value}"));
+    }
+    if let Some(value) = status.last_error_detail.as_deref() {
+        parts.push(format!("detail {value}"));
+    }
+    join_or_dash(parts)
+}
+
+fn provider_setup_text(
+    web_domain: Option<&str>,
+    callback_url: &str,
+    client_id_binding: &str,
+    secret_binding_sets: &[Vec<String>],
+) -> String {
+    let mut parts = Vec::new();
+    if let Some(web_domain) = web_domain.filter(|value| !value.trim().is_empty()) {
+        parts.push(format!("Domain {web_domain}"));
+    }
+    if !callback_url.trim().is_empty() {
+        parts.push(format!("Callback {callback_url}"));
+    }
+    if !client_id_binding.trim().is_empty() {
+        parts.push(format!("Client ID {client_id_binding}"));
+    }
+    let secret_sets = secret_binding_sets
+        .iter()
+        .filter(|set| !set.is_empty())
+        .map(|set| set.join(" + "))
+        .collect::<Vec<_>>();
+    if !secret_sets.is_empty() {
+        parts.push(format!("Secrets {}", secret_sets.join(" or ")));
+    }
+    join_or_dash(parts)
+}
+
 fn user_admin_row(user: UserAdminUi) -> impl IntoView {
     let status = if user.disabled { "Disabled" } else { "Active" };
     let status_class = if user.disabled {
         "zeroth-status zeroth-status-warn"
     } else {
         "zeroth-status zeroth-status-ok"
+    };
+    let admin_status = if user.admin { "Admin" } else { "Member" };
+    let admin_status_class = if user.admin {
+        "zeroth-status zeroth-status-ok"
+    } else {
+        "zeroth-status"
+    };
+    let admin_action = if user.admin {
+        "Revoke admin"
+    } else {
+        "Grant admin"
+    };
+    let admin_action_class = if user.admin {
+        "zeroth-action zeroth-danger"
+    } else {
+        "zeroth-action"
     };
     let action = if user.disabled { "Enable" } else { "Disable" };
     let action_class = if user.disabled {
@@ -1474,17 +2085,19 @@ fn user_admin_row(user: UserAdminUi) -> impl IntoView {
     let updated_at = user.updated_at.unwrap_or_else(|| "-".to_owned());
     let created_at = user.created_at.unwrap_or_else(|| "-".to_owned());
     let disabled = user.disabled.to_string();
+    let admin = user.admin.to_string();
     let user_id = user.user_id;
     let user_id_attr = user_id.clone();
 
     view! {
-        <tr data-user-id=user_id_attr data-user-disabled=disabled>
+        <tr data-user-id=user_id_attr data-user-disabled=disabled data-user-admin=admin>
             <td>
                 <div class="zeroth-row-title">{name}</div>
                 <div class="zeroth-row-meta">{email}</div>
                 <div class="zeroth-row-meta zeroth-code">{user_id}</div>
             </td>
             <td><span class=status_class>{status}</span></td>
+            <td><span class=admin_status_class>{admin_status}</span></td>
             <td>{user.identity_count.to_string()}</td>
             <td>{user.active_session_count.to_string()}</td>
             <td>
@@ -1493,6 +2106,8 @@ fn user_admin_row(user: UserAdminUi) -> impl IntoView {
             </td>
             <td>
                 <button class=action_class type="button" data-zeroth-toggle-user="true">{action}</button>
+                " "
+                <button class=admin_action_class type="button" data-zeroth-toggle-admin="true">{admin_action}</button>
             </td>
         </tr>
     }
@@ -1545,8 +2160,10 @@ fn client_admin_row(client: ClientAdminUi) -> impl IntoView {
     };
     let redirects = join_or_dash(client.redirect_uris.clone());
     let origins = join_or_dash(client.allowed_origins.clone());
+    let email_domains = join_or_dash(client.allowed_email_domains.clone());
     let redirect_lines = client.redirect_uris.join("\n");
     let origin_lines = client.allowed_origins.join("\n");
+    let email_domain_lines = client.allowed_email_domains.join("\n");
     let disabled = client.disabled.to_string();
     let confidential = client.confidential.to_string();
     let client_id = client.client_id;
@@ -1562,6 +2179,7 @@ fn client_admin_row(client: ClientAdminUi) -> impl IntoView {
             data-client-disabled=disabled
             data-client-redirects=redirect_lines
             data-client-origins=origin_lines
+            data-client-email-domains=email_domain_lines
         >
             <td>
                 <div class="zeroth-row-title">{client_name}</div>
@@ -1574,6 +2192,7 @@ fn client_admin_row(client: ClientAdminUi) -> impl IntoView {
             <td><span class=status_class>{status}</span></td>
             <td>{redirects}</td>
             <td>{origins}</td>
+            <td>{email_domains}</td>
             <td>
                 <button class="zeroth-action" type="button" data-zeroth-edit-client="true">"Edit"</button>
             </td>
@@ -1729,8 +2348,224 @@ fn escape_text(value: &str) -> String {
 }
 
 const ZEROTH_UI_SCRIPT: &str = r#"
+const zerothPasskeyRegisterOptionsEndpoint = "/passkeys/register/options";
+const zerothPasskeyRegisterVerifyEndpoint = "/passkeys/register/verify";
+const zerothPasskeyAuthenticateOptionsEndpoint = "/passkeys/authenticate/options";
+const zerothPasskeyAuthenticateVerifyEndpoint = "/passkeys/authenticate/verify";
+
+function zerothSetPasskeyStatus(value, error = false) {
+  const status = document.getElementById("zeroth-account-passkey-status");
+  if (!status) return;
+  status.textContent = value;
+  status.setAttribute("aria-invalid", error ? "true" : "false");
+}
+
+function zerothPasskeysAvailable() {
+  return Boolean(window.PublicKeyCredential && navigator.credentials);
+}
+
+function zerothBufferToBase64url(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function zerothBase64urlToBuffer(value) {
+  const normalized = value.replace(/-/g, "+").replace(/_/g, "/");
+  const padded = normalized + "=".repeat((4 - (normalized.length % 4)) % 4);
+  const binary = atob(padded);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return bytes.buffer;
+}
+
+function zerothCreationOptionsFromServer(options) {
+  const publicKey = Object.assign({}, options.publicKey);
+  publicKey.challenge = zerothBase64urlToBuffer(publicKey.challenge);
+  publicKey.user = Object.assign({}, publicKey.user, {
+    id: zerothBase64urlToBuffer(publicKey.user.id)
+  });
+  publicKey.excludeCredentials = (publicKey.excludeCredentials || []).map((credential) => ({
+    type: credential.type,
+    id: zerothBase64urlToBuffer(credential.id)
+  }));
+  return publicKey;
+}
+
+function zerothRequestOptionsFromServer(options) {
+  const publicKey = Object.assign({}, options.publicKey);
+  publicKey.challenge = zerothBase64urlToBuffer(publicKey.challenge);
+  publicKey.allowCredentials = (publicKey.allowCredentials || []).map((credential) => ({
+    type: credential.type,
+    id: zerothBase64urlToBuffer(credential.id)
+  }));
+  return publicKey;
+}
+
+function zerothRegistrationCredentialPayload(credential) {
+  return {
+    id: credential.id,
+    rawId: zerothBufferToBase64url(credential.rawId),
+    response: {
+      clientDataJSON: zerothBufferToBase64url(credential.response.clientDataJSON),
+      attestationObject: zerothBufferToBase64url(credential.response.attestationObject),
+      transports: typeof credential.response.getTransports === "function"
+        ? credential.response.getTransports()
+        : []
+    }
+  };
+}
+
+function zerothAuthenticationCredentialPayload(credential) {
+  return {
+    id: credential.id,
+    rawId: zerothBufferToBase64url(credential.rawId),
+    response: {
+      clientDataJSON: zerothBufferToBase64url(credential.response.clientDataJSON),
+      authenticatorData: zerothBufferToBase64url(credential.response.authenticatorData),
+      signature: zerothBufferToBase64url(credential.response.signature),
+      userHandle: credential.response.userHandle
+        ? zerothBufferToBase64url(credential.response.userHandle)
+        : null
+    }
+  };
+}
+
+async function zerothPasskeyApi(path, payload) {
+  const response = await fetch(path, {
+    method: "POST",
+    credentials: "include",
+    headers: {
+      "Accept": "application/json",
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(payload)
+  });
+  let body = {};
+  try {
+    body = await response.json();
+  } catch (_) {}
+  if (!response.ok) {
+    throw new Error(body.error_description || body.error || `HTTP ${response.status}`);
+  }
+  return body;
+}
+
+async function zerothRegisterPasskey(form) {
+  if (!zerothPasskeysAvailable()) {
+    throw new Error("Passkeys are not available in this browser");
+  }
+  const data = new FormData(form);
+  const payload = {
+    clientId: String(data.get("clientId") || "").trim(),
+    returnTo: String(data.get("returnTo") || "").trim()
+  };
+  const label = String(data.get("label") || "").trim();
+  if (label) payload.label = label;
+  zerothSetPasskeyStatus("Registering");
+  const options = await zerothPasskeyApi(zerothPasskeyRegisterOptionsEndpoint, payload);
+  const credential = await navigator.credentials.create({
+    publicKey: zerothCreationOptionsFromServer(options)
+  });
+  if (!credential) throw new Error("Passkey registration was cancelled");
+  await zerothPasskeyApi(
+    zerothPasskeyRegisterVerifyEndpoint,
+    zerothRegistrationCredentialPayload(credential)
+  );
+  zerothSetPasskeyStatus("Saved");
+  window.location.reload();
+}
+
+async function zerothSignInWithPasskey(button) {
+  if (!zerothPasskeysAvailable()) {
+    throw new Error("Passkeys are not available in this browser");
+  }
+  const payload = {
+    clientId: String(button.dataset.clientId || "").trim(),
+    returnTo: String(button.dataset.returnTo || "").trim()
+  };
+  zerothSetPasskeyStatus("Signing in");
+  const options = await zerothPasskeyApi(zerothPasskeyAuthenticateOptionsEndpoint, payload);
+  const credential = await navigator.credentials.get({
+    publicKey: zerothRequestOptionsFromServer(options)
+  });
+  if (!credential) throw new Error("Passkey sign in was cancelled");
+  const result = await zerothPasskeyApi(
+    zerothPasskeyAuthenticateVerifyEndpoint,
+    zerothAuthenticationCredentialPayload(credential)
+  );
+  zerothSetPasskeyStatus("Signed in");
+  window.location.assign((result && result.returnTo) || payload.returnTo || "/account");
+}
+
+function zerothSubmitAction(form, submitter) {
+  if (
+    submitter instanceof HTMLButtonElement &&
+    submitter.hasAttribute("formaction") &&
+    submitter.getAttribute("formaction")
+  ) {
+    return submitter.formAction;
+  }
+  const action = form.getAttribute("action");
+  return action ? new URL(action, window.location.href).toString() : form.action;
+}
+
 document.addEventListener("submit", async (event) => {
   const form = event.target;
+  if (form instanceof HTMLFormElement && form.dataset.zerothLocalAuth) {
+    event.preventDefault();
+    const submitter = event.submitter;
+    const mode = submitter instanceof HTMLElement && submitter.dataset.zerothLocalMode
+      ? submitter.dataset.zerothLocalMode
+      : form.dataset.zerothLocalAuth;
+    const data = new FormData(form);
+    const payload = {
+      email: String(data.get("email") || "").trim(),
+      clientId: String(data.get("clientId") || "").trim(),
+      returnTo: String(data.get("returnTo") || "").trim()
+    };
+    if (mode !== "magic-link") {
+      payload.password = String(data.get("password") || "");
+    }
+    const action = zerothSubmitAction(form, submitter);
+    const response = await fetch(action, {
+      method: "POST",
+      credentials: "include",
+      headers: {
+        "Accept": "application/json",
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(payload)
+    });
+    let body = {};
+    try {
+      body = await response.json();
+    } catch (_) {}
+    if (response.ok && body.returnTo) {
+      window.location.assign(body.returnTo);
+      return;
+    }
+    if (response.ok) {
+      window.alert(body.sent ? "Magic link sent" : "Email delivery is not configured");
+      if (body.devLink) window.location.assign(body.devLink);
+      return;
+    }
+    window.alert(body.error_description || body.error || "Sign in failed");
+    return;
+  }
+  if (form instanceof HTMLFormElement && form.id === "zeroth-account-passkey-register-form") {
+    event.preventDefault();
+    try {
+      await zerothRegisterPasskey(form);
+    } catch (error) {
+      zerothSetPasskeyStatus("Failed", true);
+      window.alert(error instanceof Error ? error.message : "Passkey registration failed");
+    }
+    return;
+  }
   if (!(form instanceof HTMLFormElement) || !form.dataset.zerothMethod) {
     return;
   }
@@ -1743,11 +2578,22 @@ document.addEventListener("submit", async (event) => {
   };
   if (method === "PATCH") {
     const data = new FormData(form);
+    const payload = {};
+    const displayName = String(data.get("displayName") || "").trim();
+    const pictureUrl = String(data.get("pictureUrl") || "").trim();
+    const pictureInput = form.elements.pictureUrl;
+    if (displayName) payload.displayName = displayName;
+    if (pictureUrl) {
+      payload.pictureUrl = pictureUrl;
+    } else if (pictureInput instanceof HTMLInputElement && pictureInput.defaultValue.trim()) {
+      payload.pictureUrl = null;
+    }
+    if (Object.keys(payload).length === 0) {
+      window.location.reload();
+      return;
+    }
     options.headers["Content-Type"] = "application/json";
-    options.body = JSON.stringify({
-      displayName: data.get("displayName"),
-      pictureUrl: data.get("pictureUrl")
-    });
+    options.body = JSON.stringify(payload);
   }
   const response = await fetch(form.action, options);
   if (response.ok) {
@@ -1761,6 +2607,18 @@ document.addEventListener("submit", async (event) => {
   } catch (_) {}
   window.alert(message);
 });
+
+document.addEventListener("click", (event) => {
+  const target = event.target;
+  if (!(target instanceof Element)) return;
+  const button = document.getElementById("zeroth-account-passkey-login");
+  if (!(button instanceof HTMLButtonElement) || (target !== button && !button.contains(target))) return;
+  event.preventDefault();
+  zerothSignInWithPasskey(button).catch((error) => {
+    zerothSetPasskeyStatus("Failed", true);
+    window.alert(error instanceof Error ? error.message : "Passkey sign in failed");
+  });
+});
 "#;
 
 const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
@@ -1769,12 +2627,18 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
   const clientsEndpoint = "/clients";
   const usersEndpoint = "/users";
   const providersEndpoint = "/providers/status";
+  const localAuthEndpoint = "/local-auth/status";
   const eventsEndpoint = "/events";
   const dbStatusEndpoint = "/__zeroth/db/status";
+  const passkeyRegisterOptionsEndpoint = "/passkeys/register/options";
+  const passkeyRegisterVerifyEndpoint = "/passkeys/register/verify";
+  const passkeyAuthenticateOptionsEndpoint = "/passkeys/authenticate/options";
+  const passkeyAuthenticateVerifyEndpoint = "/passkeys/authenticate/verify";
   const $ = (id) => document.getElementById(id);
   const rows = $("zeroth-client-rows");
   const userRows = $("zeroth-user-rows");
   const providerRows = $("zeroth-provider-rows");
+  const localAuthRows = $("zeroth-local-auth-rows");
   const eventRows = $("zeroth-event-rows");
   const dbStatusRows = $("zeroth-db-status-rows");
   const count = $("zeroth-client-count");
@@ -1783,9 +2647,11 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
   const dbClientCount = $("zeroth-db-client-count");
   const dbStatus = $("zeroth-db-status");
   const status = $("zeroth-admin-status");
+  const passkeyStatus = $("zeroth-passkey-status");
   const message = $("zeroth-admin-message");
   const tokenInput = $("zeroth-admin-token");
   const form = $("zeroth-client-form");
+  const passkeyForm = $("zeroth-passkey-register-form");
   const eventFilterForm = $("zeroth-events-filter-form");
   const editorMode = $("zeroth-editor-mode");
 
@@ -1795,12 +2661,92 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
     message.setAttribute("aria-invalid", error ? "true" : "false");
   }
 
+  function setPasskeyStatus(value, error = false) {
+    if (!passkeyStatus) return;
+    passkeyStatus.textContent = value;
+    passkeyStatus.className = error ? "zeroth-status zeroth-status-warn" : "zeroth-status zeroth-status-ok";
+  }
+
   function token() {
     return tokenInput.value.trim() || sessionStorage.getItem(tokenKey) || "";
   }
 
   function splitLines(value) {
     return value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  }
+
+  function bufferToBase64url(buffer) {
+    const bytes = new Uint8Array(buffer);
+    let binary = "";
+    for (const byte of bytes) binary += String.fromCharCode(byte);
+    return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+  }
+
+  function base64urlToBuffer(value) {
+    const normalized = value.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = normalized + "=".repeat((4 - (normalized.length % 4)) % 4);
+    const binary = atob(padded);
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index += 1) {
+      bytes[index] = binary.charCodeAt(index);
+    }
+    return bytes.buffer;
+  }
+
+  function creationOptionsFromServer(options) {
+    const publicKey = Object.assign({}, options.publicKey);
+    publicKey.challenge = base64urlToBuffer(publicKey.challenge);
+    publicKey.user = Object.assign({}, publicKey.user, {
+      id: base64urlToBuffer(publicKey.user.id)
+    });
+    publicKey.excludeCredentials = (publicKey.excludeCredentials || []).map((credential) => ({
+      type: credential.type,
+      id: base64urlToBuffer(credential.id)
+    }));
+    return publicKey;
+  }
+
+  function requestOptionsFromServer(options) {
+    const publicKey = Object.assign({}, options.publicKey);
+    publicKey.challenge = base64urlToBuffer(publicKey.challenge);
+    publicKey.allowCredentials = (publicKey.allowCredentials || []).map((credential) => ({
+      type: credential.type,
+      id: base64urlToBuffer(credential.id)
+    }));
+    return publicKey;
+  }
+
+  function registrationCredentialPayload(credential) {
+    return {
+      id: credential.id,
+      rawId: bufferToBase64url(credential.rawId),
+      response: {
+        clientDataJSON: bufferToBase64url(credential.response.clientDataJSON),
+        attestationObject: bufferToBase64url(credential.response.attestationObject),
+        transports: typeof credential.response.getTransports === "function"
+          ? credential.response.getTransports()
+          : []
+      }
+    };
+  }
+
+  function authenticationCredentialPayload(credential) {
+    return {
+      id: credential.id,
+      rawId: bufferToBase64url(credential.rawId),
+      response: {
+        clientDataJSON: bufferToBase64url(credential.response.clientDataJSON),
+        authenticatorData: bufferToBase64url(credential.response.authenticatorData),
+        signature: bufferToBase64url(credential.response.signature),
+        userHandle: credential.response.userHandle
+          ? bufferToBase64url(credential.response.userHandle)
+          : null
+      }
+    };
+  }
+
+  function passkeysAvailable() {
+    return Boolean(window.PublicKeyCredential && navigator.credentials);
   }
 
   function setText(parent, value, className) {
@@ -1847,7 +2793,8 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
       confidential: row.dataset.clientConfidential === "true",
       disabled: row.dataset.clientDisabled === "true",
       redirectUris: splitLines(row.dataset.clientRedirects || ""),
-      allowedOrigins: splitLines(row.dataset.clientOrigins || "")
+      allowedOrigins: splitLines(row.dataset.clientOrigins || ""),
+      allowedEmailDomains: splitLines(row.dataset.clientEmailDomains || "")
     };
   }
 
@@ -1857,6 +2804,7 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
     form.elements.type.value = client.confidential ? "confidential" : "public";
     form.elements.redirectUris.value = (client.redirectUris || client.redirect_uris || []).join("\n");
     form.elements.allowedOrigins.value = (client.allowedOrigins || client.allowed_origins || []).join("\n");
+    form.elements.allowedEmailDomains.value = (client.allowedEmailDomains || client.allowed_email_domains || []).join("\n");
     form.elements.clientSecret.value = "";
     form.elements.disabled.checked = Boolean(client.disabled);
     editorMode.textContent = client.id ? "Edit" : "New";
@@ -1867,7 +2815,7 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
     rows.replaceChildren();
     count.textContent = String(clients.length);
     if (clients.length === 0) {
-      renderEmptyRows(rows, 6);
+      renderEmptyRows(rows, 7);
       return;
     }
 
@@ -1879,6 +2827,7 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
       row.dataset.clientDisabled = String(client.disabled);
       row.dataset.clientRedirects = (client.redirectUris || client.redirect_uris || []).join("\n");
       row.dataset.clientOrigins = (client.allowedOrigins || client.allowed_origins || []).join("\n");
+      row.dataset.clientEmailDomains = (client.allowedEmailDomains || client.allowed_email_domains || []).join("\n");
 
       const name = document.createElement("td");
       setText(name, client.name, "zeroth-row-title");
@@ -1900,6 +2849,9 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
       const origins = document.createElement("td");
       origins.textContent = (client.allowedOrigins || client.allowed_origins || []).join(", ") || "-";
 
+      const emailDomains = document.createElement("td");
+      emailDomains.textContent = (client.allowedEmailDomains || client.allowed_email_domains || []).join(", ") || "-";
+
       const actions = document.createElement("td");
       const edit = document.createElement("button");
       edit.className = "zeroth-action";
@@ -1917,7 +2869,7 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
         actions.appendChild(disable);
       }
 
-      row.append(name, type, state, redirects, origins, actions);
+      row.append(name, type, state, redirects, origins, emailDomains, actions);
       rows.appendChild(row);
     }
   }
@@ -1925,7 +2877,7 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
   function renderProviderRows(providers) {
     providerRows.replaceChildren();
     if (providers.length === 0) {
-      renderEmptyRows(providerRows, 5);
+      renderEmptyRows(providerRows, 7);
       return;
     }
 
@@ -1937,8 +2889,9 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
 
       const state = document.createElement("td");
       const statePill = document.createElement("span");
+      const disabled = (provider.notes || []).includes("disabled_by_deployment");
       statePill.className = provider.enabled ? "zeroth-status zeroth-status-ok" : "zeroth-status zeroth-status-warn";
-      statePill.textContent = provider.enabled ? "Ready" : "Missing config";
+      statePill.textContent = disabled ? "Disabled" : provider.enabled ? "Ready" : "Missing config";
       state.appendChild(statePill);
 
       const clientId = document.createElement("td");
@@ -1947,12 +2900,108 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
       const secret = document.createElement("td");
       secret.textContent = provider.clientSecretConfigured ? "Configured" : "Missing";
 
-      const notes = document.createElement("td");
-      notes.textContent = (provider.notes || []).join(", ") || "-";
+      const setup = document.createElement("td");
+      setup.className = "zeroth-code";
+      setup.textContent = providerSetupText(provider);
 
-      row.append(name, state, clientId, secret, notes);
+      const lastFailure = document.createElement("td");
+      lastFailure.textContent = providerFailureText(provider);
+
+      const notes = document.createElement("td");
+      notes.textContent = providerNotesText(provider);
+
+      row.append(name, state, clientId, secret, setup, lastFailure, notes);
       providerRows.appendChild(row);
     }
+  }
+
+  function providerNotesText(provider) {
+    const parts = [...(provider.notes || [])];
+    for (const requirement of provider.activationRequirements || provider.activation_requirements || []) {
+      if (requirement) parts.push(`requires: ${requirement}`);
+    }
+    return parts.join(", ") || "-";
+  }
+
+  function providerFailureText(provider) {
+    const failure = provider.lastFailure || provider.last_failure;
+    if (!failure) return "-";
+    const parts = [
+      failure.createdAt || failure.created_at || "",
+      failure.eventType || failure.event_type || "",
+      failure.code || "",
+      failure.description || ""
+    ].filter(Boolean);
+    return parts.join(" · ") || "-";
+  }
+
+  function renderLocalAuthRows(methods) {
+    localAuthRows.replaceChildren();
+    if (methods.length === 0) {
+      renderEmptyRows(localAuthRows, 6);
+      return;
+    }
+
+    for (const method of methods) {
+      const row = document.createElement("tr");
+      const name = document.createElement("td");
+      setText(name, method.label || method.id || "-", "zeroth-row-title");
+      setText(name, method.id || "-", "zeroth-row-meta zeroth-code");
+
+      const state = document.createElement("td");
+      const statePill = document.createElement("span");
+      const degraded = localAuthDeliveryDegraded(method.notes || []);
+      statePill.className = method.enabled && !degraded ? "zeroth-status zeroth-status-ok" : "zeroth-status zeroth-status-warn";
+      statePill.textContent = !method.enabled ? "Needs setup" : degraded ? "Needs attention" : "Ready";
+      state.appendChild(statePill);
+
+      const storage = document.createElement("td");
+      storage.className = "zeroth-code";
+      storage.textContent = method.credentialStorage || "-";
+
+      const delivery = document.createElement("td");
+      delivery.textContent = method.delivery || "-";
+
+      const evidence = document.createElement("td");
+      evidence.className = "zeroth-code";
+      evidence.textContent = localAuthDeliveryEvidence(method.deliveryStatus || method.delivery_status);
+
+      const notes = document.createElement("td");
+      notes.textContent = (method.notes || []).join(", ") || "-";
+
+      row.append(name, state, storage, delivery, evidence, notes);
+      localAuthRows.appendChild(row);
+    }
+  }
+
+  function localAuthDeliveryDegraded(notes) {
+    return notes.includes("delivery_failed_recently") || notes.includes("delivery_not_proven");
+  }
+
+  function localAuthDeliveryEvidence(status) {
+    if (!status || typeof status !== "object") return "-";
+    const parts = [];
+    const issued = status.lastIssueAt || status.last_issue_at;
+    const sent = status.lastSentAt || status.last_sent_at;
+    const failed = status.lastFailedAt || status.last_failed_at;
+    const error = status.lastError || status.last_error;
+    if (issued) parts.push(`issued ${issued}`);
+    if (sent) parts.push(`sent ${sent}`);
+    if (failed) parts.push(`failed ${failed}`);
+    if (error) parts.push(`error ${error}`);
+    return parts.join(", ") || "-";
+  }
+
+  function providerSetupText(provider) {
+    const parts = [];
+    if (provider.webDomain) parts.push(`Domain ${provider.webDomain}`);
+    if (provider.callbackUrl) parts.push(`Callback ${provider.callbackUrl}`);
+    if (provider.clientIdBinding) parts.push(`Client ID ${provider.clientIdBinding}`);
+    const secretSets = (provider.secretBindingSets || [])
+      .filter((set) => Array.isArray(set) && set.length > 0)
+      .map((set) => set.join(" + "));
+    if (secretSets.length > 0) parts.push(`Secrets ${secretSets.join(" or ")}`);
+    return parts.join("; ") || "-";
   }
 
   function renderDbStatus(body) {
@@ -2013,7 +3062,7 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
     userRows.replaceChildren();
     userCount.textContent = String(users.length);
     if (users.length === 0) {
-      renderEmptyRows(userRows, 6);
+      renderEmptyRows(userRows, 7);
       return;
     }
 
@@ -2021,6 +3070,7 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
       const row = document.createElement("tr");
       row.dataset.userId = user.id;
       row.dataset.userDisabled = String(user.disabled);
+      row.dataset.userAdmin = String(user.admin);
 
       const profile = document.createElement("td");
       setText(profile, user.displayName || user.email || "Unnamed user", "zeroth-row-title");
@@ -2032,6 +3082,12 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
       statePill.className = user.disabled ? "zeroth-status zeroth-status-warn" : "zeroth-status zeroth-status-ok";
       statePill.textContent = user.disabled ? "Disabled" : "Active";
       state.appendChild(statePill);
+
+      const admin = document.createElement("td");
+      const adminPill = document.createElement("span");
+      adminPill.className = user.admin ? "zeroth-status zeroth-status-ok" : "zeroth-status";
+      adminPill.textContent = user.admin ? "Admin" : "Member";
+      admin.appendChild(adminPill);
 
       const identities = document.createElement("td");
       identities.textContent = String(user.identityCount || 0);
@@ -2051,7 +3107,15 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
       toggle.textContent = user.disabled ? "Enable" : "Disable";
       actions.appendChild(toggle);
 
-      row.append(profile, state, identities, sessions, updated, actions);
+      const adminToggle = document.createElement("button");
+      adminToggle.className = user.admin ? "zeroth-action zeroth-danger" : "zeroth-action";
+      adminToggle.type = "button";
+      adminToggle.dataset.zerothToggleAdmin = "true";
+      adminToggle.textContent = user.admin ? "Revoke admin" : "Grant admin";
+      actions.appendChild(document.createTextNode(" "));
+      actions.appendChild(adminToggle);
+
+      row.append(profile, state, admin, identities, sessions, updated, actions);
       userRows.appendChild(row);
     }
   }
@@ -2116,6 +3180,12 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
     status.textContent = "Connected";
   }
 
+  async function loadLocalAuth() {
+    const body = await api(localAuthEndpoint);
+    renderLocalAuthRows(body.methods || []);
+    status.textContent = "Connected";
+  }
+
   async function loadDbStatus() {
     const body = await api(dbStatusEndpoint, { allowError: true });
     if (body && (body.error || body.error_description)) {
@@ -2140,7 +3210,7 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
 
   async function loadAdmin() {
     const dbReady = await loadDbStatus();
-    await loadProviders();
+    await Promise.all([loadProviders(), loadLocalAuth()]);
     if (!dbReady) {
       setMessage("Database setup incomplete", true);
       return;
@@ -2157,6 +3227,7 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
       name: data.get("name"),
       redirectUris: splitLines(data.get("redirectUris") || ""),
       allowedOrigins: splitLines(data.get("allowedOrigins") || ""),
+      allowedEmailDomains: splitLines(data.get("allowedEmailDomains") || ""),
       confidential: data.get("type") === "confidential",
       disabled: form.elements.disabled.checked
     };
@@ -2191,6 +3262,74 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
     await loadUsers();
   }
 
+  async function toggleAdmin(row) {
+    const userId = row.dataset.userId || "";
+    const admin = row.dataset.userAdmin === "true";
+    await api(`${usersEndpoint}?user_id=${encodeURIComponent(userId)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ admin: !admin })
+    });
+    setMessage(admin ? "Admin revoked" : "Admin granted");
+    await loadUsers();
+  }
+
+  async function registerPasskey(event) {
+    event.preventDefault();
+    if (!passkeysAvailable()) {
+      throw new Error("Passkeys are not available in this browser");
+    }
+    const data = new FormData(passkeyForm);
+    const payload = {
+      email: String(data.get("email") || "").trim() || undefined,
+      displayName: String(data.get("displayName") || "").trim() || undefined,
+      label: String(data.get("label") || "").trim() || undefined,
+      returnTo: `${window.location.origin}/admin`
+    };
+    setPasskeyStatus("Registering");
+    const options = await api(passkeyRegisterOptionsEndpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    const credential = await navigator.credentials.create({
+      publicKey: creationOptionsFromServer(options)
+    });
+    if (!credential) throw new Error("Passkey registration was cancelled");
+    await api(passkeyRegisterVerifyEndpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(registrationCredentialPayload(credential))
+    });
+    setPasskeyStatus("Registered");
+    setMessage("Passkey registered");
+    await loadAdmin();
+  }
+
+  async function signInWithPasskey() {
+    if (!passkeysAvailable()) {
+      throw new Error("Passkeys are not available in this browser");
+    }
+    setPasskeyStatus("Signing in");
+    const options = await api(passkeyAuthenticateOptionsEndpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ returnTo: `${window.location.origin}/admin` })
+    });
+    const credential = await navigator.credentials.get({
+      publicKey: requestOptionsFromServer(options)
+    });
+    if (!credential) throw new Error("Passkey sign in was cancelled");
+    const result = await api(passkeyAuthenticateVerifyEndpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(authenticationCredentialPayload(credential))
+    });
+    setPasskeyStatus("Signed in");
+    setMessage("Signed in");
+    window.location.assign((result && result.returnTo) || "/admin");
+  }
+
   document.addEventListener("DOMContentLoaded", () => {
     const stored = sessionStorage.getItem(tokenKey) || "";
     if (stored) {
@@ -2206,6 +3345,22 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
         renderProviderRows([]);
         renderEventRows([]);
       }
+    });
+  });
+
+  if (passkeyForm) {
+    passkeyForm.addEventListener("submit", (event) => {
+      registerPasskey(event).catch((error) => {
+        setPasskeyStatus("Failed", true);
+        setMessage(error.message, true);
+      });
+    });
+  }
+
+  $("zeroth-passkey-login").addEventListener("click", () => {
+    signInWithPasskey().catch((error) => {
+      setPasskeyStatus("Failed", true);
+      setMessage(error.message, true);
     });
   });
 
@@ -2244,6 +3399,10 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
     loadProviders().catch((error) => setMessage(error.message, true));
   });
 
+  $("zeroth-local-auth-refresh").addEventListener("click", () => {
+    loadLocalAuth().catch((error) => setMessage(error.message, true));
+  });
+
   $("zeroth-users-refresh").addEventListener("click", () => {
     loadUsers().catch((error) => setMessage(error.message, true));
   });
@@ -2271,10 +3430,14 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
   userRows.addEventListener("click", (event) => {
     const target = event.target instanceof Element ? event.target : event.target.parentElement;
     const button = target && target.closest("button");
-    if (!button || !button.dataset.zerothToggleUser) return;
+    if (!button || (!button.dataset.zerothToggleUser && !button.dataset.zerothToggleAdmin)) return;
     const row = button.closest("tr");
     if (!row) return;
-    toggleUser(row).catch((error) => setMessage(error.message, true));
+    if (button.dataset.zerothToggleAdmin) {
+      toggleAdmin(row).catch((error) => setMessage(error.message, true));
+    } else {
+      toggleUser(row).catch((error) => setMessage(error.message, true));
+    }
   });
 
   rows.addEventListener("click", (event) => {
@@ -2407,6 +3570,86 @@ mod tests {
     }
 
     #[test]
+    fn hosted_login_html_uses_z_branding() {
+        let mut state = ZerothUiState::new(ZerothUiConfig::new(
+            "https://id.example.com",
+            "browser-client",
+            "https://id.example.com/admin",
+        ));
+        state.config.provider_authorize_path = "/login".to_owned();
+        state.config.return_to = Some("https://id.example.com/admin".to_owned());
+        state.config.link_identities = false;
+        state.providers = vec![ProviderUi::apple(false), ProviderUi::google(false)];
+
+        let html = render_account_html(state);
+        let provider_index = html.find("zeroth-provider-list").unwrap();
+        let password_index = html.find("zeroth-login-form").unwrap();
+
+        assert!(html.contains("zeroth-login-mode"));
+        assert!(html.contains("zeroth-hero-mark"));
+        assert!(html.contains(">Z<"));
+        assert!(html.contains("Sign in"));
+        assert!(provider_index < password_index);
+        assert!(html.contains("Continue with Apple"));
+        assert!(html.contains("Continue with Google"));
+        assert!(html.contains("zeroth-status zeroth-hidden"));
+        assert!(html.contains("/password/login"));
+        assert!(html.contains("/password/register"));
+        assert!(html.contains("/magic-links"));
+        assert!(html.contains("zeroth-account-passkey-login"));
+        assert!(html.contains("Use passkey"));
+        assert!(html.contains("zeroth-login-card"));
+        assert!(html.contains("zeroth-panel zeroth-hidden"));
+        assert!(html.contains("provider=apple"));
+    }
+
+    #[test]
+    fn hosted_authorize_html_uses_normal_login_surface() {
+        let mut state = ZerothUiState::new(ZerothUiConfig::new(
+            "https://id.example.com",
+            "browser-client",
+            "https://app.example.com/auth/callback",
+        ));
+        state.config.link_identities = false;
+        state.config.state = Some("state-1".to_owned());
+        state.config.code_challenge = Some("challenge-1".to_owned());
+        state.providers = vec![ProviderUi::apple(false), ProviderUi::google(false)];
+
+        let html = render_account_html(state);
+        let provider_index = html.find("zeroth-provider-list").unwrap();
+        let password_index = html.find("zeroth-login-form").unwrap();
+
+        assert!(html.contains("zeroth-login-mode"));
+        assert!(provider_index < password_index);
+        assert!(html.contains("Continue with Apple"));
+        assert!(html.contains("Continue with Google"));
+        assert!(html.contains("/authorize"));
+        assert!(html.contains("code_challenge=challenge-1"));
+        assert!(html.contains("state=state-1"));
+    }
+
+    #[test]
+    fn account_document_omits_blank_profile_patch_fields() {
+        let document = render_account_document(ZerothUiState::new(ZerothUiConfig::new(
+            "https://id.example.com",
+            "browser-client",
+            "https://app.example.com/callback",
+        )));
+
+        assert!(document.contains("/favicon.svg"));
+        assert!(!document.contains("src=\"\""));
+        assert!(document.contains("const payload = {};"));
+        assert!(document.contains("if (displayName) payload.displayName = displayName;"));
+        assert!(document.contains("payload.pictureUrl = null;"));
+        assert!(document.contains("JSON.stringify(payload)"));
+        assert!(document.contains("navigator.credentials.get"));
+        assert!(document.contains("/passkeys/authenticate/options"));
+        assert!(document.contains("function zerothSubmitAction(form, submitter)"));
+        assert!(document.contains("submitter.hasAttribute(\"formaction\")"));
+        assert!(document.contains("zerothSubmitAction(form, submitter)"));
+    }
+
+    #[test]
     fn account_html_contains_core_surfaces() {
         let mut state = ZerothUiState::new(ZerothUiConfig::new(
             "https://id.example.com",
@@ -2440,6 +3683,7 @@ mod tests {
             public_client: true,
             redirect_uris: vec!["https://app.example.com/callback".to_owned()],
             allowed_origins: vec!["https://app.example.com".to_owned()],
+            allowed_email_domains: vec!["example.com".to_owned()],
         });
 
         let html = render_account_html(state);
@@ -2464,6 +3708,7 @@ mod tests {
             confidential: false,
             redirect_uris: vec!["wavey://auth/callback".to_owned()],
             allowed_origins: Vec::new(),
+            allowed_email_domains: Vec::new(),
             disabled: false,
             has_secret: false,
         });
@@ -2474,13 +3719,72 @@ mod tests {
             enabled: true,
             client_id_configured: true,
             client_secret_configured: true,
+            client_id_binding: "APPLE_CLIENT_ID".to_owned(),
+            secret_binding_sets: vec![vec![
+                "APPLE_TEAM_ID".to_owned(),
+                "APPLE_KEY_ID".to_owned(),
+                "APPLE_PRIVATE_KEY".to_owned(),
+            ]],
+            callback_url: "https://id.example.com/oauth2/callback".to_owned(),
+            web_domain: Some("id.example.com".to_owned()),
             notes: Vec::new(),
+            activation_requirements: Vec::new(),
+            last_failure: None,
+        });
+        state.providers.push(ProviderAdminUi {
+            id: well_known::SPOTIFY.to_owned(),
+            label: "Spotify".to_owned(),
+            kind: "oauth2".to_owned(),
+            enabled: false,
+            client_id_configured: true,
+            client_secret_configured: true,
+            client_id_binding: "SPOTIFY_CLIENT_ID".to_owned(),
+            secret_binding_sets: vec![vec!["SPOTIFY_CLIENT_SECRET".to_owned()]],
+            callback_url: "https://id.example.com/oauth2/callback".to_owned(),
+            web_domain: None,
+            notes: vec![
+                "disabled_by_deployment".to_owned(),
+                "spotify_development_mode_owner_premium_required".to_owned(),
+                "spotify_development_mode_users_must_be_allowlisted".to_owned(),
+            ],
+            activation_requirements: vec![
+                "Spotify app owner account has Premium while the app is in development mode"
+                    .to_owned(),
+                "Spotify test login user is allowlisted in the Spotify app Users Management tab"
+                    .to_owned(),
+                "Spotify current-user profile endpoint /v1/me returns HTTP 200 for an authorized user"
+                    .to_owned(),
+            ],
+            last_failure: Some(ProviderFailureAdminUi {
+                event_type: "provider.profile.failed".to_owned(),
+                created_at: "1780000400".to_owned(),
+                code: Some("invalid_response".to_owned()),
+                description: Some("Spotify profile endpoint returned HTTP 403".to_owned()),
+            }),
+        });
+        state.local_auth.push(LocalAuthAdminUi {
+            id: "magic_link".to_owned(),
+            label: "Magic link".to_owned(),
+            enabled: true,
+            credential_storage: "zeroth_magic_links".to_owned(),
+            delivery: "cloudflare_email".to_owned(),
+            delivery_status: Some(LocalAuthDeliveryAdminUi {
+                last_issue_at: Some("1780000300".to_owned()),
+                last_sent_at: None,
+                last_failed_at: Some("1780000300".to_owned()),
+                last_error: Some("email_internal_server_error".to_owned()),
+                last_error_detail: Some(
+                    "email.sending.error.internal_server [code: 10002]".to_owned(),
+                ),
+            }),
+            notes: vec!["delivery_failed_recently".to_owned()],
         });
         state.users.push(UserAdminUi {
             user_id: "usr_123".to_owned(),
             email: Some("user@example.com".to_owned()),
             display_name: Some("Example User".to_owned()),
             disabled: false,
+            admin: true,
             identity_count: 1,
             active_session_count: 1,
             created_at: Some("1780000000".to_owned()),
@@ -2504,16 +3808,29 @@ mod tests {
             "https://id.example.com/login?return_to=https%3A%2F%2Fid.example.com%2Fadmin"
         ));
         assert!(html.contains("Providers"));
+        assert!(html.contains("Local auth"));
         assert!(html.contains("Database"));
         assert!(html.contains("zeroth-db-status-rows"));
+        assert!(html.contains("zeroth-local-auth-rows"));
         assert!(html.contains("Users"));
         assert!(html.contains("Events"));
+        assert!(html.contains("Needs attention"));
+        assert!(html.contains("email_internal_server_error"));
         assert!(html.contains("zeroth-events-filter-form"));
         assert!(html.contains("Event type"));
         assert!(html.contains("Provider ID"));
         assert!(html.contains("Registered clients"));
         assert!(html.contains("Client editor"));
         assert!(html.contains("Apple"));
+        assert!(html.contains("Spotify"));
+        assert!(html.contains("Disabled"));
+        assert!(html.contains("disabled_by_deployment"));
+        assert!(html.contains("spotify_development_mode_owner_premium_required"));
+        assert!(html.contains("Spotify current-user profile endpoint /v1/me returns HTTP 200"));
+        assert!(html.contains("provider.profile.failed"));
+        assert!(html.contains("Spotify profile endpoint returned HTTP 403"));
+        assert!(html.contains("Magic link"));
+        assert!(html.contains("zeroth_magic_links"));
         assert!(html.contains("usr_123"));
         assert!(html.contains("session.login"));
         assert!(html.contains("wavey-ios"));
@@ -2528,9 +3845,11 @@ mod tests {
         );
 
         assert!(document.contains("zeroth.adminToken"));
+        assert!(document.contains("/favicon.svg"));
         assert!(document.contains("fetch(path"));
         assert!(document.contains("loadAdmin().catch"));
         assert!(document.contains("/__zeroth/db/status"));
+        assert!(document.contains("/local-auth/status"));
         assert!(document.contains("allowError"));
         assert!(document.contains("Database setup incomplete"));
         assert!(document.contains("renderDbStatus"));
