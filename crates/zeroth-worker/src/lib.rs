@@ -4324,6 +4324,8 @@ fn compatibility_route_path(path: &str) -> Cow<'_, str> {
         "/magic-link"
         | "/magic_link"
         | "/magic-links/request"
+        | "/magic-link/request"
+        | "/magic_link/request"
         | "/magic-links/send"
         | "/magic-link/send"
         | "/magic_link/send"
@@ -4331,6 +4333,8 @@ fn compatibility_route_path(path: &str) -> Cow<'_, str> {
         | "/auth/magic-link"
         | "/auth/magic_link"
         | "/auth/magic-links/request"
+        | "/auth/magic-link/request"
+        | "/auth/magic_link/request"
         | "/auth/magic-links/send"
         | "/auth/magic-link/send"
         | "/auth/magic_link/send"
@@ -4338,6 +4342,8 @@ fn compatibility_route_path(path: &str) -> Cow<'_, str> {
         | "/api/auth/magic-link"
         | "/api/auth/magic_link"
         | "/api/auth/magic-links/request"
+        | "/api/auth/magic-link/request"
+        | "/api/auth/magic_link/request"
         | "/api/auth/magic-links/send"
         | "/api/auth/magic-link/send"
         | "/api/auth/magic_link/send"
@@ -4345,6 +4351,8 @@ fn compatibility_route_path(path: &str) -> Cow<'_, str> {
         | "/api/magic-link"
         | "/api/magic_link"
         | "/api/magic-links/request"
+        | "/api/magic-link/request"
+        | "/api/magic_link/request"
         | "/api/magic-links/send"
         | "/api/magic-link/send"
         | "/api/magic_link/send"
@@ -4352,6 +4360,8 @@ fn compatibility_route_path(path: &str) -> Cow<'_, str> {
         | "/api/local-auth/magic-link"
         | "/api/local-auth/magic_link"
         | "/api/local-auth/magic-links/request"
+        | "/api/local-auth/magic-link/request"
+        | "/api/local-auth/magic_link/request"
         | "/api/local-auth/magic-links/send"
         | "/api/local-auth/magic-link/send"
         | "/api/local-auth/magic_link/send"
@@ -4359,6 +4369,8 @@ fn compatibility_route_path(path: &str) -> Cow<'_, str> {
         | "/local-auth/magic-link"
         | "/local-auth/magic_link"
         | "/local-auth/magic-links/request"
+        | "/local-auth/magic-link/request"
+        | "/local-auth/magic_link/request"
         | "/local-auth/magic-links/send"
         | "/local-auth/magic-link/send"
         | "/local-auth/magic_link/send" => Cow::Borrowed("/magic-links"),
@@ -5824,7 +5836,13 @@ fn provider_callback_alias_path(path: &str) -> bool {
     provider_segment_alias(path, "/oauth/callback/", "").is_some()
         || provider_segment_alias(path, "/oauth2/callback/", "").is_some()
         || provider_segment_alias(path, "/callback/", "").is_some()
+        || provider_segment_alias(path, "/auth/callback/", "").is_some()
+        || provider_segment_alias(path, "/api/callback/", "").is_some()
+        || provider_segment_alias(path, "/api/auth/callback/", "").is_some()
         || path == "/callback"
+        || path == "/auth/callback"
+        || path == "/api/callback"
+        || path == "/api/auth/callback"
 }
 
 fn provider_authorize_alias_url(request_url: &url::Url) -> Option<url::Url> {
@@ -12516,6 +12534,8 @@ fn cors_path(path: &str) -> bool {
             | "/magic-link"
             | "/magic_link"
             | "/magic-links/request"
+            | "/magic-link/request"
+            | "/magic_link/request"
             | "/magic-links/consume"
             | "/magic-link/consume"
             | "/magic_link/consume"
@@ -12546,7 +12566,12 @@ fn cors_method_allowed(path: &str, method: &str) -> bool {
         | "/passkeys/login/finish" => method == "POST",
         "/password/register" => method == "POST",
         "/password/login" => method == "POST",
-        "/magic-links" | "/magic-link" | "/magic_link" | "/magic-links/request" => method == "POST",
+        "/magic-links"
+        | "/magic-link"
+        | "/magic_link"
+        | "/magic-links/request"
+        | "/magic-link/request"
+        | "/magic_link/request" => method == "POST",
         "/magic-links/consume" | "/magic-link/consume" | "/magic_link/consume" => {
             method == "GET" || method == "POST"
         }
@@ -18015,10 +18040,15 @@ mod tests {
         assert!(provider_callback_alias_path("/oauth2/callback/apple"));
         assert!(provider_callback_alias_path("/callback"));
         assert!(provider_callback_alias_path("/callback/apple"));
+        assert!(provider_callback_alias_path("/auth/callback"));
+        assert!(provider_callback_alias_path("/auth/callback/apple"));
+        assert!(provider_callback_alias_path("/api/callback"));
+        assert!(provider_callback_alias_path("/api/auth/callback/google"));
         assert!(!provider_authorize_alias_path(
             "/providers/google/extra/authorize"
         ));
         assert!(!provider_callback_alias_path("/oauth/callback/apple/extra"));
+        assert!(!provider_callback_alias_path("/auth/callback/apple/extra"));
         assert!(!provider_callback_alias_path("/callback/apple/extra"));
     }
 
@@ -18044,6 +18074,14 @@ mod tests {
         assert_eq!(compatibility_route_path("/dashboard").as_ref(), "/admin");
         assert_eq!(
             compatibility_route_path("/callback/apple").as_ref(),
+            "/oauth2/callback"
+        );
+        assert_eq!(
+            compatibility_route_path("/auth/callback/apple").as_ref(),
+            "/oauth2/callback"
+        );
+        assert_eq!(
+            compatibility_route_path("/api/auth/callback").as_ref(),
             "/oauth2/callback"
         );
         assert_eq!(compatibility_route_path("/admin/users").as_ref(), "/admin");
@@ -18081,6 +18119,22 @@ mod tests {
         );
         assert_eq!(
             compatibility_route_path("/api/magic-links/request").as_ref(),
+            "/magic-links"
+        );
+        assert_eq!(
+            compatibility_route_path("/magic-link/request").as_ref(),
+            "/magic-links"
+        );
+        assert_eq!(
+            compatibility_route_path("/auth/magic-link/request").as_ref(),
+            "/magic-links"
+        );
+        assert_eq!(
+            compatibility_route_path("/api/auth/magic-link/request").as_ref(),
+            "/magic-links"
+        );
+        assert_eq!(
+            compatibility_route_path("/local-auth/magic-link/request").as_ref(),
             "/magic-links"
         );
         assert_eq!(
@@ -18157,6 +18211,9 @@ mod tests {
         assert!(known_route_path(compatibility_route_path("/ui").as_ref()));
         assert!(known_route_path(
             compatibility_route_path("/callback/apple").as_ref()
+        ));
+        assert!(known_route_path(
+            compatibility_route_path("/auth/callback/apple").as_ref()
         ));
         assert!(known_route_path(
             compatibility_route_path("/api/passkeys/login/options").as_ref()
@@ -18459,6 +18516,8 @@ mod tests {
         assert!(cors_path("/magic-link"));
         assert!(cors_path("/magic_link"));
         assert!(cors_path("/magic-links/request"));
+        assert!(cors_path("/magic-link/request"));
+        assert!(cors_path("/magic_link/request"));
         assert!(cors_path("/magic-links/consume"));
         assert!(cors_path("/magic-link/consume"));
         assert!(cors_path("/magic_link/consume"));
@@ -18497,6 +18556,8 @@ mod tests {
         assert!(cors_method_allowed("/magic-link", "POST"));
         assert!(cors_method_allowed("/magic_link", "POST"));
         assert!(cors_method_allowed("/magic-links/request", "POST"));
+        assert!(cors_method_allowed("/magic-link/request", "POST"));
+        assert!(cors_method_allowed("/magic_link/request", "POST"));
         assert!(!cors_method_allowed("/magic-links", "GET"));
         let magic_links_trailing_slash = canonical_route_path("/magic-links/");
         assert!(cors_path(magic_links_trailing_slash.as_ref()));

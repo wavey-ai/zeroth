@@ -311,6 +311,54 @@ pub const ROUTES: &[Route] = &[
     },
     Route {
         method: "GET",
+        path: "/auth/callback",
+    },
+    Route {
+        method: "POST",
+        path: "/auth/callback",
+    },
+    Route {
+        method: "GET",
+        path: "/auth/callback/{provider}",
+    },
+    Route {
+        method: "POST",
+        path: "/auth/callback/{provider}",
+    },
+    Route {
+        method: "GET",
+        path: "/api/callback",
+    },
+    Route {
+        method: "POST",
+        path: "/api/callback",
+    },
+    Route {
+        method: "GET",
+        path: "/api/callback/{provider}",
+    },
+    Route {
+        method: "POST",
+        path: "/api/callback/{provider}",
+    },
+    Route {
+        method: "GET",
+        path: "/api/auth/callback",
+    },
+    Route {
+        method: "POST",
+        path: "/api/auth/callback",
+    },
+    Route {
+        method: "GET",
+        path: "/api/auth/callback/{provider}",
+    },
+    Route {
+        method: "POST",
+        path: "/api/auth/callback/{provider}",
+    },
+    Route {
+        method: "GET",
         path: "/session",
     },
     Route {
@@ -651,6 +699,22 @@ pub const ROUTES: &[Route] = &[
     },
     Route {
         method: "POST",
+        path: "/magic-link/request",
+    },
+    Route {
+        method: "OPTIONS",
+        path: "/magic-link/request",
+    },
+    Route {
+        method: "POST",
+        path: "/magic_link/request",
+    },
+    Route {
+        method: "OPTIONS",
+        path: "/magic_link/request",
+    },
+    Route {
+        method: "POST",
         path: "/api/magic-links",
     },
     Route {
@@ -731,6 +795,38 @@ pub const ROUTES: &[Route] = &[
     },
     Route {
         method: "POST",
+        path: "/api/magic-link/request",
+    },
+    Route {
+        method: "OPTIONS",
+        path: "/api/magic-link/request",
+    },
+    Route {
+        method: "POST",
+        path: "/api/magic_link/request",
+    },
+    Route {
+        method: "OPTIONS",
+        path: "/api/magic_link/request",
+    },
+    Route {
+        method: "POST",
+        path: "/auth/magic-link/request",
+    },
+    Route {
+        method: "OPTIONS",
+        path: "/auth/magic-link/request",
+    },
+    Route {
+        method: "POST",
+        path: "/api/auth/magic-link/request",
+    },
+    Route {
+        method: "OPTIONS",
+        path: "/api/auth/magic-link/request",
+    },
+    Route {
+        method: "POST",
         path: "/local-auth/magic-links",
     },
     Route {
@@ -772,6 +868,30 @@ pub const ROUTES: &[Route] = &[
     Route {
         method: "OPTIONS",
         path: "/local-auth/magic-links/request",
+    },
+    Route {
+        method: "POST",
+        path: "/local-auth/magic-link/request",
+    },
+    Route {
+        method: "OPTIONS",
+        path: "/local-auth/magic-link/request",
+    },
+    Route {
+        method: "POST",
+        path: "/local-auth/magic_link/request",
+    },
+    Route {
+        method: "OPTIONS",
+        path: "/local-auth/magic_link/request",
+    },
+    Route {
+        method: "POST",
+        path: "/api/local-auth/magic-link/request",
+    },
+    Route {
+        method: "OPTIONS",
+        path: "/api/local-auth/magic-link/request",
     },
     Route {
         method: "GET",
@@ -1016,6 +1136,18 @@ mod tests {
             ("POST", "/callback"),
             ("GET", "/callback/{provider}"),
             ("POST", "/callback/{provider}"),
+            ("GET", "/auth/callback"),
+            ("POST", "/auth/callback"),
+            ("GET", "/auth/callback/{provider}"),
+            ("POST", "/auth/callback/{provider}"),
+            ("GET", "/api/callback"),
+            ("POST", "/api/callback"),
+            ("GET", "/api/callback/{provider}"),
+            ("POST", "/api/callback/{provider}"),
+            ("GET", "/api/auth/callback"),
+            ("POST", "/api/auth/callback"),
+            ("GET", "/api/auth/callback/{provider}"),
+            ("POST", "/api/auth/callback/{provider}"),
             ("POST", "/passkeys/registration/options"),
             ("POST", "/passkeys/registration/finish"),
             ("POST", "/passkeys/authentication/options"),
@@ -1037,6 +1169,8 @@ mod tests {
             ("GET", "/magic_link"),
             ("POST", "/magic_link"),
             ("POST", "/magic-links/request"),
+            ("POST", "/magic-link/request"),
+            ("POST", "/magic_link/request"),
             ("GET", "/api/password/login"),
             ("POST", "/api/password/login"),
             ("GET", "/auth/password/login"),
@@ -1057,10 +1191,17 @@ mod tests {
             ("POST", "/api/auth/magic-link/send"),
             ("GET", "/api/magic_link"),
             ("POST", "/api/magic_link"),
+            ("POST", "/api/magic-link/request"),
+            ("POST", "/api/magic_link/request"),
+            ("POST", "/auth/magic-link/request"),
+            ("POST", "/api/auth/magic-link/request"),
             ("GET", "/local-auth/magic-links"),
             ("POST", "/local-auth/magic-links"),
             ("GET", "/local-auth/magic_link"),
             ("POST", "/local-auth/magic_link"),
+            ("POST", "/local-auth/magic-link/request"),
+            ("POST", "/local-auth/magic_link/request"),
+            ("POST", "/api/local-auth/magic-link/request"),
             ("GET", "/magic-link/consume"),
             ("POST", "/magic-link/consume"),
             ("GET", "/magic_link/consume"),
