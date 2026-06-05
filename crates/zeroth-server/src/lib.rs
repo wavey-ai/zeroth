@@ -115,6 +115,10 @@ pub const ROUTES: &[Route] = &[
     },
     Route {
         method: "GET",
+        path: "/.well-known/assetlinks.json",
+    },
+    Route {
+        method: "GET",
         path: "/favicon.ico",
     },
     Route {
@@ -363,7 +367,15 @@ pub const ROUTES: &[Route] = &[
     },
     Route {
         method: "POST",
+        path: "/api/passkeys/registration/options",
+    },
+    Route {
+        method: "POST",
         path: "/api/passkeys/register/verify",
+    },
+    Route {
+        method: "POST",
+        path: "/api/passkeys/registration/verify",
     },
     Route {
         method: "POST",
@@ -371,7 +383,15 @@ pub const ROUTES: &[Route] = &[
     },
     Route {
         method: "POST",
+        path: "/api/passkeys/registration/finish",
+    },
+    Route {
+        method: "POST",
         path: "/api/passkeys/authenticate/options",
+    },
+    Route {
+        method: "POST",
+        path: "/api/passkeys/authentication/options",
     },
     Route {
         method: "POST",
@@ -379,7 +399,15 @@ pub const ROUTES: &[Route] = &[
     },
     Route {
         method: "POST",
+        path: "/api/passkeys/authentication/verify",
+    },
+    Route {
+        method: "POST",
         path: "/api/passkeys/authenticate/finish",
+    },
+    Route {
+        method: "POST",
+        path: "/api/passkeys/authentication/finish",
     },
     Route {
         method: "POST",
@@ -535,6 +563,18 @@ pub const ROUTES: &[Route] = &[
     },
     Route {
         method: "POST",
+        path: "/api/magic_link",
+    },
+    Route {
+        method: "GET",
+        path: "/api/magic_link",
+    },
+    Route {
+        method: "OPTIONS",
+        path: "/api/magic_link",
+    },
+    Route {
+        method: "POST",
         path: "/api/magic-links/request",
     },
     Route {
@@ -564,6 +604,18 @@ pub const ROUTES: &[Route] = &[
     Route {
         method: "OPTIONS",
         path: "/local-auth/magic-link",
+    },
+    Route {
+        method: "POST",
+        path: "/local-auth/magic_link",
+    },
+    Route {
+        method: "GET",
+        path: "/local-auth/magic_link",
+    },
+    Route {
+        method: "OPTIONS",
+        path: "/local-auth/magic_link",
     },
     Route {
         method: "POST",
@@ -635,6 +687,18 @@ pub const ROUTES: &[Route] = &[
     },
     Route {
         method: "GET",
+        path: "/api/magic_link/consume",
+    },
+    Route {
+        method: "POST",
+        path: "/api/magic_link/consume",
+    },
+    Route {
+        method: "OPTIONS",
+        path: "/api/magic_link/consume",
+    },
+    Route {
+        method: "GET",
         path: "/local-auth/magic-links/consume",
     },
     Route {
@@ -656,6 +720,18 @@ pub const ROUTES: &[Route] = &[
     Route {
         method: "OPTIONS",
         path: "/local-auth/magic-link/consume",
+    },
+    Route {
+        method: "GET",
+        path: "/local-auth/magic_link/consume",
+    },
+    Route {
+        method: "POST",
+        path: "/local-auth/magic_link/consume",
+    },
+    Route {
+        method: "OPTIONS",
+        path: "/local-auth/magic_link/consume",
     },
     Route {
         method: "GET",
@@ -728,6 +804,7 @@ mod tests {
             "/apple-touch-icon-precomposed.png",
             "/apple-touch-icon-{size}.png",
             "/apple-touch-icon-{size}-precomposed.png",
+            "/.well-known/assetlinks.json",
             "/site.webmanifest",
             "/manifest.json",
             "/browserconfig.xml",
@@ -786,7 +863,13 @@ mod tests {
             ("POST", "/passkeys/login/verify"),
             ("POST", "/passkeys/login/finish"),
             ("POST", "/api/passkeys/register/options"),
+            ("POST", "/api/passkeys/registration/options"),
+            ("POST", "/api/passkeys/registration/verify"),
+            ("POST", "/api/passkeys/registration/finish"),
             ("POST", "/api/passkeys/authenticate/options"),
+            ("POST", "/api/passkeys/authentication/options"),
+            ("POST", "/api/passkeys/authentication/verify"),
+            ("POST", "/api/passkeys/authentication/finish"),
             ("POST", "/api/passkeys/login/options"),
             ("GET", "/magic-link"),
             ("POST", "/magic-link"),
@@ -799,16 +882,24 @@ mod tests {
             ("POST", "/local-auth/password/login"),
             ("GET", "/api/magic-links"),
             ("POST", "/api/magic-links"),
+            ("GET", "/api/magic_link"),
+            ("POST", "/api/magic_link"),
             ("GET", "/local-auth/magic-links"),
             ("POST", "/local-auth/magic-links"),
+            ("GET", "/local-auth/magic_link"),
+            ("POST", "/local-auth/magic_link"),
             ("GET", "/magic-link/consume"),
             ("POST", "/magic-link/consume"),
             ("GET", "/magic_link/consume"),
             ("POST", "/magic_link/consume"),
             ("GET", "/api/magic-links/consume"),
             ("POST", "/api/magic-links/consume"),
+            ("GET", "/api/magic_link/consume"),
+            ("POST", "/api/magic_link/consume"),
             ("GET", "/local-auth/magic-links/consume"),
             ("POST", "/local-auth/magic-links/consume"),
+            ("GET", "/local-auth/magic_link/consume"),
+            ("POST", "/local-auth/magic_link/consume"),
         ] {
             assert!(ROUTES
                 .iter()

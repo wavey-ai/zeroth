@@ -1770,7 +1770,7 @@ async fn handle_request(request: Request, env: Env) -> worker::Result<Response> 
         (
             Method::Get,
             "/password/register" | "/password/login" | "/magic-links" | "/magic-link"
-                | "/magic_link",
+            | "/magic_link",
         ) => redirect_local_auth_get_to_login(request, env),
         (Method::Post, "/password/register") => password_register(request, env).await,
         (Method::Post, "/password/login") => password_login(request, env).await,
@@ -1783,6 +1783,13 @@ async fn handle_request(request: Request, env: Env) -> worker::Result<Response> 
         ) => magic_link_consume(request, env).await,
         (Method::Get, "/validate") => validate(request, env).await,
         (Method::Get | Method::Post, "/logout") => logout(request, env).await,
+        _ if known_route_path(route_path.as_ref()) => json_status(
+            &serde_json::json!({
+                "error": "method_not_allowed",
+                "errorDescription": "route exists but does not allow this method"
+            }),
+            405,
+        ),
         _ => json_status(&serde_json::json!({ "error": "not_found" }), 404),
     }
 }
@@ -4277,22 +4284,36 @@ fn compatibility_route_path(path: &str) -> Cow<'_, str> {
         | "/magic-links/request"
         | "/api/magic-links"
         | "/api/magic-link"
+        | "/api/magic_link"
         | "/api/magic-links/request"
         | "/local-auth/magic-links"
         | "/local-auth/magic-link"
+        | "/local-auth/magic_link"
         | "/local-auth/magic-links/request" => Cow::Borrowed("/magic-links"),
         "/magic-link/consume"
         | "/magic_link/consume"
         | "/api/magic-links/consume"
         | "/api/magic-link/consume"
+        | "/api/magic_link/consume"
         | "/local-auth/magic-links/consume"
-        | "/local-auth/magic-link/consume" => Cow::Borrowed("/magic-links/consume"),
+        | "/local-auth/magic-link/consume"
+        | "/local-auth/magic_link/consume" => Cow::Borrowed("/magic-links/consume"),
         "/api/passkeys/register/options" => Cow::Borrowed("/passkeys/register/options"),
-        "/api/passkeys/register/verify" => Cow::Borrowed("/passkeys/register/verify"),
-        "/api/passkeys/register/finish" => Cow::Borrowed("/passkeys/register/finish"),
+        "/api/passkeys/registration/options" => Cow::Borrowed("/passkeys/registration/options"),
+        "/api/passkeys/register/verify" | "/api/passkeys/registration/verify" => {
+            Cow::Borrowed("/passkeys/register/verify")
+        }
+        "/api/passkeys/register/finish" | "/api/passkeys/registration/finish" => {
+            Cow::Borrowed("/passkeys/register/finish")
+        }
         "/api/passkeys/authenticate/options" => Cow::Borrowed("/passkeys/authenticate/options"),
-        "/api/passkeys/authenticate/verify" => Cow::Borrowed("/passkeys/authenticate/verify"),
-        "/api/passkeys/authenticate/finish" => Cow::Borrowed("/passkeys/authenticate/finish"),
+        "/api/passkeys/authentication/options" => Cow::Borrowed("/passkeys/authentication/options"),
+        "/api/passkeys/authenticate/verify" | "/api/passkeys/authentication/verify" => {
+            Cow::Borrowed("/passkeys/authenticate/verify")
+        }
+        "/api/passkeys/authenticate/finish" | "/api/passkeys/authentication/finish" => {
+            Cow::Borrowed("/passkeys/authenticate/finish")
+        }
         "/api/passkeys/login/options" | "/passkeys/login/options" => {
             Cow::Borrowed("/passkeys/authenticate/options")
         }
@@ -4308,7 +4329,11 @@ fn compatibility_route_path(path: &str) -> Cow<'_, str> {
 }
 
 fn quiet_browser_asset_path(path: &str) -> bool {
-    apple_touch_icon_path(path) || path == "/.well-known/appspecific/com.chrome.devtools.json"
+    apple_touch_icon_path(path)
+        || matches!(
+            path,
+            "/.well-known/assetlinks.json" | "/.well-known/appspecific/com.chrome.devtools.json"
+        )
 }
 
 fn apple_touch_icon_path(path: &str) -> bool {
@@ -4334,6 +4359,65 @@ fn apple_touch_icon_path(path: &str) -> bool {
         && !height.is_empty()
         && width.bytes().all(|byte| byte.is_ascii_digit())
         && height.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn known_route_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/health"
+            | "/ready"
+            | "/providers"
+            | "/providers/status"
+            | "/local-auth/status"
+            | "/clients"
+            | "/users"
+            | "/events"
+            | "/routes"
+            | "/.well-known/openid-configuration"
+            | "/.well-known/oauth-authorization-server"
+            | "/.well-known/jwks.json"
+            | "/.well-known/apple-app-site-association"
+            | "/favicon.ico"
+            | "/favicon.svg"
+            | "/site.webmanifest"
+            | "/manifest.json"
+            | "/browserconfig.xml"
+            | "/robots.txt"
+            | "/login"
+            | "/account"
+            | "/admin"
+            | "/authorize"
+            | "/__zeroth/db/status"
+            | "/__zeroth/db/ensure"
+            | "/oauth2/callback"
+            | "/oauth/token"
+            | "/oauth/revoke"
+            | "/oauth/introspect"
+            | "/userinfo"
+            | "/session"
+            | "/sessions"
+            | "/profile"
+            | "/identities/link"
+            | "/identities"
+            | "/passkeys/register/options"
+            | "/passkeys/registration/options"
+            | "/passkeys/register/verify"
+            | "/passkeys/register/finish"
+            | "/passkeys/registration/finish"
+            | "/passkeys/authenticate/options"
+            | "/passkeys/authentication/options"
+            | "/passkeys/authenticate/verify"
+            | "/passkeys/authenticate/finish"
+            | "/passkeys/authentication/finish"
+            | "/password/register"
+            | "/password/login"
+            | "/magic-links"
+            | "/magic-links/consume"
+            | "/validate"
+            | "/logout"
+    ) || provider_authorize_alias_path(path)
+        || provider_callback_alias_path(path)
+        || quiet_browser_asset_path(path)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -5468,7 +5552,10 @@ fn provider_authorize_alias_path(path: &str) -> bool {
 fn admin_console_alias_path(path: &str) -> bool {
     matches!(
         path,
-        "/admin/users" | "/admin/events" | "/admin/providers" | "/admin/local-auth"
+        "/admin/users"
+            | "/admin/events"
+            | "/admin/providers"
+            | "/admin/local-auth"
             | "/admin/database"
     )
 }
@@ -7184,9 +7271,8 @@ fn sanitize_magic_link_email_error_detail(error: &str) -> Option<String> {
 }
 
 fn redact_magic_link_email_error_token(token: &str) -> Cow<'_, str> {
-    let probe = token.trim_matches(|ch: char| {
-        ch.is_ascii_punctuation() && !matches!(ch, '_' | '-' | '.')
-    });
+    let probe =
+        token.trim_matches(|ch: char| ch.is_ascii_punctuation() && !matches!(ch, '_' | '-' | '.'));
     if magic_link_error_token_is_url(probe) {
         Cow::Borrowed("[url]")
     } else if magic_link_error_token_is_email(probe) {
@@ -11851,9 +11937,7 @@ fn cors_method_allowed(path: &str, method: &str) -> bool {
         | "/passkeys/login/finish" => method == "POST",
         "/password/register" => method == "POST",
         "/password/login" => method == "POST",
-        "/magic-links" | "/magic-link" | "/magic_link" | "/magic-links/request" => {
-            method == "POST"
-        }
+        "/magic-links" | "/magic-link" | "/magic_link" | "/magic-links/request" => method == "POST",
         "/magic-links/consume" | "/magic-link/consume" | "/magic_link/consume" => {
             method == "GET" || method == "POST"
         }
@@ -14435,7 +14519,11 @@ mod tests {
             Some("email_internal_server_error".to_owned())
         );
         assert_eq!(
-            magic_link.delivery_status.as_ref().unwrap().last_error_detail,
+            magic_link
+                .delivery_status
+                .as_ref()
+                .unwrap()
+                .last_error_detail,
             Some("email.sending.error.internal_server [code: 10002]".to_owned())
         );
     }
@@ -17167,10 +17255,7 @@ mod tests {
 
     #[test]
     fn compatibility_route_path_maps_bounded_aliases_to_canonical_routes() {
-        assert_eq!(
-            compatibility_route_path("/admin/users").as_ref(),
-            "/admin"
-        );
+        assert_eq!(compatibility_route_path("/admin/users").as_ref(), "/admin");
         assert_eq!(
             compatibility_route_path("/api/clients").as_ref(),
             "/clients"
@@ -17184,6 +17269,10 @@ mod tests {
             "/magic-links"
         );
         assert_eq!(
+            compatibility_route_path("/api/magic_link").as_ref(),
+            "/magic-links"
+        );
+        assert_eq!(
             compatibility_route_path("/api/magic-links/request").as_ref(),
             "/magic-links"
         );
@@ -17192,8 +17281,28 @@ mod tests {
             "/magic-links/consume"
         );
         assert_eq!(
+            compatibility_route_path("/local-auth/magic_link/consume").as_ref(),
+            "/magic-links/consume"
+        );
+        assert_eq!(
             compatibility_route_path("/api/password/login").as_ref(),
             "/password/login"
+        );
+        assert_eq!(
+            compatibility_route_path("/api/passkeys/registration/options").as_ref(),
+            "/passkeys/registration/options"
+        );
+        assert_eq!(
+            compatibility_route_path("/api/passkeys/registration/verify").as_ref(),
+            "/passkeys/register/verify"
+        );
+        assert_eq!(
+            compatibility_route_path("/api/passkeys/authentication/options").as_ref(),
+            "/passkeys/authentication/options"
+        );
+        assert_eq!(
+            compatibility_route_path("/api/passkeys/authentication/finish").as_ref(),
+            "/passkeys/authenticate/finish"
         );
         assert_eq!(
             compatibility_route_path("/api/passkeys/login/options").as_ref(),
@@ -17203,6 +17312,18 @@ mod tests {
             compatibility_route_path("/admin/users/export").as_ref(),
             "/admin/users/export"
         );
+    }
+
+    #[test]
+    fn known_route_path_covers_aliases_after_normalization() {
+        assert!(known_route_path(
+            compatibility_route_path("/api/passkeys/login/options").as_ref()
+        ));
+        assert!(known_route_path(
+            compatibility_route_path("/api/magic_link").as_ref()
+        ));
+        assert!(known_route_path("/.well-known/assetlinks.json"));
+        assert!(!known_route_path("/admin/users/export"));
     }
 
     #[test]
@@ -17520,7 +17641,10 @@ mod tests {
         assert!(cors_method_allowed("/identities", "DELETE"));
         assert!(!cors_method_allowed("/identities", "POST"));
         assert!(cors_method_allowed("/passkeys/register/options", "POST"));
-        assert!(cors_method_allowed("/passkeys/authenticate/options", "POST"));
+        assert!(cors_method_allowed(
+            "/passkeys/authenticate/options",
+            "POST"
+        ));
         assert!(cors_method_allowed("/passkeys/login/options", "POST"));
         assert!(!cors_method_allowed("/passkeys/login/options", "GET"));
         assert!(cors_method_allowed("/password/register", "POST"));
@@ -17552,10 +17676,7 @@ mod tests {
 
         let local_auth_magic_links = compatibility_route_path("/local-auth/magic-links");
         assert!(cors_path(local_auth_magic_links.as_ref()));
-        assert!(cors_method_allowed(
-            local_auth_magic_links.as_ref(),
-            "POST"
-        ));
+        assert!(cors_method_allowed(local_auth_magic_links.as_ref(), "POST"));
     }
 
     #[test]
