@@ -29,6 +29,11 @@ pub const ZEROTH_UI_CSS: &str = r#"
   --z-red: #cf222e;
   --z-ink: #1f2328;
   --z-ink-deep: #0b0f19;
+  --z-sidebar: #111318;
+  --z-sidebar-text: #f6f8fa;
+  --z-sidebar-muted: #8c959f;
+  --z-sidebar-line: #30363d;
+  --z-sidebar-active: #1f6feb;
 }
 
 * {
@@ -56,13 +61,20 @@ a:hover {
 .zeroth-shell {
   min-height: 100vh;
   display: grid;
-  grid-template-columns: 220px minmax(0, 1fr);
+  grid-template-columns: 248px minmax(0, 1fr);
 }
 
 .zeroth-sidebar {
-  border-right: 1px solid var(--z-line);
-  background: #ffffff;
+  position: sticky;
+  top: 0;
+  align-self: start;
+  height: 100vh;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  border-right: 1px solid var(--z-sidebar-line);
+  background: var(--z-sidebar);
   padding: 18px 14px;
+  overflow-y: auto;
 }
 
 .zeroth-brand {
@@ -72,7 +84,25 @@ a:hover {
   margin-bottom: 18px;
   font-size: 16px;
   font-weight: 700;
-  color: var(--z-ink);
+  color: var(--z-sidebar-text);
+}
+
+.zeroth-brand-text {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+}
+
+.zeroth-brand-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.zeroth-brand-subtitle {
+  color: var(--z-sidebar-muted);
+  font-size: 11px;
+  font-weight: 600;
 }
 
 .zeroth-mark {
@@ -100,13 +130,24 @@ a:hover {
 .zeroth-login-mode .zeroth-sidebar {
   display: flex;
   justify-content: center;
+  height: auto;
+  position: static;
   border-right: 0;
   border-bottom: 1px solid var(--z-line);
   background: rgba(255, 255, 255, 0.92);
 }
 
 .zeroth-login-mode .zeroth-brand {
+  color: var(--z-ink);
   margin-bottom: 0;
+}
+
+.zeroth-login-mode .zeroth-brand-subtitle {
+  color: var(--z-muted);
+}
+
+.zeroth-login-mode .zeroth-sidebar-footer {
+  display: none;
 }
 
 .zeroth-login-mode .zeroth-mark {
@@ -204,6 +245,11 @@ a:hover {
   gap: 12px;
 }
 
+.zeroth-auth-group {
+  display: grid;
+  gap: 12px;
+}
+
 .zeroth-login-actions {
   display: grid;
   grid-template-columns: 1fr auto;
@@ -289,19 +335,47 @@ a:hover {
 
 .zeroth-nav {
   display: grid;
-  gap: 4px;
+  align-content: start;
+  gap: 3px;
 }
 
 .zeroth-nav a {
   border-radius: 6px;
-  color: var(--z-text);
+  color: var(--z-sidebar-text);
   padding: 7px 9px;
+  font-weight: 600;
+}
+
+.zeroth-nav a:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: #ffffff;
+  text-decoration: none;
 }
 
 .zeroth-nav a[aria-current="page"] {
-  background: var(--z-blue-soft);
-  color: #0550ae;
-  font-weight: 600;
+  background: var(--z-sidebar-active);
+  color: #ffffff;
+}
+
+.zeroth-nav-section {
+  margin: 13px 9px 5px;
+  color: var(--z-sidebar-muted);
+  font-size: 11px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.zeroth-nav-section:first-child {
+  margin-top: 0;
+}
+
+.zeroth-sidebar-footer {
+  margin-top: 18px;
+  border-top: 1px solid var(--z-sidebar-line);
+  padding-top: 12px;
+  color: var(--z-sidebar-muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
 }
 
 .zeroth-main {
@@ -340,6 +414,42 @@ a:hover {
 .zeroth-stack {
   display: grid;
   gap: 14px;
+}
+
+.zeroth-overview-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(160px, 1fr));
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.zeroth-metric {
+  display: grid;
+  gap: 4px;
+  min-height: 92px;
+  border: 1px solid var(--z-line);
+  border-radius: 8px;
+  background: #ffffff;
+  padding: 14px;
+}
+
+.zeroth-metric-label {
+  color: var(--z-muted);
+  font-size: 12px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.zeroth-metric-value {
+  color: var(--z-ink);
+  font-size: 28px;
+  line-height: 1;
+  font-weight: 800;
+}
+
+.zeroth-metric-meta {
+  color: var(--z-muted);
+  font-size: 12px;
 }
 
 .zeroth-panel {
@@ -488,6 +598,7 @@ a:hover {
 .zeroth-status {
   display: inline-flex;
   align-items: center;
+  gap: 4px;
   border: 1px solid var(--z-line);
   border-radius: 999px;
   padding: 2px 8px;
@@ -607,6 +718,20 @@ a:hover {
   margin-top: 2px;
 }
 
+.zeroth-inline-form {
+  display: inline-flex;
+  margin: 0;
+}
+
+.zeroth-current-session {
+  display: grid;
+  gap: 10px;
+  border: 1px solid var(--z-line);
+  border-radius: 8px;
+  background: var(--z-bg);
+  padding: 12px;
+}
+
 .zeroth-table {
   width: 100%;
   border-collapse: collapse;
@@ -688,8 +813,10 @@ a:hover {
   }
 
   .zeroth-sidebar {
+    position: static;
+    height: auto;
     border-right: 0;
-    border-bottom: 1px solid var(--z-line);
+    border-bottom: 1px solid var(--z-sidebar-line);
   }
 
   .zeroth-nav {
@@ -701,6 +828,10 @@ a:hover {
   }
 
   .zeroth-client-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .zeroth-overview-grid {
     grid-template-columns: 1fr;
   }
 
@@ -1129,14 +1260,13 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
     } = state;
 
     let signed_in = profile.is_some();
+    let profile_email_value = profile.as_ref().and_then(|profile| profile.email.clone());
     let profile_name = profile
         .as_ref()
         .and_then(|profile| profile.display_name.clone())
+        .or_else(|| profile_email_value.clone())
         .unwrap_or_else(|| "Not signed in".to_owned());
-    let profile_email = profile
-        .as_ref()
-        .and_then(|profile| profile.email.clone())
-        .unwrap_or_else(|| "No email".to_owned());
+    let profile_email = profile_email_value.unwrap_or_else(|| "No email".to_owned());
     let profile_subject = profile
         .as_ref()
         .map(|profile| profile.sub.clone())
@@ -1185,14 +1315,27 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
     } else {
         "zeroth-avatar-hidden"
     };
+    let admin_url = endpoint_url(&config, "/admin");
     let profile_action = endpoint_url(&config, "/profile");
     let logout_action = endpoint_url(&config, "/logout");
     let csrf_token = config.csrf_token.clone().unwrap_or_default();
-    let login_mode = !signed_in && !config.link_identities;
+    let signed_in_account_mode = signed_in && config.link_identities;
+    let signed_in_login_flow = signed_in && !config.link_identities;
+    let login_mode = !signed_in;
     let shell_class = if login_mode {
         "zeroth-shell zeroth-login-mode"
     } else {
         "zeroth-shell"
+    };
+    let signed_in_nav_class = if signed_in {
+        "zeroth-nav"
+    } else {
+        "zeroth-nav zeroth-hidden"
+    };
+    let signed_out_nav_class = if signed_in {
+        "zeroth-nav zeroth-hidden"
+    } else {
+        "zeroth-nav"
     };
     let login_intro_class = if login_mode {
         "zeroth-login-intro"
@@ -1214,12 +1357,48 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
     } else {
         "zeroth-status"
     };
+    let account_actions_class = if signed_in {
+        "zeroth-status-row"
+    } else {
+        "zeroth-status-row zeroth-hidden"
+    };
+    let credential_auth_class = if signed_in {
+        "zeroth-auth-group zeroth-hidden"
+    } else {
+        "zeroth-auth-group"
+    };
+    let provider_list_class = if signed_in_login_flow {
+        "zeroth-provider-list zeroth-hidden"
+    } else {
+        "zeroth-provider-list"
+    };
+    let continue_session_class = if signed_in_login_flow {
+        "zeroth-current-session"
+    } else {
+        "zeroth-current-session zeroth-hidden"
+    };
+    let passkey_login_class = if signed_in {
+        "zeroth-login-actions zeroth-hidden"
+    } else {
+        "zeroth-login-actions"
+    };
     let passkey_register_class = if signed_in {
         "zeroth-form zeroth-passkey-register-form"
     } else {
         "zeroth-form zeroth-passkey-register-form zeroth-hidden"
     };
-    let login_panel_title = if login_mode { "Sign in" } else { "Login" };
+    let login_panel_title = if signed_in_account_mode {
+        "Sign-in methods"
+    } else if signed_in_login_flow {
+        "Continue"
+    } else {
+        "Sign in"
+    };
+    let login_panel_id = if signed_in_account_mode {
+        "security"
+    } else {
+        "login"
+    };
     let login_return_to = config
         .return_to
         .clone()
@@ -1247,14 +1426,26 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
             <aside class="zeroth-sidebar">
                 <div class="zeroth-brand">
                     <span class="zeroth-mark">"Z"</span>
-                    <span>{product_name.clone()}</span>
+                    <span class="zeroth-brand-text">
+                        <span class="zeroth-brand-name">{product_name.clone()}</span>
+                        <span class="zeroth-brand-subtitle">"Identity"</span>
+                    </span>
                 </div>
-                <nav class="zeroth-nav" aria-label="Account sections">
+                <nav class=signed_out_nav_class aria-label="Sign in sections" data-zeroth-section-nav="true" data-zeroth-default-section="#login">
                     <a href="#login" aria-current="page">"Login"</a>
-                    <a href="#profile">"Profile"</a>
-                    <a href="#identities">"Identities"</a>
-                    <a href="#applications">"Applications"</a>
                 </nav>
+                <nav class=signed_in_nav_class aria-label="Account sections" data-zeroth-section-nav="true" data-zeroth-default-section="#profile">
+                    <div class="zeroth-nav-section">"Account"</div>
+                    <a href="#profile" aria-current="page">"Profile"</a>
+                    <a href="#security">"Sign-in methods"</a>
+                    <a href="#sessions">"Sessions"</a>
+                    <a href="#applications">"Applications"</a>
+                    <div class="zeroth-nav-section">"Manage"</div>
+                    <a href=admin_url.clone()>"Admin"</a>
+                </nav>
+                <div class="zeroth-sidebar-footer">
+                    {config.issuer_base_url.clone()}
+                </div>
             </aside>
 
             <main class="zeroth-main">
@@ -1272,54 +1463,77 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
                         <h1 class="zeroth-title">{product_name}</h1>
                         <div class="zeroth-subtitle">{config.issuer_base_url.clone()}</div>
                     </div>
-                    <span class=auth_status_class>{auth_status}</span>
+                    <div class=account_actions_class>
+                        <span class=auth_status_class>{auth_status}</span>
+                        <a class="zeroth-action" href=admin_url>"Admin"</a>
+                        <form class="zeroth-inline-form" method="post" action=logout_action.clone() data-zeroth-method="POST">
+                            <input type="hidden" name="_csrf" value=csrf_token.clone() />
+                            <button class="zeroth-action" type="submit">"Sign out"</button>
+                        </form>
+                    </div>
                 </header>
 
                 <div class="zeroth-grid">
                     <div class="zeroth-stack">
-                        <section id="login" class=login_panel_class>
+                        <section id=login_panel_id class=login_panel_class>
                             <div class="zeroth-panel-header">
                                 <h2 class="zeroth-panel-title">{login_panel_title}</h2>
                                 <span class=login_client_status_class>{config.client_id.clone()}</span>
                             </div>
                             <div class="zeroth-panel-body zeroth-local-auth">
-                                <div class="zeroth-provider-list">{provider_rows}</div>
-
-                                <div class="zeroth-divider">"Email and password"</div>
-                                <form class="zeroth-form zeroth-login-form" method="post" action=password_login_action data-zeroth-local-auth="password-login">
-                                    <input type="hidden" name="clientId" value=config.client_id.clone() />
-                                    <input type="hidden" name="returnTo" value=login_return_to.clone() />
-                                    <div class="zeroth-field">
-                                        <label for="zeroth-login-email">"Email"</label>
-                                        <input id="zeroth-login-email" name="email" type="email" autocomplete="email" />
-                                    </div>
-                                    <div class="zeroth-login-actions">
-                                        <div class="zeroth-field">
-                                            <label for="zeroth-login-password">"Password"</label>
-                                            <input id="zeroth-login-password" name="password" type="password" autocomplete="current-password" />
-                                        </div>
-                                        <button class="zeroth-action zeroth-primary" type="submit">"Sign in"</button>
+                                <div class=continue_session_class>
+                                    <div>
+                                        <div class="zeroth-row-title">{profile_name.clone()}</div>
+                                        <div class="zeroth-row-meta">{profile_email.clone()}</div>
                                     </div>
                                     <div class="zeroth-form-actions">
-                                        <button class="zeroth-action" type="submit" formaction=password_register_action data-zeroth-local-mode="password-register">"Create account"</button>
+                                        <form class="zeroth-inline-form" method="post" action=logout_action.clone() data-zeroth-method="POST">
+                                            <input type="hidden" name="_csrf" value=csrf_token.clone() />
+                                            <button class="zeroth-action" type="submit">"Sign out"</button>
+                                        </form>
+                                        <a class="zeroth-action zeroth-primary" href=login_return_to.clone()>"Continue"</a>
                                     </div>
-                                </form>
+                                </div>
 
-                                <div class="zeroth-divider">"Magic link"</div>
-                                <form class="zeroth-form zeroth-login-form" method="post" action=magic_link_action data-zeroth-local-auth="magic-link">
-                                    <input type="hidden" name="clientId" value=config.client_id.clone() />
-                                    <input type="hidden" name="returnTo" value=login_return_to.clone() />
-                                    <div class="zeroth-login-actions">
+                                <div class=provider_list_class>{provider_rows}</div>
+
+                                <div class=credential_auth_class>
+                                    <div class="zeroth-divider">"Email and password"</div>
+                                    <form class="zeroth-form zeroth-login-form" method="post" action=password_login_action data-zeroth-local-auth="password-login">
+                                        <input type="hidden" name="clientId" value=config.client_id.clone() />
+                                        <input type="hidden" name="returnTo" value=login_return_to.clone() />
                                         <div class="zeroth-field">
-                                            <label for="zeroth-magic-email">"Email"</label>
-                                            <input id="zeroth-magic-email" name="email" type="email" autocomplete="email" />
+                                            <label for="zeroth-login-email">"Email"</label>
+                                            <input id="zeroth-login-email" name="email" type="email" autocomplete="email" />
                                         </div>
-                                        <button class="zeroth-action" type="submit">"Send link"</button>
-                                    </div>
-                                </form>
+                                        <div class="zeroth-login-actions">
+                                            <div class="zeroth-field">
+                                                <label for="zeroth-login-password">"Password"</label>
+                                                <input id="zeroth-login-password" name="password" type="password" autocomplete="current-password" />
+                                            </div>
+                                            <button class="zeroth-action zeroth-primary" type="submit">"Sign in"</button>
+                                        </div>
+                                        <div class="zeroth-form-actions">
+                                            <button class="zeroth-action" type="submit" formaction=password_register_action data-zeroth-local-mode="password-register">"Create account"</button>
+                                        </div>
+                                    </form>
+
+                                    <div class="zeroth-divider">"Magic link"</div>
+                                    <form class="zeroth-form zeroth-login-form" method="post" action=magic_link_action data-zeroth-local-auth="magic-link">
+                                        <input type="hidden" name="clientId" value=config.client_id.clone() />
+                                        <input type="hidden" name="returnTo" value=login_return_to.clone() />
+                                        <div class="zeroth-login-actions">
+                                            <div class="zeroth-field">
+                                                <label for="zeroth-magic-email">"Email"</label>
+                                                <input id="zeroth-magic-email" name="email" type="email" autocomplete="email" />
+                                            </div>
+                                            <button class="zeroth-action" type="submit">"Send link"</button>
+                                        </div>
+                                    </form>
+                                </div>
 
                                 <div class="zeroth-divider">"Passkey"</div>
-                                <div class="zeroth-login-actions">
+                                <div class=passkey_login_class>
                                     <div>
                                         <div class="zeroth-row-title">"Passkey"</div>
                                         <div class="zeroth-row-meta" id="zeroth-account-passkey-status">"Ready"</div>
@@ -1450,6 +1664,19 @@ pub fn ClientsAdminApp(state: ClientsAdminUiState) -> impl IntoView {
     let client_count = clients.len().to_string();
     let user_count = users.len().to_string();
     let event_count = events.len().to_string();
+    let user_count_label = format!("{user_count} users");
+    let event_count_label = format!("{event_count} events");
+    let client_count_label = format!("{client_count} clients");
+    let ready_provider_count = providers
+        .iter()
+        .filter(|provider| provider.enabled)
+        .count()
+        .to_string();
+    let login_method_count = local_auth
+        .iter()
+        .filter(|method| method.enabled)
+        .count()
+        .to_string();
     let provider_rows = providers.into_iter().map(provider_admin_row).collect_view();
     let local_auth_rows = local_auth
         .into_iter()
@@ -1464,44 +1691,91 @@ pub fn ClientsAdminApp(state: ClientsAdminUiState) -> impl IntoView {
             <aside class="zeroth-sidebar">
                 <div class="zeroth-brand">
                     <span class="zeroth-mark">"Z"</span>
-                    <span>{product_name.clone()}</span>
+                    <span class="zeroth-brand-text">
+                        <span class="zeroth-brand-name">{product_name.clone()}</span>
+                        <span class="zeroth-brand-subtitle">"Dashboard"</span>
+                    </span>
                 </div>
-                <nav class="zeroth-nav" aria-label="Management sections">
-                    <a href="#database">"Database"</a>
-                    <a href="#providers">"Providers"</a>
-                    <a href="#local-auth">"Local auth"</a>
+                <nav class="zeroth-nav" aria-label="Management sections" data-zeroth-section-nav="true" data-zeroth-default-section="#overview">
+                    <div class="zeroth-nav-section">"Dashboard"</div>
+                    <a href="#overview" aria-current="page">"Overview"</a>
+                    <div class="zeroth-nav-section">"User Management"</div>
                     <a href="#users">"Users"</a>
+                    <div class="zeroth-nav-section">"Applications"</div>
+                    <a href="#clients">"Applications"</a>
+                    <div class="zeroth-nav-section">"Authentication"</div>
+                    <a href="#providers">"Connections"</a>
+                    <a href="#local-auth">"Login methods"</a>
+                    <div class="zeroth-nav-section">"Monitoring"</div>
                     <a href="#events">"Events"</a>
-                    <a href="#clients" aria-current="page">"Clients"</a>
-                    <a href="/account">"Account"</a>
+                    <a href="#database">"System"</a>
+                    <div class="zeroth-nav-section">"Tenant"</div>
+                    <a href="/account">"My account"</a>
                 </nav>
+                <div class="zeroth-sidebar-footer">
+                    {issuer_base_url.clone()}
+                </div>
             </aside>
 
             <main class="zeroth-main">
                 <header class="zeroth-topbar">
                     <div>
-                        <h1 class="zeroth-title">"Admin"</h1>
+                        <h1 class="zeroth-title">"Dashboard"</h1>
                         <div class="zeroth-subtitle" id="zeroth-admin-issuer">{issuer_base_url}</div>
                     </div>
                     <div class="zeroth-status-row">
-                        <span class="zeroth-status"><span id="zeroth-user-count">{user_count}</span> " users"</span>
-                        <span class="zeroth-status"><span id="zeroth-event-count">{event_count}</span> " events"</span>
-                        <span class="zeroth-status"><span id="zeroth-client-count">{client_count}</span> " clients"</span>
+                        <span class="zeroth-status" id="zeroth-user-count">{user_count_label}</span>
+                        <span class="zeroth-status" id="zeroth-event-count">{event_count_label}</span>
+                        <span class="zeroth-status" id="zeroth-client-count">{client_count_label}</span>
+                        <a class="zeroth-action" href="/account">"Account"</a>
                         <button class="zeroth-action" id="zeroth-admin-logout" type="button">"Sign out"</button>
                     </div>
                 </header>
+
+                <section id="overview" class="zeroth-overview-grid" aria-label="Overview">
+                    <div class="zeroth-metric">
+                        <div class="zeroth-metric-label">"Users"</div>
+                        <div class="zeroth-metric-value">{user_count}</div>
+                        <div class="zeroth-metric-meta">"Accounts in this tenant"</div>
+                    </div>
+                    <div class="zeroth-metric">
+                        <div class="zeroth-metric-label">"Applications"</div>
+                        <div class="zeroth-metric-value">{client_count}</div>
+                        <div class="zeroth-metric-meta">"Registered OIDC clients"</div>
+                    </div>
+                    <div class="zeroth-metric">
+                        <div class="zeroth-metric-label">"Connections"</div>
+                        <div class="zeroth-metric-value">{ready_provider_count}</div>
+                        <div class="zeroth-metric-meta">"Ready identity providers"</div>
+                    </div>
+                    <div class="zeroth-metric">
+                        <div class="zeroth-metric-label">"Login methods"</div>
+                        <div class="zeroth-metric-value">{login_method_count}</div>
+                        <div class="zeroth-metric-meta">"Enabled local methods"</div>
+                    </div>
+                    <div class="zeroth-metric">
+                        <div class="zeroth-metric-label">"Events"</div>
+                        <div class="zeroth-metric-value">{event_count}</div>
+                        <div class="zeroth-metric-meta">"Recent audit entries"</div>
+                    </div>
+                    <div class="zeroth-metric">
+                        <div class="zeroth-metric-label">"Status"</div>
+                        <div class="zeroth-metric-value">"Alpha"</div>
+                        <div class="zeroth-metric-meta">"Public preview"</div>
+                    </div>
+                </section>
 
                 <div class="zeroth-client-layout">
                     <div class="zeroth-stack">
                         <section class="zeroth-panel">
                             <div class="zeroth-panel-header">
-                                <h2 class="zeroth-panel-title">"Admin token"</h2>
+                                <h2 class="zeroth-panel-title">"Admin access"</h2>
                                 <span class="zeroth-status" id="zeroth-admin-status">"Disconnected"</span>
                             </div>
                             <div class="zeroth-panel-body">
                                 <form class="zeroth-toolbar" id="zeroth-admin-token-form">
                                     <div class="zeroth-field">
-                                        <label for="zeroth-admin-token">"Bearer token"</label>
+                                        <label for="zeroth-admin-token">"Bootstrap token"</label>
                                         <input id="zeroth-admin-token" name="token" type="password" autocomplete="off" />
                                     </div>
                                     <a class="zeroth-action" href=admin_login_url>"Sign in"</a>
@@ -1513,7 +1787,7 @@ pub fn ClientsAdminApp(state: ClientsAdminUiState) -> impl IntoView {
 
                         <section class="zeroth-panel">
                             <div class="zeroth-panel-header">
-                                <h2 class="zeroth-panel-title">"Passkey"</h2>
+                                <h2 class="zeroth-panel-title">"Admin passkey"</h2>
                                 <span class="zeroth-status" id="zeroth-passkey-status">"Ready"</span>
                             </div>
                             <div class="zeroth-panel-body zeroth-stack">
@@ -1543,7 +1817,7 @@ pub fn ClientsAdminApp(state: ClientsAdminUiState) -> impl IntoView {
                                 <h2 class="zeroth-panel-title">"Database"</h2>
                                 <div class="zeroth-status-row">
                                     <span class="zeroth-status" id="zeroth-db-status">"Unknown"</span>
-                                    <span class="zeroth-status"><span id="zeroth-db-client-count">"0"</span> " clients"</span>
+                                    <span class="zeroth-status" id="zeroth-db-client-count">"0 clients"</span>
                                     <button class="zeroth-action" id="zeroth-db-refresh" type="button">"Refresh"</button>
                                 </div>
                             </div>
@@ -1582,7 +1856,7 @@ pub fn ClientsAdminApp(state: ClientsAdminUiState) -> impl IntoView {
 
                         <section id="local-auth" class="zeroth-panel">
                             <div class="zeroth-panel-header">
-                                <h2 class="zeroth-panel-title">"Local auth"</h2>
+                                <h2 class="zeroth-panel-title">"Login methods"</h2>
                                 <button class="zeroth-action" id="zeroth-local-auth-refresh" type="button">"Refresh"</button>
                             </div>
                             <table class="zeroth-table">
@@ -1666,7 +1940,7 @@ pub fn ClientsAdminApp(state: ClientsAdminUiState) -> impl IntoView {
 
                         <section id="clients" class="zeroth-panel">
                             <div class="zeroth-panel-header">
-                                <h2 class="zeroth-panel-title">"Registered clients"</h2>
+                                <h2 class="zeroth-panel-title">"Applications"</h2>
                                 <button class="zeroth-action" id="zeroth-clients-refresh" type="button">"Refresh"</button>
                             </div>
                             <table class="zeroth-table">
@@ -2548,6 +2822,34 @@ function zerothSubmitAction(form, submitter) {
   return action ? new URL(action, window.location.href).toString() : form.action;
 }
 
+function zerothBindSectionNav() {
+  for (const nav of document.querySelectorAll("[data-zeroth-section-nav]")) {
+    const links = Array.from(nav.querySelectorAll("a[href^='#']"));
+    if (links.length === 0) continue;
+    const defaultHash = nav.getAttribute("data-zeroth-default-section") || links[0].getAttribute("href");
+    const update = () => {
+      const activeHash = window.location.hash || defaultHash;
+      for (const link of links) {
+        if (link.getAttribute("href") === activeHash) {
+          link.setAttribute("aria-current", "page");
+        } else {
+          link.removeAttribute("aria-current");
+        }
+      }
+    };
+    nav.addEventListener("click", (event) => {
+      const target = event.target;
+      if (!(target instanceof Element)) return;
+      const link = target.closest("a[href^='#']");
+      if (link) window.setTimeout(update, 0);
+    });
+    window.addEventListener("hashchange", update);
+    update();
+  }
+}
+
+document.addEventListener("DOMContentLoaded", zerothBindSectionNav);
+
 document.addEventListener("submit", async (event) => {
   const form = event.target;
   if (form instanceof HTMLFormElement && form.dataset.zerothLocalAuth) {
@@ -2707,6 +3009,32 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
     return tokenInput.value.trim() || sessionStorage.getItem(tokenKey) || "";
   }
 
+  function bindSectionNav() {
+    for (const nav of document.querySelectorAll("[data-zeroth-section-nav]")) {
+      const links = Array.from(nav.querySelectorAll("a[href^='#']"));
+      if (links.length === 0) continue;
+      const defaultHash = nav.getAttribute("data-zeroth-default-section") || links[0].getAttribute("href");
+      const update = () => {
+        const activeHash = window.location.hash || defaultHash;
+        for (const link of links) {
+          if (link.getAttribute("href") === activeHash) {
+            link.setAttribute("aria-current", "page");
+          } else {
+            link.removeAttribute("aria-current");
+          }
+        }
+      };
+      nav.addEventListener("click", (event) => {
+        const target = event.target;
+        if (!(target instanceof Element)) return;
+        const link = target.closest("a[href^='#']");
+        if (link) window.setTimeout(update, 0);
+      });
+      window.addEventListener("hashchange", update);
+      update();
+    }
+  }
+
   function splitLines(value) {
     return value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
   }
@@ -2793,6 +3121,11 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
     return node;
   }
 
+  function setCountLabel(element, value, label) {
+    if (!element) return;
+    element.textContent = `${value} ${label}`;
+  }
+
   function renderEmptyRows(target, colSpan) {
     target.replaceChildren();
     const row = document.createElement("tr");
@@ -2854,7 +3187,7 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
 
   function renderRows(clients) {
     rows.replaceChildren();
-    count.textContent = String(clients.length);
+    setCountLabel(count, clients.length, "clients");
     if (clients.length === 0) {
       renderEmptyRows(rows, 8);
       return;
@@ -3056,7 +3389,7 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
     const ok = body && body.ok === true;
     dbStatus.textContent = ok ? "Ready" : "Needs setup";
     dbStatus.className = ok ? "zeroth-status zeroth-status-ok" : "zeroth-status zeroth-status-warn";
-    dbClientCount.textContent = String((body && body.clientCount) || 0);
+    setCountLabel(dbClientCount, (body && body.clientCount) || 0, "clients");
     dbStatusRows.replaceChildren();
 
     const items = [];
@@ -3108,7 +3441,7 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
 
   function renderUserRows(users) {
     userRows.replaceChildren();
-    userCount.textContent = String(users.length);
+    setCountLabel(userCount, users.length, "users");
     if (users.length === 0) {
       renderEmptyRows(userRows, 7);
       return;
@@ -3170,7 +3503,7 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
 
   function renderEventRows(events) {
     eventRows.replaceChildren();
-    eventCount.textContent = String(events.length);
+    setCountLabel(eventCount, events.length, "events");
     if (events.length === 0) {
       renderEmptyRows(eventRows, 5);
       return;
@@ -3381,6 +3714,7 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
   }
 
   document.addEventListener("DOMContentLoaded", () => {
+    bindSectionNav();
     const stored = sessionStorage.getItem(tokenKey) || "";
     if (stored) {
       tokenInput.value = stored;
@@ -3714,6 +4048,7 @@ mod tests {
         assert!(document.contains("function zerothSubmitAction(form, submitter)"));
         assert!(document.contains("submitter.hasAttribute(\"formaction\")"));
         assert!(document.contains("zerothSubmitAction(form, submitter)"));
+        assert!(document.contains("function zerothBindSectionNav()"));
     }
 
     #[test]
@@ -3783,6 +4118,12 @@ mod tests {
         assert!(html.contains("Identities"));
         assert!(html.contains("Sessions"));
         assert!(html.contains("Applications"));
+        assert!(html.contains("Sign-in methods"));
+        assert!(html.contains("https://id.example.com/admin"));
+        assert!(html.contains("Sign out"));
+        assert!(html.contains("id=\"security\""));
+        assert!(html.contains("zeroth-auth-group zeroth-hidden"));
+        assert!(!html.contains("id=\"login\""));
         assert!(html.contains("Example User"));
         assert!(html.contains("google-user"));
     }
@@ -3894,7 +4235,14 @@ mod tests {
 
         let html = render_clients_admin_html(state);
 
-        assert!(html.contains("Admin token"));
+        assert!(html.contains("Dashboard"));
+        assert!(html.contains("User Management"));
+        assert!(html.contains("Authentication"));
+        assert!(html.contains("Monitoring"));
+        assert!(html.contains("My account"));
+        assert!(html.contains("zeroth-overview-grid"));
+        assert!(html.contains("Admin access"));
+        assert!(html.contains("Bootstrap token"));
         assert!(html.contains("Sign in"));
         assert!(html.contains("zeroth-admin-logout"));
         assert!(html.contains("Sign out"));
@@ -3902,7 +4250,7 @@ mod tests {
             "https://id.example.com/login?return_to=https%3A%2F%2Fid.example.com%2Fadmin"
         ));
         assert!(html.contains("Providers"));
-        assert!(html.contains("Local auth"));
+        assert!(html.contains("Login methods"));
         assert!(html.contains("Database"));
         assert!(html.contains("zeroth-db-status-rows"));
         assert!(html.contains("zeroth-local-auth-rows"));
@@ -3913,7 +4261,7 @@ mod tests {
         assert!(html.contains("zeroth-events-filter-form"));
         assert!(html.contains("Event type"));
         assert!(html.contains("Provider ID"));
-        assert!(html.contains("Registered clients"));
+        assert!(html.contains("Applications"));
         assert!(html.contains("Client editor"));
         assert!(html.contains("Apple"));
         assert!(html.contains("Spotify"));
@@ -3955,6 +4303,7 @@ mod tests {
         assert!(document.contains("event_type"));
         assert!(document.contains("fetch(\"/logout\""));
         assert!(document.contains("window.location.assign(\"/login\")"));
+        assert!(document.contains("function bindSectionNav()"));
     }
 
     #[test]
