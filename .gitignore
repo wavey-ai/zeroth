@@ -1,5 +1,6 @@
 /target
 /crates/zeroth-worker/build/
+/crates/zeroth-worker/wrangler.generated.jsonc
 /.wrangler/
 .dev.vars
 .env
