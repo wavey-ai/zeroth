@@ -477,6 +477,12 @@ struct AdminUserRow {
     active_session_count: i32,
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+struct AdminMembershipProbeRow {
+    user_id: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AdminUserResponse {
@@ -1419,6 +1425,12 @@ impl ProviderJwksCache {
 struct CurrentSession {
     session: SessionRow,
     user: UserRow,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum AdminAuthorization {
+    BootstrapToken,
+    Session { user_id: String },
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -2792,6 +2804,9 @@ async fn passkey_register_verify(mut request: Request, env: Env) -> worker::Resu
         Ok(validation) => validation,
         Err(error) => return oauth_error_json("invalid_request", error, 400),
     };
+    let admin_authorization = authorize_admin_request(&request, &env, &db, &config, now)
+        .await
+        .ok();
     let challenge_hash =
         match passkey_challenge_hash_from_client_data(&body.response.client_data_json) {
             Ok(challenge_hash) => challenge_hash,
@@ -2825,6 +2840,24 @@ async fn passkey_register_verify(mut request: Request, env: Env) -> worker::Resu
         now,
     )
     .await?;
+    if let Some(admin_authorization) = admin_authorization {
+        let granted_by = admin_authorization_granted_by(&admin_authorization);
+        upsert_admin_membership(&db, &user_id, &granted_by, now).await?;
+        record_audit_event(
+            &db,
+            &request,
+            "admin.membership.grant",
+            Some(&user_id),
+            challenge.client_id.as_deref(),
+            Some("passkey"),
+            serde_json::json!({
+                "grantedBy": granted_by,
+                "mode": "passkey_registration"
+            }),
+            now,
+        )
+        .await;
+    }
     record_audit_event(
         &db,
         &request,
@@ -5141,6 +5174,55 @@ async fn list_admin_user_rows(
     .all()
     .await?
     .results::<AdminUserRow>()
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn user_has_active_admin_membership(
+    db: &worker::d1::D1Database,
+    user_id: &str,
+) -> worker::Result<bool> {
+    let args = [worker::d1::D1Type::Text(user_id)];
+    Ok(db
+        .prepare(
+            "SELECT user_id
+             FROM zeroth_admin_memberships
+             WHERE user_id = ? AND disabled_at IS NULL
+             LIMIT 1",
+        )
+        .bind_refs(&args)?
+        .first::<AdminMembershipProbeRow>(None)
+        .await?
+        .is_some())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn upsert_admin_membership(
+    db: &worker::d1::D1Database,
+    user_id: &str,
+    granted_by: &str,
+    now: i32,
+) -> worker::Result<()> {
+    let args = [
+        worker::d1::D1Type::Text(user_id),
+        worker::d1::D1Type::Text("admin"),
+        worker::d1::D1Type::Text(granted_by),
+        worker::d1::D1Type::Integer(now),
+        worker::d1::D1Type::Integer(now),
+    ];
+    db.prepare(
+        "INSERT INTO zeroth_admin_memberships (
+             user_id, role, granted_by, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(user_id) DO UPDATE SET
+             role = excluded.role,
+             granted_by = excluded.granted_by,
+             updated_at = excluded.updated_at,
+             disabled_at = NULL",
+    )
+    .bind_refs(&args)?
+    .run()
+    .await?;
+    Ok(())
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -10033,8 +10115,21 @@ async fn validate_admin_request(
     config: &ZerothServerConfig,
     now: i32,
 ) -> Result<(), ClientManagementError> {
+    authorize_admin_request(request, env, db, config, now)
+        .await
+        .map(|_| ())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn authorize_admin_request(
+    request: &Request,
+    env: &Env,
+    db: &worker::d1::D1Database,
+    config: &ZerothServerConfig,
+    now: i32,
+) -> Result<AdminAuthorization, ClientManagementError> {
     if validate_admin_bearer_request(request, env).is_ok() {
-        return Ok(());
+        return Ok(AdminAuthorization::BootstrapToken);
     }
 
     let Some(current) = current_session_from_request(request, db, config, now)
@@ -10060,8 +10155,18 @@ async fn validate_admin_request(
         ));
     };
 
-    if admin_user_allowed(env, &admin_user) {
-        Ok(())
+    if admin_user_allowed(env, &admin_user)
+        || user_has_active_admin_membership(db, &admin_user.id)
+            .await
+            .map_err(|error| {
+                ClientManagementError::server_error(format!(
+                    "could not load admin membership: {error}"
+                ))
+            })?
+    {
+        Ok(AdminAuthorization::Session {
+            user_id: current.user.id,
+        })
     } else {
         Err(ClientManagementError::unauthorized(
             "admin session user is not allowlisted",
@@ -10108,6 +10213,13 @@ fn admin_identity_allowed(
 ) -> bool {
     token_list_contains(allowed_user_ids, user_id, false)
         || verified_email.is_some_and(|email| token_list_contains(allowed_emails, email, true))
+}
+
+fn admin_authorization_granted_by(authorization: &AdminAuthorization) -> String {
+    match authorization {
+        AdminAuthorization::BootstrapToken => "bootstrap_token".to_owned(),
+        AdminAuthorization::Session { user_id } => format!("user:{user_id}"),
+    }
 }
 
 fn token_list_contains(values: Option<&str>, needle: &str, ascii_case_insensitive: bool) -> bool {
@@ -12028,6 +12140,20 @@ mod tests {
             None,
             Some("admin@wavey.ai"),
         ));
+    }
+
+    #[test]
+    fn admin_authorization_granted_by_records_source() {
+        assert_eq!(
+            admin_authorization_granted_by(&AdminAuthorization::BootstrapToken),
+            "bootstrap_token"
+        );
+        assert_eq!(
+            admin_authorization_granted_by(&AdminAuthorization::Session {
+                user_id: "usr_admin".to_owned()
+            }),
+            "user:usr_admin"
+        );
     }
 
     #[test]

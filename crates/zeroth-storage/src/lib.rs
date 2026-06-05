@@ -95,7 +95,13 @@ pub mod migrations {
         sql: include_str!("../migrations/0002_passkeys.sql"),
     };
 
-    pub const ALL: &[Migration] = &[INIT, PASSKEYS];
+    pub const ADMIN_MEMBERSHIPS: Migration = Migration {
+        version: 3,
+        name: "admin_memberships",
+        sql: include_str!("../migrations/0003_admin_memberships.sql"),
+    };
+
+    pub const ALL: &[Migration] = &[INIT, PASSKEYS, ADMIN_MEMBERSHIPS];
 }
 
 pub const REQUIRED_TABLES: &[&str] = &[
@@ -109,6 +115,7 @@ pub const REQUIRED_TABLES: &[&str] = &[
     "zeroth_sessions",
     "zeroth_passkey_credentials",
     "zeroth_passkey_challenges",
+    "zeroth_admin_memberships",
     "zeroth_signing_keys",
     "zeroth_audit_events",
 ];
@@ -183,11 +190,9 @@ mod tests {
     #[test]
     fn init_migration_contains_auth_tables() {
         let sql = migrations::INIT.sql;
-        for table in super::REQUIRED_TABLES
-            .iter()
-            .copied()
-            .filter(|table| !table.starts_with("zeroth_passkey_"))
-        {
+        for table in super::REQUIRED_TABLES.iter().copied().filter(|table| {
+            !table.starts_with("zeroth_passkey_") && *table != "zeroth_admin_memberships"
+        }) {
             assert!(sql.contains(table), "missing table {table}");
         }
     }
@@ -199,8 +204,17 @@ mod tests {
         for table in ["zeroth_passkey_credentials", "zeroth_passkey_challenges"] {
             assert!(sql.contains(table), "missing table {table}");
         }
-        assert_eq!(migrations::ALL.len(), 2);
+        assert_eq!(migrations::ALL.len(), 3);
         assert_eq!(migrations::ALL[1].version, 2);
+    }
+
+    #[test]
+    fn admin_membership_migration_contains_admin_table() {
+        let sql = migrations::ADMIN_MEMBERSHIPS.sql;
+
+        assert!(sql.contains("zeroth_admin_memberships"));
+        assert!(sql.contains("granted_by TEXT NOT NULL"));
+        assert_eq!(migrations::ALL[2].version, 3);
     }
 
     #[test]
