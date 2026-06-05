@@ -14,7 +14,7 @@ use rsa::{
     pkcs1v15::{Signature as RsaPkcs1v15Signature, VerifyingKey as RsaPkcs1v15VerifyingKey},
     BigUint, RsaPublicKey,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 #[cfg(target_arch = "wasm32")]
 use std::cell::RefCell;
@@ -673,7 +673,7 @@ struct SpotifyApiProfile {
     email: Option<String>,
     #[serde(default)]
     display_name: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_default_vec")]
     images: Vec<SpotifyApiImage>,
 }
 
@@ -11549,6 +11549,14 @@ fn boolish_claim(value: Option<&serde_json::Value>) -> Option<bool> {
     }
 }
 
+fn deserialize_default_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<Vec<T>>::deserialize(deserializer).map(Option::unwrap_or_default)
+}
+
 #[cfg(target_arch = "wasm32")]
 async fn fetch_spotify_profile(
     provider: &OAuthProvider,
@@ -11582,17 +11590,21 @@ async fn fetch_spotify_profile(
         .await
         .map_err(ProviderProfileError::worker)?;
     let status = response.status_code();
-    let spotify_profile = response
-        .json::<SpotifyApiProfile>()
+    let raw_profile_json = response
+        .text()
         .await
         .map_err(ProviderProfileError::worker)?;
     if !(200..300).contains(&status) {
         return Err(ProviderProfileError::invalid_response(format!(
-            "Spotify profile endpoint returned HTTP {status}"
+            "Spotify profile endpoint returned HTTP {status}: {}",
+            response_body_excerpt(&raw_profile_json)
         )));
     }
 
-    let raw_profile_json = serde_json::to_string(&spotify_profile).ok();
+    let spotify_profile =
+        serde_json::from_str::<SpotifyApiProfile>(&raw_profile_json).map_err(|error| {
+            ProviderProfileError::invalid_response(format!("invalid Spotify profile JSON: {error}"))
+        })?;
     let source = spotify_profile_source(spotify_profile)?;
     let profile = provider
         .normalize_profile(source)
@@ -11603,7 +11615,7 @@ async fn fetch_spotify_profile(
 
     Ok(ResolvedProviderProfile {
         profile,
-        raw_profile_json,
+        raw_profile_json: Some(raw_profile_json),
     })
 }
 
@@ -11626,6 +11638,19 @@ fn spotify_profile_source(
 
 fn spotify_profile_image_url(images: &[SpotifyApiImage]) -> Option<String> {
     images.iter().find_map(|image| image.url.clone())
+}
+
+fn response_body_excerpt(body: &str) -> String {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return "empty response body".to_owned();
+    }
+    let excerpt = trimmed.chars().take(512).collect::<String>();
+    if trimmed.chars().count() > 512 {
+        format!("{excerpt}...")
+    } else {
+        excerpt
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -15387,6 +15412,34 @@ mod tests {
                 image_url: Some("https://i.scdn.co/image/1".to_owned()),
             }
         );
+    }
+
+    #[test]
+    fn spotify_profile_json_allows_null_images() {
+        let profile = serde_json::from_str::<SpotifyApiProfile>(
+            r#"{
+                "id": "spotify-user",
+                "email": "listener@example.com",
+                "display_name": "Listener",
+                "images": null
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(profile.id, "spotify-user");
+        assert_eq!(profile.email.as_deref(), Some("listener@example.com"));
+        assert!(profile.images.is_empty());
+    }
+
+    #[test]
+    fn response_body_excerpt_bounds_provider_error_details() {
+        assert_eq!(response_body_excerpt(" \n "), "empty response body");
+        assert_eq!(response_body_excerpt(" short body "), "short body");
+
+        let long = "a".repeat(600);
+        let excerpt = response_body_excerpt(&long);
+        assert_eq!(excerpt.chars().count(), 515);
+        assert!(excerpt.ends_with("..."));
     }
 
     #[test]

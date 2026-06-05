@@ -1996,11 +1996,22 @@ document.addEventListener("submit", async (event) => {
   };
   if (method === "PATCH") {
     const data = new FormData(form);
+    const payload = {};
+    const displayName = String(data.get("displayName") || "").trim();
+    const pictureUrl = String(data.get("pictureUrl") || "").trim();
+    const pictureInput = form.elements.pictureUrl;
+    if (displayName) payload.displayName = displayName;
+    if (pictureUrl) {
+      payload.pictureUrl = pictureUrl;
+    } else if (pictureInput instanceof HTMLInputElement && pictureInput.defaultValue.trim()) {
+      payload.pictureUrl = null;
+    }
+    if (Object.keys(payload).length === 0) {
+      window.location.reload();
+      return;
+    }
     options.headers["Content-Type"] = "application/json";
-    options.body = JSON.stringify({
-      displayName: data.get("displayName"),
-      pictureUrl: data.get("pictureUrl")
-    });
+    options.body = JSON.stringify(payload);
   }
   const response = await fetch(form.action, options);
   if (response.ok) {
@@ -2890,6 +2901,20 @@ mod tests {
         assert!(html.contains("Sign in"));
         assert!(html.contains("zeroth-panel zeroth-hidden"));
         assert!(html.contains("provider=apple"));
+    }
+
+    #[test]
+    fn account_document_omits_blank_profile_patch_fields() {
+        let document = render_account_document(ZerothUiState::new(ZerothUiConfig::new(
+            "https://id.example.com",
+            "browser-client",
+            "https://app.example.com/callback",
+        )));
+
+        assert!(document.contains("const payload = {};"));
+        assert!(document.contains("if (displayName) payload.displayName = displayName;"));
+        assert!(document.contains("payload.pictureUrl = null;"));
+        assert!(document.contains("JSON.stringify(payload)"));
     }
 
     #[test]
