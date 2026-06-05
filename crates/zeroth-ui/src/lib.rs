@@ -854,6 +854,8 @@ pub struct ZerothUiConfig {
     pub csrf_token: Option<String>,
     pub link_identities: bool,
     pub provider_authorize_path: String,
+    pub show_passkey_login: bool,
+    pub show_magic_link_login: bool,
 }
 
 impl ZerothUiConfig {
@@ -876,6 +878,8 @@ impl ZerothUiConfig {
             csrf_token: None,
             link_identities: true,
             provider_authorize_path: "/authorize".to_owned(),
+            show_passkey_login: false,
+            show_magic_link_login: false,
         }
     }
 }
@@ -1025,6 +1029,7 @@ pub struct ClientAdminUi {
     pub account_sharing_mode: String,
     pub account_tenant_id: String,
     pub account_namespace: String,
+    pub visible_login_methods: Vec<String>,
     pub disabled: bool,
     pub has_secret: bool,
 }
@@ -1393,6 +1398,9 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
         .unwrap_or(config.redirect_uri.clone());
     let password_login_action = endpoint_url(&config, "/password/login");
     let password_register_action = endpoint_url(&config, "/password/register");
+    let magic_link_action = endpoint_url(&config, "/magic-links");
+    let wallet_challenge_action = endpoint_url(&config, "/wallet/challenge");
+    let wallet_verify_action = endpoint_url(&config, "/wallet/verify");
     let provider_rows = providers
         .into_iter()
         .map(|provider| provider_row(&config, provider, signed_in))
@@ -1406,6 +1414,57 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
         .map(|session| session_row(&logout_action, &csrf_token, session))
         .collect_view();
     let application_rows = applications.into_iter().map(application_row).collect_view();
+    let magic_link_section = config.show_magic_link_login.then(|| {
+        view! {
+            <div class="zeroth-auth-group">
+                <div class="zeroth-divider">"Magic link"</div>
+                <form class="zeroth-form zeroth-login-form" method="post" action=magic_link_action.clone() data-zeroth-local-auth="magic-link">
+                    <input type="hidden" name="clientId" value=config.client_id.clone() />
+                    <input type="hidden" name="returnTo" value=login_return_to.clone() />
+                    <div class="zeroth-login-actions">
+                        <div class="zeroth-field">
+                            <label for="zeroth-magic-email">"Email"</label>
+                            <input id="zeroth-magic-email" name="email" type="email" autocomplete="email" />
+                        </div>
+                        <button class="zeroth-action" type="submit">"Send link"</button>
+                    </div>
+                </form>
+            </div>
+        }
+    });
+    let passkey_section = config.show_passkey_login.then(|| {
+        view! {
+            <div>
+                <div class="zeroth-divider">"Passkey"</div>
+                <div class=passkey_login_class>
+                    <div>
+                        <div class="zeroth-row-title">"Passkey"</div>
+                        <div class="zeroth-row-meta" id="zeroth-account-passkey-status">"Ready"</div>
+                    </div>
+                    <button
+                        class="zeroth-action"
+                        id="zeroth-account-passkey-login"
+                        type="button"
+                        data-client-id=config.client_id.clone()
+                        data-return-to=login_return_to.clone()
+                    >
+                        "Use passkey"
+                    </button>
+                </div>
+                <form class=passkey_register_class id="zeroth-account-passkey-register-form">
+                    <input type="hidden" name="clientId" value=config.client_id.clone() />
+                    <input type="hidden" name="returnTo" value=login_return_to.clone() />
+                    <div class="zeroth-login-actions">
+                        <div class="zeroth-field">
+                            <label for="zeroth-account-passkey-label">"New passkey"</label>
+                            <input id="zeroth-account-passkey-label" name="label" type="text" autocomplete="off" />
+                        </div>
+                        <button class="zeroth-action" type="submit">"Save passkey"</button>
+                    </div>
+                </form>
+            </div>
+        }
+    });
 
     view! {
         <div class=shell_class>
@@ -1475,6 +1534,27 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
                                 <div class=provider_list_class>{provider_rows}</div>
 
                                 <div class=credential_auth_class>
+                                    <div class="zeroth-divider">"Wallet"</div>
+                                    <div class="zeroth-login-actions">
+                                        <div>
+                                            <div class="zeroth-row-title">"Ethereum wallet"</div>
+                                            <div class="zeroth-row-meta" id="zeroth-wallet-status">"MetaMask, Coinbase Wallet, Rabby"</div>
+                                        </div>
+                                        <button
+                                            class="zeroth-action"
+                                            id="zeroth-wallet-login"
+                                            type="button"
+                                            data-client-id=config.client_id.clone()
+                                            data-return-to=login_return_to.clone()
+                                            data-challenge-url=wallet_challenge_action
+                                            data-verify-url=wallet_verify_action
+                                        >
+                                            "Use wallet"
+                                        </button>
+                                    </div>
+                                </div>
+
+                                <div class=credential_auth_class>
                                     <div class="zeroth-divider">"Email and password"</div>
                                     <form class="zeroth-form zeroth-login-form" method="post" action=password_login_action data-zeroth-local-auth="password-login">
                                         <input type="hidden" name="clientId" value=config.client_id.clone() />
@@ -1495,33 +1575,8 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
 
                                 </div>
 
-                                <div class="zeroth-divider">"Passkey"</div>
-                                <div class=passkey_login_class>
-                                    <div>
-                                        <div class="zeroth-row-title">"Passkey"</div>
-                                        <div class="zeroth-row-meta" id="zeroth-account-passkey-status">"Ready"</div>
-                                    </div>
-                                    <button
-                                        class="zeroth-action"
-                                        id="zeroth-account-passkey-login"
-                                        type="button"
-                                        data-client-id=config.client_id.clone()
-                                        data-return-to=login_return_to.clone()
-                                    >
-                                        "Use passkey"
-                                    </button>
-                                </div>
-                                <form class=passkey_register_class id="zeroth-account-passkey-register-form">
-                                    <input type="hidden" name="clientId" value=config.client_id.clone() />
-                                    <input type="hidden" name="returnTo" value=login_return_to />
-                                    <div class="zeroth-login-actions">
-                                        <div class="zeroth-field">
-                                            <label for="zeroth-account-passkey-label">"New passkey"</label>
-                                            <input id="zeroth-account-passkey-label" name="label" type="text" autocomplete="off" />
-                                        </div>
-                                        <button class="zeroth-action" type="submit">"Save passkey"</button>
-                                    </div>
-                                </form>
+                                {magic_link_section}
+                                {passkey_section}
                             </div>
                         </section>
 
@@ -1916,6 +1971,7 @@ pub fn ClientsAdminApp(state: ClientsAdminUiState) -> impl IntoView {
                                         <th>"Origins"</th>
                                         <th>"Email domains"</th>
                                         <th>"Account"</th>
+                                        <th>"Login"</th>
                                         <th>"Actions"</th>
                                     </tr>
                                 </thead>
@@ -1970,6 +2026,17 @@ pub fn ClientsAdminApp(state: ClientsAdminUiState) -> impl IntoView {
                                     <div class="zeroth-field">
                                         <label for="zeroth-client-account-tenant">"Tenant ID"</label>
                                         <input id="zeroth-client-account-tenant" name="accountTenantId" autocomplete="off" />
+                                    </div>
+                                    <div class="zeroth-field">
+                                        <label>"Visible login methods"</label>
+                                        <div class="zeroth-checkbox-field">
+                                            <input id="zeroth-client-show-passkey" name="visibleLoginMethods" value="passkey" type="checkbox" />
+                                            <label for="zeroth-client-show-passkey">"Passkey"</label>
+                                        </div>
+                                        <div class="zeroth-checkbox-field">
+                                            <input id="zeroth-client-show-magic-link" name="visibleLoginMethods" value="magic_link" type="checkbox" />
+                                            <label for="zeroth-client-show-magic-link">"Magic link"</label>
+                                        </div>
                                     </div>
                                     <div class="zeroth-field">
                                         <label for="zeroth-client-secret">"Client secret"</label>
@@ -2421,9 +2488,11 @@ fn client_admin_row(client: ClientAdminUi) -> impl IntoView {
         "{} / {}",
         client.account_sharing_mode, client.account_namespace
     );
+    let visible_login_methods = join_or_dash(client.visible_login_methods.clone());
     let redirect_lines = client.redirect_uris.join("\n");
     let origin_lines = client.allowed_origins.join("\n");
     let email_domain_lines = client.allowed_email_domains.join("\n");
+    let visible_login_method_lines = client.visible_login_methods.join("\n");
     let account_sharing_mode = client.account_sharing_mode.clone();
     let account_tenant_id = client.account_tenant_id.clone();
     let account_namespace = client.account_namespace.clone();
@@ -2446,6 +2515,7 @@ fn client_admin_row(client: ClientAdminUi) -> impl IntoView {
             data-client-account-sharing-mode=account_sharing_mode
             data-client-account-tenant-id=account_tenant_id
             data-client-account-namespace=account_namespace
+            data-client-visible-login-methods=visible_login_method_lines
         >
             <td>
                 <div class="zeroth-row-title">{client_name}</div>
@@ -2460,6 +2530,7 @@ fn client_admin_row(client: ClientAdminUi) -> impl IntoView {
             <td>{origins}</td>
             <td>{email_domains}</td>
             <td>{account}</td>
+            <td>{visible_login_methods}</td>
             <td>
                 <button class="zeroth-action" type="button" data-zeroth-edit-client="true">"Edit"</button>
             </td>
@@ -2631,6 +2702,8 @@ const zerothPasskeyRegisterOptionsEndpoint = "/passkeys/register/options";
 const zerothPasskeyRegisterVerifyEndpoint = "/passkeys/register/verify";
 const zerothPasskeyAuthenticateOptionsEndpoint = "/passkeys/authenticate/options";
 const zerothPasskeyAuthenticateVerifyEndpoint = "/passkeys/authenticate/verify";
+const zerothWalletChallengeEndpoint = "/wallet/challenge";
+const zerothWalletVerifyEndpoint = "/wallet/verify";
 
 function zerothSetPasskeyStatus(value, error = false) {
   const status = document.getElementById("zeroth-account-passkey-status");
@@ -2639,8 +2712,20 @@ function zerothSetPasskeyStatus(value, error = false) {
   status.setAttribute("aria-invalid", error ? "true" : "false");
 }
 
+function zerothSetWalletStatus(value, error = false) {
+  const status = document.getElementById("zeroth-wallet-status");
+  if (!status) return;
+  status.textContent = value;
+  status.setAttribute("aria-invalid", error ? "true" : "false");
+}
+
 function zerothPasskeysAvailable() {
   return Boolean(window.PublicKeyCredential && navigator.credentials);
+}
+
+function zerothEthereumProvider() {
+  const provider = window.ethereum;
+  return provider && typeof provider.request === "function" ? provider : null;
 }
 
 function zerothBufferToBase64url(buffer) {
@@ -2738,6 +2823,26 @@ async function zerothPasskeyApi(path, payload) {
   return body;
 }
 
+async function zerothWalletApi(path, payload) {
+  const response = await fetch(path, {
+    method: "POST",
+    credentials: "include",
+    headers: {
+      "Accept": "application/json",
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(payload)
+  });
+  let body = {};
+  try {
+    body = await response.json();
+  } catch (_) {}
+  if (!response.ok) {
+    throw new Error(zerothErrorMessage(body, `HTTP ${response.status}`));
+  }
+  return body;
+}
+
 async function zerothRegisterPasskey(form) {
   if (!zerothPasskeysAvailable()) {
     throw new Error("Passkeys are not available in this browser");
@@ -2782,6 +2887,55 @@ async function zerothSignInWithPasskey(button) {
     zerothAuthenticationCredentialPayload(credential)
   );
   zerothSetPasskeyStatus("Signed in");
+  window.location.assign((result && result.returnTo) || payload.returnTo || "/account");
+}
+
+async function zerothSignInWithWallet(button) {
+  const provider = zerothEthereumProvider();
+  if (!provider) {
+    throw new Error("No Ethereum wallet found");
+  }
+  zerothSetWalletStatus("Connecting");
+  const accounts = await provider.request({ method: "eth_requestAccounts" });
+  const address = String(Array.isArray(accounts) && accounts[0] ? accounts[0] : "").trim();
+  if (!address) {
+    throw new Error("Wallet did not return an account");
+  }
+  const chainId = String(await provider.request({ method: "eth_chainId" }) || "").trim();
+  if (!chainId) {
+    throw new Error("Wallet did not return a chain");
+  }
+  const payload = {
+    address,
+    chainId,
+    clientId: String(button.dataset.clientId || "").trim(),
+    returnTo: String(button.dataset.returnTo || "").trim()
+  };
+  zerothSetWalletStatus("Preparing");
+  const challenge = await zerothWalletApi(
+    button.dataset.challengeUrl || zerothWalletChallengeEndpoint,
+    payload
+  );
+  zerothSetWalletStatus("Confirm signature");
+  const signature = await provider.request({
+    method: "personal_sign",
+    params: [challenge.message, challenge.address || address]
+  });
+  if (!signature) {
+    throw new Error("Wallet signature was cancelled");
+  }
+  zerothSetWalletStatus("Verifying");
+  const result = await zerothWalletApi(
+    button.dataset.verifyUrl || zerothWalletVerifyEndpoint,
+    {
+      address: challenge.address || address,
+      chainId: challenge.chainId || chainId,
+      nonce: challenge.nonce,
+      message: challenge.message,
+      signature: String(signature)
+    }
+  );
+  zerothSetWalletStatus("Signed in");
   window.location.assign((result && result.returnTo) || payload.returnTo || "/account");
 }
 
@@ -2860,7 +3014,12 @@ document.addEventListener("submit", async (event) => {
       window.location.assign(body.returnTo);
       return;
     }
-    if (response.ok) return;
+    if (response.ok) {
+      if (mode === "magic-link") {
+        window.alert(body && body.sent ? "Magic link sent" : "Magic link email could not be sent");
+      }
+      return;
+    }
     window.alert(zerothErrorMessage(body, "Sign in failed"));
     return;
   }
@@ -2919,6 +3078,18 @@ document.addEventListener("submit", async (event) => {
 document.addEventListener("click", (event) => {
   const target = event.target;
   if (!(target instanceof Element)) return;
+  const walletButton = document.getElementById("zeroth-wallet-login");
+  if (
+    walletButton instanceof HTMLButtonElement &&
+    (target === walletButton || walletButton.contains(target))
+  ) {
+    event.preventDefault();
+    zerothSignInWithWallet(walletButton).catch((error) => {
+      zerothSetWalletStatus("Failed", true);
+      window.alert(error instanceof Error ? error.message : "Wallet sign in failed");
+    });
+    return;
+  }
   const button = document.getElementById("zeroth-account-passkey-login");
   if (!(button instanceof HTMLButtonElement) || (target !== button && !button.contains(target))) return;
   event.preventDefault();
@@ -3137,8 +3308,18 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
       allowedEmailDomains: splitLines(row.dataset.clientEmailDomains || ""),
       accountSharingMode: row.dataset.clientAccountSharingMode || "global",
       accountTenantId: row.dataset.clientAccountTenantId || "global",
-      accountNamespace: row.dataset.clientAccountNamespace || "global"
+      accountNamespace: row.dataset.clientAccountNamespace || "global",
+      visibleLoginMethods: splitLines(row.dataset.clientVisibleLoginMethods || "")
     };
+  }
+
+  function visibleLoginMethodsForClient(client) {
+    return client.visibleLoginMethods || client.visible_login_methods || [];
+  }
+
+  function visibleLoginMethodLabel(client) {
+    const methods = visibleLoginMethodsForClient(client);
+    return methods.length > 0 ? methods.join(", ") : "-";
   }
 
   function fillForm(client) {
@@ -3150,6 +3331,10 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
     form.elements.allowedEmailDomains.value = (client.allowedEmailDomains || client.allowed_email_domains || []).join("\n");
     form.elements.accountSharingMode.value = client.accountSharingMode || client.account_sharing_mode || "global";
     form.elements.accountTenantId.value = client.accountTenantId || client.account_tenant_id || "";
+    const visibleMethods = new Set(visibleLoginMethodsForClient(client));
+    for (const checkbox of form.querySelectorAll("input[name='visibleLoginMethods']")) {
+      checkbox.checked = visibleMethods.has(checkbox.value);
+    }
     form.elements.clientSecret.value = "";
     form.elements.disabled.checked = Boolean(client.disabled);
     editorMode.textContent = client.id ? "Edit" : "New";
@@ -3160,7 +3345,7 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
     rows.replaceChildren();
     setCountLabel(count, clients.length, "clients");
     if (clients.length === 0) {
-      renderEmptyRows(rows, 8);
+      renderEmptyRows(rows, 9);
       return;
     }
 
@@ -3176,6 +3361,7 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
       row.dataset.clientAccountSharingMode = client.accountSharingMode || client.account_sharing_mode || "global";
       row.dataset.clientAccountTenantId = client.accountTenantId || client.account_tenant_id || "global";
       row.dataset.clientAccountNamespace = client.accountNamespace || client.account_namespace || "global";
+      row.dataset.clientVisibleLoginMethods = visibleLoginMethodsForClient(client).join("\n");
 
       const name = document.createElement("td");
       setText(name, client.name, "zeroth-row-title");
@@ -3204,6 +3390,9 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
       setText(account, client.accountSharingMode || client.account_sharing_mode || "global");
       setText(account, client.accountNamespace || client.account_namespace || "global", "zeroth-row-meta zeroth-code");
 
+      const login = document.createElement("td");
+      login.textContent = visibleLoginMethodLabel(client);
+
       const actions = document.createElement("td");
       const edit = document.createElement("button");
       edit.className = "zeroth-action";
@@ -3221,7 +3410,7 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
         actions.appendChild(disable);
       }
 
-      row.append(name, type, state, redirects, origins, emailDomains, account, actions);
+      row.append(name, type, state, redirects, origins, emailDomains, account, login, actions);
       rows.appendChild(row);
     }
   }
@@ -3582,6 +3771,7 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
       allowedEmailDomains: splitLines(data.get("allowedEmailDomains") || ""),
       accountSharingMode: String(data.get("accountSharingMode") || "global"),
       accountTenantId: String(data.get("accountTenantId") || "").trim() || undefined,
+      visibleLoginMethods: data.getAll("visibleLoginMethods").map((value) => String(value)),
       confidential: data.get("type") === "confidential",
       disabled: form.elements.disabled.checked
     };
@@ -3971,13 +4161,39 @@ mod tests {
         assert!(html.contains("zeroth-status zeroth-hidden"));
         assert!(html.contains("/password/login"));
         assert!(html.contains("/password/register"));
+        assert!(html.contains("/wallet/challenge"));
+        assert!(html.contains("/wallet/verify"));
+        assert!(html.contains("zeroth-wallet-login"));
+        assert!(html.contains("Use wallet"));
         assert!(!html.contains("/magic-links"));
         assert!(!html.contains("Magic link"));
-        assert!(html.contains("zeroth-account-passkey-login"));
-        assert!(html.contains("Use passkey"));
+        assert!(!html.contains("zeroth-account-passkey-login"));
+        assert!(!html.contains("Use passkey"));
         assert!(html.contains("zeroth-login-card"));
         assert!(html.contains("zeroth-panel zeroth-hidden"));
         assert!(html.contains("provider=apple"));
+    }
+
+    #[test]
+    fn hosted_login_html_can_show_configured_passkey_and_magic_link_methods() {
+        let mut state = ZerothUiState::new(ZerothUiConfig::new(
+            "https://id.example.com",
+            "browser-client",
+            "https://id.example.com/admin",
+        ));
+        state.config.provider_authorize_path = "/login".to_owned();
+        state.config.return_to = Some("https://id.example.com/admin".to_owned());
+        state.config.link_identities = false;
+        state.config.show_passkey_login = true;
+        state.config.show_magic_link_login = true;
+
+        let html = render_account_html(state);
+
+        assert!(html.contains("/magic-links"));
+        assert!(html.contains("Magic link"));
+        assert!(html.contains("Send link"));
+        assert!(html.contains("zeroth-account-passkey-login"));
+        assert!(html.contains("Use passkey"));
     }
 
     #[test]
@@ -4019,6 +4235,8 @@ mod tests {
         assert!(document.contains("if (displayName) payload.displayName = displayName;"));
         assert!(document.contains("payload.pictureUrl = null;"));
         assert!(document.contains("JSON.stringify(payload)"));
+        assert!(document.contains("function zerothSignInWithWallet(button)"));
+        assert!(document.contains("personal_sign"));
         assert!(document.contains("navigator.credentials.get"));
         assert!(document.contains("/passkeys/authenticate/options"));
         assert!(document.contains("function zerothSubmitAction(form, submitter)"));
@@ -4089,7 +4307,7 @@ mod tests {
 
         assert!(document.contains("function zerothErrorMessage(body, fallback)"));
         assert!(document.contains("body.errorDescription || body.error_description"));
-        assert!(!document.contains("Magic link email could not be sent"));
+        assert!(document.contains("zerothErrorMessage(body, \"Sign in failed\")"));
     }
 
     #[test]
@@ -4161,6 +4379,7 @@ mod tests {
             account_sharing_mode: "global".to_owned(),
             account_tenant_id: "global".to_owned(),
             account_namespace: "global".to_owned(),
+            visible_login_methods: vec!["passkey".to_owned()],
             disabled: false,
             has_secret: false,
         });
@@ -4282,6 +4501,9 @@ mod tests {
         assert!(html.contains("Provider ID"));
         assert!(html.contains("Applications"));
         assert!(html.contains("Client editor"));
+        assert!(html.contains("Visible login methods"));
+        assert!(html.contains("zeroth-client-show-passkey"));
+        assert!(html.contains("zeroth-client-show-magic-link"));
         assert!(html.contains("Apple"));
         assert!(html.contains("Spotify"));
         assert!(html.contains("Disabled"));
@@ -4295,6 +4517,7 @@ mod tests {
         assert!(html.contains("usr_123"));
         assert!(html.contains("session.login"));
         assert!(html.contains("wavey-ios"));
+        assert!(html.contains("passkey"));
         assert!(html.contains("wavey://auth/callback"));
         assert!(!html.contains("super-secret-admin-token"));
     }

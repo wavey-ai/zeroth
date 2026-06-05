@@ -40,6 +40,24 @@ Worker consumers do not pull UI dependencies by default.
 `worker-build` produces `build/worker/shim.mjs`, and D1 is exposed through a
 `ZEROTH_DB` binding.
 
+## UI Screenshots
+
+Captured from the live `https://id.wavey.ai` Zeroth deployment on 2026-06-05
+using a disposable admin account. Session and user identifiers are redacted in
+the captures, and the disposable account was disabled after capture.
+
+| Hosted login | Account management |
+| --- | --- |
+| <img src="docs/screenshots/zeroth-login.png" alt="Zeroth hosted login with Apple, Google, wallet, and password options" width="520"> | <img src="docs/screenshots/zeroth-account.png" alt="Zeroth account page showing profile, linked identities, sessions, and applications" width="520"> |
+
+| Admin overview | Provider and system detail |
+| --- | --- |
+| <img src="docs/screenshots/zeroth-admin-overview.png" alt="Zeroth admin overview with tenant metrics, admin access, passkey registration, schema status, and client editor" width="520"> | <img src="docs/screenshots/zeroth-admin-system.png" alt="Zeroth admin provider detail with configured providers, setup evidence, disabled Spotify notes, and last failure text" width="520"> |
+
+| Application management |
+| --- |
+| <img src="docs/screenshots/zeroth-admin-applications.png" alt="Zeroth admin application table showing clients, redirect URIs, origins, account sharing, login visibility, and actions" width="1040"> |
+
 ## Current Status
 
 Implemented so far:

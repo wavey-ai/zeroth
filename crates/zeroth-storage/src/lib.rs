@@ -113,12 +113,26 @@ pub mod migrations {
         sql: include_str!("../migrations/0005_account_namespaces.sql"),
     };
 
+    pub const WALLET_AUTH: Migration = Migration {
+        version: 6,
+        name: "wallet_auth",
+        sql: include_str!("../migrations/0006_wallet_auth.sql"),
+    };
+
+    pub const CLIENT_LOGIN_METHODS: Migration = Migration {
+        version: 7,
+        name: "client_login_methods",
+        sql: include_str!("../migrations/0007_client_login_methods.sql"),
+    };
+
     pub const ALL: &[Migration] = &[
         INIT,
         PASSKEYS,
         ADMIN_MEMBERSHIPS,
         LOCAL_AUTH,
         ACCOUNT_NAMESPACES,
+        WALLET_AUTH,
+        CLIENT_LOGIN_METHODS,
     ];
 }
 
@@ -137,6 +151,7 @@ pub const REQUIRED_TABLES: &[&str] = &[
     "zeroth_admin_memberships",
     "zeroth_local_credentials",
     "zeroth_magic_links",
+    "zeroth_wallet_challenges",
     "zeroth_signing_keys",
     "zeroth_audit_events",
 ];
@@ -194,6 +209,11 @@ pub mod compatibility {
         name: "account_tenant_id",
         definition: "TEXT NOT NULL DEFAULT 'global'",
     };
+    pub const CLIENT_VISIBLE_LOGIN_METHODS: CompatibilityColumn = CompatibilityColumn {
+        table: "zeroth_clients",
+        name: "visible_login_methods_json",
+        definition: "TEXT NOT NULL DEFAULT '[]'",
+    };
 
     pub const TABLES: &[&str] = &[
         "zeroth_clients",
@@ -206,6 +226,7 @@ pub mod compatibility {
         CLIENT_ALLOWED_EMAIL_DOMAINS,
         CLIENT_ACCOUNT_SHARING_MODE,
         CLIENT_ACCOUNT_TENANT_ID,
+        CLIENT_VISIBLE_LOGIN_METHODS,
         AUTH_TRANSACTION_PROVIDER_NONCE,
         AUTH_TRANSACTION_LINK_USER_ID,
         AUTH_TRANSACTION_LINK_SESSION_ID,
@@ -228,6 +249,7 @@ mod tests {
                 && *table != "zeroth_admin_memberships"
                 && *table != "zeroth_local_credentials"
                 && *table != "zeroth_magic_links"
+                && *table != "zeroth_wallet_challenges"
                 && *table != "zeroth_account_identities"
         }) {
             assert!(sql.contains(table), "missing table {table}");
@@ -241,7 +263,7 @@ mod tests {
         for table in ["zeroth_passkey_credentials", "zeroth_passkey_challenges"] {
             assert!(sql.contains(table), "missing table {table}");
         }
-        assert_eq!(migrations::ALL.len(), 5);
+        assert_eq!(migrations::ALL.len(), 7);
         assert_eq!(migrations::ALL[1].version, 2);
     }
 
@@ -274,8 +296,28 @@ mod tests {
         assert!(sql.contains("account_sharing_mode TEXT NOT NULL DEFAULT 'global'"));
         assert!(sql.contains("account_tenant_id TEXT NOT NULL DEFAULT 'global'"));
         assert!(sql.contains("INSERT OR IGNORE INTO zeroth_account_identities"));
-        assert_eq!(migrations::ALL.len(), 5);
+        assert_eq!(migrations::ALL.len(), 7);
         assert_eq!(migrations::ALL[4].version, 5);
+    }
+
+    #[test]
+    fn wallet_auth_migration_contains_wallet_challenge_table() {
+        let sql = migrations::WALLET_AUTH.sql;
+
+        assert!(sql.contains("zeroth_wallet_challenges"));
+        assert!(sql.contains("challenge_hash TEXT PRIMARY KEY"));
+        assert!(sql.contains("account_namespace TEXT NOT NULL"));
+        assert_eq!(migrations::ALL.len(), 7);
+        assert_eq!(migrations::ALL[5].version, 6);
+    }
+
+    #[test]
+    fn client_login_methods_migration_contains_visibility_column() {
+        let sql = migrations::CLIENT_LOGIN_METHODS.sql;
+
+        assert!(sql.contains("visible_login_methods_json TEXT NOT NULL DEFAULT '[]'"));
+        assert_eq!(migrations::ALL.len(), 7);
+        assert_eq!(migrations::ALL[6].version, 7);
     }
 
     #[test]
@@ -336,6 +378,7 @@ mod tests {
             "allowed_email_domains_json",
             "account_sharing_mode",
             "account_tenant_id",
+            "visible_login_methods_json",
             "provider_nonce",
             "link_user_id",
             "link_session_id",

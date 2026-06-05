@@ -4,6 +4,9 @@ use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE, URL_SAFE_NO_PAD},
     Engine as _,
 };
+use k256::ecdsa::{
+    RecoveryId as EvmRecoveryId, Signature as EvmSignature, VerifyingKey as EvmVerifyingKey,
+};
 use p256::ecdsa::{
     signature::{Signer as _, Verifier as _},
     Signature, SigningKey, VerifyingKey,
@@ -16,6 +19,7 @@ use rsa::{
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
+use sha3::Keccak256;
 #[cfg(target_arch = "wasm32")]
 use std::cell::RefCell;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -38,12 +42,12 @@ use zeroth_providers::{
 };
 use zeroth_server::ZerothServerConfig;
 #[cfg(target_arch = "wasm32")]
-use zeroth_ui::{render_account_document, ZerothUiConfig, ZerothUiState};
+use zeroth_ui::{render_account_document, ZerothUiState};
 #[cfg(target_arch = "wasm32")]
 use zeroth_ui::{render_clients_admin_document, ClientsAdminUiState};
 use zeroth_ui::{
     ApplicationUi, ClientAdminUi, EventAdminUi, IdentityUi, ProfileUi, ProviderKind, ProviderUi,
-    SessionUi, UserAdminUi, ZerothUiTheme,
+    SessionUi, UserAdminUi, ZerothUiConfig, ZerothUiTheme,
 };
 #[cfg(target_arch = "wasm32")]
 use zeroth_ui::{
@@ -73,6 +77,8 @@ const CLIENT_URI_MAX_BYTES: usize = 2048;
 const CLIENT_URI_LIST_LIMIT: usize = 32;
 const CLIENT_EMAIL_DOMAIN_MAX_BYTES: usize = 253;
 const CLIENT_ACCOUNT_TENANT_ID_MAX_CHARS: usize = 128;
+const LOGIN_METHOD_PASSKEY: &str = "passkey";
+const LOGIN_METHOD_MAGIC_LINK: &str = "magic_link";
 const ACCOUNT_SHARING_MODE_GLOBAL: &str = "global";
 const ACCOUNT_SHARING_MODE_TENANT: &str = "tenant";
 const ACCOUNT_SHARING_MODE_CLIENT: &str = "client";
@@ -94,6 +100,12 @@ const PASSKEY_CREDENTIAL_LIST_LIMIT: i32 = 64;
 const PASSKEY_BODY_LIMIT: usize = 16 * 1024;
 const PASSKEY_LABEL_MAX_CHARS: usize = 128;
 const PASSKEY_EMAIL_MAX_BYTES: usize = 320;
+const EVM_WALLET_PROVIDER_ID: &str = "wallet_evm";
+const EVM_WALLET_CHALLENGE_TTL_SECONDS: i32 = 5 * 60;
+const EVM_WALLET_CHALLENGE_CLEANUP_LIMIT: i32 = 64;
+const EVM_WALLET_BODY_LIMIT: usize = 8 * 1024;
+const EVM_WALLET_MESSAGE_MAX_BYTES: usize = 2048;
+const EVM_WALLET_SIGNATURE_HEX_BYTES: usize = 65;
 const LOCAL_AUTH_BODY_LIMIT: usize = 8 * 1024;
 const LOCAL_AUTH_PROVIDER_ID: &str = "zeroth";
 const PASSWORD_MIN_BYTES: usize = 8;
@@ -125,6 +137,226 @@ const CORS_ALLOW_METHODS: &str = "GET, POST, PATCH, DELETE, OPTIONS";
 const CORS_ALLOW_HEADERS: &str = "Authorization, Content-Type";
 const CORS_MAX_AGE_SECONDS: &str = "600";
 const ZEROTH_FAVICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><defs><linearGradient id="g" x1="0" x2="1" y1="0" y2="1"><stop stop-color="#2d333b"/><stop offset="0.58" stop-color="#1f2328"/><stop offset="1" stop-color="#0b0f19"/></linearGradient></defs><rect width="64" height="64" rx="12" fill="url(#g)"/><path d="M17 16h30L25 48h25" fill="none" stroke="#f9fafb" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/></svg>"##;
+const ZEROTH_PROFILE_PANEL_JS: &str = r###"
+(() => {
+  const defaultIssuer = () => {
+    const script = document.currentScript;
+    return script && script.src ? new URL(script.src, window.location.href).origin : window.location.origin;
+  };
+  const text = (value) => value == null || value === "" ? "-" : String(value);
+  const esc = (value) => text(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll("\"", "&quot;");
+  const shortId = (value) => {
+    const raw = text(value);
+    return raw.length > 24 ? `${raw.slice(0, 10)}...${raw.slice(-8)}` : raw;
+  };
+  const fmtTime = (value) => {
+    const seconds = Number(value || 0);
+    if (!Number.isFinite(seconds) || seconds <= 0) return "-";
+    return new Date(seconds * 1000).toLocaleString();
+  };
+  const providerLabel = (value) => {
+    const raw = text(value);
+    if (raw === "wallet_evm") return "Ethereum wallet";
+    if (raw === "magic_link") return "Magic link";
+    return raw.replace(/[_-]+/g, " ").replace(/\b\w/g, (ch) => ch.toUpperCase());
+  };
+  const style = `
+    :host, .zeroth-profile-panel { color: #111827; font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    .zeroth-profile-panel { border: 1px solid #e5e7eb; border-radius: 8px; background: #fff; overflow: hidden; max-width: 560px; }
+    .zeroth-head { display: flex; gap: 12px; align-items: center; justify-content: space-between; padding: 14px 16px; background: linear-gradient(135deg, #111827, #2d333b); color: #fff; }
+    .zeroth-brand { display: flex; gap: 10px; align-items: center; min-width: 0; }
+    .zeroth-mark { display: grid; place-items: center; width: 32px; height: 32px; border-radius: 8px; background: #fff; color: #111827; font-weight: 800; }
+    .zeroth-title { font-size: 15px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .zeroth-sub { color: #d1d5db; font-size: 12px; }
+    .zeroth-body { padding: 14px 16px; display: grid; gap: 14px; }
+    .zeroth-profile { display: flex; align-items: center; gap: 12px; min-width: 0; }
+    .zeroth-avatar { width: 42px; height: 42px; border-radius: 50%; background: #f3f4f6; color: #111827; display: grid; place-items: center; font-weight: 700; overflow: hidden; flex: 0 0 auto; }
+    .zeroth-avatar img { width: 100%; height: 100%; object-fit: cover; }
+    .zeroth-name { font-weight: 700; overflow-wrap: anywhere; }
+    .zeroth-meta { color: #6b7280; font-size: 12px; overflow-wrap: anywhere; }
+    .zeroth-grid { display: grid; gap: 8px; }
+    .zeroth-section-title { color: #374151; font-weight: 700; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+    .zeroth-row { display: flex; justify-content: space-between; gap: 10px; padding: 8px 0; border-top: 1px solid #f3f4f6; }
+    .zeroth-row-main { min-width: 0; }
+    .zeroth-row-name { font-weight: 600; overflow-wrap: anywhere; }
+    .zeroth-row-meta { color: #6b7280; font-size: 12px; overflow-wrap: anywhere; }
+    .zeroth-form { display: grid; gap: 10px; }
+    .zeroth-field { display: grid; gap: 4px; }
+    .zeroth-field label { color: #374151; font-size: 12px; font-weight: 600; }
+    .zeroth-field input { border: 1px solid #d1d5db; border-radius: 6px; padding: 8px 10px; font: inherit; min-width: 0; }
+    .zeroth-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+    .zeroth-action { appearance: none; border: 1px solid #d1d5db; border-radius: 6px; background: #fff; color: #111827; padding: 8px 10px; font: inherit; font-weight: 600; text-decoration: none; cursor: pointer; }
+    .zeroth-primary { border-color: #111827; background: #111827; color: #fff; }
+    .zeroth-status { color: #6b7280; font-size: 12px; min-height: 18px; }
+    .zeroth-error { color: #991b1b; }
+  `;
+
+  async function tokenFor(options, host) {
+    if (typeof options.getAccessToken === "function") return await options.getAccessToken();
+    if (options.accessToken) return options.accessToken;
+    if (host && typeof host.getAccessToken === "function") return await host.getAccessToken();
+    return host && host.getAttribute ? host.getAttribute("access-token") : "";
+  }
+
+  async function api(issuer, path, token, init = {}) {
+    const headers = new Headers(init.headers || {});
+    headers.set("Accept", "application/json");
+    headers.set("Authorization", `Bearer ${token}`);
+    if (init.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
+    const response = await fetch(new URL(path, issuer).toString(), {
+      ...init,
+      headers,
+      credentials: "omit",
+    });
+    let body = {};
+    try { body = await response.json(); } catch (_) {}
+    if (!response.ok) {
+      throw new Error(body.errorDescription || body.error_description || body.error || `HTTP ${response.status}`);
+    }
+    return body;
+  }
+
+  function avatar(user) {
+    if (user && user.picture) return `<img src="${esc(user.picture)}" alt="">`;
+    const label = text((user && (user.name || user.email || user.sub)) || "Z").trim();
+    return esc(label.slice(0, 1).toUpperCase() || "Z");
+  }
+
+  function renderPanel(root, state) {
+    const issuer = state.issuer.replace(/\/+$/, "");
+    const manageUrl = state.manageUrl || `${issuer}/account?return_to=${encodeURIComponent(state.returnTo || window.location.href)}`;
+    if (state.loading) {
+      root.innerHTML = `<style>${style}</style><div class="zeroth-profile-panel"><div class="zeroth-head"><div class="zeroth-brand"><span class="zeroth-mark">Z</span><div><div class="zeroth-title">${esc(state.title)}</div><div class="zeroth-sub">Identity</div></div></div></div><div class="zeroth-body"><div class="zeroth-status">Loading profile</div></div></div>`;
+      return;
+    }
+    if (state.error) {
+      root.innerHTML = `<style>${style}</style><div class="zeroth-profile-panel"><div class="zeroth-head"><div class="zeroth-brand"><span class="zeroth-mark">Z</span><div><div class="zeroth-title">${esc(state.title)}</div><div class="zeroth-sub">Identity</div></div></div></div><div class="zeroth-body"><div class="zeroth-status zeroth-error">${esc(state.error)}</div><div class="zeroth-actions"><a class="zeroth-action zeroth-primary" href="${esc(manageUrl)}">Open account</a><button class="zeroth-action" data-zeroth-refresh type="button">Refresh</button></div></div></div>`;
+      return;
+    }
+    const user = state.profile || {};
+    const identities = Array.isArray(state.identities) ? state.identities : [];
+    const sessions = Array.isArray(state.sessions) ? state.sessions : [];
+    root.innerHTML = `<style>${style}</style>
+      <div class="zeroth-profile-panel">
+        <div class="zeroth-head">
+          <div class="zeroth-brand"><span class="zeroth-mark">Z</span><div><div class="zeroth-title">${esc(state.title)}</div><div class="zeroth-sub">Identity</div></div></div>
+          <a class="zeroth-action" href="${esc(manageUrl)}">Account</a>
+        </div>
+        <div class="zeroth-body">
+          <div class="zeroth-profile"><div class="zeroth-avatar">${avatar(user)}</div><div><div class="zeroth-name">${esc(user.name || user.email || "Signed in")}</div><div class="zeroth-meta">${esc(user.email || user.sub)}</div></div></div>
+          <form class="zeroth-form" data-zeroth-profile-form>
+            <div class="zeroth-field"><label>Display name</label><input name="displayName" autocomplete="name" value="${esc(user.name || "")}"></div>
+            <div class="zeroth-field"><label>Picture URL</label><input name="pictureUrl" autocomplete="url" value="${esc(user.picture || "")}"></div>
+            <div class="zeroth-actions"><button class="zeroth-action zeroth-primary" type="submit">Save profile</button><button class="zeroth-action" data-zeroth-refresh type="button">Refresh</button></div>
+            <div class="zeroth-status" data-zeroth-status>${esc(state.status || "")}</div>
+          </form>
+          <div class="zeroth-grid"><div class="zeroth-section-title">Sign-in methods</div>${identities.map((identity) => `<div class="zeroth-row"><div class="zeroth-row-main"><div class="zeroth-row-name">${esc(providerLabel(identity.providerId || identity.provider_id))}</div><div class="zeroth-row-meta">${esc(identity.email || identity.displayName || identity.display_name || shortId(identity.providerSubject || identity.provider_subject))}</div></div><div class="zeroth-row-meta">${identity.emailVerified || identity.email_verified ? "Verified" : ""}</div></div>`).join("") || `<div class="zeroth-meta">No linked sign-in methods returned.</div>`}</div>
+          <div class="zeroth-grid"><div class="zeroth-section-title">Sessions</div>${sessions.slice(0, 4).map((session) => `<div class="zeroth-row"><div class="zeroth-row-main"><div class="zeroth-row-name">${esc(session.current ? "Current session" : "Session")}</div><div class="zeroth-row-meta">${esc(session.clientId || session.client_id || "Browser")} - expires ${esc(fmtTime(session.expiresAt || session.expires_at))}</div></div></div>`).join("") || `<div class="zeroth-meta">No active sessions returned.</div>`}</div>
+        </div>
+      </div>`;
+  }
+
+  function mount(target, options = {}) {
+    const host = typeof target === "string" ? document.querySelector(target) : target;
+    if (!host) throw new Error("Zeroth profile panel target was not found");
+    const root = host.attachShadow ? host.attachShadow({ mode: "open" }) : host;
+    const state = {
+      issuer: options.issuer || host.getAttribute?.("issuer") || defaultIssuer(),
+      returnTo: options.returnTo || host.getAttribute?.("return-to") || window.location.href,
+      manageUrl: options.manageUrl || host.getAttribute?.("manage-url") || "",
+      title: options.title || host.getAttribute?.("title") || "Zeroth",
+      loading: true,
+    };
+    async function load() {
+      state.loading = true;
+      state.error = "";
+      renderPanel(root, state);
+      try {
+        const token = await tokenFor(options, host);
+        if (!token) throw new Error("Access token is required");
+        const [profile, identities, sessions] = await Promise.all([
+          api(state.issuer, "/profile", token),
+          api(state.issuer, "/identities", token),
+          api(state.issuer, "/sessions", token),
+        ]);
+        Object.assign(state, {
+          loading: false,
+          token,
+          profile,
+          identities: identities.identities || [],
+          sessions: sessions.sessions || [],
+        });
+      } catch (error) {
+        Object.assign(state, {
+          loading: false,
+          error: error instanceof Error ? error.message : "Profile could not be loaded",
+        });
+      }
+      renderPanel(root, state);
+    }
+    root.addEventListener("click", (event) => {
+      const target = event.target;
+      if (target instanceof Element && target.closest("[data-zeroth-refresh]")) {
+        event.preventDefault();
+        load();
+      }
+    });
+    root.addEventListener("submit", async (event) => {
+      const form = event.target;
+      if (!(form instanceof HTMLFormElement) || !form.matches("[data-zeroth-profile-form]")) return;
+      event.preventDefault();
+      const status = root.querySelector("[data-zeroth-status]");
+      if (status) status.textContent = "Saving";
+      const data = new FormData(form);
+      try {
+        const updated = await api(state.issuer, "/profile", state.token, {
+          method: "PATCH",
+          body: JSON.stringify({
+            displayName: String(data.get("displayName") || "").trim(),
+            pictureUrl: String(data.get("pictureUrl") || "").trim() || null,
+          }),
+        });
+        state.profile = updated;
+        state.status = "Saved";
+        renderPanel(root, state);
+      } catch (error) {
+        if (status) {
+          status.textContent = error instanceof Error ? error.message : "Profile could not be saved";
+          status.classList.add("zeroth-error");
+        }
+      }
+    });
+    load();
+    return { refresh: load, root, state };
+  }
+
+  class ZerothProfilePanelElement extends HTMLElement {
+    connectedCallback() {
+      if (this.__zerothProfilePanel) return;
+      this.__zerothProfilePanel = mount(this, {
+        getAccessToken: () => typeof this.getAccessToken === "function" ? this.getAccessToken() : null,
+      });
+    }
+    refresh() {
+      return this.__zerothProfilePanel && this.__zerothProfilePanel.refresh();
+    }
+  }
+
+  window.ZerothProfilePanel = { mount };
+  if (window.customElements && !customElements.get("zeroth-profile-panel")) {
+    customElements.define("zeroth-profile-panel", ZerothProfilePanelElement);
+  }
+  document.addEventListener("DOMContentLoaded", () => {
+    document.querySelectorAll("[data-zeroth-profile-panel]").forEach((node) => {
+      if (!node.__zerothProfilePanel) node.__zerothProfilePanel = mount(node, {});
+    });
+  });
+})();
+"###;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -371,6 +603,8 @@ struct ClientRow {
     #[serde(default)]
     account_tenant_id: Option<String>,
     #[serde(default)]
+    visible_login_methods_json: Option<String>,
+    #[serde(default)]
     confidential: i32,
     #[serde(default)]
     disabled_at: Option<i32>,
@@ -393,6 +627,7 @@ struct ClientResponse {
     account_sharing_mode: String,
     account_tenant_id: String,
     account_namespace: String,
+    visible_login_methods: Vec<String>,
     confidential: bool,
     disabled: bool,
     has_secret: bool,
@@ -595,6 +830,8 @@ struct ClientUpsertRequest {
     account_sharing_mode: Option<String>,
     #[serde(default, alias = "account_tenant_id")]
     account_tenant_id: Option<String>,
+    #[serde(default, alias = "visible_login_methods")]
+    visible_login_methods: Vec<String>,
     #[serde(default)]
     confidential: bool,
     #[serde(default, alias = "client_secret")]
@@ -614,6 +851,7 @@ struct ValidatedClientUpsert {
     allowed_email_domains: Vec<String>,
     account_sharing_mode: AccountSharingMode,
     account_tenant_id: String,
+    visible_login_methods: Vec<String>,
     confidential: bool,
     secret_hash: Option<String>,
     disabled: bool,
@@ -1098,6 +1336,27 @@ struct MagicLinkRow {
     user_agent: Option<String>,
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+struct WalletChallengeRow {
+    challenge_hash: String,
+    provider_id: String,
+    address: String,
+    chain_id: String,
+    client_id: String,
+    return_to: String,
+    account_namespace: String,
+    message: String,
+    created_at: i32,
+    expires_at: i32,
+    #[serde(default)]
+    consumed_at: Option<i32>,
+    #[serde(default)]
+    ip_hash: Option<String>,
+    #[serde(default)]
+    user_agent: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[serde(rename_all = "camelCase")]
@@ -1168,6 +1427,31 @@ struct MagicLinkConsumeRequest {
     token: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+struct WalletChallengeRequest {
+    address: String,
+    #[serde(alias = "chain_id")]
+    chain_id: String,
+    #[serde(default, alias = "return_to")]
+    return_to: Option<String>,
+    #[serde(default, alias = "client_id")]
+    client_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+struct WalletVerifyRequest {
+    address: String,
+    #[serde(alias = "chain_id")]
+    chain_id: String,
+    nonce: String,
+    message: String,
+    signature: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct LocalAuthResponse {
@@ -1183,6 +1467,17 @@ struct MagicLinkResponse {
     sent: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     dev_link: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WalletChallengeResponse {
+    ok: bool,
+    provider: &'static str,
+    address: String,
+    chain_id: String,
+    nonce: String,
+    message: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1443,6 +1738,7 @@ struct RegisteredClient {
     client: Client,
     secret_hash: Option<String>,
     account_scope: ClientAccountScope,
+    visible_login_methods: Vec<String>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -1755,6 +2051,65 @@ struct CurrentSession {
     user: UserRow,
 }
 
+#[cfg(target_arch = "wasm32")]
+#[derive(Debug, Clone)]
+struct CurrentAccount {
+    user: UserRow,
+    client_id: Option<String>,
+    session_id: Option<String>,
+    scope: Option<String>,
+    access_token: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct AccountAuthError {
+    code: &'static str,
+    description: String,
+    status: u16,
+}
+
+impl AccountAuthError {
+    fn new(code: &'static str, description: impl Into<String>, status: u16) -> Self {
+        Self {
+            code,
+            description: description.into(),
+            status,
+        }
+    }
+
+    fn invalid_token(description: impl Into<String>) -> Self {
+        Self::new("invalid_token", description, 401)
+    }
+
+    fn login_required(description: impl Into<String>) -> Self {
+        Self::new("login_required", description, 401)
+    }
+
+    fn invalid_request(description: impl Into<String>, status: u16) -> Self {
+        Self::new("invalid_request", description, status)
+    }
+
+    fn invalid_scope(description: impl Into<String>) -> Self {
+        Self::new("invalid_scope", description, 403)
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl CurrentAccount {
+    fn profile_scope(&self) -> &str {
+        self.scope.as_deref().unwrap_or("email profile")
+    }
+
+    fn require_profile_scope(&self) -> Result<(), AccountAuthError> {
+        if !self.access_token || scope_contains(self.scope.as_deref(), "profile") {
+            return Ok(());
+        }
+        Err(AccountAuthError::invalid_scope(
+            "access token requires profile scope",
+        ))
+    }
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 enum AdminAuthorization {
     BootstrapToken,
@@ -1826,6 +2181,7 @@ async fn handle_request(request: Request, env: Env) -> worker::Result<Response> 
         (Method::Get, "/robots.txt") => robots_txt(),
         (Method::Get, "/login") => hosted_login(request, env).await,
         (Method::Get, "/account") => hosted_account(request, env).await,
+        (Method::Get, "/profile-panel.js") => profile_panel_script(),
         (Method::Get, "/admin") => hosted_clients_admin(request, env).await,
         (Method::Get, "/admin/clients") => hosted_clients_admin(request, env).await,
         (Method::Get, path) if admin_console_alias_path(path) => {
@@ -1878,10 +2234,15 @@ async fn handle_request(request: Request, env: Env) -> worker::Result<Response> 
         (
             Method::Get,
             "/password/register" | "/password/login" | "/magic-links" | "/magic-link"
-            | "/magic_link",
+            | "/magic_link" | "/wallet/challenge" | "/wallet/nonce" | "/wallet/verify"
+            | "/wallet/login",
         ) => redirect_local_auth_get_to_login(request, env),
         (Method::Post, "/password/register") => password_register(request, env).await,
         (Method::Post, "/password/login") => password_login(request, env).await,
+        (Method::Post, "/wallet/challenge" | "/wallet/nonce") => {
+            evm_wallet_challenge(request, env).await
+        }
+        (Method::Post, "/wallet/verify" | "/wallet/login") => evm_wallet_verify(request, env).await,
         (Method::Post, "/magic-links" | "/magic-link" | "/magic_link" | "/magic-links/request") => {
             magic_link_request(request, env).await
         }
@@ -2344,6 +2705,7 @@ async fn clients(mut request: Request, env: Env) -> worker::Result<Response> {
                     "disabled": upsert.disabled,
                     "redirectUriCount": upsert.redirect_uris.len(),
                     "allowedOriginCount": upsert.allowed_origins.len(),
+                    "visibleLoginMethodCount": upsert.visible_login_methods.len(),
                     "secretUpdated": upsert.secret_hash.is_some()
                 }),
                 now,
@@ -3112,30 +3474,35 @@ async fn sessions(request: Request, env: Env) -> worker::Result<Response> {
     let origin = request_origin(&request)?;
     let config = server_config(&env, &request_url);
     let db = env.d1(D1_BINDING)?;
-    let Some(current) =
-        current_session_from_request(&request, &db, &config, unix_timestamp_seconds()).await?
-    else {
-        return oauth_error_json(
-            "login_required",
-            "active browser session was not found",
-            401,
-        );
-    };
-    if let Err(error) =
-        validate_session_cors_origin(&db, origin.as_deref(), &current.session).await?
-    {
-        return oauth_error_json("invalid_request", error, 403);
-    }
+    let now = unix_timestamp_seconds();
+    let current =
+        match current_account_from_request(&request, &env, &db, &config, origin.as_deref(), now)
+            .await?
+        {
+            Ok(current) => current,
+            Err(error) => return oauth_error_json(error.code, error.description, error.status),
+        };
 
     match request.method() {
         Method::Get => {
-            let sessions =
-                list_active_sessions_for_user(&db, &current.user.id, unix_timestamp_seconds())
-                    .await?;
-            let response = json(&sessions_response(&sessions, &current.session.id))?;
+            if let Err(error) = current.require_profile_scope() {
+                return oauth_error_json(error.code, error.description, error.status);
+            }
+            let sessions = list_active_sessions_for_user(&db, &current.user.id, now).await?;
+            let response = json(&sessions_response(
+                &sessions,
+                current.session_id.as_deref().unwrap_or_default(),
+            ))?;
             with_cors_actual_headers(response, origin.as_deref())
         }
         Method::Delete => {
+            if current.access_token {
+                return oauth_error_json(
+                    "invalid_request",
+                    "session revocation requires hosted account session",
+                    403,
+                );
+            }
             let Some(session_id) =
                 query_param(&request_url, "session_id").filter(|id| !id.is_empty())
             else {
@@ -3150,17 +3517,17 @@ async fn sessions(request: Request, env: Env) -> worker::Result<Response> {
                 &request,
                 "session.revoke",
                 Some(&current.user.id),
-                current.session.client_id.as_deref(),
+                current.client_id.as_deref(),
                 None,
                 serde_json::json!({
-                    "current": session_id == current.session.id
+                    "current": current.session_id.as_deref() == Some(session_id.as_str())
                 }),
                 now,
             )
             .await;
 
             let response = json(&serde_json::json!({ "ok": true }))?;
-            let response = if session_id == current.session.id {
+            let response = if current.session_id.as_deref() == Some(session_id.as_str()) {
                 with_set_cookie(
                     response,
                     &clear_session_cookie(&config.cookie_name, config.cookie_domain.as_deref()),
@@ -3180,27 +3547,27 @@ async fn profile(mut request: Request, env: Env) -> worker::Result<Response> {
     let config = server_config(&env, &request_url);
     let origin = request_origin_for_config(&request, &config)?;
     let db = env.d1(D1_BINDING)?;
-    let Some(current) =
-        current_session_from_request(&request, &db, &config, unix_timestamp_seconds()).await?
-    else {
-        return oauth_error_json(
-            "login_required",
-            "active browser session was not found",
-            401,
-        );
-    };
-    if let Err(error) =
-        validate_session_cors_origin(&db, origin.as_deref(), &current.session).await?
-    {
-        return oauth_error_json("invalid_request", error, 403);
-    }
+    let now = unix_timestamp_seconds();
+    let current =
+        match current_account_from_request(&request, &env, &db, &config, origin.as_deref(), now)
+            .await?
+        {
+            Ok(current) => current,
+            Err(error) => return oauth_error_json(error.code, error.description, error.status),
+        };
 
     match request.method() {
         Method::Get => {
-            let response = json(&userinfo_response(&current.user, Some("email profile")))?;
+            let response = json(&userinfo_response(
+                &current.user,
+                Some(current.profile_scope()),
+            ))?;
             with_cors_actual_headers(response, origin.as_deref())
         }
         Method::Patch => {
+            if let Err(error) = current.require_profile_scope() {
+                return oauth_error_json(error.code, error.description, error.status);
+            }
             let patch = match profile_patch_from_request(&mut request).await {
                 Ok(patch) => patch,
                 Err(error) => {
@@ -3214,7 +3581,7 @@ async fn profile(mut request: Request, env: Env) -> worker::Result<Response> {
                 &request,
                 "user.profile.update",
                 Some(&current.user.id),
-                current.session.client_id.as_deref(),
+                current.client_id.as_deref(),
                 None,
                 serde_json::json!({
                     "displayName": patch.display_name.is_some(),
@@ -3224,7 +3591,10 @@ async fn profile(mut request: Request, env: Env) -> worker::Result<Response> {
             )
             .await;
             let updated_user = user_with_profile_patch(&current.user, &patch);
-            let response = json(&userinfo_response(&updated_user, Some("email profile")))?;
+            let response = json(&userinfo_response(
+                &updated_user,
+                Some(current.profile_scope()),
+            ))?;
             with_cors_actual_headers(response, origin.as_deref())
         }
         _ => json_status(&serde_json::json!({ "error": "method_not_allowed" }), 405),
@@ -3237,28 +3607,32 @@ async fn identities(request: Request, env: Env) -> worker::Result<Response> {
     let config = server_config(&env, &request_url);
     let origin = request_origin_for_config(&request, &config)?;
     let db = env.d1(D1_BINDING)?;
-    let Some(current) =
-        current_session_from_request(&request, &db, &config, unix_timestamp_seconds()).await?
-    else {
-        return oauth_error_json(
-            "login_required",
-            "active browser session was not found",
-            401,
-        );
-    };
-    if let Err(error) =
-        validate_session_cors_origin(&db, origin.as_deref(), &current.session).await?
-    {
-        return oauth_error_json("invalid_request", error, 403);
-    }
+    let now = unix_timestamp_seconds();
+    let current =
+        match current_account_from_request(&request, &env, &db, &config, origin.as_deref(), now)
+            .await?
+        {
+            Ok(current) => current,
+            Err(error) => return oauth_error_json(error.code, error.description, error.status),
+        };
 
     match request.method() {
         Method::Get => {
+            if let Err(error) = current.require_profile_scope() {
+                return oauth_error_json(error.code, error.description, error.status);
+            }
             let identities = list_identities_for_user(&db, &current.user.id).await?;
             let response = json(&identities_response(&identities))?;
             with_cors_actual_headers(response, origin.as_deref())
         }
         Method::Delete => {
+            if current.access_token {
+                return oauth_error_json(
+                    "invalid_request",
+                    "identity unlink requires hosted account session",
+                    403,
+                );
+            }
             let identity = match identity_reference_from_url(&request_url) {
                 Ok(identity) => identity,
                 Err(error) => return oauth_error_json("invalid_request", error, 400),
@@ -3300,7 +3674,7 @@ async fn identities(request: Request, env: Env) -> worker::Result<Response> {
                 &request,
                 "identity.unlink",
                 Some(&current.user.id),
-                current.session.client_id.as_deref(),
+                current.client_id.as_deref(),
                 Some(&identity.provider_id),
                 serde_json::json!({}),
                 unix_timestamp_seconds(),
@@ -3828,6 +4202,185 @@ async fn password_login(mut request: Request, env: Env) -> worker::Result<Respon
 }
 
 #[cfg(target_arch = "wasm32")]
+async fn evm_wallet_challenge(mut request: Request, env: Env) -> worker::Result<Response> {
+    let url = request.url()?;
+    let config = server_config(&env, &url);
+    let db = env.d1(D1_BINDING)?;
+    let now = unix_timestamp_seconds();
+    let body = match wallet_json_from_request::<WalletChallengeRequest>(&mut request).await {
+        Ok(body) => body,
+        Err(error) => return oauth_error_json("invalid_request", error, 400),
+    };
+    let address = match validate_evm_wallet_address(&body.address) {
+        Ok(address) => address,
+        Err(error) => return oauth_error_json("invalid_request", error, 400),
+    };
+    let chain_id = match normalize_evm_chain_id(&body.chain_id) {
+        Ok(chain_id) => chain_id,
+        Err(error) => return oauth_error_json("invalid_request", error, 400),
+    };
+    let (client, return_to) = match local_auth_client_and_return_to(
+        &env,
+        &url,
+        &db,
+        body.client_id.as_deref(),
+        body.return_to.as_deref(),
+        &config,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => return oauth_error_json("invalid_request", error, 400),
+    };
+    if let Err(error) = validate_local_auth_origin(&request, &db, &client, &config).await? {
+        return oauth_error_json("invalid_request", error, 403);
+    }
+    let Some(registered_client) = get_registered_client(&db, &client.id.0).await? else {
+        return oauth_error_json("invalid_request", "wallet client is not registered", 400);
+    };
+
+    cleanup_expired_wallet_challenges(&db, now).await?;
+    let nonce = random_token()?;
+    let challenge_hash = hash_secret(&nonce);
+    let domain = url
+        .host_str()
+        .ok_or_else(|| worker_error("wallet login host is missing".to_owned()))?;
+    let message = evm_wallet_signin_message(
+        domain,
+        &config.public_base_url,
+        &product_name_from_env(&env),
+        &address,
+        &chain_id,
+        &nonce,
+        now,
+    );
+    let audit_context = audit_request_context(&request).unwrap_or_default();
+    put_wallet_challenge(
+        &db,
+        &challenge_hash,
+        &address,
+        &chain_id,
+        &client.id.0,
+        &return_to,
+        &registered_client.account_scope.namespace,
+        &message,
+        now,
+        audit_context.user_agent.as_deref(),
+        audit_context.ip_hash.as_deref(),
+    )
+    .await?;
+    record_audit_event(
+        &db,
+        &request,
+        "wallet.challenge",
+        None,
+        Some(&client.id.0),
+        Some(EVM_WALLET_PROVIDER_ID),
+        serde_json::json!({
+            "addressHash": hash_secret(&address),
+            "chainId": &chain_id
+        }),
+        now,
+    )
+    .await;
+    json(&WalletChallengeResponse {
+        ok: true,
+        provider: EVM_WALLET_PROVIDER_ID,
+        address,
+        chain_id,
+        nonce,
+        message,
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn evm_wallet_verify(mut request: Request, env: Env) -> worker::Result<Response> {
+    let url = request.url()?;
+    let config = server_config(&env, &url);
+    let db = env.d1(D1_BINDING)?;
+    let now = unix_timestamp_seconds();
+    let body = match wallet_json_from_request::<WalletVerifyRequest>(&mut request).await {
+        Ok(body) => body,
+        Err(error) => return oauth_error_json("invalid_request", error, 400),
+    };
+    let address = match validate_evm_wallet_address(&body.address) {
+        Ok(address) => address,
+        Err(_) => return oauth_error_json("invalid_grant", "invalid wallet signature", 401),
+    };
+    let chain_id = match normalize_evm_chain_id(&body.chain_id) {
+        Ok(chain_id) => chain_id,
+        Err(_) => return oauth_error_json("invalid_grant", "invalid wallet signature", 401),
+    };
+    if !wallet_nonce_valid(&body.nonce) {
+        return oauth_error_json("invalid_grant", "invalid wallet challenge", 401);
+    }
+    let challenge_hash = hash_secret(&body.nonce);
+    let Some(challenge) = get_wallet_challenge(&db, &challenge_hash).await? else {
+        return oauth_error_json("invalid_grant", "invalid wallet challenge", 401);
+    };
+    if let Err(error) = validate_wallet_challenge(&challenge, now) {
+        return oauth_error_json("invalid_grant", error, 401);
+    }
+    if challenge.provider_id != EVM_WALLET_PROVIDER_ID
+        || challenge.address != address
+        || challenge.chain_id != chain_id
+        || challenge.message != body.message
+    {
+        return oauth_error_json(
+            "invalid_grant",
+            "wallet challenge did not match request",
+            401,
+        );
+    }
+    let recovered_address = match recover_evm_wallet_address(&body.message, &body.signature) {
+        Ok(recovered_address) => recovered_address,
+        Err(_) => return oauth_error_json("invalid_grant", "invalid wallet signature", 401),
+    };
+    if recovered_address != address {
+        return oauth_error_json("invalid_grant", "invalid wallet signature", 401);
+    }
+    if !consume_wallet_challenge(&db, &challenge_hash, now).await? {
+        return oauth_error_json("invalid_grant", "wallet challenge was already used", 401);
+    }
+
+    let profile = evm_wallet_profile(&address);
+    let raw_profile_json = serde_json::json!({
+        "kind": "wallet",
+        "provider": EVM_WALLET_PROVIDER_ID,
+        "address": &address,
+        "chainId": &chain_id
+    })
+    .to_string();
+    let user_id = upsert_provider_profile(
+        &db,
+        &challenge.account_namespace,
+        &profile,
+        Some(&raw_profile_json),
+        now,
+    )
+    .await?;
+    let Some(user) = get_user(&db, &user_id).await? else {
+        return oauth_error_json("invalid_request", "wallet user was not found", 400);
+    };
+    if user.disabled_at.is_some() {
+        return oauth_error_json("invalid_request", "wallet user is disabled", 403);
+    }
+    let response = issue_wallet_session_response(
+        &request,
+        &db,
+        &config,
+        &challenge.client_id,
+        &user,
+        &challenge.return_to,
+        &address,
+        &chain_id,
+        now,
+    )
+    .await?;
+    Ok(response)
+}
+
+#[cfg(target_arch = "wasm32")]
 async fn magic_link_request(mut request: Request, env: Env) -> worker::Result<Response> {
     let url = request.url()?;
     let config = server_config(&env, &url);
@@ -4296,6 +4849,18 @@ fn favicon() -> worker::Result<Response> {
 }
 
 #[cfg(target_arch = "wasm32")]
+fn profile_panel_script() -> worker::Result<Response> {
+    let response = Response::ok(ZEROTH_PROFILE_PANEL_JS)?;
+    response
+        .headers()
+        .set("Content-Type", "text/javascript; charset=utf-8")?;
+    response
+        .headers()
+        .set("Cache-Control", "public, max-age=3600")?;
+    Ok(response)
+}
+
+#[cfg(target_arch = "wasm32")]
 fn empty_cached_asset() -> worker::Result<Response> {
     let response = Response::empty()?.with_status(204);
     response
@@ -4408,6 +4973,26 @@ fn compatibility_route_path(path: &str) -> Cow<'_, str> {
         | "/api/password/login"
         | "/api/local-auth/password/login"
         | "/local-auth/password/login" => Cow::Borrowed("/password/login"),
+        "/api/wallet/challenge"
+        | "/api/wallet/nonce"
+        | "/auth/wallet/challenge"
+        | "/auth/wallet/nonce"
+        | "/api/auth/wallet/challenge"
+        | "/api/auth/wallet/nonce"
+        | "/api/local-auth/wallet/challenge"
+        | "/api/local-auth/wallet/nonce"
+        | "/local-auth/wallet/challenge"
+        | "/local-auth/wallet/nonce" => Cow::Borrowed("/wallet/challenge"),
+        "/api/wallet/verify"
+        | "/api/wallet/login"
+        | "/auth/wallet/verify"
+        | "/auth/wallet/login"
+        | "/api/auth/wallet/verify"
+        | "/api/auth/wallet/login"
+        | "/api/local-auth/wallet/verify"
+        | "/api/local-auth/wallet/login"
+        | "/local-auth/wallet/verify"
+        | "/local-auth/wallet/login" => Cow::Borrowed("/wallet/verify"),
         "/magic-link"
         | "/magic_link"
         | "/magic-links/request"
@@ -4602,6 +5187,7 @@ fn known_route_path(path: &str) -> bool {
             | "/robots.txt"
             | "/login"
             | "/account"
+            | "/profile-panel.js"
             | "/admin"
             | "/authorize"
             | "/__zeroth/db/status"
@@ -4628,6 +5214,10 @@ fn known_route_path(path: &str) -> bool {
             | "/passkeys/authentication/finish"
             | "/password/register"
             | "/password/login"
+            | "/wallet/challenge"
+            | "/wallet/nonce"
+            | "/wallet/verify"
+            | "/wallet/login"
             | "/magic-links"
             | "/magic-links/consume"
             | "/validate"
@@ -4650,20 +5240,30 @@ async fn hosted_login(request: Request, env: Env) -> worker::Result<Response> {
     };
 
     let db = env.d1(D1_BINDING)?;
-    let client = match get_client(&db, &authorization_request.client_id.0).await? {
-        Some(client) => client,
-        None => {
-            return auth_error_json(
-                &AuthorizationRequestError::unauthorized_client("client is not registered"),
-                400,
-            )
-        }
-    };
-    if let Err(error) = validate_authorization_request_for_client(&authorization_request, &client) {
+    let registered_client =
+        match get_registered_client(&db, &authorization_request.client_id.0).await? {
+            Some(client) => client,
+            None => {
+                return auth_error_json(
+                    &AuthorizationRequestError::unauthorized_client("client is not registered"),
+                    400,
+                )
+            }
+        };
+    let client = &registered_client.client;
+    if let Err(error) = validate_authorization_request_for_client(&authorization_request, client) {
         return auth_error_json(&error, 400);
     }
 
-    hosted_authorization_document(&request, &env, &url, &db, &authorization_request, &client).await
+    hosted_authorization_document(
+        &request,
+        &env,
+        &url,
+        &db,
+        &authorization_request,
+        &registered_client,
+    )
+    .await
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -4680,7 +5280,7 @@ async fn hosted_session_login(request: Request, env: Env) -> worker::Result<Resp
 
     let config = server_config(&env, &url);
     let db = env.d1(D1_BINDING)?;
-    let client = match get_client(&db, &client_id).await? {
+    let registered_client = match get_registered_client(&db, &client_id).await? {
         Some(client) => client,
         None => {
             return auth_error_json(
@@ -4689,7 +5289,8 @@ async fn hosted_session_login(request: Request, env: Env) -> worker::Result<Resp
             )
         }
     };
-    let return_to = match session_login_return_to_from_url(&url, &client, &config.public_base_url) {
+    let client = &registered_client.client;
+    let return_to = match session_login_return_to_from_url(&url, client, &config.public_base_url) {
         Ok(return_to) => return_to,
         Err(error) => {
             return auth_error_json(&AuthorizationRequestError::invalid_request(error), 400)
@@ -4697,7 +5298,15 @@ async fn hosted_session_login(request: Request, env: Env) -> worker::Result<Resp
     };
 
     let Some(provider_id) = provider_id else {
-        return hosted_session_login_document(&request, &env, &url, &db, &client, return_to).await;
+        return hosted_session_login_document(
+            &request,
+            &env,
+            &url,
+            &db,
+            &registered_client,
+            return_to,
+        )
+        .await;
     };
     if !provider_configured_for_login(&env, &provider_id) {
         return auth_error_json(
@@ -4715,7 +5324,7 @@ async fn hosted_session_login(request: Request, env: Env) -> worker::Result<Resp
     let now = unix_timestamp_seconds();
     cleanup_expired_auth_transactions(&db, now).await?;
     let transaction = auth_transaction_from_session_login_request(
-        &client,
+        client,
         &provider_id,
         provider_state,
         provider_nonce,
@@ -4872,20 +5481,22 @@ async fn authorize(request: Request, env: Env) -> worker::Result<Response> {
     };
 
     let db = env.d1(D1_BINDING)?;
-    let client = match get_client(&db, &authorization_request.client_id.0).await? {
-        Some(client) => client,
-        None => {
-            return auth_error_json(
-                &AuthorizationRequestError::unauthorized_client("client is not registered"),
-                400,
-            )
-        }
-    };
+    let registered_client =
+        match get_registered_client(&db, &authorization_request.client_id.0).await? {
+            Some(client) => client,
+            None => {
+                return auth_error_json(
+                    &AuthorizationRequestError::unauthorized_client("client is not registered"),
+                    400,
+                )
+            }
+        };
+    let client = &registered_client.client;
 
-    if let Err(error) = validate_authorization_request_for_client(&authorization_request, &client) {
+    if let Err(error) = validate_authorization_request_for_client(&authorization_request, client) {
         if let Some(redirect_url) = authorization_request_error_redirect_url_for_client(
             &authorization_request,
-            &client,
+            client,
             &config.issuer().issuer,
             &error,
         )
@@ -4964,7 +5575,7 @@ async fn authorize(request: Request, env: Env) -> worker::Result<Response> {
             &url,
             &db,
             &authorization_request,
-            &client,
+            &registered_client,
         )
         .await;
     };
@@ -5022,9 +5633,10 @@ async fn hosted_session_login_document(
     env: &Env,
     url: &url::Url,
     db: &worker::d1::D1Database,
-    client: &Client,
+    registered_client: &RegisteredClient,
     return_to: String,
 ) -> worker::Result<Response> {
+    let client = &registered_client.client;
     let config = server_config(env, url);
     let current =
         current_session_from_request(request, db, &config, unix_timestamp_seconds()).await?;
@@ -5047,6 +5659,7 @@ async fn hosted_session_login_document(
     ui_config.code_challenge_method = None;
     ui_config.link_identities = false;
     ui_config.provider_authorize_path = "/login".to_owned();
+    apply_client_login_method_visibility(&mut ui_config, &registered_client.visible_login_methods);
     let target_url = ui_config.return_to.clone();
 
     let mut state = themed_login_state(
@@ -5073,8 +5686,9 @@ async fn hosted_authorization_document(
     url: &url::Url,
     db: &worker::d1::D1Database,
     authorization_request: &AuthorizationRequest,
-    client: &Client,
+    registered_client: &RegisteredClient,
 ) -> worker::Result<Response> {
+    let client = &registered_client.client;
     let config = server_config(env, url);
     let now = unix_timestamp_seconds();
     let current = current_session_from_request(request, db, &config, now).await?;
@@ -5090,6 +5704,7 @@ async fn hosted_authorization_document(
     let mut ui_config = ui_config_from_authorization_request(&config, authorization_request);
     ui_config.return_to = query_param(url, "return_to");
     ui_config.link_identities = false;
+    apply_client_login_method_visibility(&mut ui_config, &registered_client.visible_login_methods);
     let target_url = ui_config
         .return_to
         .clone()
@@ -5132,6 +5747,12 @@ fn ui_config_from_authorization_request(
         .as_ref()
         .map(|method| method.as_str().to_owned());
     ui_config
+}
+
+fn apply_client_login_method_visibility(ui_config: &mut ZerothUiConfig, methods: &[String]) {
+    ui_config.show_passkey_login = token_list_slice_contains(methods, LOGIN_METHOD_PASSKEY, false);
+    ui_config.show_magic_link_login =
+        token_list_slice_contains(methods, LOGIN_METHOD_MAGIC_LINK, false);
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -5617,6 +6238,15 @@ fn local_auth_status_rows_from_config(
             delivery_status: None,
         },
         LocalAuthStatus {
+            id: "wallet_evm",
+            label: "EVM wallet",
+            enabled: true,
+            credential_storage: "zeroth_account_identities",
+            delivery: "browser_wallet",
+            notes: vec!["eoa_signatures_only", "requires_injected_eip1193_wallet"],
+            delivery_status: None,
+        },
+        LocalAuthStatus {
             id: "magic_link",
             label: "Magic link",
             enabled: magic_link_delivery_config.enabled,
@@ -5917,6 +6547,7 @@ fn client_admin_ui_from_row(row: ClientRow) -> Result<ClientAdminUi, String> {
         account_sharing_mode: response.account_sharing_mode,
         account_tenant_id: response.account_tenant_id,
         account_namespace: response.account_namespace,
+        visible_login_methods: response.visible_login_methods,
         disabled: response.disabled,
         has_secret: response.has_secret,
     })
@@ -6241,7 +6872,7 @@ async fn get_registered_client(
         .prepare(
             "SELECT id, name, secret_hash, redirect_uris_json, allowed_origins_json,
                     allowed_email_domains_json, account_sharing_mode, account_tenant_id,
-                    confidential, disabled_at
+                    visible_login_methods_json, confidential, disabled_at
              FROM zeroth_clients
              WHERE id = ?
              LIMIT 1",
@@ -6265,7 +6896,7 @@ async fn get_client_row_for_admin(
     db.prepare(
         "SELECT id, name, secret_hash, redirect_uris_json, allowed_origins_json,
                 allowed_email_domains_json, account_sharing_mode, account_tenant_id,
-                confidential, disabled_at
+                visible_login_methods_json, confidential, disabled_at
          FROM zeroth_clients
          WHERE id = ?
          LIMIT 1",
@@ -6281,7 +6912,7 @@ async fn list_client_rows_for_admin(db: &worker::d1::D1Database) -> worker::Resu
     db.prepare(
         "SELECT id, name, secret_hash, redirect_uris_json, allowed_origins_json,
                 allowed_email_domains_json, account_sharing_mode, account_tenant_id,
-                confidential, disabled_at
+                visible_login_methods_json, confidential, disabled_at
          FROM zeroth_clients
          ORDER BY id
          LIMIT ?",
@@ -6310,6 +6941,12 @@ async fn upsert_client(
                 "could not serialize allowed email domains: {error}"
             ))
         })?;
+    let visible_login_methods_json =
+        serde_json::to_string(&client.visible_login_methods).map_err(|error| {
+            worker::Error::RustError(format!(
+                "could not serialize visible login methods: {error}"
+            ))
+        })?;
     let secret_hash = d1_optional_text(client.secret_hash.as_deref());
     let disabled_at = if client.disabled {
         worker::d1::D1Type::Integer(now)
@@ -6327,6 +6964,7 @@ async fn upsert_client(
         worker::d1::D1Type::Text(&allowed_email_domains_json),
         worker::d1::D1Type::Text(account_sharing_mode_label(client.account_sharing_mode)),
         worker::d1::D1Type::Text(&client.account_tenant_id),
+        worker::d1::D1Type::Text(&visible_login_methods_json),
         worker::d1::D1Type::Integer(now),
         worker::d1::D1Type::Integer(now),
         disabled_at,
@@ -6336,8 +6974,8 @@ async fn upsert_client(
         "INSERT INTO zeroth_clients (
              id, name, secret_hash, confidential, redirect_uris_json,
              allowed_origins_json, allowed_email_domains_json, account_sharing_mode,
-             account_tenant_id, created_at, updated_at, disabled_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             account_tenant_id, visible_login_methods_json, created_at, updated_at, disabled_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
              name = excluded.name,
              secret_hash = CASE
@@ -6351,6 +6989,7 @@ async fn upsert_client(
              allowed_email_domains_json = excluded.allowed_email_domains_json,
              account_sharing_mode = excluded.account_sharing_mode,
              account_tenant_id = excluded.account_tenant_id,
+             visible_login_methods_json = excluded.visible_login_methods_json,
              updated_at = excluded.updated_at,
              disabled_at = excluded.disabled_at",
     )
@@ -6928,6 +7567,113 @@ async fn upsert_local_auth_identity(
     })
     .to_string();
     upsert_identity_from_profile(db, user_id, &profile, Some(&raw_profile_json), now).await
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn put_wallet_challenge(
+    db: &worker::d1::D1Database,
+    challenge_hash: &str,
+    address: &str,
+    chain_id: &str,
+    client_id: &str,
+    return_to: &str,
+    account_namespace: &str,
+    message: &str,
+    now: i32,
+    user_agent: Option<&str>,
+    ip_hash: Option<&str>,
+) -> worker::Result<()> {
+    let user_agent = d1_optional_text(user_agent);
+    let ip_hash = d1_optional_text(ip_hash);
+    let args = [
+        worker::d1::D1Type::Text(challenge_hash),
+        worker::d1::D1Type::Text(EVM_WALLET_PROVIDER_ID),
+        worker::d1::D1Type::Text(address),
+        worker::d1::D1Type::Text(chain_id),
+        worker::d1::D1Type::Text(client_id),
+        worker::d1::D1Type::Text(return_to),
+        worker::d1::D1Type::Text(account_namespace),
+        worker::d1::D1Type::Text(message),
+        worker::d1::D1Type::Integer(now),
+        worker::d1::D1Type::Integer(now + EVM_WALLET_CHALLENGE_TTL_SECONDS),
+        ip_hash,
+        user_agent,
+    ];
+    db.prepare(
+        "INSERT INTO zeroth_wallet_challenges (
+             challenge_hash, provider_id, address, chain_id, client_id, return_to,
+             account_namespace, message, created_at, expires_at, ip_hash, user_agent
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind_refs(&args)?
+    .run()
+    .await?;
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn get_wallet_challenge(
+    db: &worker::d1::D1Database,
+    challenge_hash: &str,
+) -> worker::Result<Option<WalletChallengeRow>> {
+    let args = [worker::d1::D1Type::Text(challenge_hash)];
+    db.prepare(
+        "SELECT challenge_hash, provider_id, address, chain_id, client_id, return_to,
+                account_namespace, message, created_at, expires_at, consumed_at,
+                ip_hash, user_agent
+         FROM zeroth_wallet_challenges
+         WHERE challenge_hash = ?
+         LIMIT 1",
+    )
+    .bind_refs(&args)?
+    .first::<WalletChallengeRow>(None)
+    .await
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn consume_wallet_challenge(
+    db: &worker::d1::D1Database,
+    challenge_hash: &str,
+    now: i32,
+) -> worker::Result<bool> {
+    let args = [
+        worker::d1::D1Type::Integer(now),
+        worker::d1::D1Type::Text(challenge_hash),
+    ];
+    let result = db
+        .prepare(
+            "UPDATE zeroth_wallet_challenges
+             SET consumed_at = ?
+             WHERE challenge_hash = ? AND consumed_at IS NULL",
+        )
+        .bind_refs(&args)?
+        .run()
+        .await?;
+    d1_result_changed_one(result)
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn cleanup_expired_wallet_challenges(
+    db: &worker::d1::D1Database,
+    now: i32,
+) -> worker::Result<()> {
+    let args = [
+        worker::d1::D1Type::Integer(now),
+        worker::d1::D1Type::Integer(EVM_WALLET_CHALLENGE_CLEANUP_LIMIT),
+    ];
+    db.prepare(
+        "DELETE FROM zeroth_wallet_challenges
+         WHERE challenge_hash IN (
+             SELECT challenge_hash FROM zeroth_wallet_challenges
+             WHERE expires_at <= ?
+             ORDER BY expires_at
+             LIMIT ?
+         )",
+    )
+    .bind_refs(&args)?
+    .run()
+    .await?;
+    Ok(())
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -8771,6 +9517,71 @@ async fn current_session_from_request(
     }
 
     Ok(Some(CurrentSession { session, user }))
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn current_account_from_request(
+    request: &Request,
+    env: &Env,
+    db: &worker::d1::D1Database,
+    config: &ZerothServerConfig,
+    origin: Option<&str>,
+    now: i32,
+) -> worker::Result<Result<CurrentAccount, AccountAuthError>> {
+    let authorization = request_header(request, "Authorization")?;
+    let bearer_token = match bearer_token_from_authorization_header(authorization.as_deref()) {
+        Ok(token) => token,
+        Err(error) => return Ok(Err(AccountAuthError::invalid_token(error))),
+    };
+
+    if let Some(bearer_token) = bearer_token {
+        let material = signing_material_from_env(env)?;
+        let claims = match verify_zeroth_access_token(&bearer_token, config, &material.jwks, now) {
+            Ok(claims) => claims,
+            Err(error) => return Ok(Err(AccountAuthError::invalid_token(error))),
+        };
+        let user = match get_user(db, &claims.sub).await? {
+            Some(user) => user,
+            None => return Ok(Err(AccountAuthError::invalid_token("user was not found"))),
+        };
+        if user.disabled_at.is_some() {
+            return Ok(Err(AccountAuthError::invalid_token("user is disabled")));
+        }
+        if let Err(error) = validate_access_token_session(db, &claims, now).await? {
+            return Ok(Err(AccountAuthError::invalid_token(error)));
+        }
+        let allowed_origins = match active_client_allowed_origins(db, &claims.aud).await? {
+            Ok(allowed_origins) => allowed_origins,
+            Err(error) => return Ok(Err(AccountAuthError::invalid_token(error))),
+        };
+        if let Err(error) = validate_cors_origin(origin, &allowed_origins) {
+            return Ok(Err(AccountAuthError::invalid_request(error, 403)));
+        }
+        return Ok(Ok(CurrentAccount {
+            user,
+            client_id: Some(claims.aud),
+            session_id: claims.sid,
+            scope: claims.scope,
+            access_token: true,
+        }));
+    }
+
+    let Some(current) = current_session_from_request(request, db, config, now).await? else {
+        return Ok(Err(AccountAuthError::login_required(
+            "active browser session or bearer token was not found",
+        )));
+    };
+    if let Err(error) = validate_session_cors_origin(db, origin, &current.session).await? {
+        return Ok(Err(AccountAuthError::invalid_request(error, 403)));
+    }
+
+    Ok(Ok(CurrentAccount {
+        client_id: current.session.client_id.clone(),
+        session_id: Some(current.session.id.clone()),
+        user: current.user,
+        scope: None,
+        access_token: false,
+    }))
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -10683,6 +11494,7 @@ fn validate_client_upsert_request(
     let redirect_uris = validate_redirect_uris(&request.redirect_uris)?;
     let allowed_origins = validate_allowed_origins(&request.allowed_origins)?;
     let allowed_email_domains = validate_allowed_email_domains(&request.allowed_email_domains)?;
+    let visible_login_methods = validate_visible_login_methods(&request.visible_login_methods)?;
     let account_sharing_mode =
         validate_account_sharing_mode(request.account_sharing_mode.as_deref())?;
     let account_tenant_id = validate_account_tenant_id(
@@ -10704,6 +11516,7 @@ fn validate_client_upsert_request(
         allowed_email_domains,
         account_sharing_mode,
         account_tenant_id,
+        visible_login_methods,
         confidential: request.confidential,
         secret_hash,
         disabled: request.disabled,
@@ -10912,6 +11725,36 @@ fn validate_allowed_email_domains(raw: &[String]) -> Result<Vec<String>, ClientM
         push_unique(&mut domains, normalize_allowed_email_domain(raw_domain)?);
     }
     Ok(domains)
+}
+
+fn validate_visible_login_methods(raw: &[String]) -> Result<Vec<String>, ClientManagementError> {
+    if raw.len() > 8 {
+        return Err(ClientManagementError::invalid_request(
+            "client can register at most 8 visible login methods",
+        ));
+    }
+
+    let mut methods = Vec::with_capacity(raw.len());
+    for raw_method in raw {
+        let method = normalize_visible_login_method(raw_method)?;
+        push_unique(&mut methods, method);
+    }
+    Ok(methods)
+}
+
+fn normalize_visible_login_method(raw: &str) -> Result<String, ClientManagementError> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        LOGIN_METHOD_PASSKEY => Ok(LOGIN_METHOD_PASSKEY.to_owned()),
+        LOGIN_METHOD_MAGIC_LINK | "magic-link" | "magiclink" => {
+            Ok(LOGIN_METHOD_MAGIC_LINK.to_owned())
+        }
+        value if value.is_empty() => Err(ClientManagementError::invalid_request(
+            "visible login method must not be empty",
+        )),
+        value => Err(ClientManagementError::invalid_request(format!(
+            "unsupported visible login method: {value}"
+        ))),
+    }
 }
 
 fn validate_account_sharing_mode(
@@ -11366,6 +12209,7 @@ fn normalize_admin_token_hash(value: &str) -> Result<String, String> {
 
 fn client_response_from_row(row: ClientRow) -> Result<ClientResponse, String> {
     let account_scope = client_account_scope_from_row(&row)?;
+    let visible_login_methods = client_visible_login_methods_from_row(&row)?;
     Ok(ClientResponse {
         id: row.id,
         name: row.name,
@@ -11381,6 +12225,7 @@ fn client_response_from_row(row: ClientRow) -> Result<ClientResponse, String> {
         account_sharing_mode: account_sharing_mode_label(account_scope.sharing_mode).to_owned(),
         account_tenant_id: account_scope.tenant_id,
         account_namespace: account_scope.namespace,
+        visible_login_methods,
         confidential: row.confidential != 0,
         disabled: row.disabled_at.is_some(),
         has_secret: row
@@ -11573,6 +12418,27 @@ async fn passkey_json_from_request<T: serde::de::DeserializeOwned>(
 }
 
 #[cfg(target_arch = "wasm32")]
+async fn wallet_json_from_request<T: serde::de::DeserializeOwned>(
+    request: &mut Request,
+) -> Result<T, String> {
+    let content_type = request
+        .headers()
+        .get("Content-Type")
+        .map_err(|error| format!("could not read Content-Type header: {error}"))?;
+    if !content_type_is_json(content_type.as_deref()) {
+        return Err("Content-Type must be application/json".to_owned());
+    }
+    let body = request
+        .bytes()
+        .await
+        .map_err(|error| format!("could not read wallet body: {error}"))?;
+    if body.len() > EVM_WALLET_BODY_LIMIT {
+        return Err("wallet JSON body is too large".to_owned());
+    }
+    serde_json::from_slice::<T>(&body).map_err(|error| format!("invalid wallet JSON: {error}"))
+}
+
+#[cfg(target_arch = "wasm32")]
 async fn local_auth_body_from_request<T: serde::de::DeserializeOwned>(
     request: &mut Request,
 ) -> Result<T, String> {
@@ -11601,6 +12467,165 @@ async fn local_auth_body_from_request<T: serde::de::DeserializeOwned>(
 
 fn validate_local_auth_email(value: &str) -> Result<String, String> {
     validate_passkey_email(value)
+}
+
+fn validate_evm_wallet_address(value: &str) -> Result<String, String> {
+    let address = value.trim();
+    let Some(hex) = address
+        .strip_prefix("0x")
+        .or_else(|| address.strip_prefix("0X"))
+    else {
+        return Err("wallet address must start with 0x".to_owned());
+    };
+    if hex.len() != 40 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("wallet address must be a 20 byte EVM address".to_owned());
+    }
+    Ok(format!("0x{}", hex.to_ascii_lowercase()))
+}
+
+fn normalize_evm_chain_id(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("wallet chain_id must not be empty".to_owned());
+    }
+    let parsed = if let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        if hex.is_empty() || hex.len() > 16 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err("wallet chain_id is not valid".to_owned());
+        }
+        u64::from_str_radix(hex, 16).map_err(|_| "wallet chain_id is not valid".to_owned())?
+    } else {
+        if value.len() > 20 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err("wallet chain_id is not valid".to_owned());
+        }
+        value
+            .parse::<u64>()
+            .map_err(|_| "wallet chain_id is not valid".to_owned())?
+    };
+    if parsed == 0 {
+        return Err("wallet chain_id must be positive".to_owned());
+    }
+    Ok(parsed.to_string())
+}
+
+fn wallet_nonce_valid(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn validate_wallet_challenge(row: &WalletChallengeRow, now: i32) -> Result<(), String> {
+    if row.consumed_at.is_some() {
+        return Err("wallet challenge was already used".to_owned());
+    }
+    if row.expires_at <= now {
+        return Err("wallet challenge expired".to_owned());
+    }
+    Ok(())
+}
+
+fn evm_wallet_signin_message(
+    domain: &str,
+    uri: &str,
+    product_name: &str,
+    address: &str,
+    chain_id: &str,
+    nonce: &str,
+    issued_at: i32,
+) -> String {
+    let product_name = product_name.trim();
+    let product_line = if product_name.is_empty() {
+        "Zeroth".to_owned()
+    } else {
+        product_name.to_owned()
+    };
+    format!(
+        "{domain} wants you to sign in with your Ethereum account:\n\
+         {address}\n\n\
+         Sign in to {product_line}.\n\n\
+         URI: {uri}\n\
+         Version: 1\n\
+         Chain ID: {chain_id}\n\
+         Nonce: {nonce}\n\
+         Issued At: {issued_at}"
+    )
+}
+
+fn evm_wallet_profile(address: &str) -> ProviderProfile {
+    ProviderProfile {
+        provider_id: ProviderId(EVM_WALLET_PROVIDER_ID.to_owned()),
+        subject: Subject(address.to_owned()),
+        email: None,
+        email_verified: false,
+        display_name: Some(short_evm_wallet_address(address)),
+        picture_url: None,
+    }
+}
+
+fn short_evm_wallet_address(address: &str) -> String {
+    if address.len() == 42 {
+        format!("{}...{}", &address[..6], &address[38..])
+    } else {
+        address.to_owned()
+    }
+}
+
+fn recover_evm_wallet_address(message: &str, signature: &str) -> Result<String, String> {
+    if message.as_bytes().len() > EVM_WALLET_MESSAGE_MAX_BYTES {
+        return Err("wallet message is too large".to_owned());
+    }
+    let signature = evm_signature_from_hex(signature)?;
+    let recovery_id = evm_recovery_id(signature[64])?;
+    let ecdsa_signature = EvmSignature::try_from(&signature[..64])
+        .map_err(|_| "wallet signature is not valid".to_owned())?;
+    let digest = eip191_personal_message_hash(message);
+    let key = EvmVerifyingKey::recover_from_prehash(&digest, &ecdsa_signature, recovery_id)
+        .map_err(|_| "wallet signature did not recover".to_owned())?;
+    Ok(evm_address_from_verifying_key(&key))
+}
+
+fn evm_signature_from_hex(value: &str) -> Result<[u8; EVM_WALLET_SIGNATURE_HEX_BYTES], String> {
+    let trimmed = value.trim();
+    let hex = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .unwrap_or(trimmed);
+    if hex.len() != EVM_WALLET_SIGNATURE_HEX_BYTES * 2
+        || !hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err("wallet signature must be a 65 byte hex value".to_owned());
+    }
+    let bytes = hex_to_bytes_with_context(hex, "wallet signature")?;
+    let mut signature = [0u8; EVM_WALLET_SIGNATURE_HEX_BYTES];
+    signature.copy_from_slice(&bytes);
+    Ok(signature)
+}
+
+fn evm_recovery_id(value: u8) -> Result<EvmRecoveryId, String> {
+    let normalized = match value {
+        0 | 1 => value,
+        27 | 28 => value - 27,
+        _ => return Err("wallet signature recovery id is not supported".to_owned()),
+    };
+    EvmRecoveryId::try_from(normalized).map_err(|_| "wallet recovery id is not valid".to_owned())
+}
+
+fn eip191_personal_message_hash(message: &str) -> [u8; 32] {
+    let prefix = format!("\x19Ethereum Signed Message:\n{}", message.as_bytes().len());
+    let digest = Keccak256::new()
+        .chain_update(prefix.as_bytes())
+        .chain_update(message.as_bytes())
+        .finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
+}
+
+fn evm_address_from_verifying_key(key: &EvmVerifyingKey) -> String {
+    let point = key.to_encoded_point(false);
+    let bytes = point.as_bytes();
+    let digest = Keccak256::digest(&bytes[1..]);
+    format!("0x{}", bytes_to_hex(&digest[12..]))
 }
 
 fn validate_local_auth_password(value: &str) -> Result<(), String> {
@@ -11919,6 +12944,61 @@ async fn issue_local_auth_session_response(
         &session_cookie(
             &config.cookie_name,
             &issue.session_id,
+            SESSION_TTL_SECONDS,
+            config.cookie_domain.as_deref(),
+        ),
+    )
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn issue_wallet_session_response(
+    request: &Request,
+    db: &worker::d1::D1Database,
+    config: &ZerothServerConfig,
+    client_id: &str,
+    user: &UserRow,
+    return_to: &str,
+    address: &str,
+    chain_id: &str,
+    now: i32,
+) -> worker::Result<Response> {
+    let session_id = format!("sess_{}", random_token()?);
+    let audit_context = audit_request_context(request).unwrap_or_default();
+    put_session(
+        db,
+        &session_id,
+        &user.id,
+        client_id,
+        now,
+        audit_context.user_agent.as_deref(),
+        audit_context.ip_hash.as_deref(),
+    )
+    .await?;
+    record_audit_event(
+        db,
+        request,
+        "session.login",
+        Some(&user.id),
+        Some(client_id),
+        Some(EVM_WALLET_PROVIDER_ID),
+        serde_json::json!({
+            "mode": "wallet_evm",
+            "addressHash": hash_secret(address),
+            "chainId": chain_id
+        }),
+        now,
+    )
+    .await;
+    let response = json(&LocalAuthResponse {
+        ok: true,
+        return_to: return_to.to_owned(),
+        user: userinfo_response(user, Some("email profile")),
+    })?;
+    with_set_cookie(
+        response,
+        &session_cookie(
+            &config.cookie_name,
+            &session_id,
             SESSION_TTL_SECONDS,
             config.cookie_domain.as_deref(),
         ),
@@ -13071,6 +14151,10 @@ fn cors_path(path: &str) -> bool {
             | "/passkeys/login/finish"
             | "/password/register"
             | "/password/login"
+            | "/wallet/challenge"
+            | "/wallet/nonce"
+            | "/wallet/verify"
+            | "/wallet/login"
             | "/magic-links"
             | "/magic-link"
             | "/magic_link"
@@ -13107,6 +14191,9 @@ fn cors_method_allowed(path: &str, method: &str) -> bool {
         | "/passkeys/login/finish" => method == "POST",
         "/password/register" => method == "POST",
         "/password/login" => method == "POST",
+        "/wallet/challenge" | "/wallet/nonce" | "/wallet/verify" | "/wallet/login" => {
+            method == "POST"
+        }
         "/magic-links"
         | "/magic-link"
         | "/magic_link"
@@ -13548,10 +14635,17 @@ fn decode_base64(value: &str, field_name: &str) -> Result<Vec<u8>, String> {
 }
 
 fn hex_to_bytes(value: &str) -> Result<Vec<u8>, String> {
+    hex_to_bytes_with_context(value, "ES256 private key")
+}
+
+fn hex_to_bytes_with_context(value: &str, field_name: &str) -> Result<Vec<u8>, String> {
+    if value.len() % 2 != 0 {
+        return Err(format!("invalid hex {field_name}: odd length"));
+    }
     let mut bytes = Vec::with_capacity(value.len() / 2);
     for index in (0..value.len()).step_by(2) {
         let byte = u8::from_str_radix(&value[index..index + 2], 16)
-            .map_err(|error| format!("invalid hex ES256 private key: {error}"))?;
+            .map_err(|error| format!("invalid hex {field_name}: {error}"))?;
         bytes.push(byte);
     }
     Ok(bytes)
@@ -13619,10 +14713,12 @@ fn discovery_response(config: &ZerothServerConfig) -> DiscoveryResponse {
 fn registered_client_from_row(row: ClientRow) -> Result<Option<RegisteredClient>, String> {
     let secret_hash = row.secret_hash.clone();
     let account_scope = client_account_scope_from_row(&row)?;
+    let visible_login_methods = client_visible_login_methods_from_row(&row)?;
     Ok(client_from_row(row)?.map(|client| RegisteredClient {
         client,
         secret_hash,
         account_scope,
+        visible_login_methods,
     }))
 }
 
@@ -13650,6 +14746,35 @@ fn client_from_row(row: ClientRow) -> Result<Option<Client>, String> {
 fn parse_string_array_json(value: &str, field_name: &str) -> Result<Vec<String>, String> {
     serde_json::from_str(value)
         .map_err(|error| format!("client {field_name} must be a JSON string array: {error}"))
+}
+
+fn client_visible_login_methods_from_row(row: &ClientRow) -> Result<Vec<String>, String> {
+    let value = row
+        .visible_login_methods_json
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("[]");
+    parse_string_array_json(value, "visible_login_methods_json")
+        .and_then(|methods| validate_stored_visible_login_methods(&methods))
+}
+
+fn validate_stored_visible_login_methods(methods: &[String]) -> Result<Vec<String>, String> {
+    let mut visible = Vec::with_capacity(methods.len());
+    for method in methods {
+        match method.trim() {
+            LOGIN_METHOD_PASSKEY => push_unique(&mut visible, LOGIN_METHOD_PASSKEY.to_owned()),
+            LOGIN_METHOD_MAGIC_LINK => {
+                push_unique(&mut visible, LOGIN_METHOD_MAGIC_LINK.to_owned())
+            }
+            value => {
+                return Err(format!(
+                    "client visible_login_methods_json includes unsupported method: {value}"
+                ))
+            }
+        }
+    }
+    Ok(visible)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -16342,6 +17467,7 @@ mod tests {
             allowed_email_domains_json: "[]".to_owned(),
             account_sharing_mode: None,
             account_tenant_id: None,
+            visible_login_methods_json: None,
             confidential: 0,
             disabled_at: None,
         })
@@ -16364,6 +17490,7 @@ mod tests {
             allowed_email_domains_json: "[]".to_owned(),
             account_sharing_mode: None,
             account_tenant_id: None,
+            visible_login_methods_json: None,
             confidential: 1,
             disabled_at: Some(1_780_000_000),
         })
@@ -16415,8 +17542,62 @@ mod tests {
         assert_eq!(upsert.allowed_email_domains, Vec::<String>::new());
         assert_eq!(upsert.account_sharing_mode, AccountSharingMode::Global);
         assert_eq!(upsert.account_tenant_id, ACCOUNT_NAMESPACE_GLOBAL);
+        assert!(upsert.visible_login_methods.is_empty());
         assert!(!upsert.confidential);
         assert_eq!(upsert.secret_hash, None);
+    }
+
+    #[test]
+    fn client_upsert_accepts_visible_login_methods() {
+        let upsert = client_upsert_from_value(serde_json::json!({
+            "id": "bitneedle",
+            "name": "Bitneedle",
+            "redirectUris": ["https://bitneedle.example.com/callback"],
+            "visibleLoginMethods": ["passkey", "magic-link", "magic_link"],
+            "confidential": false
+        }))
+        .unwrap();
+
+        assert_eq!(
+            upsert.visible_login_methods,
+            vec![
+                LOGIN_METHOD_PASSKEY.to_owned(),
+                LOGIN_METHOD_MAGIC_LINK.to_owned()
+            ]
+        );
+
+        let error = client_upsert_from_value(serde_json::json!({
+            "id": "web",
+            "name": "Web",
+            "redirectUris": ["https://app.example.com/callback"],
+            "visibleLoginMethods": ["sms"],
+            "confidential": false
+        }))
+        .unwrap_err();
+        assert_eq!(error.description, "unsupported visible login method: sms");
+    }
+
+    #[test]
+    fn client_login_method_visibility_controls_ui_flags() {
+        let mut config = ZerothUiConfig::new(
+            "https://id.example.com",
+            "web",
+            "https://app.example.com/callback",
+        );
+
+        apply_client_login_method_visibility(&mut config, &[]);
+        assert!(!config.show_passkey_login);
+        assert!(!config.show_magic_link_login);
+
+        apply_client_login_method_visibility(
+            &mut config,
+            &[
+                LOGIN_METHOD_PASSKEY.to_owned(),
+                LOGIN_METHOD_MAGIC_LINK.to_owned(),
+            ],
+        );
+        assert!(config.show_passkey_login);
+        assert!(config.show_magic_link_login);
     }
 
     #[test]
@@ -16657,6 +17838,7 @@ mod tests {
             allowed_email_domains_json: r#"["example.com"]"#.to_owned(),
             account_sharing_mode: Some(ACCOUNT_SHARING_MODE_GLOBAL.to_owned()),
             account_tenant_id: Some(ACCOUNT_NAMESPACE_GLOBAL.to_owned()),
+            visible_login_methods_json: Some(r#"["passkey","magic_link"]"#.to_owned()),
             confidential: 1,
             disabled_at: Some(1_780_000_000),
         })
@@ -16676,6 +17858,13 @@ mod tests {
         assert!(response.has_secret);
         assert_eq!(response.account_sharing_mode, ACCOUNT_SHARING_MODE_GLOBAL);
         assert_eq!(response.account_namespace, ACCOUNT_NAMESPACE_GLOBAL);
+        assert_eq!(
+            response.visible_login_methods,
+            vec![
+                LOGIN_METHOD_PASSKEY.to_owned(),
+                LOGIN_METHOD_MAGIC_LINK.to_owned()
+            ]
+        );
     }
 
     #[test]
@@ -16813,6 +18002,7 @@ mod tests {
             allowed_email_domains_json: r#"["example.com"]"#.to_owned(),
             account_sharing_mode: None,
             account_tenant_id: None,
+            visible_login_methods_json: Some(r#"["passkey"]"#.to_owned()),
             confidential: 1,
             disabled_at: Some(1_780_000_000),
         })
@@ -16822,6 +18012,7 @@ mod tests {
         assert!(client.confidential);
         assert!(client.disabled);
         assert!(client.has_secret);
+        assert_eq!(client.visible_login_methods, vec!["passkey".to_owned()]);
     }
 
     #[test]
@@ -18946,6 +20137,7 @@ mod tests {
             compatibility_route_path("/status").as_ref()
         ));
         assert!(known_route_path(compatibility_route_path("/ui").as_ref()));
+        assert!(known_route_path("/profile-panel.js"));
         assert!(known_route_path(
             compatibility_route_path("/callback/apple").as_ref()
         ));
@@ -18960,6 +20152,19 @@ mod tests {
         ));
         assert!(known_route_path("/.well-known/assetlinks.json"));
         assert!(!known_route_path("/admin/users/export"));
+    }
+
+    #[test]
+    fn profile_panel_script_exposes_profile_panel_api() {
+        assert!(ZEROTH_PROFILE_PANEL_JS.contains("ZerothProfilePanel"));
+        assert!(ZEROTH_PROFILE_PANEL_JS.contains("zeroth-profile-panel"));
+        assert!(ZEROTH_PROFILE_PANEL_JS.contains("/profile"));
+        assert!(ZEROTH_PROFILE_PANEL_JS.contains("/identities"));
+        assert!(ZEROTH_PROFILE_PANEL_JS.contains("/sessions"));
+        let blocked_term = ["wid", "get"].concat();
+        assert!(!ZEROTH_PROFILE_PANEL_JS
+            .to_ascii_lowercase()
+            .contains(&blocked_term));
     }
 
     #[test]
@@ -19162,6 +20367,121 @@ mod tests {
         assert_eq!(
             validate_passkey_email("person+product@example.com").unwrap(),
             "person+product@example.com"
+        );
+    }
+
+    #[test]
+    fn evm_wallet_validation_accepts_common_address_and_chain_values() {
+        assert_eq!(
+            validate_evm_wallet_address("0xAbCDEFabcdefABCDEFabcdefABCDEFabcdefABCD").unwrap(),
+            "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+        );
+        assert_eq!(normalize_evm_chain_id("0x1").unwrap(), "1");
+        assert_eq!(normalize_evm_chain_id("0x2105").unwrap(), "8453");
+        assert_eq!(normalize_evm_chain_id("84532").unwrap(), "84532");
+        assert_eq!(
+            validate_evm_wallet_address("abcdef").unwrap_err(),
+            "wallet address must start with 0x"
+        );
+        assert_eq!(
+            normalize_evm_chain_id("0").unwrap_err(),
+            "wallet chain_id must be positive"
+        );
+    }
+
+    #[test]
+    fn evm_wallet_request_bodies_accept_snake_case_chain_id() {
+        let challenge: WalletChallengeRequest = serde_json::from_value(serde_json::json!({
+            "address": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+            "chain_id": "0x2105",
+            "client_id": "browser",
+            "return_to": "https://app.example.com/callback"
+        }))
+        .unwrap();
+
+        assert_eq!(challenge.chain_id, "0x2105");
+        assert_eq!(challenge.client_id.as_deref(), Some("browser"));
+        assert_eq!(
+            challenge.return_to.as_deref(),
+            Some("https://app.example.com/callback")
+        );
+
+        let verify: WalletVerifyRequest = serde_json::from_value(serde_json::json!({
+            "address": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+            "chain_id": "8453",
+            "nonce": "a".repeat(64),
+            "message": "message",
+            "signature": format!("0x{}", "1".repeat(130))
+        }))
+        .unwrap();
+
+        assert_eq!(verify.chain_id, "8453");
+    }
+
+    #[test]
+    fn evm_wallet_challenge_validation_rejects_consumed_or_expired_rows() {
+        let mut row = WalletChallengeRow {
+            challenge_hash: "hash".to_owned(),
+            provider_id: EVM_WALLET_PROVIDER_ID.to_owned(),
+            address: "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd".to_owned(),
+            chain_id: "8453".to_owned(),
+            client_id: "browser".to_owned(),
+            return_to: "https://app.example.com/callback".to_owned(),
+            account_namespace: "global".to_owned(),
+            message: "message".to_owned(),
+            created_at: 1_780_000_000,
+            expires_at: 1_780_000_300,
+            consumed_at: None,
+            ip_hash: None,
+            user_agent: None,
+        };
+
+        validate_wallet_challenge(&row, 1_780_000_100).unwrap();
+        row.consumed_at = Some(1_780_000_050);
+        assert_eq!(
+            validate_wallet_challenge(&row, 1_780_000_100).unwrap_err(),
+            "wallet challenge was already used"
+        );
+        row.consumed_at = None;
+        assert_eq!(
+            validate_wallet_challenge(&row, 1_780_000_300).unwrap_err(),
+            "wallet challenge expired"
+        );
+    }
+
+    #[test]
+    fn evm_wallet_signature_recovers_signed_address() {
+        use k256::ecdsa::SigningKey as K256SigningKey;
+
+        let signing_key = K256SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let address = evm_address_from_verifying_key(signing_key.verifying_key());
+        let nonce = "a".repeat(64);
+        let message = evm_wallet_signin_message(
+            "id.example.com",
+            "https://id.example.com",
+            "Zeroth",
+            &address,
+            "8453",
+            &nonce,
+            1_780_000_000,
+        );
+        let prefix = format!("\x19Ethereum Signed Message:\n{}", message.as_bytes().len());
+        let digest = Keccak256::new()
+            .chain_update(prefix.as_bytes())
+            .chain_update(message.as_bytes());
+        let (signature, recovery_id) = signing_key.sign_digest_recoverable(digest).unwrap();
+        let mut signature_bytes = [0u8; EVM_WALLET_SIGNATURE_HEX_BYTES];
+        signature_bytes[..64].copy_from_slice(signature.to_bytes().as_slice());
+        signature_bytes[64] = recovery_id.to_byte() + 27;
+        let signature_hex = format!("0x{}", bytes_to_hex(&signature_bytes));
+
+        assert_eq!(
+            recover_evm_wallet_address(&message, &signature_hex).unwrap(),
+            address
+        );
+        assert_eq!(
+            recover_evm_wallet_address(&message, &signature_hex[..130]).unwrap_err(),
+            "wallet signature must be a 65 byte hex value"
         );
     }
 
@@ -19960,6 +21280,7 @@ mod tests {
                 AccountSharingMode::Global,
                 ACCOUNT_NAMESPACE_GLOBAL.to_owned(),
             ),
+            visible_login_methods: Vec::new(),
         }
     }
 
@@ -19979,6 +21300,7 @@ mod tests {
                 AccountSharingMode::Global,
                 ACCOUNT_NAMESPACE_GLOBAL.to_owned(),
             ),
+            visible_login_methods: Vec::new(),
         }
     }
 
