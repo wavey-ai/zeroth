@@ -91,6 +91,38 @@ pub const ROUTES: &[Route] = &[
     },
     Route {
         method: "GET",
+        path: "/apple-touch-icon.png",
+    },
+    Route {
+        method: "GET",
+        path: "/apple-touch-icon-precomposed.png",
+    },
+    Route {
+        method: "GET",
+        path: "/apple-touch-icon-{size}.png",
+    },
+    Route {
+        method: "GET",
+        path: "/apple-touch-icon-{size}-precomposed.png",
+    },
+    Route {
+        method: "GET",
+        path: "/site.webmanifest",
+    },
+    Route {
+        method: "GET",
+        path: "/manifest.json",
+    },
+    Route {
+        method: "GET",
+        path: "/browserconfig.xml",
+    },
+    Route {
+        method: "GET",
+        path: "/robots.txt",
+    },
+    Route {
+        method: "GET",
         path: "/authorize",
     },
     Route {
@@ -369,7 +401,18 @@ mod tests {
 
     #[test]
     fn routes_include_favicon_assets() {
-        for path in ["/favicon.ico", "/favicon.svg"] {
+        for path in [
+            "/favicon.ico",
+            "/favicon.svg",
+            "/apple-touch-icon.png",
+            "/apple-touch-icon-precomposed.png",
+            "/apple-touch-icon-{size}.png",
+            "/apple-touch-icon-{size}-precomposed.png",
+            "/site.webmanifest",
+            "/manifest.json",
+            "/browserconfig.xml",
+            "/robots.txt",
+        ] {
             assert!(ROUTES
                 .iter()
                 .any(|route| route.method == "GET" && route.path == path));

@@ -1646,6 +1646,10 @@ async fn handle_request(request: Request, env: Env) -> worker::Result<Response> 
         (Method::Get, "/.well-known/jwks.json") => jwks(env),
         (Method::Get, "/.well-known/apple-app-site-association") => apple_app_site_association(env),
         (Method::Get, "/favicon.ico" | "/favicon.svg") => favicon(),
+        (Method::Get, path) if apple_touch_icon_path(path) => empty_cached_asset(),
+        (Method::Get, "/site.webmanifest" | "/manifest.json") => web_manifest(&env),
+        (Method::Get, "/browserconfig.xml") => browserconfig_xml(),
+        (Method::Get, "/robots.txt") => robots_txt(),
         (Method::Get, "/login") => hosted_login(request, env).await,
         (Method::Get, "/account") => hosted_account(request, env).await,
         (Method::Get, "/admin") => hosted_clients_admin(request, env).await,
@@ -4089,6 +4093,97 @@ fn favicon() -> worker::Result<Response> {
         .headers()
         .set("Cache-Control", "public, max-age=86400")?;
     Ok(response)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn empty_cached_asset() -> worker::Result<Response> {
+    let response = Response::empty()?.with_status(204);
+    response
+        .headers()
+        .set("Cache-Control", "public, max-age=86400")?;
+    Ok(response)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn web_manifest(env: &Env) -> worker::Result<Response> {
+    let name = env
+        .var("PRODUCT_NAME")
+        .map(|value| value.to_string())
+        .unwrap_or_else(|_| "Zeroth".to_owned());
+    let payload = serde_json::json!({
+        "name": name,
+        "short_name": "Zeroth",
+        "start_url": "/admin",
+        "display": "standalone",
+        "background_color": "#f8fafc",
+        "theme_color": "#111827",
+        "icons": [
+            {
+                "src": "/favicon.svg",
+                "sizes": "any",
+                "type": "image/svg+xml"
+            }
+        ]
+    });
+    let response = Response::ok(payload.to_string())?;
+    response
+        .headers()
+        .set("Content-Type", "application/manifest+json; charset=utf-8")?;
+    response
+        .headers()
+        .set("Cache-Control", "public, max-age=3600")?;
+    Ok(response)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn browserconfig_xml() -> worker::Result<Response> {
+    let response = Response::ok(
+        r#"<?xml version="1.0" encoding="utf-8"?><browserconfig><msapplication><tile><TileColor>#111827</TileColor></tile></msapplication></browserconfig>"#,
+    )?;
+    response
+        .headers()
+        .set("Content-Type", "application/xml; charset=utf-8")?;
+    response
+        .headers()
+        .set("Cache-Control", "public, max-age=86400")?;
+    Ok(response)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn robots_txt() -> worker::Result<Response> {
+    let response = Response::ok("User-agent: *\nDisallow:\n")?;
+    response
+        .headers()
+        .set("Content-Type", "text/plain; charset=utf-8")?;
+    response
+        .headers()
+        .set("Cache-Control", "public, max-age=3600")?;
+    Ok(response)
+}
+
+fn apple_touch_icon_path(path: &str) -> bool {
+    if matches!(
+        path,
+        "/apple-touch-icon.png" | "/apple-touch-icon-precomposed.png"
+    ) {
+        return true;
+    }
+
+    let Some(sized) = path.strip_prefix("/apple-touch-icon-") else {
+        return false;
+    };
+    let Some(stem) = sized.strip_suffix(".png") else {
+        return false;
+    };
+    let dimensions = stem.strip_suffix("-precomposed").unwrap_or(stem);
+    let Some((width, height)) = dimensions.split_once('x') else {
+        return false;
+    };
+
+    !width.is_empty()
+        && !height.is_empty()
+        && width.bytes().all(|byte| byte.is_ascii_digit())
+        && height.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -13503,6 +13598,28 @@ mod tests {
         assert!(!provider_status_enabled(true, true, true));
         assert!(!provider_status_enabled(true, false, false));
         assert!(!provider_status_enabled(false, true, false));
+    }
+
+    #[test]
+    fn apple_touch_icon_path_matches_common_browser_probes() {
+        for path in [
+            "/apple-touch-icon.png",
+            "/apple-touch-icon-precomposed.png",
+            "/apple-touch-icon-120x120.png",
+            "/apple-touch-icon-180x180-precomposed.png",
+        ] {
+            assert!(apple_touch_icon_path(path), "{path}");
+        }
+
+        for path in [
+            "/apple-touch-icon.svg",
+            "/apple-touch-icon-180.png",
+            "/apple-touch-icon-180x.png",
+            "/apple-touch-icon-bigx180.png",
+            "/assets/apple-touch-icon-180x180.png",
+        ] {
+            assert!(!apple_touch_icon_path(path), "{path}");
+        }
     }
 
     #[test]
