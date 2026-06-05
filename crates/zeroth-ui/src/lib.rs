@@ -24,7 +24,8 @@ pub const ZEROTH_UI_CSS: &str = r#"
   --z-blue-soft: #ddf4ff;
   --z-green: #1a7f37;
   --z-green-soft: #dafbe1;
-  --z-orange: #bc4c00;
+  --z-orange: #ff6a00;
+  --z-orange-strong: #ff5300;
   --z-orange-soft: #fff1e5;
   --z-red: #cf222e;
   --z-ink: #1f2328;
@@ -80,9 +81,10 @@ a:hover {
   width: 28px;
   height: 28px;
   border-radius: 6px;
-  background: var(--z-ink);
+  background: linear-gradient(145deg, #ff7c12 0%, var(--z-orange) 52%, var(--z-orange-strong) 100%);
   color: #ffffff;
   font-weight: 800;
+  box-shadow: 0 8px 18px rgba(255, 106, 0, 0.2);
 }
 
 .zeroth-hidden {
@@ -111,8 +113,8 @@ a:hover {
   width: 34px;
   height: 34px;
   border-radius: 8px;
-  background: linear-gradient(145deg, #1f2328 0%, #0550ae 100%);
-  box-shadow: 0 8px 24px rgba(9, 105, 218, 0.22);
+  background: linear-gradient(145deg, #ff7c12 0%, var(--z-orange) 52%, var(--z-orange-strong) 100%);
+  box-shadow: 0 8px 24px rgba(255, 106, 0, 0.26);
 }
 
 .zeroth-login-mode .zeroth-nav,
@@ -142,12 +144,12 @@ a:hover {
   height: 88px;
   border-radius: 20px;
   background:
-    linear-gradient(145deg, #1f2328 0%, #0550ae 55%, #1a7f37 100%);
+    linear-gradient(145deg, #ff7c12 0%, var(--z-orange) 50%, var(--z-orange-strong) 100%);
   color: #ffffff;
   font-size: 50px;
   line-height: 1;
   font-weight: 900;
-  box-shadow: 0 20px 50px rgba(9, 105, 218, 0.2);
+  box-shadow: 0 20px 50px rgba(255, 106, 0, 0.24);
 }
 
 .zeroth-kicker {
@@ -3691,6 +3693,14 @@ mod tests {
         assert!(document.contains("function zerothSubmitAction(form, submitter)"));
         assert!(document.contains("submitter.hasAttribute(\"formaction\")"));
         assert!(document.contains("zerothSubmitAction(form, submitter)"));
+    }
+
+    #[test]
+    fn default_css_uses_lastcommit_orange_brand_mark() {
+        assert!(ZEROTH_UI_CSS.contains("--z-orange: #ff6a00"));
+        assert!(ZEROTH_UI_CSS.contains("#ff7c12 0%, var(--z-orange)"));
+        assert!(ZEROTH_UI_CSS.contains("rgba(255, 106, 0"));
+        assert!(!ZEROTH_UI_CSS.contains("#0550ae 55%, #1a7f37"));
     }
 
     #[test]

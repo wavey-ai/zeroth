@@ -124,7 +124,7 @@ const DEFAULT_NATIVE_TOKEN_SCOPE: &str = "openid profile email";
 const CORS_ALLOW_METHODS: &str = "GET, POST, PATCH, DELETE, OPTIONS";
 const CORS_ALLOW_HEADERS: &str = "Authorization, Content-Type";
 const CORS_MAX_AGE_SECONDS: &str = "600";
-const ZEROTH_FAVICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="12" fill="#111827"/><path d="M17 16h30L25 48h25" fill="none" stroke="#f9fafb" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/></svg>"##;
+const ZEROTH_FAVICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="12" fill="#111827"/><path d="M17 16h30L25 48h25" fill="none" stroke="#ff6a00" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/></svg>"##;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -4256,7 +4256,7 @@ fn web_manifest(env: &Env) -> worker::Result<Response> {
         "start_url": "/admin",
         "display": "standalone",
         "background_color": "#f8fafc",
-        "theme_color": "#111827",
+        "theme_color": "#ff6a00",
         "icons": [
             {
                 "src": "/favicon.svg",
@@ -4278,7 +4278,7 @@ fn web_manifest(env: &Env) -> worker::Result<Response> {
 #[cfg(target_arch = "wasm32")]
 fn browserconfig_xml() -> worker::Result<Response> {
     let response = Response::ok(
-        r#"<?xml version="1.0" encoding="utf-8"?><browserconfig><msapplication><tile><TileColor>#111827</TileColor></tile></msapplication></browserconfig>"#,
+        r#"<?xml version="1.0" encoding="utf-8"?><browserconfig><msapplication><tile><TileColor>#ff6a00</TileColor></tile></msapplication></browserconfig>"#,
     )?;
     response
         .headers()
@@ -15354,6 +15354,12 @@ mod tests {
         ] {
             assert!(!quiet_browser_asset_path(path), "{path}");
         }
+    }
+
+    #[test]
+    fn favicon_uses_lastcommit_orange_mark() {
+        assert!(ZEROTH_FAVICON_SVG.contains(r##"stroke="#ff6a00""##));
+        assert!(!ZEROTH_FAVICON_SVG.contains(r##"stroke="#f9fafb""##));
     }
 
     #[test]
