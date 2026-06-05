@@ -137,6 +137,244 @@ const CORS_ALLOW_METHODS: &str = "GET, POST, PATCH, DELETE, OPTIONS";
 const CORS_ALLOW_HEADERS: &str = "Authorization, Content-Type";
 const CORS_MAX_AGE_SECONDS: &str = "600";
 const ZEROTH_FAVICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><defs><linearGradient id="g" x1="0" x2="1" y1="0" y2="1"><stop stop-color="#2d333b"/><stop offset="0.58" stop-color="#1f2328"/><stop offset="1" stop-color="#0b0f19"/></linearGradient></defs><rect width="64" height="64" rx="12" fill="url(#g)"/><path d="M17 16h30L25 48h25" fill="none" stroke="#f9fafb" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/></svg>"##;
+const ZEROTH_PROFILE_MENU_JS: &str = r###"
+(() => {
+  const scriptOrigin = document.currentScript && document.currentScript.src
+    ? new URL(document.currentScript.src, window.location.href).origin
+    : "";
+  const defaultIssuer = () => scriptOrigin || window.location.origin;
+  const text = (value) => value == null || value === "" ? "-" : String(value);
+  const esc = (value) => text(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll("\"", "&quot;");
+  const first = (object, names) => {
+    for (const name of names) {
+      if (object && object[name] != null && object[name] !== "") return object[name];
+    }
+    return "";
+  };
+  const attr = (host, name) => host && host.getAttribute ? host.getAttribute(name) || "" : "";
+  const boolAttr = (host, name, fallback = false) => {
+    const value = attr(host, name);
+    if (!value) return fallback;
+    return !["0", "false", "no", "off"].includes(value.toLowerCase());
+  };
+  const trimSlash = (value) => String(value || "").replace(/\/+$/, "");
+  const endpoint = (issuer, value, fallback) => new URL(value || fallback, trimSlash(issuer) + "/").toString();
+  const initial = (user) => {
+    const label = text(first(user, ["name", "email", "sub"]) || "Z").trim();
+    return esc((label && label[0] ? label[0] : "Z").toUpperCase());
+  };
+
+  const style = `
+    :host, .zeroth-profile-menu { color: #24292f; font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    .zeroth-profile-menu { position: relative; display: inline-block; text-align: left; }
+    .zeroth-profile-menu * { box-sizing: border-box; }
+    .zeroth-menu-button, .zeroth-menu-link, .zeroth-menu-item { min-height: 34px; border: 1px solid #d0d7de; border-radius: 8px; background: #fff; color: #24292f; font: inherit; font-weight: 700; text-decoration: none; cursor: pointer; }
+    .zeroth-menu-link { display: inline-flex; align-items: center; justify-content: center; padding: 7px 12px; white-space: nowrap; }
+    .zeroth-menu-button { display: inline-flex; align-items: center; gap: 8px; max-width: 260px; padding: 4px 9px 4px 5px; }
+    .zeroth-menu-button:hover, .zeroth-menu-link:hover, .zeroth-menu-item:hover { background: #f6f8fa; text-decoration: none; }
+    .zeroth-avatar { display: grid; place-items: center; width: 26px; height: 26px; border-radius: 6px; background: linear-gradient(145deg, #2d333b 0%, #1f2328 55%, #0b0f19 100%); color: #fff; font-weight: 800; overflow: hidden; flex: 0 0 auto; }
+    .zeroth-avatar img { width: 100%; height: 100%; object-fit: cover; }
+    .zeroth-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .zeroth-caret { color: #57606a; font-size: 11px; }
+    .zeroth-popover { position: absolute; right: 0; top: calc(100% + 8px); width: min(320px, calc(100vw - 24px)); border: 1px solid #d0d7de; border-radius: 8px; background: #fff; box-shadow: 0 16px 40px rgba(31, 35, 40, 0.16); overflow: hidden; z-index: 2147483647; }
+    .zeroth-popover[hidden] { display: none; }
+    .zeroth-menu-head { display: flex; align-items: center; gap: 10px; padding: 12px; border-bottom: 1px solid #d8dee4; }
+    .zeroth-menu-name { font-weight: 800; overflow-wrap: anywhere; }
+    .zeroth-menu-email { color: #57606a; font-size: 12px; overflow-wrap: anywhere; }
+    .zeroth-menu-list { display: grid; padding: 6px; gap: 4px; }
+    .zeroth-menu-item { display: flex; width: 100%; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 10px; border-color: transparent; font-weight: 700; }
+    .zeroth-menu-item-danger { color: #cf222e; }
+    .zeroth-status { color: #57606a; font-size: 12px; padding: 8px 10px; }
+  `;
+
+  async function tokenFor(options, host) {
+    if (typeof options.getAccessToken === "function") return await options.getAccessToken();
+    if (options.accessToken) return options.accessToken;
+    if (host && typeof host.getAccessToken === "function") return await host.getAccessToken();
+    return attr(host, "access-token") || attr(host, "data-access-token");
+  }
+
+  async function apiJson(url, init = {}) {
+    const response = await fetch(url, init);
+    let body = {};
+    try { body = await response.json(); } catch (_) {}
+    if (!response.ok) {
+      throw new Error(body.errorDescription || body.error_description || body.error || `HTTP ${response.status}`);
+    }
+    return body;
+  }
+
+  async function loadIdentity(state, options, host) {
+    const token = await tokenFor(options, host);
+    if (token) {
+      const headers = new Headers({ Accept: "application/json", Authorization: `Bearer ${token}` });
+      const profile = await apiJson(endpoint(state.issuer, state.profilePath, "/profile"), {
+        headers,
+        credentials: "omit",
+      });
+      return { authenticated: true, user: profile, token };
+    }
+    const session = await apiJson(endpoint(state.issuer, state.sessionPath, "/session"), {
+      headers: { Accept: "application/json" },
+      credentials: "include",
+    });
+    return { authenticated: Boolean(session.authenticated), user: session.user || null, token: "" };
+  }
+
+  function avatar(user) {
+    const picture = user && (user.picture || user.pictureUrl);
+    if (picture) return `<img src="${esc(picture)}" alt="">`;
+    return initial(user);
+  }
+
+  function render(root, state) {
+    const loginUrl = state.loginUrl || endpoint(state.issuer, "/login", "/login");
+    const loginTarget = new URL(loginUrl);
+    if (state.returnTo && !loginTarget.searchParams.has("return_to")) loginTarget.searchParams.set("return_to", state.returnTo);
+    if (state.clientId && !loginTarget.searchParams.has("client_id")) loginTarget.searchParams.set("client_id", state.clientId);
+    const accountUrl = state.accountUrl || `${trimSlash(state.issuer)}/account?return_to=${encodeURIComponent(state.returnTo || window.location.href)}`;
+    const adminUrl = state.adminUrl || `${trimSlash(state.issuer)}/admin`;
+
+    if (state.loading) {
+      root.innerHTML = `<style>${style}</style><span class="zeroth-profile-menu"><span class="zeroth-status">Loading account</span></span>`;
+      return;
+    }
+    if (!state.authenticated || !state.user) {
+      root.innerHTML = `<style>${style}</style><span class="zeroth-profile-menu"><a class="zeroth-menu-link" href="${esc(loginTarget.toString())}">Sign in</a></span>`;
+      return;
+    }
+
+    const user = state.user;
+    const name = first(user, ["name", "displayName", "email", "sub"]) || "Account";
+    const email = first(user, ["email", "sub"]);
+    const open = state.open ? "" : " hidden";
+    const adminItem = state.showAdmin ? `<a class="zeroth-menu-item" href="${esc(adminUrl)}"><span>Admin</span><span>Open</span></a>` : "";
+    root.innerHTML = `<style>${style}</style>
+      <div class="zeroth-profile-menu">
+        <button class="zeroth-menu-button" type="button" aria-haspopup="menu" aria-expanded="${state.open ? "true" : "false"}" data-zeroth-menu-toggle>
+          <span class="zeroth-avatar">${avatar(user)}</span>
+          <span class="zeroth-label">${esc(name)}</span>
+          <span class="zeroth-caret">v</span>
+        </button>
+        <div class="zeroth-popover" role="menu"${open}>
+          <div class="zeroth-menu-head"><span class="zeroth-avatar">${avatar(user)}</span><div><div class="zeroth-menu-name">${esc(name)}</div><div class="zeroth-menu-email">${esc(email)}</div></div></div>
+          <div class="zeroth-menu-list">
+            <a class="zeroth-menu-item" href="${esc(accountUrl)}"><span>Account</span><span>Manage</span></a>
+            ${adminItem}
+            <button class="zeroth-menu-item zeroth-menu-item-danger" type="button" data-zeroth-menu-logout><span>Sign out</span><span>End session</span></button>
+          </div>
+        </div>
+      </div>`;
+  }
+
+  function mount(target, options = {}) {
+    const host = typeof target === "string" ? document.querySelector(target) : target;
+    if (!host) throw new Error("Zeroth profile menu target was not found");
+    const root = host.shadowRoot || (host.attachShadow ? host.attachShadow({ mode: "open" }) : host);
+    const state = {
+      issuer: options.issuer || attr(host, "issuer") || attr(host, "data-issuer") || defaultIssuer(),
+      clientId: options.clientId || attr(host, "client-id") || attr(host, "data-client-id"),
+      returnTo: options.returnTo || attr(host, "return-to") || attr(host, "data-return-to") || window.location.href,
+      accountUrl: options.accountUrl || attr(host, "account-url") || attr(host, "data-account-url"),
+      adminUrl: options.adminUrl || attr(host, "admin-url") || attr(host, "data-admin-url"),
+      loginUrl: options.loginUrl || attr(host, "login-url") || attr(host, "data-login-url"),
+      logoutUrl: options.logoutUrl || attr(host, "logout-url") || attr(host, "data-logout-url"),
+      sessionPath: options.sessionPath || attr(host, "session-path") || attr(host, "data-session-path") || "/session",
+      profilePath: options.profilePath || attr(host, "profile-path") || attr(host, "data-profile-path") || "/profile",
+      showAdmin: options.showAdmin ?? boolAttr(host, "data-show-admin", boolAttr(host, "show-admin", true)),
+      loading: true,
+      authenticated: false,
+      user: null,
+      open: false,
+    };
+
+    async function refresh() {
+      state.loading = true;
+      state.open = false;
+      render(root, state);
+      try {
+        Object.assign(state, await loadIdentity(state, options, host), { loading: false });
+      } catch (error) {
+        Object.assign(state, { loading: false, authenticated: false, user: null, error });
+      }
+      render(root, state);
+    }
+
+    async function signOut() {
+      if (typeof options.onLogout === "function") {
+        await options.onLogout({ issuer: state.issuer, user: state.user });
+        return;
+      }
+      const logoutUrl = endpoint(state.issuer, state.logoutUrl, "/logout");
+      await fetch(logoutUrl, {
+        method: "POST",
+        credentials: "include",
+        headers: { Accept: "application/json" },
+      }).catch(() => null);
+      state.authenticated = false;
+      state.user = null;
+      state.open = false;
+      render(root, state);
+      const signedOutUrl = options.signedOutUrl || attr(host, "signed-out-url") || attr(host, "data-signed-out-url");
+      if (signedOutUrl) window.location.assign(signedOutUrl);
+    }
+
+    root.addEventListener("click", (event) => {
+      const target = event.target;
+      if (!(target instanceof Element)) return;
+      if (target.closest("[data-zeroth-menu-toggle]")) {
+        event.preventDefault();
+        state.open = !state.open;
+        render(root, state);
+        return;
+      }
+      if (target.closest("[data-zeroth-menu-logout]")) {
+        event.preventDefault();
+        signOut();
+      }
+    });
+    document.addEventListener("click", (event) => {
+      if (!state.open) return;
+      const path = typeof event.composedPath === "function" ? event.composedPath() : [];
+      if (path.includes(host) || path.includes(root)) return;
+      state.open = false;
+      render(root, state);
+    });
+
+    refresh();
+    return { refresh, signOut, root, state };
+  }
+
+  class ZerothProfileMenuElement extends HTMLElement {
+    connectedCallback() {
+      if (this.__zerothProfileMenu) return;
+      this.__zerothProfileMenu = mount(this, {
+        getAccessToken: () => typeof this.getAccessToken === "function" ? this.getAccessToken() : null,
+      });
+    }
+    refresh() {
+      return this.__zerothProfileMenu && this.__zerothProfileMenu.refresh();
+    }
+    signOut() {
+      return this.__zerothProfileMenu && this.__zerothProfileMenu.signOut();
+    }
+  }
+
+  window.ZerothProfileMenu = { mount };
+  if (window.customElements && !customElements.get("zeroth-profile-menu")) {
+    customElements.define("zeroth-profile-menu", ZerothProfileMenuElement);
+  }
+  document.addEventListener("DOMContentLoaded", () => {
+    document.querySelectorAll("[data-zeroth-profile-menu]").forEach((node) => {
+      if (!node.__zerothProfileMenu) node.__zerothProfileMenu = mount(node, {});
+    });
+  });
+})();
+"###;
 const ZEROTH_PROFILE_PANEL_JS: &str = r###"
 (() => {
   const defaultIssuer = () => {
@@ -2181,6 +2419,7 @@ async fn handle_request(request: Request, env: Env) -> worker::Result<Response> 
         (Method::Get, "/robots.txt") => robots_txt(),
         (Method::Get, "/login") => hosted_login(request, env).await,
         (Method::Get, "/account") => hosted_account(request, env).await,
+        (Method::Get, "/profile-menu.js") => profile_menu_script(),
         (Method::Get, "/profile-panel.js") => profile_panel_script(),
         (Method::Get, "/admin") => hosted_clients_admin(request, env).await,
         (Method::Get, "/admin/clients") => hosted_clients_admin(request, env).await,
@@ -4849,6 +5088,18 @@ fn favicon() -> worker::Result<Response> {
 }
 
 #[cfg(target_arch = "wasm32")]
+fn profile_menu_script() -> worker::Result<Response> {
+    let response = Response::ok(ZEROTH_PROFILE_MENU_JS)?;
+    response
+        .headers()
+        .set("Content-Type", "text/javascript; charset=utf-8")?;
+    response
+        .headers()
+        .set("Cache-Control", "public, max-age=3600")?;
+    Ok(response)
+}
+
+#[cfg(target_arch = "wasm32")]
 fn profile_panel_script() -> worker::Result<Response> {
     let response = Response::ok(ZEROTH_PROFILE_PANEL_JS)?;
     response
@@ -5187,6 +5438,7 @@ fn known_route_path(path: &str) -> bool {
             | "/robots.txt"
             | "/login"
             | "/account"
+            | "/profile-menu.js"
             | "/profile-panel.js"
             | "/admin"
             | "/authorize"
@@ -20137,6 +20389,7 @@ mod tests {
             compatibility_route_path("/status").as_ref()
         ));
         assert!(known_route_path(compatibility_route_path("/ui").as_ref()));
+        assert!(known_route_path("/profile-menu.js"));
         assert!(known_route_path("/profile-panel.js"));
         assert!(known_route_path(
             compatibility_route_path("/callback/apple").as_ref()
@@ -20152,6 +20405,20 @@ mod tests {
         ));
         assert!(known_route_path("/.well-known/assetlinks.json"));
         assert!(!known_route_path("/admin/users/export"));
+    }
+
+    #[test]
+    fn profile_menu_script_exposes_profile_menu_api() {
+        assert!(ZEROTH_PROFILE_MENU_JS.contains("ZerothProfileMenu"));
+        assert!(ZEROTH_PROFILE_MENU_JS.contains("zeroth-profile-menu"));
+        assert!(ZEROTH_PROFILE_MENU_JS.contains("/session"));
+        assert!(ZEROTH_PROFILE_MENU_JS.contains("/profile"));
+        assert!(ZEROTH_PROFILE_MENU_JS.contains("/logout"));
+        assert!(ZEROTH_PROFILE_MENU_JS.contains("[data-zeroth-profile-menu]"));
+        let blocked_term = ["wid", "get"].concat();
+        assert!(!ZEROTH_PROFILE_MENU_JS
+            .to_ascii_lowercase()
+            .contains(&blocked_term));
     }
 
     #[test]

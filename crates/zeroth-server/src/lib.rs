@@ -231,6 +231,10 @@ pub const ROUTES: &[Route] = &[
     },
     Route {
         method: "GET",
+        path: "/profile-menu.js",
+    },
+    Route {
+        method: "GET",
         path: "/profile-panel.js",
     },
     Route {
@@ -1089,10 +1093,12 @@ mod tests {
     }
 
     #[test]
-    fn routes_include_profile_panel_asset() {
-        assert!(ROUTES
-            .iter()
-            .any(|route| route.method == "GET" && route.path == "/profile-panel.js"));
+    fn routes_include_profile_assets() {
+        for path in ["/profile-menu.js", "/profile-panel.js"] {
+            assert!(ROUTES
+                .iter()
+                .any(|route| route.method == "GET" && route.path == path));
+        }
     }
 
     #[test]

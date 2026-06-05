@@ -1216,7 +1216,7 @@ pub fn render_account_document(state: ZerothUiState) -> String {
             "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">",
             "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">",
             "<link rel=\"icon\" href=\"/favicon.svg\" type=\"image/svg+xml\">",
-            "<title>{}</title><style>{}{}</style></head><body>{}<script>{}</script></body></html>"
+            "<title>{}</title><style>{}{}</style></head><body>{}<script src=\"/profile-menu.js\" defer></script><script>{}</script></body></html>"
         ),
         title, ZEROTH_UI_CSS, theme_css, html, ZEROTH_UI_SCRIPT
     )
@@ -1234,7 +1234,7 @@ pub fn render_clients_admin_document(state: ClientsAdminUiState) -> String {
             "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">",
             "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">",
             "<link rel=\"icon\" href=\"/favicon.svg\" type=\"image/svg+xml\">",
-            "<title>{} Clients</title><style>{}</style></head><body>{}<script>{}</script></body></html>"
+            "<title>{} Clients</title><style>{}</style></head><body>{}<script src=\"/profile-menu.js\" defer></script><script>{}</script></body></html>"
         ),
         escape_text(&state.product_name),
         ZEROTH_UI_CSS,
@@ -1287,16 +1287,6 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
     } else {
         "zeroth-status zeroth-status-warn"
     };
-    let auth_status = if signed_in {
-        "Signed in".to_owned()
-    } else {
-        "Signed out".to_owned()
-    };
-    let auth_status_class = if signed_in {
-        "zeroth-status zeroth-status-ok"
-    } else {
-        "zeroth-status"
-    };
     let avatar_initial = avatar_initial(&profile_name);
     let avatar_image_class = if profile_picture.is_empty() {
         "zeroth-avatar-hidden"
@@ -1313,7 +1303,9 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
     } else {
         "zeroth-avatar-hidden"
     };
+    let account_url = endpoint_url(&config, "/account");
     let admin_url = endpoint_url(&config, "/admin");
+    let login_url = endpoint_url(&config, "/login");
     let profile_action = endpoint_url(&config, "/profile");
     let logout_action = endpoint_url(&config, "/logout");
     let csrf_token = config.csrf_token.clone().unwrap_or_default();
@@ -1500,12 +1492,18 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
                         <div class="zeroth-subtitle">{config.issuer_base_url.clone()}</div>
                     </div>
                     <div class=account_actions_class>
-                        <span class=auth_status_class>{auth_status}</span>
-                        <a class="zeroth-action" href=admin_url>"Admin"</a>
-                        <form class="zeroth-inline-form" method="post" action=logout_action.clone() data-zeroth-method="POST">
-                            <input type="hidden" name="_csrf" value=csrf_token.clone() />
-                            <button class="zeroth-action" type="submit">"Sign out"</button>
-                        </form>
+                        <div
+                            data-zeroth-profile-menu="true"
+                            data-issuer=config.issuer_base_url.clone()
+                            data-client-id=config.client_id.clone()
+                            data-return-to=login_return_to.clone()
+                            data-account-url=account_url
+                            data-admin-url=admin_url
+                            data-login-url=login_url.clone()
+                            data-logout-url=logout_action.clone()
+                            data-signed-out-url=login_url
+                            data-show-admin="true"
+                        ></div>
                     </div>
                 </header>
 
@@ -1739,14 +1737,22 @@ pub fn ClientsAdminApp(state: ClientsAdminUiState) -> impl IntoView {
                 <header class="zeroth-topbar">
                     <div>
                         <h1 class="zeroth-title">"Dashboard"</h1>
-                        <div class="zeroth-subtitle" id="zeroth-admin-issuer">{issuer_base_url}</div>
+                        <div class="zeroth-subtitle" id="zeroth-admin-issuer">{issuer_base_url.clone()}</div>
                     </div>
                     <div class="zeroth-status-row">
                         <span class="zeroth-status" id="zeroth-user-count">{user_count_label}</span>
                         <span class="zeroth-status" id="zeroth-event-count">{event_count_label}</span>
                         <span class="zeroth-status" id="zeroth-client-count">{client_count_label}</span>
-                        <a class="zeroth-action" href="/account">"Account"</a>
-                        <button class="zeroth-action" id="zeroth-admin-logout" type="button">"Sign out"</button>
+                        <div
+                            data-zeroth-profile-menu="true"
+                            data-issuer=issuer_base_url.clone()
+                            data-account-url="/account"
+                            data-admin-url="/admin"
+                            data-login-url="/login"
+                            data-logout-url="/logout"
+                            data-signed-out-url="/login"
+                            data-show-admin="false"
+                        ></div>
                     </div>
                 </header>
 
@@ -3131,7 +3137,6 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
   const tokenInput = $("zeroth-admin-token");
   const form = $("zeroth-client-form");
   const passkeyForm = $("zeroth-passkey-register-form");
-  const logoutButton = $("zeroth-admin-logout");
   const eventFilterForm = $("zeroth-events-filter-form");
   const editorMode = $("zeroth-editor-mode");
 
@@ -3936,20 +3941,6 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
     });
   });
 
-  if (logoutButton) {
-    logoutButton.addEventListener("click", () => {
-      sessionStorage.removeItem(tokenKey);
-      if (tokenInput) tokenInput.value = "";
-      fetch("/logout", {
-        method: "POST",
-        credentials: "include",
-        headers: { "Accept": "application/json" }
-      }).finally(() => {
-        window.location.assign("/login");
-      });
-    });
-  }
-
   $("zeroth-db-refresh").addEventListener("click", () => {
     loadDbStatus().catch((error) => setMessage(error.message, true));
   });
@@ -4230,6 +4221,7 @@ mod tests {
         )));
 
         assert!(document.contains("/favicon.svg"));
+        assert!(document.contains("src=\"/profile-menu.js\" defer"));
         assert!(!document.contains("src=\"\""));
         assert!(document.contains("const payload = {};"));
         assert!(document.contains("if (displayName) payload.displayName = displayName;"));
@@ -4357,6 +4349,7 @@ mod tests {
         assert!(html.contains("Applications"));
         assert!(html.contains("Sign-in methods"));
         assert!(html.contains("https://id.example.com/admin"));
+        assert!(html.contains("data-zeroth-profile-menu"));
         assert!(html.contains("Sign out"));
         assert!(html.contains("id=\"security\""));
         assert!(html.contains("zeroth-auth-group zeroth-hidden"));
@@ -4482,8 +4475,9 @@ mod tests {
         assert!(html.contains("Admin access"));
         assert!(html.contains("Bootstrap token"));
         assert!(html.contains("Sign in"));
-        assert!(html.contains("zeroth-admin-logout"));
-        assert!(html.contains("Sign out"));
+        assert!(html.contains("data-zeroth-profile-menu"));
+        assert!(html.contains("data-show-admin=\"false\""));
+        assert!(!html.contains("zeroth-admin-logout"));
         assert!(html.contains(
             "https://id.example.com/login?return_to=https%3A%2F%2Fid.example.com%2Fadmin"
         ));
@@ -4530,6 +4524,7 @@ mod tests {
 
         assert!(document.contains("zeroth.adminToken"));
         assert!(document.contains("/favicon.svg"));
+        assert!(document.contains("src=\"/profile-menu.js\" defer"));
         assert!(document.contains("fetch(path"));
         assert!(document.contains("loadAdmin().catch"));
         assert!(document.contains("/__zeroth/db/status"));
@@ -4543,8 +4538,6 @@ mod tests {
         assert!(document.contains("/events"));
         assert!(document.contains("URLSearchParams"));
         assert!(document.contains("event_type"));
-        assert!(document.contains("fetch(\"/logout\""));
-        assert!(document.contains("window.location.assign(\"/login\")"));
         assert!(document.contains("function bindSectionNav()"));
     }
 
