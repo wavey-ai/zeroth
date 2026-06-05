@@ -82,6 +82,115 @@ a:hover {
   font-weight: 800;
 }
 
+.zeroth-hidden {
+  display: none !important;
+}
+
+.zeroth-login-mode {
+  grid-template-columns: 1fr;
+  background:
+    linear-gradient(180deg, #ffffff 0%, #f6f8fa 54%, #eef7f1 100%);
+}
+
+.zeroth-login-mode .zeroth-sidebar {
+  display: flex;
+  justify-content: center;
+  border-right: 0;
+  border-bottom: 1px solid var(--z-line);
+  background: rgba(255, 255, 255, 0.92);
+}
+
+.zeroth-login-mode .zeroth-brand {
+  margin-bottom: 0;
+}
+
+.zeroth-login-mode .zeroth-mark {
+  width: 34px;
+  height: 34px;
+  border-radius: 8px;
+  background: linear-gradient(145deg, #1f2328 0%, #0550ae 100%);
+  box-shadow: 0 8px 24px rgba(9, 105, 218, 0.22);
+}
+
+.zeroth-login-mode .zeroth-nav,
+.zeroth-login-mode .zeroth-topbar {
+  display: none;
+}
+
+.zeroth-login-mode .zeroth-main {
+  width: min(760px, 100%);
+  margin: 0 auto;
+  padding: 44px 20px 28px;
+}
+
+.zeroth-login-intro {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 18px;
+  margin-bottom: 18px;
+}
+
+.zeroth-hero-mark {
+  display: grid;
+  place-items: center;
+  width: 82px;
+  height: 82px;
+  border-radius: 18px;
+  background: #1f2328;
+  color: #ffffff;
+  font-size: 48px;
+  line-height: 1;
+  font-weight: 900;
+  box-shadow: 0 18px 44px rgba(31, 35, 40, 0.18);
+}
+
+.zeroth-kicker {
+  color: var(--z-green);
+  font-size: 12px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.zeroth-login-title {
+  margin: 1px 0 0;
+  color: var(--z-ink);
+  font-size: 34px;
+  line-height: 1.1;
+  letter-spacing: 0;
+}
+
+.zeroth-login-subtitle {
+  margin-top: 5px;
+  color: var(--z-muted);
+  font-size: 14px;
+}
+
+.zeroth-login-mode .zeroth-grid {
+  grid-template-columns: 1fr;
+}
+
+.zeroth-login-mode .zeroth-panel {
+  border-color: var(--z-line-strong);
+  box-shadow: 0 20px 54px rgba(31, 35, 40, 0.1);
+}
+
+.zeroth-login-mode .zeroth-provider {
+  grid-template-columns: 42px minmax(0, 1fr) auto;
+  padding: 14px 0;
+}
+
+.zeroth-login-mode .zeroth-provider-badge {
+  width: 38px;
+  height: 38px;
+  border-radius: 8px;
+}
+
+.zeroth-login-mode .zeroth-action {
+  min-height: 36px;
+  min-width: 94px;
+}
+
 .zeroth-nav {
   display: grid;
   gap: 4px;
@@ -535,6 +644,22 @@ a:hover {
   .zeroth-filter-grid {
     grid-template-columns: 1fr;
   }
+
+  .zeroth-login-intro {
+    grid-template-columns: 1fr;
+    justify-items: start;
+  }
+
+  .zeroth-hero-mark {
+    width: 68px;
+    height: 68px;
+    border-radius: 14px;
+    font-size: 40px;
+  }
+
+  .zeroth-login-title {
+    font-size: 28px;
+  }
 }
 "#;
 
@@ -918,6 +1043,23 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
     let profile_action = endpoint_url(&config, "/profile");
     let logout_action = endpoint_url(&config, "/logout");
     let csrf_token = config.csrf_token.clone().unwrap_or_default();
+    let login_mode = config.provider_authorize_path == "/login" && !signed_in;
+    let shell_class = if login_mode {
+        "zeroth-shell zeroth-login-mode"
+    } else {
+        "zeroth-shell"
+    };
+    let login_intro_class = if login_mode {
+        "zeroth-login-intro"
+    } else {
+        "zeroth-login-intro zeroth-hidden"
+    };
+    let account_panel_class = if login_mode {
+        "zeroth-panel zeroth-hidden"
+    } else {
+        "zeroth-panel"
+    };
+    let login_panel_title = if login_mode { "Sign in" } else { "Login" };
 
     let provider_rows = providers
         .into_iter()
@@ -934,7 +1076,7 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
     let application_rows = applications.into_iter().map(application_row).collect_view();
 
     view! {
-        <div class="zeroth-shell">
+        <div class=shell_class>
             <aside class="zeroth-sidebar">
                 <div class="zeroth-brand">
                     <span class="zeroth-mark">"Z"</span>
@@ -949,6 +1091,15 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
             </aside>
 
             <main class="zeroth-main">
+                <section class=login_intro_class aria-label="Zeroth sign in">
+                    <span class="zeroth-hero-mark">"Z"</span>
+                    <div>
+                        <div class="zeroth-kicker">"SSO"</div>
+                        <h1 class="zeroth-login-title">{product_name.clone()}</h1>
+                        <div class="zeroth-login-subtitle">{config.issuer_base_url.clone()}</div>
+                    </div>
+                </section>
+
                 <header class="zeroth-topbar">
                     <div>
                         <h1 class="zeroth-title">{product_name}</h1>
@@ -961,7 +1112,7 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
                     <div class="zeroth-stack">
                         <section id="login" class="zeroth-panel">
                             <div class="zeroth-panel-header">
-                                <h2 class="zeroth-panel-title">"Login"</h2>
+                                <h2 class="zeroth-panel-title">{login_panel_title}</h2>
                                 <span class="zeroth-status">{config.client_id.clone()}</span>
                             </div>
                             <div class="zeroth-panel-body">
@@ -969,7 +1120,7 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
                             </div>
                         </section>
 
-                        <section id="sessions" class="zeroth-panel">
+                        <section id="sessions" class=account_panel_class>
                             <div class="zeroth-panel-header">
                                 <h2 class="zeroth-panel-title">"Sessions"</h2>
                                 <span class="zeroth-status">{profile_subject.clone()}</span>
@@ -981,7 +1132,7 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
                     </div>
 
                     <div class="zeroth-stack">
-                        <section id="profile" class="zeroth-panel">
+                        <section id="profile" class=account_panel_class>
                             <div class="zeroth-panel-header">
                                 <h2 class="zeroth-panel-title">"Profile"</h2>
                                 <span class=email_status_class>{email_status}</span>
@@ -1020,7 +1171,7 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
                             </div>
                         </section>
 
-                        <section id="identities" class="zeroth-panel">
+                        <section id="identities" class=account_panel_class>
                             <div class="zeroth-panel-header">
                                 <h2 class="zeroth-panel-title">"Identities"</h2>
                                 <span class="zeroth-status">"Linked providers"</span>
@@ -1030,7 +1181,7 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
                             </div>
                         </section>
 
-                        <section id="applications" class="zeroth-panel">
+                        <section id="applications" class=account_panel_class>
                             <div class="zeroth-panel-header">
                                 <h2 class="zeroth-panel-title">"Applications"</h2>
                                 <span class="zeroth-status">"OIDC"</span>
@@ -2718,6 +2869,27 @@ mod tests {
         assert!(html.contains("Continue"));
         assert!(html.contains("/authorize"));
         assert!(!html.contains("Connected</a>"));
+    }
+
+    #[test]
+    fn hosted_login_html_uses_z_branding() {
+        let mut state = ZerothUiState::new(ZerothUiConfig::new(
+            "https://id.example.com",
+            "browser-client",
+            "https://id.example.com/admin",
+        ));
+        state.config.provider_authorize_path = "/login".to_owned();
+        state.config.return_to = Some("https://id.example.com/admin".to_owned());
+        state.providers = vec![ProviderUi::apple(false)];
+
+        let html = render_account_html(state);
+
+        assert!(html.contains("zeroth-login-mode"));
+        assert!(html.contains("zeroth-hero-mark"));
+        assert!(html.contains(">Z<"));
+        assert!(html.contains("Sign in"));
+        assert!(html.contains("zeroth-panel zeroth-hidden"));
+        assert!(html.contains("provider=apple"));
     }
 
     #[test]

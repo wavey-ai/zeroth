@@ -3744,27 +3744,42 @@ async fn hosted_clients_admin(request: Request, env: Env) -> worker::Result<Resp
         .with_product_name(product_name_from_env(&env));
     state.providers = provider_admin_ui_rows(&env, &config);
     let db = env.d1(D1_BINDING)?;
+    let now = unix_timestamp_seconds();
 
-    if validate_admin_request(&request, &env, &db, &config, unix_timestamp_seconds())
-        .await
-        .is_ok()
-    {
-        let rows = list_client_rows_for_admin(&db).await?;
-        state.clients = rows
-            .into_iter()
-            .map(client_admin_ui_from_row)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(worker_error)?;
-        state.users = list_admin_user_rows(&db, unix_timestamp_seconds())
-            .await?
-            .into_iter()
-            .map(user_admin_ui_from_row)
-            .collect();
-        state.events = list_audit_event_rows(&db, &AuditEventFilter::default())
-            .await?
-            .into_iter()
-            .map(audit_event_admin_ui_from_row)
-            .collect();
+    match authorize_admin_request(&request, &env, &db, &config, now).await {
+        Ok(_) => {
+            let rows = list_client_rows_for_admin(&db).await?;
+            state.clients = rows
+                .into_iter()
+                .map(client_admin_ui_from_row)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(worker_error)?;
+            state.users = list_admin_user_rows(&db, now)
+                .await?
+                .into_iter()
+                .map(user_admin_ui_from_row)
+                .collect();
+            state.events = list_audit_event_rows(&db, &AuditEventFilter::default())
+                .await?
+                .into_iter()
+                .map(audit_event_admin_ui_from_row)
+                .collect();
+        }
+        Err(error) => {
+            if query_param(&url, "bootstrap").as_deref() == Some("1") {
+                return html(render_clients_admin_document(state));
+            }
+
+            let current = current_session_from_request(&request, &db, &config, now).await?;
+            if current.is_none()
+                && error.status == 401
+                && provider_configured_for_login(&env, well_known::APPLE)
+            {
+                return redirect_to_hosted_admin_login(&config, url.path());
+            }
+
+            return client_management_error_json(&error);
+        }
     }
 
     html(render_clients_admin_document(state))
@@ -6936,6 +6951,16 @@ fn redirect_to_session_login_return(transaction: &AuthTransaction) -> worker::Re
 }
 
 #[cfg(target_arch = "wasm32")]
+fn redirect_to_hosted_admin_login(
+    config: &ZerothServerConfig,
+    return_to_path: &str,
+) -> worker::Result<Response> {
+    let login_url = hosted_admin_login_url(&config.issuer().issuer, return_to_path)
+        .map_err(worker::Error::RustError)?;
+    Response::redirect(login_url)
+}
+
+#[cfg(target_arch = "wasm32")]
 fn redirect_to_provider_callback_error(
     transaction: &AuthTransaction,
     issuer: &str,
@@ -7053,6 +7078,19 @@ fn provider_callback_error_return_url(
         }
     }
     Ok(return_url)
+}
+
+fn hosted_admin_login_url(issuer_base_url: &str, return_to_path: &str) -> Result<url::Url, String> {
+    let base = issuer_base_url.trim_end_matches('/');
+    let mut login_url = url::Url::parse(&format!("{base}/login"))
+        .map_err(|error| format!("invalid issuer URL: {error}"))?;
+    let return_to = format!("{base}{return_to_path}");
+    {
+        let mut pairs = login_url.query_pairs_mut();
+        pairs.append_pair("provider", well_known::APPLE);
+        pairs.append_pair("return_to", &return_to);
+    }
+    Ok(login_url)
 }
 
 fn client_return_to_from_url(
@@ -13334,6 +13372,32 @@ mod tests {
         assert!(error_pairs.contains(&("state".to_owned(), "app-state".to_owned())));
         assert!(error_pairs.contains(&("iss".to_owned(), "https://id.example.com".to_owned())));
         assert!(!error_pairs.iter().any(|(key, _)| key == "code"));
+    }
+
+    #[test]
+    fn hosted_admin_login_url_targets_apple_session_login() {
+        let url = hosted_admin_login_url("https://id.example.com", "/admin").unwrap();
+        let query_pairs = url
+            .query_pairs()
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            url.as_str(),
+            "https://id.example.com/login?provider=apple&return_to=https%3A%2F%2Fid.example.com%2Fadmin"
+        );
+        assert!(query_pairs.contains(&("provider".to_owned(), well_known::APPLE.to_owned())));
+        assert!(query_pairs.contains(&(
+            "return_to".to_owned(),
+            "https://id.example.com/admin".to_owned()
+        )));
+
+        let clients_url =
+            hosted_admin_login_url("https://id.example.com/", "/admin/clients").unwrap();
+        assert_eq!(
+            clients_url.as_str(),
+            "https://id.example.com/login?provider=apple&return_to=https%3A%2F%2Fid.example.com%2Fadmin%2Fclients"
+        );
     }
 
     #[test]
