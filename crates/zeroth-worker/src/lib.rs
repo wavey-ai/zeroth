@@ -44,7 +44,7 @@ use zeroth_ui::{
     SessionUi, UserAdminUi,
 };
 #[cfg(target_arch = "wasm32")]
-use zeroth_ui::{LocalAuthAdminUi, ProviderAdminUi};
+use zeroth_ui::{LocalAuthAdminUi, LocalAuthDeliveryAdminUi, ProviderAdminUi};
 
 #[cfg(target_arch = "wasm32")]
 use zeroth_providers::{OAuthProvider, Provider, ProviderAuthorizeRequest};
@@ -4392,12 +4392,14 @@ async fn hosted_clients_admin(request: Request, env: Env) -> worker::Result<Resp
     let mut state = ClientsAdminUiState::new(config.issuer().issuer)
         .with_product_name(product_name_from_env(&env));
     state.providers = provider_admin_ui_rows(&env, &config);
-    state.local_auth = local_auth_admin_ui_rows(&env);
+    state.local_auth = local_auth_admin_ui_rows(&env, None);
     let db = env.d1(D1_BINDING)?;
     let now = unix_timestamp_seconds();
 
     match authorize_admin_request(&request, &env, &db, &config, now).await {
         Ok(_) => {
+            state.local_auth =
+                local_auth_admin_ui_rows(&env, magic_link_delivery_status(&db).await?);
             let rows = list_client_rows_for_admin(&db).await?;
             state.clients = rows
                 .into_iter()
@@ -5175,8 +5177,11 @@ fn provider_admin_ui_rows(env: &Env, config: &ZerothServerConfig) -> Vec<Provide
 }
 
 #[cfg(target_arch = "wasm32")]
-fn local_auth_admin_ui_rows(env: &Env) -> Vec<LocalAuthAdminUi> {
-    local_auth_status_rows(env, None)
+fn local_auth_admin_ui_rows(
+    env: &Env,
+    magic_link_delivery: Option<LocalAuthDeliveryStatus>,
+) -> Vec<LocalAuthAdminUi> {
+    local_auth_status_rows(env, magic_link_delivery)
         .into_iter()
         .map(|status| LocalAuthAdminUi {
             id: status.id.to_owned(),
@@ -5184,9 +5189,20 @@ fn local_auth_admin_ui_rows(env: &Env) -> Vec<LocalAuthAdminUi> {
             enabled: status.enabled,
             credential_storage: status.credential_storage.to_owned(),
             delivery: status.delivery.to_owned(),
+            delivery_status: status.delivery_status.map(local_auth_delivery_admin_ui),
             notes: status.notes.iter().map(|note| (*note).to_owned()).collect(),
         })
         .collect()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn local_auth_delivery_admin_ui(status: LocalAuthDeliveryStatus) -> LocalAuthDeliveryAdminUi {
+    LocalAuthDeliveryAdminUi {
+        last_issue_at: status.last_issue_at.map(|value| value.to_string()),
+        last_sent_at: status.last_sent_at.map(|value| value.to_string()),
+        last_failed_at: status.last_failed_at.map(|value| value.to_string()),
+        last_error: status.last_error,
+    }
 }
 
 fn profile_ui_from_user(user: &UserRow, identities: &[IdentityRow]) -> ProfileUi {

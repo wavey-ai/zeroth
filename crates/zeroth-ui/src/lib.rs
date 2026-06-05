@@ -889,7 +889,17 @@ pub struct LocalAuthAdminUi {
     pub enabled: bool,
     pub credential_storage: String,
     pub delivery: String,
+    pub delivery_status: Option<LocalAuthDeliveryAdminUi>,
     pub notes: Vec<String>,
+}
+
+/// Bounded delivery evidence for a local auth method.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalAuthDeliveryAdminUi {
+    pub last_issue_at: Option<String>,
+    pub last_sent_at: Option<String>,
+    pub last_failed_at: Option<String>,
+    pub last_error: Option<String>,
 }
 
 /// User row shown in the Zeroth management UI.
@@ -1514,6 +1524,7 @@ pub fn ClientsAdminApp(state: ClientsAdminUiState) -> impl IntoView {
                                         <th>"Status"</th>
                                         <th>"Storage"</th>
                                         <th>"Delivery"</th>
+                                        <th>"Evidence"</th>
                                         <th>"Notes"</th>
                                     </tr>
                                 </thead>
@@ -1838,17 +1849,21 @@ fn provider_admin_row(provider: ProviderAdminUi) -> impl IntoView {
 }
 
 fn local_auth_admin_row(method: LocalAuthAdminUi) -> impl IntoView {
-    let status = if method.enabled {
-        "Ready"
-    } else {
+    let degraded = local_auth_delivery_degraded(&method.notes);
+    let status = if !method.enabled {
         "Needs setup"
+    } else if degraded {
+        "Needs attention"
+    } else {
+        "Ready"
     };
-    let status_class = if method.enabled {
+    let status_class = if method.enabled && !degraded {
         "zeroth-status zeroth-status-ok"
     } else {
         "zeroth-status zeroth-status-warn"
     };
     let notes = join_or_dash(method.notes);
+    let evidence = local_auth_delivery_evidence(method.delivery_status.as_ref());
 
     view! {
         <tr>
@@ -1859,9 +1874,39 @@ fn local_auth_admin_row(method: LocalAuthAdminUi) -> impl IntoView {
             <td><span class=status_class>{status}</span></td>
             <td class="zeroth-code">{method.credential_storage}</td>
             <td>{method.delivery}</td>
+            <td class="zeroth-code">{evidence}</td>
             <td>{notes}</td>
         </tr>
     }
+}
+
+fn local_auth_delivery_degraded(notes: &[String]) -> bool {
+    notes.iter().any(|note| {
+        matches!(
+            note.as_str(),
+            "delivery_failed_recently" | "delivery_not_proven"
+        )
+    })
+}
+
+fn local_auth_delivery_evidence(status: Option<&LocalAuthDeliveryAdminUi>) -> String {
+    let Some(status) = status else {
+        return "-".to_owned();
+    };
+    let mut parts = Vec::new();
+    if let Some(value) = status.last_issue_at.as_deref() {
+        parts.push(format!("issued {value}"));
+    }
+    if let Some(value) = status.last_sent_at.as_deref() {
+        parts.push(format!("sent {value}"));
+    }
+    if let Some(value) = status.last_failed_at.as_deref() {
+        parts.push(format!("failed {value}"));
+    }
+    if let Some(value) = status.last_error.as_deref() {
+        parts.push(format!("error {value}"));
+    }
+    join_or_dash(parts)
 }
 
 fn provider_setup_text(
@@ -2749,7 +2794,7 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
   function renderLocalAuthRows(methods) {
     localAuthRows.replaceChildren();
     if (methods.length === 0) {
-      renderEmptyRows(localAuthRows, 5);
+      renderEmptyRows(localAuthRows, 6);
       return;
     }
 
@@ -2761,8 +2806,9 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
 
       const state = document.createElement("td");
       const statePill = document.createElement("span");
-      statePill.className = method.enabled ? "zeroth-status zeroth-status-ok" : "zeroth-status zeroth-status-warn";
-      statePill.textContent = method.enabled ? "Ready" : "Needs setup";
+      const degraded = localAuthDeliveryDegraded(method.notes || []);
+      statePill.className = method.enabled && !degraded ? "zeroth-status zeroth-status-ok" : "zeroth-status zeroth-status-warn";
+      statePill.textContent = !method.enabled ? "Needs setup" : degraded ? "Needs attention" : "Ready";
       state.appendChild(statePill);
 
       const storage = document.createElement("td");
@@ -2772,12 +2818,34 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
       const delivery = document.createElement("td");
       delivery.textContent = method.delivery || "-";
 
+      const evidence = document.createElement("td");
+      evidence.className = "zeroth-code";
+      evidence.textContent = localAuthDeliveryEvidence(method.deliveryStatus || method.delivery_status);
+
       const notes = document.createElement("td");
       notes.textContent = (method.notes || []).join(", ") || "-";
 
-      row.append(name, state, storage, delivery, notes);
+      row.append(name, state, storage, delivery, evidence, notes);
       localAuthRows.appendChild(row);
     }
+  }
+
+  function localAuthDeliveryDegraded(notes) {
+    return notes.includes("delivery_failed_recently") || notes.includes("delivery_not_proven");
+  }
+
+  function localAuthDeliveryEvidence(status) {
+    if (!status || typeof status !== "object") return "-";
+    const parts = [];
+    const issued = status.lastIssueAt || status.last_issue_at;
+    const sent = status.lastSentAt || status.last_sent_at;
+    const failed = status.lastFailedAt || status.last_failed_at;
+    const error = status.lastError || status.last_error;
+    if (issued) parts.push(`issued ${issued}`);
+    if (sent) parts.push(`sent ${sent}`);
+    if (failed) parts.push(`failed ${failed}`);
+    if (error) parts.push(`error ${error}`);
+    return parts.join(", ") || "-";
   }
 
   function providerSetupText(provider) {
@@ -3498,10 +3566,16 @@ mod tests {
         state.local_auth.push(LocalAuthAdminUi {
             id: "magic_link".to_owned(),
             label: "Magic link".to_owned(),
-            enabled: false,
+            enabled: true,
             credential_storage: "zeroth_magic_links".to_owned(),
             delivery: "cloudflare_email".to_owned(),
-            notes: vec!["missing_email_binding".to_owned()],
+            delivery_status: Some(LocalAuthDeliveryAdminUi {
+                last_issue_at: Some("1780000300".to_owned()),
+                last_sent_at: None,
+                last_failed_at: Some("1780000300".to_owned()),
+                last_error: Some("email_internal_server_error".to_owned()),
+            }),
+            notes: vec!["delivery_failed_recently".to_owned()],
         });
         state.users.push(UserAdminUi {
             user_id: "usr_123".to_owned(),
@@ -3538,6 +3612,8 @@ mod tests {
         assert!(html.contains("zeroth-local-auth-rows"));
         assert!(html.contains("Users"));
         assert!(html.contains("Events"));
+        assert!(html.contains("Needs attention"));
+        assert!(html.contains("email_internal_server_error"));
         assert!(html.contains("zeroth-events-filter-form"));
         assert!(html.contains("Event type"));
         assert!(html.contains("Provider ID"));
