@@ -72,6 +72,11 @@ const CLIENT_NAME_MAX_CHARS: usize = 128;
 const CLIENT_URI_MAX_BYTES: usize = 2048;
 const CLIENT_URI_LIST_LIMIT: usize = 32;
 const CLIENT_EMAIL_DOMAIN_MAX_BYTES: usize = 253;
+const CLIENT_ACCOUNT_TENANT_ID_MAX_CHARS: usize = 128;
+const ACCOUNT_SHARING_MODE_GLOBAL: &str = "global";
+const ACCOUNT_SHARING_MODE_TENANT: &str = "tenant";
+const ACCOUNT_SHARING_MODE_CLIENT: &str = "client";
+const ACCOUNT_NAMESPACE_GLOBAL: &str = "global";
 const USER_LIST_LIMIT: i32 = 100;
 const USER_MANAGEMENT_BODY_LIMIT: usize = 1024;
 const USER_ID_MAX_CHARS: usize = 128;
@@ -362,6 +367,10 @@ struct ClientRow {
     #[serde(default)]
     allowed_email_domains_json: String,
     #[serde(default)]
+    account_sharing_mode: Option<String>,
+    #[serde(default)]
+    account_tenant_id: Option<String>,
+    #[serde(default)]
     confidential: i32,
     #[serde(default)]
     disabled_at: Option<i32>,
@@ -381,6 +390,9 @@ struct ClientResponse {
     redirect_uris: Vec<String>,
     allowed_origins: Vec<String>,
     allowed_email_domains: Vec<String>,
+    account_sharing_mode: String,
+    account_tenant_id: String,
+    account_namespace: String,
     confidential: bool,
     disabled: bool,
     has_secret: bool,
@@ -521,6 +533,10 @@ struct ClientUpsertRequest {
     allowed_origins: Vec<String>,
     #[serde(default, alias = "allowed_email_domains")]
     allowed_email_domains: Vec<String>,
+    #[serde(default, alias = "account_sharing_mode")]
+    account_sharing_mode: Option<String>,
+    #[serde(default, alias = "account_tenant_id")]
+    account_tenant_id: Option<String>,
     #[serde(default)]
     confidential: bool,
     #[serde(default, alias = "client_secret")]
@@ -538,6 +554,8 @@ struct ValidatedClientUpsert {
     redirect_uris: Vec<String>,
     allowed_origins: Vec<String>,
     allowed_email_domains: Vec<String>,
+    account_sharing_mode: AccountSharingMode,
+    account_tenant_id: String,
     confidential: bool,
     secret_hash: Option<String>,
     disabled: bool,
@@ -1342,6 +1360,20 @@ enum ClientAuth {
     SecretBasic(String),
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum AccountSharingMode {
+    Global,
+    Tenant,
+    Client,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct ClientAccountScope {
+    sharing_mode: AccountSharingMode,
+    tenant_id: String,
+    namespace: String,
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct ClientBasicAuth {
     client_id: String,
@@ -1352,6 +1384,7 @@ struct ClientBasicAuth {
 struct RegisteredClient {
     client: Client,
     secret_hash: Option<String>,
+    account_scope: ClientAccountScope,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -2011,7 +2044,9 @@ async fn provider_callback(mut request: Request, env: Env) -> worker::Result<Res
         );
     }
 
-    let Some(client) = get_client(&db, &record.transaction.client_id.0).await? else {
+    let Some(registered_client) =
+        get_registered_client(&db, &record.transaction.client_id.0).await?
+    else {
         let error = ProviderCallbackError::invalid_request("client is disabled or not found");
         record_audit_event(
             &db,
@@ -2034,7 +2069,9 @@ async fn provider_callback(mut request: Request, env: Env) -> worker::Result<Res
             &clear_transaction_cookie(&config.transaction_cookie_name),
         );
     };
-    if let Err(error) = validate_client_email_domain_policy(&client, &resolved_profile.profile) {
+    if let Err(error) =
+        validate_client_email_domain_policy(&registered_client.client, &resolved_profile.profile)
+    {
         record_audit_event(
             &db,
             &request,
@@ -2063,6 +2100,7 @@ async fn provider_callback(mut request: Request, env: Env) -> worker::Result<Res
     if record.transaction.session_return_to.is_some() {
         let user_id = upsert_provider_profile(
             &db,
+            &registered_client.account_scope.namespace,
             &resolved_profile.profile,
             resolved_profile.raw_profile_json.as_deref(),
             now,
@@ -2111,6 +2149,7 @@ async fn provider_callback(mut request: Request, env: Env) -> worker::Result<Res
 
     let user_id = upsert_provider_profile(
         &db,
+        &registered_client.account_scope.namespace,
         &resolved_profile.profile,
         resolved_profile.raw_profile_json.as_deref(),
         now,
@@ -2531,7 +2570,7 @@ async fn oauth_token(mut request: Request, env: Env) -> worker::Result<Response>
                 &env,
                 &config,
                 &signing_key,
-                &registered_client.client,
+                &registered_client,
                 &form,
                 now,
             )
@@ -2697,7 +2736,7 @@ async fn native_provider_token(
     env: &Env,
     config: &ZerothServerConfig,
     signing_key: &Es256SigningKey,
-    client: &Client,
+    client: &RegisteredClient,
     form: &TokenExchangeForm,
     now: i32,
 ) -> worker::Result<Response> {
@@ -2719,12 +2758,13 @@ async fn native_provider_token(
         Ok(resolved) => resolved,
         Err((error, status)) => return provider_profile_error_json(&error, status),
     };
-    if let Err(error) = validate_client_email_domain_policy(client, &resolved.profile) {
+    if let Err(error) = validate_client_email_domain_policy(&client.client, &resolved.profile) {
         return provider_callback_error_json(&error, 403);
     }
 
     let user_id = upsert_provider_profile(
         db,
+        &client.account_scope.namespace,
         &resolved.profile,
         resolved.raw_profile_json.as_deref(),
         now,
@@ -5796,6 +5836,9 @@ fn client_admin_ui_from_row(row: ClientRow) -> Result<ClientAdminUi, String> {
         redirect_uris: response.redirect_uris,
         allowed_origins: response.allowed_origins,
         allowed_email_domains: response.allowed_email_domains,
+        account_sharing_mode: response.account_sharing_mode,
+        account_tenant_id: response.account_tenant_id,
+        account_namespace: response.account_namespace,
         disabled: response.disabled,
         has_secret: response.has_secret,
     })
@@ -5993,7 +6036,7 @@ async fn get_registered_client(
     let row = db
         .prepare(
             "SELECT id, name, secret_hash, redirect_uris_json, allowed_origins_json,
-                    allowed_email_domains_json,
+                    allowed_email_domains_json, account_sharing_mode, account_tenant_id,
                     confidential, disabled_at
              FROM zeroth_clients
              WHERE id = ?
@@ -6017,7 +6060,7 @@ async fn get_client_row_for_admin(
     let args = [worker::d1::D1Type::Text(client_id)];
     db.prepare(
         "SELECT id, name, secret_hash, redirect_uris_json, allowed_origins_json,
-                allowed_email_domains_json,
+                allowed_email_domains_json, account_sharing_mode, account_tenant_id,
                 confidential, disabled_at
          FROM zeroth_clients
          WHERE id = ?
@@ -6033,7 +6076,7 @@ async fn list_client_rows_for_admin(db: &worker::d1::D1Database) -> worker::Resu
     let args = [worker::d1::D1Type::Integer(CLIENT_LIST_LIMIT)];
     db.prepare(
         "SELECT id, name, secret_hash, redirect_uris_json, allowed_origins_json,
-                allowed_email_domains_json,
+                allowed_email_domains_json, account_sharing_mode, account_tenant_id,
                 confidential, disabled_at
          FROM zeroth_clients
          ORDER BY id
@@ -6078,6 +6121,8 @@ async fn upsert_client(
         worker::d1::D1Type::Text(&redirect_uris_json),
         worker::d1::D1Type::Text(&allowed_origins_json),
         worker::d1::D1Type::Text(&allowed_email_domains_json),
+        worker::d1::D1Type::Text(account_sharing_mode_label(client.account_sharing_mode)),
+        worker::d1::D1Type::Text(&client.account_tenant_id),
         worker::d1::D1Type::Integer(now),
         worker::d1::D1Type::Integer(now),
         disabled_at,
@@ -6086,9 +6131,9 @@ async fn upsert_client(
     db.prepare(
         "INSERT INTO zeroth_clients (
              id, name, secret_hash, confidential, redirect_uris_json,
-             allowed_origins_json, allowed_email_domains_json, created_at, updated_at,
-             disabled_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             allowed_origins_json, allowed_email_domains_json, account_sharing_mode,
+             account_tenant_id, created_at, updated_at, disabled_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
              name = excluded.name,
              secret_hash = CASE
@@ -6100,6 +6145,8 @@ async fn upsert_client(
              redirect_uris_json = excluded.redirect_uris_json,
              allowed_origins_json = excluded.allowed_origins_json,
              allowed_email_domains_json = excluded.allowed_email_domains_json,
+             account_sharing_mode = excluded.account_sharing_mode,
+             account_tenant_id = excluded.account_tenant_id,
              updated_at = excluded.updated_at,
              disabled_at = excluded.disabled_at",
     )
@@ -6213,17 +6260,19 @@ async fn consume_auth_transaction(
 #[cfg(target_arch = "wasm32")]
 async fn get_identity_user_id(
     db: &worker::d1::D1Database,
+    account_namespace: &str,
     profile: &ProviderProfile,
 ) -> worker::Result<Option<String>> {
     let args = [
+        worker::d1::D1Type::Text(account_namespace),
         worker::d1::D1Type::Text(&profile.provider_id.0),
         worker::d1::D1Type::Text(&profile.subject.0),
     ];
     let row = db
         .prepare(
             "SELECT user_id
-             FROM zeroth_identities
-             WHERE provider_id = ? AND provider_subject = ?
+             FROM zeroth_account_identities
+             WHERE account_namespace = ? AND provider_id = ? AND provider_subject = ?
              LIMIT 1",
         )
         .bind_refs(&args)?
@@ -6269,7 +6318,18 @@ async fn complete_provider_identity_link(
         )));
     }
 
-    if let Some(existing_user_id) = get_identity_user_id(db, profile).await? {
+    let account_namespace = if let Some(client_id) = session.client_id.as_deref() {
+        let Some(registered_client) = get_registered_client(db, client_id).await? else {
+            return Ok(Err(IdentityLinkError::invalid_request(
+                "identity link client is disabled or not found",
+            )));
+        };
+        registered_client.account_scope.namespace
+    } else {
+        ACCOUNT_NAMESPACE_GLOBAL.to_owned()
+    };
+
+    if let Some(existing_user_id) = get_identity_user_id(db, &account_namespace, profile).await? {
         if existing_user_id != link_user_id.0 {
             return Ok(Err(IdentityLinkError::conflict(
                 "identity is already linked to another user",
@@ -6282,9 +6342,17 @@ async fn complete_provider_identity_link(
     }
 
     update_user_from_profile(db, &link_user_id.0, profile, now).await?;
-    upsert_identity_from_profile(db, &link_user_id.0, profile, raw_profile_json, now).await?;
+    upsert_account_identity_from_profile(
+        db,
+        &account_namespace,
+        &link_user_id.0,
+        profile,
+        raw_profile_json,
+        now,
+    )
+    .await?;
 
-    match get_identity_user_id(db, profile).await? {
+    match get_identity_user_id(db, &account_namespace, profile).await? {
         Some(user_id) if user_id == link_user_id.0 => Ok(Ok(())),
         Some(_) => Ok(Err(IdentityLinkError::conflict(
             "identity is already linked to another user",
@@ -6302,13 +6370,33 @@ async fn list_identities_for_user(
 ) -> worker::Result<Vec<IdentityRow>> {
     let args = [
         worker::d1::D1Type::Text(user_id),
+        worker::d1::D1Type::Text(user_id),
+        worker::d1::D1Type::Text(ACCOUNT_NAMESPACE_GLOBAL),
         worker::d1::D1Type::Integer(IDENTITY_LIST_LIMIT),
     ];
     db.prepare(
         "SELECT provider_id, provider_subject, email, email_verified, display_name,
                 picture_url, created_at, updated_at
-         FROM zeroth_identities
-         WHERE user_id = ?
+         FROM (
+             SELECT provider_id, provider_subject, email, email_verified, display_name,
+                    picture_url, created_at, updated_at
+             FROM zeroth_account_identities
+             WHERE user_id = ?
+             UNION ALL
+             SELECT i.provider_id, i.provider_subject, i.email, i.email_verified,
+                    i.display_name, i.picture_url, i.created_at, i.updated_at
+             FROM zeroth_identities i
+             WHERE i.user_id = ?
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM zeroth_account_identities ai
+                   WHERE ai.account_namespace = ?
+                     AND ai.provider_id = i.provider_id
+                     AND ai.provider_subject = i.provider_subject
+                     AND ai.user_id = i.user_id
+                   LIMIT 1
+               )
+         )
          ORDER BY provider_id, created_at
          LIMIT ?",
     )
@@ -6329,12 +6417,22 @@ async fn identity_exists_for_user(
         worker::d1::D1Type::Text(user_id),
         worker::d1::D1Type::Text(provider_id),
         worker::d1::D1Type::Text(provider_subject),
+        worker::d1::D1Type::Text(user_id),
+        worker::d1::D1Type::Text(provider_id),
+        worker::d1::D1Type::Text(provider_subject),
     ];
     let row = db
         .prepare(
             "SELECT user_id
-             FROM zeroth_identities
-             WHERE user_id = ? AND provider_id = ? AND provider_subject = ?
+             FROM (
+                 SELECT user_id
+                 FROM zeroth_account_identities
+                 WHERE user_id = ? AND provider_id = ? AND provider_subject = ?
+                 UNION
+                 SELECT user_id
+                 FROM zeroth_identities
+                 WHERE user_id = ? AND provider_id = ? AND provider_subject = ?
+             )
              LIMIT 1",
         )
         .bind_refs(&args)?
@@ -6348,12 +6446,22 @@ async fn count_identities_for_user(
     db: &worker::d1::D1Database,
     user_id: &str,
 ) -> worker::Result<i32> {
-    let args = [worker::d1::D1Type::Text(user_id)];
+    let args = [
+        worker::d1::D1Type::Text(user_id),
+        worker::d1::D1Type::Text(user_id),
+    ];
     let row = db
         .prepare(
             "SELECT COUNT(*) AS count
-             FROM zeroth_identities
-             WHERE user_id = ?",
+             FROM (
+                 SELECT provider_id, provider_subject
+                 FROM zeroth_account_identities
+                 WHERE user_id = ?
+                 UNION
+                 SELECT provider_id, provider_subject
+                 FROM zeroth_identities
+                 WHERE user_id = ?
+             )",
         )
         .bind_refs(&args)?
         .first::<IdentityCountRow>(None)
@@ -6368,22 +6476,31 @@ async fn delete_user_identity(
     provider_id: &str,
     provider_subject: &str,
 ) -> worker::Result<bool> {
+    if count_identities_for_user(db, user_id).await? <= 1 {
+        return Ok(false);
+    }
     let args = [
         worker::d1::D1Type::Text(user_id),
         worker::d1::D1Type::Text(provider_id),
         worker::d1::D1Type::Text(provider_subject),
-        worker::d1::D1Type::Text(user_id),
     ];
-    let result = db
+    let account_result = db
         .prepare(
-            "DELETE FROM zeroth_identities
-         WHERE user_id = ? AND provider_id = ? AND provider_subject = ?
-           AND (SELECT COUNT(*) FROM zeroth_identities WHERE user_id = ?) > 1",
+            "DELETE FROM zeroth_account_identities
+             WHERE user_id = ? AND provider_id = ? AND provider_subject = ?",
         )
         .bind_refs(&args)?
         .run()
         .await?;
-    d1_result_changed_one(result)
+    let legacy_result = db
+        .prepare(
+            "DELETE FROM zeroth_identities
+             WHERE user_id = ? AND provider_id = ? AND provider_subject = ?",
+        )
+        .bind_refs(&args)?
+        .run()
+        .await?;
+    Ok(d1_result_changed_any(account_result)? || d1_result_changed_any(legacy_result)?)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -7016,9 +7133,16 @@ async fn get_user_token_claims(
         "SELECT u.id, u.primary_email, u.display_name, u.picture_url, u.disabled_at,
                 EXISTS (
                     SELECT 1
-                    FROM zeroth_identities i
-                    WHERE i.user_id = u.id
-                      AND i.email = u.primary_email
+                    FROM (
+                        SELECT email, email_verified
+                        FROM zeroth_account_identities
+                        WHERE user_id = u.id
+                        UNION ALL
+                        SELECT email, email_verified
+                        FROM zeroth_identities
+                        WHERE user_id = u.id
+                    ) i
+                    WHERE i.email = u.primary_email
                       AND i.email_verified != 0
                     LIMIT 1
                 ) AS email_verified,
@@ -7052,8 +7176,15 @@ async fn get_admin_user_row(
         "SELECT u.id, u.primary_email, u.display_name, u.picture_url, u.created_at,
                 u.updated_at, u.disabled_at,
                 (SELECT COUNT(*)
-                   FROM zeroth_identities i
-                  WHERE i.user_id = u.id) AS identity_count,
+                   FROM (
+                       SELECT provider_id, provider_subject
+                       FROM zeroth_account_identities
+                       WHERE user_id = u.id
+                       UNION
+                       SELECT provider_id, provider_subject
+                       FROM zeroth_identities
+                       WHERE user_id = u.id
+                   )) AS identity_count,
                 (SELECT COUNT(*)
                    FROM zeroth_sessions s
                   WHERE s.user_id = u.id
@@ -7061,9 +7192,16 @@ async fn get_admin_user_row(
                     AND s.expires_at > ?) AS active_session_count,
                 EXISTS (
                     SELECT 1
-                    FROM zeroth_identities i
-                    WHERE i.user_id = u.id
-                      AND i.email = u.primary_email
+                    FROM (
+                        SELECT email, email_verified
+                        FROM zeroth_account_identities
+                        WHERE user_id = u.id
+                        UNION ALL
+                        SELECT email, email_verified
+                        FROM zeroth_identities
+                        WHERE user_id = u.id
+                    ) i
+                    WHERE i.email = u.primary_email
                       AND i.email_verified != 0
                     LIMIT 1
                 ) AS email_verified,
@@ -7096,8 +7234,15 @@ async fn list_admin_user_rows(
         "SELECT u.id, u.primary_email, u.display_name, u.picture_url, u.created_at,
                 u.updated_at, u.disabled_at,
                 (SELECT COUNT(*)
-                   FROM zeroth_identities i
-                  WHERE i.user_id = u.id) AS identity_count,
+                   FROM (
+                       SELECT provider_id, provider_subject
+                       FROM zeroth_account_identities
+                       WHERE user_id = u.id
+                       UNION
+                       SELECT provider_id, provider_subject
+                       FROM zeroth_identities
+                       WHERE user_id = u.id
+                   )) AS identity_count,
                 (SELECT COUNT(*)
                    FROM zeroth_sessions s
                   WHERE s.user_id = u.id
@@ -7105,9 +7250,16 @@ async fn list_admin_user_rows(
                     AND s.expires_at > ?) AS active_session_count,
                 EXISTS (
                     SELECT 1
-                    FROM zeroth_identities i
-                    WHERE i.user_id = u.id
-                      AND i.email = u.primary_email
+                    FROM (
+                        SELECT email, email_verified
+                        FROM zeroth_account_identities
+                        WHERE user_id = u.id
+                        UNION ALL
+                        SELECT email, email_verified
+                        FROM zeroth_identities
+                        WHERE user_id = u.id
+                    ) i
+                    WHERE i.email = u.primary_email
                       AND i.email_verified != 0
                     LIMIT 1
                 ) AS email_verified,
@@ -7698,11 +7850,12 @@ async fn record_audit_event(
 #[cfg(target_arch = "wasm32")]
 async fn upsert_provider_profile(
     db: &worker::d1::D1Database,
+    account_namespace: &str,
     profile: &ProviderProfile,
     raw_profile_json: Option<&str>,
     now: i32,
 ) -> worker::Result<String> {
-    let user_id = match get_identity_user_id(db, profile).await? {
+    let user_id = match get_identity_user_id(db, account_namespace, profile).await? {
         Some(user_id) => {
             update_user_from_profile(db, &user_id, profile, now).await?;
             user_id
@@ -7714,8 +7867,16 @@ async fn upsert_provider_profile(
         }
     };
 
-    upsert_identity_from_profile(db, &user_id, profile, raw_profile_json, now).await?;
-    let identity_user_id = get_identity_user_id(db, profile).await?;
+    upsert_account_identity_from_profile(
+        db,
+        account_namespace,
+        &user_id,
+        profile,
+        raw_profile_json,
+        now,
+    )
+    .await?;
+    let identity_user_id = get_identity_user_id(db, account_namespace, profile).await?;
     validate_provider_identity_attached_to_user(identity_user_id.as_deref(), &user_id)
         .map_err(worker_error)?;
     Ok(user_id)
@@ -7831,6 +7992,55 @@ async fn update_user_profile_patch(
              picture_url = CASE WHEN ? THEN ? ELSE picture_url END,
              updated_at = ?
          WHERE id = ?",
+    )
+    .bind_refs(&args)?
+    .run()
+    .await?;
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn upsert_account_identity_from_profile(
+    db: &worker::d1::D1Database,
+    account_namespace: &str,
+    user_id: &str,
+    profile: &ProviderProfile,
+    raw_profile_json: Option<&str>,
+    now: i32,
+) -> worker::Result<()> {
+    let email = d1_optional_text(profile.email.as_deref());
+    let display_name = d1_optional_text(profile.display_name.as_deref());
+    let picture_url = d1_optional_text(profile.picture_url.as_deref());
+    let raw_profile_json = d1_optional_text(raw_profile_json);
+    let email_verified = i32::from(profile.email_verified);
+    let args = [
+        worker::d1::D1Type::Text(account_namespace),
+        worker::d1::D1Type::Text(&profile.provider_id.0),
+        worker::d1::D1Type::Text(&profile.subject.0),
+        worker::d1::D1Type::Text(user_id),
+        email,
+        worker::d1::D1Type::Integer(email_verified),
+        display_name,
+        picture_url,
+        raw_profile_json,
+        worker::d1::D1Type::Integer(now),
+        worker::d1::D1Type::Integer(now),
+    ];
+
+    db.prepare(
+        "INSERT INTO zeroth_account_identities (
+             account_namespace, provider_id, provider_subject, user_id, email,
+             email_verified, display_name, picture_url, raw_profile_json, created_at,
+             updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(account_namespace, provider_id, provider_subject) DO UPDATE SET
+             email = excluded.email,
+             email_verified = excluded.email_verified,
+             display_name = excluded.display_name,
+             picture_url = excluded.picture_url,
+             raw_profile_json = excluded.raw_profile_json,
+             updated_at = excluded.updated_at
+         WHERE zeroth_account_identities.user_id = excluded.user_id",
     )
     .bind_refs(&args)?
     .run()
@@ -10269,6 +10479,13 @@ fn validate_client_upsert_request(
     let redirect_uris = validate_redirect_uris(&request.redirect_uris)?;
     let allowed_origins = validate_allowed_origins(&request.allowed_origins)?;
     let allowed_email_domains = validate_allowed_email_domains(&request.allowed_email_domains)?;
+    let account_sharing_mode =
+        validate_account_sharing_mode(request.account_sharing_mode.as_deref())?;
+    let account_tenant_id = validate_account_tenant_id(
+        request.account_tenant_id.as_deref(),
+        account_sharing_mode,
+        &id,
+    )?;
     let secret_hash = validated_client_secret_hash(
         request.confidential,
         request.client_secret.as_deref(),
@@ -10281,6 +10498,8 @@ fn validate_client_upsert_request(
         redirect_uris,
         allowed_origins,
         allowed_email_domains,
+        account_sharing_mode,
+        account_tenant_id,
         confidential: request.confidential,
         secret_hash,
         disabled: request.disabled,
@@ -10489,6 +10708,129 @@ fn validate_allowed_email_domains(raw: &[String]) -> Result<Vec<String>, ClientM
         push_unique(&mut domains, normalize_allowed_email_domain(raw_domain)?);
     }
     Ok(domains)
+}
+
+fn validate_account_sharing_mode(
+    raw: Option<&str>,
+) -> Result<AccountSharingMode, ClientManagementError> {
+    let value = raw.map(str::trim).filter(|value| !value.is_empty());
+    match value.unwrap_or(ACCOUNT_SHARING_MODE_GLOBAL) {
+        ACCOUNT_SHARING_MODE_GLOBAL => Ok(AccountSharingMode::Global),
+        ACCOUNT_SHARING_MODE_TENANT => Ok(AccountSharingMode::Tenant),
+        ACCOUNT_SHARING_MODE_CLIENT => Ok(AccountSharingMode::Client),
+        _ => Err(ClientManagementError::invalid_request(
+            "accountSharingMode must be global, tenant, or client",
+        )),
+    }
+}
+
+fn validate_account_tenant_id(
+    raw: Option<&str>,
+    sharing_mode: AccountSharingMode,
+    client_id: &str,
+) -> Result<String, ClientManagementError> {
+    match sharing_mode {
+        AccountSharingMode::Global => Ok(ACCOUNT_NAMESPACE_GLOBAL.to_owned()),
+        AccountSharingMode::Client => Ok(client_id.to_owned()),
+        AccountSharingMode::Tenant => {
+            let value = raw
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    ClientManagementError::invalid_request(
+                        "accountTenantId is required when accountSharingMode is tenant",
+                    )
+                })?;
+            validate_account_tenant_id_value(value).map_err(ClientManagementError::invalid_request)
+        }
+    }
+}
+
+fn validate_account_tenant_id_value(raw: &str) -> Result<String, String> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return Err("account tenant id must not be empty".to_owned());
+    }
+    if value.chars().count() > CLIENT_ACCOUNT_TENANT_ID_MAX_CHARS {
+        return Err(format!(
+            "account tenant id must be at most {CLIENT_ACCOUNT_TENANT_ID_MAX_CHARS} characters"
+        ));
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':'))
+    {
+        return Err("account tenant id contains unsupported characters".to_owned());
+    }
+    Ok(value.to_owned())
+}
+
+fn account_sharing_mode_label(mode: AccountSharingMode) -> &'static str {
+    match mode {
+        AccountSharingMode::Global => ACCOUNT_SHARING_MODE_GLOBAL,
+        AccountSharingMode::Tenant => ACCOUNT_SHARING_MODE_TENANT,
+        AccountSharingMode::Client => ACCOUNT_SHARING_MODE_CLIENT,
+    }
+}
+
+fn account_namespace_for_parts(
+    sharing_mode: AccountSharingMode,
+    tenant_id: &str,
+    client_id: &str,
+) -> String {
+    match sharing_mode {
+        AccountSharingMode::Global => ACCOUNT_NAMESPACE_GLOBAL.to_owned(),
+        AccountSharingMode::Tenant => format!("tenant:{tenant_id}"),
+        AccountSharingMode::Client => format!("client:{client_id}"),
+    }
+}
+
+fn client_account_scope_from_values(
+    client_id: &str,
+    sharing_mode: AccountSharingMode,
+    tenant_id: String,
+) -> ClientAccountScope {
+    let namespace = account_namespace_for_parts(sharing_mode, &tenant_id, client_id);
+    ClientAccountScope {
+        sharing_mode,
+        tenant_id,
+        namespace,
+    }
+}
+
+fn client_account_scope_from_row(row: &ClientRow) -> Result<ClientAccountScope, String> {
+    let sharing_mode = account_sharing_mode_from_row(row)?;
+    let tenant_id = match sharing_mode {
+        AccountSharingMode::Global => ACCOUNT_NAMESPACE_GLOBAL.to_owned(),
+        AccountSharingMode::Client => row.id.clone(),
+        AccountSharingMode::Tenant => validate_account_tenant_id_value(
+            row.account_tenant_id
+                .as_deref()
+                .unwrap_or(ACCOUNT_NAMESPACE_GLOBAL),
+        )?,
+    };
+    Ok(client_account_scope_from_values(
+        &row.id,
+        sharing_mode,
+        tenant_id,
+    ))
+}
+
+fn account_sharing_mode_from_row(row: &ClientRow) -> Result<AccountSharingMode, String> {
+    match row
+        .account_sharing_mode
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(ACCOUNT_SHARING_MODE_GLOBAL)
+    {
+        ACCOUNT_SHARING_MODE_GLOBAL => Ok(AccountSharingMode::Global),
+        ACCOUNT_SHARING_MODE_TENANT => Ok(AccountSharingMode::Tenant),
+        ACCOUNT_SHARING_MODE_CLIENT => Ok(AccountSharingMode::Client),
+        value => Err(format!(
+            "client account_sharing_mode is unsupported: {value}"
+        )),
+    }
 }
 
 fn normalize_allowed_email_domain(raw: &str) -> Result<String, ClientManagementError> {
@@ -10819,6 +11161,7 @@ fn normalize_admin_token_hash(value: &str) -> Result<String, String> {
 }
 
 fn client_response_from_row(row: ClientRow) -> Result<ClientResponse, String> {
+    let account_scope = client_account_scope_from_row(&row)?;
     Ok(ClientResponse {
         id: row.id,
         name: row.name,
@@ -10831,6 +11174,9 @@ fn client_response_from_row(row: ClientRow) -> Result<ClientResponse, String> {
             &row.allowed_email_domains_json,
             "allowed_email_domains_json",
         )?,
+        account_sharing_mode: account_sharing_mode_label(account_scope.sharing_mode).to_owned(),
+        account_tenant_id: account_scope.tenant_id,
+        account_namespace: account_scope.namespace,
         confidential: row.confidential != 0,
         disabled: row.disabled_at.is_some(),
         has_secret: row
@@ -13060,9 +13406,11 @@ fn discovery_response(config: &ZerothServerConfig) -> DiscoveryResponse {
 
 fn registered_client_from_row(row: ClientRow) -> Result<Option<RegisteredClient>, String> {
     let secret_hash = row.secret_hash.clone();
+    let account_scope = client_account_scope_from_row(&row)?;
     Ok(client_from_row(row)?.map(|client| RegisteredClient {
         client,
         secret_hash,
+        account_scope,
     }))
 }
 
@@ -14472,6 +14820,14 @@ fn d1_result_changed_one(result: worker::d1::D1Result) -> worker::Result<bool> {
 }
 
 #[cfg(target_arch = "wasm32")]
+fn d1_result_changed_any(result: worker::d1::D1Result) -> worker::Result<bool> {
+    let meta = result
+        .meta()?
+        .ok_or_else(|| worker_error("D1 result metadata was not populated".to_owned()))?;
+    Ok(meta.changes.is_some_and(|changes| changes > 0))
+}
+
+#[cfg(target_arch = "wasm32")]
 fn unix_timestamp_seconds() -> i32 {
     (worker::js_sys::Date::now() / 1000.0) as i32
 }
@@ -15660,6 +16016,8 @@ mod tests {
             redirect_uris_json: r#"["wavey://auth/callback"]"#.to_owned(),
             allowed_origins_json: "[]".to_owned(),
             allowed_email_domains_json: "[]".to_owned(),
+            account_sharing_mode: None,
+            account_tenant_id: None,
             confidential: 0,
             disabled_at: None,
         })
@@ -15680,6 +16038,8 @@ mod tests {
             redirect_uris_json: r#"["https://app.example.com/callback"]"#.to_owned(),
             allowed_origins_json: "[]".to_owned(),
             allowed_email_domains_json: "[]".to_owned(),
+            account_sharing_mode: None,
+            account_tenant_id: None,
             confidential: 1,
             disabled_at: Some(1_780_000_000),
         })
@@ -15729,8 +16089,81 @@ mod tests {
             vec!["https://app.example.com".to_owned()]
         );
         assert_eq!(upsert.allowed_email_domains, Vec::<String>::new());
+        assert_eq!(upsert.account_sharing_mode, AccountSharingMode::Global);
+        assert_eq!(upsert.account_tenant_id, ACCOUNT_NAMESPACE_GLOBAL);
         assert!(!upsert.confidential);
         assert_eq!(upsert.secret_hash, None);
+    }
+
+    #[test]
+    fn client_upsert_accepts_account_sharing_modes() {
+        let tenant = client_upsert_from_value(serde_json::json!({
+            "id": "wavey-admin",
+            "name": "Wavey Admin",
+            "redirectUris": ["https://id.example.com/admin"],
+            "accountSharingMode": "tenant",
+            "accountTenantId": "wavey",
+            "confidential": false
+        }))
+        .unwrap();
+        assert_eq!(tenant.account_sharing_mode, AccountSharingMode::Tenant);
+        assert_eq!(tenant.account_tenant_id, "wavey");
+
+        let client = client_upsert_from_value(serde_json::json!({
+            "id": "bitneedle",
+            "name": "Bitneedle",
+            "redirectUris": ["https://bitneedle.example.com/callback"],
+            "account_sharing_mode": "client",
+            "confidential": false
+        }))
+        .unwrap();
+        assert_eq!(client.account_sharing_mode, AccountSharingMode::Client);
+        assert_eq!(client.account_tenant_id, "bitneedle");
+    }
+
+    #[test]
+    fn client_upsert_rejects_invalid_account_sharing_config() {
+        let error = client_upsert_from_value(serde_json::json!({
+            "id": "web",
+            "name": "Web",
+            "redirectUris": ["https://app.example.com/callback"],
+            "accountSharingMode": "org",
+            "confidential": false
+        }))
+        .unwrap_err();
+        assert_eq!(
+            error.description,
+            "accountSharingMode must be global, tenant, or client"
+        );
+
+        let error = client_upsert_from_value(serde_json::json!({
+            "id": "web",
+            "name": "Web",
+            "redirectUris": ["https://app.example.com/callback"],
+            "accountSharingMode": "tenant",
+            "confidential": false
+        }))
+        .unwrap_err();
+        assert_eq!(
+            error.description,
+            "accountTenantId is required when accountSharingMode is tenant"
+        );
+    }
+
+    #[test]
+    fn account_namespace_is_derived_from_client_mode() {
+        assert_eq!(
+            account_namespace_for_parts(AccountSharingMode::Global, "wavey", "bitneedle"),
+            "global"
+        );
+        assert_eq!(
+            account_namespace_for_parts(AccountSharingMode::Tenant, "wavey", "bitneedle"),
+            "tenant:wavey"
+        );
+        assert_eq!(
+            account_namespace_for_parts(AccountSharingMode::Client, "wavey", "bitneedle"),
+            "client:bitneedle"
+        );
     }
 
     #[test]
@@ -15898,6 +16331,8 @@ mod tests {
             redirect_uris_json: r#"["https://app.example.com/callback"]"#.to_owned(),
             allowed_origins_json: r#"["https://app.example.com"]"#.to_owned(),
             allowed_email_domains_json: r#"["example.com"]"#.to_owned(),
+            account_sharing_mode: Some(ACCOUNT_SHARING_MODE_GLOBAL.to_owned()),
+            account_tenant_id: Some(ACCOUNT_NAMESPACE_GLOBAL.to_owned()),
             confidential: 1,
             disabled_at: Some(1_780_000_000),
         })
@@ -15915,6 +16350,8 @@ mod tests {
         assert!(response.confidential);
         assert!(response.disabled);
         assert!(response.has_secret);
+        assert_eq!(response.account_sharing_mode, ACCOUNT_SHARING_MODE_GLOBAL);
+        assert_eq!(response.account_namespace, ACCOUNT_NAMESPACE_GLOBAL);
     }
 
     #[test]
@@ -16050,6 +16487,8 @@ mod tests {
             redirect_uris_json: r#"["https://app.example.com/callback"]"#.to_owned(),
             allowed_origins_json: r#"["https://app.example.com"]"#.to_owned(),
             allowed_email_domains_json: r#"["example.com"]"#.to_owned(),
+            account_sharing_mode: None,
+            account_tenant_id: None,
             confidential: 1,
             disabled_at: Some(1_780_000_000),
         })
@@ -19161,6 +19600,11 @@ mod tests {
                 confidential: false,
             },
             secret_hash: None,
+            account_scope: client_account_scope_from_values(
+                "ios",
+                AccountSharingMode::Global,
+                ACCOUNT_NAMESPACE_GLOBAL.to_owned(),
+            ),
         }
     }
 
@@ -19175,6 +19619,11 @@ mod tests {
                 confidential: true,
             },
             secret_hash: Some(format!("sha256:{}", hash_secret(secret))),
+            account_scope: client_account_scope_from_values(
+                "web",
+                AccountSharingMode::Global,
+                ACCOUNT_NAMESPACE_GLOBAL.to_owned(),
+            ),
         }
     }
 

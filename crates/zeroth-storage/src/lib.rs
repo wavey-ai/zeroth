@@ -107,13 +107,26 @@ pub mod migrations {
         sql: include_str!("../migrations/0004_local_auth.sql"),
     };
 
-    pub const ALL: &[Migration] = &[INIT, PASSKEYS, ADMIN_MEMBERSHIPS, LOCAL_AUTH];
+    pub const ACCOUNT_NAMESPACES: Migration = Migration {
+        version: 5,
+        name: "account_namespaces",
+        sql: include_str!("../migrations/0005_account_namespaces.sql"),
+    };
+
+    pub const ALL: &[Migration] = &[
+        INIT,
+        PASSKEYS,
+        ADMIN_MEMBERSHIPS,
+        LOCAL_AUTH,
+        ACCOUNT_NAMESPACES,
+    ];
 }
 
 pub const REQUIRED_TABLES: &[&str] = &[
     SCHEMA_MIGRATIONS_TABLE,
     "zeroth_users",
     "zeroth_identities",
+    "zeroth_account_identities",
     "zeroth_clients",
     "zeroth_auth_transactions",
     "zeroth_auth_codes",
@@ -171,6 +184,16 @@ pub mod compatibility {
         name: "allowed_email_domains_json",
         definition: "TEXT NOT NULL DEFAULT '[]'",
     };
+    pub const CLIENT_ACCOUNT_SHARING_MODE: CompatibilityColumn = CompatibilityColumn {
+        table: "zeroth_clients",
+        name: "account_sharing_mode",
+        definition: "TEXT NOT NULL DEFAULT 'global'",
+    };
+    pub const CLIENT_ACCOUNT_TENANT_ID: CompatibilityColumn = CompatibilityColumn {
+        table: "zeroth_clients",
+        name: "account_tenant_id",
+        definition: "TEXT NOT NULL DEFAULT 'global'",
+    };
 
     pub const TABLES: &[&str] = &[
         "zeroth_clients",
@@ -181,6 +204,8 @@ pub mod compatibility {
 
     pub const ALL: &[CompatibilityColumn] = &[
         CLIENT_ALLOWED_EMAIL_DOMAINS,
+        CLIENT_ACCOUNT_SHARING_MODE,
+        CLIENT_ACCOUNT_TENANT_ID,
         AUTH_TRANSACTION_PROVIDER_NONCE,
         AUTH_TRANSACTION_LINK_USER_ID,
         AUTH_TRANSACTION_LINK_SESSION_ID,
@@ -203,6 +228,7 @@ mod tests {
                 && *table != "zeroth_admin_memberships"
                 && *table != "zeroth_local_credentials"
                 && *table != "zeroth_magic_links"
+                && *table != "zeroth_account_identities"
         }) {
             assert!(sql.contains(table), "missing table {table}");
         }
@@ -215,7 +241,7 @@ mod tests {
         for table in ["zeroth_passkey_credentials", "zeroth_passkey_challenges"] {
             assert!(sql.contains(table), "missing table {table}");
         }
-        assert_eq!(migrations::ALL.len(), 4);
+        assert_eq!(migrations::ALL.len(), 5);
         assert_eq!(migrations::ALL[1].version, 2);
     }
 
@@ -237,6 +263,19 @@ mod tests {
         assert!(sql.contains("zeroth_magic_links"));
         assert!(sql.contains("token_hash TEXT PRIMARY KEY"));
         assert_eq!(migrations::ALL[3].version, 4);
+    }
+
+    #[test]
+    fn account_namespaces_migration_contains_identity_table_and_client_columns() {
+        let sql = migrations::ACCOUNT_NAMESPACES.sql;
+
+        assert!(sql.contains("zeroth_account_identities"));
+        assert!(sql.contains("account_namespace TEXT NOT NULL"));
+        assert!(sql.contains("account_sharing_mode TEXT NOT NULL DEFAULT 'global'"));
+        assert!(sql.contains("account_tenant_id TEXT NOT NULL DEFAULT 'global'"));
+        assert!(sql.contains("INSERT OR IGNORE INTO zeroth_account_identities"));
+        assert_eq!(migrations::ALL.len(), 5);
+        assert_eq!(migrations::ALL[4].version, 5);
     }
 
     #[test]
@@ -295,6 +334,8 @@ mod tests {
 
         for column in [
             "allowed_email_domains_json",
+            "account_sharing_mode",
+            "account_tenant_id",
             "provider_nonce",
             "link_user_id",
             "link_session_id",

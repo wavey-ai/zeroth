@@ -904,6 +904,9 @@ pub struct ClientAdminUi {
     pub redirect_uris: Vec<String>,
     pub allowed_origins: Vec<String>,
     pub allowed_email_domains: Vec<String>,
+    pub account_sharing_mode: String,
+    pub account_tenant_id: String,
+    pub account_namespace: String,
     pub disabled: bool,
     pub has_secret: bool,
 }
@@ -1672,6 +1675,7 @@ pub fn ClientsAdminApp(state: ClientsAdminUiState) -> impl IntoView {
                                         <th>"Redirect URIs"</th>
                                         <th>"Origins"</th>
                                         <th>"Email domains"</th>
+                                        <th>"Account"</th>
                                         <th>"Actions"</th>
                                     </tr>
                                 </thead>
@@ -1714,6 +1718,18 @@ pub fn ClientsAdminApp(state: ClientsAdminUiState) -> impl IntoView {
                                     <div class="zeroth-field">
                                         <label for="zeroth-client-email-domains">"Email domains"</label>
                                         <textarea id="zeroth-client-email-domains" name="allowedEmailDomains" spellcheck="false"></textarea>
+                                    </div>
+                                    <div class="zeroth-field">
+                                        <label for="zeroth-client-account-sharing">"Account sharing"</label>
+                                        <select id="zeroth-client-account-sharing" name="accountSharingMode">
+                                            <option value="global">"Global"</option>
+                                            <option value="tenant">"Tenant"</option>
+                                            <option value="client">"Client"</option>
+                                        </select>
+                                    </div>
+                                    <div class="zeroth-field">
+                                        <label for="zeroth-client-account-tenant">"Tenant ID"</label>
+                                        <input id="zeroth-client-account-tenant" name="accountTenantId" autocomplete="off" />
                                     </div>
                                     <div class="zeroth-field">
                                         <label for="zeroth-client-secret">"Client secret"</label>
@@ -2161,9 +2177,16 @@ fn client_admin_row(client: ClientAdminUi) -> impl IntoView {
     let redirects = join_or_dash(client.redirect_uris.clone());
     let origins = join_or_dash(client.allowed_origins.clone());
     let email_domains = join_or_dash(client.allowed_email_domains.clone());
+    let account = format!(
+        "{} / {}",
+        client.account_sharing_mode, client.account_namespace
+    );
     let redirect_lines = client.redirect_uris.join("\n");
     let origin_lines = client.allowed_origins.join("\n");
     let email_domain_lines = client.allowed_email_domains.join("\n");
+    let account_sharing_mode = client.account_sharing_mode.clone();
+    let account_tenant_id = client.account_tenant_id.clone();
+    let account_namespace = client.account_namespace.clone();
     let disabled = client.disabled.to_string();
     let confidential = client.confidential.to_string();
     let client_id = client.client_id;
@@ -2180,6 +2203,9 @@ fn client_admin_row(client: ClientAdminUi) -> impl IntoView {
             data-client-redirects=redirect_lines
             data-client-origins=origin_lines
             data-client-email-domains=email_domain_lines
+            data-client-account-sharing-mode=account_sharing_mode
+            data-client-account-tenant-id=account_tenant_id
+            data-client-account-namespace=account_namespace
         >
             <td>
                 <div class="zeroth-row-title">{client_name}</div>
@@ -2193,6 +2219,7 @@ fn client_admin_row(client: ClientAdminUi) -> impl IntoView {
             <td>{redirects}</td>
             <td>{origins}</td>
             <td>{email_domains}</td>
+            <td>{account}</td>
             <td>
                 <button class="zeroth-action" type="button" data-zeroth-edit-client="true">"Edit"</button>
             </td>
@@ -2794,7 +2821,10 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
       disabled: row.dataset.clientDisabled === "true",
       redirectUris: splitLines(row.dataset.clientRedirects || ""),
       allowedOrigins: splitLines(row.dataset.clientOrigins || ""),
-      allowedEmailDomains: splitLines(row.dataset.clientEmailDomains || "")
+      allowedEmailDomains: splitLines(row.dataset.clientEmailDomains || ""),
+      accountSharingMode: row.dataset.clientAccountSharingMode || "global",
+      accountTenantId: row.dataset.clientAccountTenantId || "global",
+      accountNamespace: row.dataset.clientAccountNamespace || "global"
     };
   }
 
@@ -2805,6 +2835,8 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
     form.elements.redirectUris.value = (client.redirectUris || client.redirect_uris || []).join("\n");
     form.elements.allowedOrigins.value = (client.allowedOrigins || client.allowed_origins || []).join("\n");
     form.elements.allowedEmailDomains.value = (client.allowedEmailDomains || client.allowed_email_domains || []).join("\n");
+    form.elements.accountSharingMode.value = client.accountSharingMode || client.account_sharing_mode || "global";
+    form.elements.accountTenantId.value = client.accountTenantId || client.account_tenant_id || "";
     form.elements.clientSecret.value = "";
     form.elements.disabled.checked = Boolean(client.disabled);
     editorMode.textContent = client.id ? "Edit" : "New";
@@ -2815,7 +2847,7 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
     rows.replaceChildren();
     count.textContent = String(clients.length);
     if (clients.length === 0) {
-      renderEmptyRows(rows, 7);
+      renderEmptyRows(rows, 8);
       return;
     }
 
@@ -2828,6 +2860,9 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
       row.dataset.clientRedirects = (client.redirectUris || client.redirect_uris || []).join("\n");
       row.dataset.clientOrigins = (client.allowedOrigins || client.allowed_origins || []).join("\n");
       row.dataset.clientEmailDomains = (client.allowedEmailDomains || client.allowed_email_domains || []).join("\n");
+      row.dataset.clientAccountSharingMode = client.accountSharingMode || client.account_sharing_mode || "global";
+      row.dataset.clientAccountTenantId = client.accountTenantId || client.account_tenant_id || "global";
+      row.dataset.clientAccountNamespace = client.accountNamespace || client.account_namespace || "global";
 
       const name = document.createElement("td");
       setText(name, client.name, "zeroth-row-title");
@@ -2852,6 +2887,10 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
       const emailDomains = document.createElement("td");
       emailDomains.textContent = (client.allowedEmailDomains || client.allowed_email_domains || []).join(", ") || "-";
 
+      const account = document.createElement("td");
+      setText(account, client.accountSharingMode || client.account_sharing_mode || "global");
+      setText(account, client.accountNamespace || client.account_namespace || "global", "zeroth-row-meta zeroth-code");
+
       const actions = document.createElement("td");
       const edit = document.createElement("button");
       edit.className = "zeroth-action";
@@ -2869,7 +2908,7 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
         actions.appendChild(disable);
       }
 
-      row.append(name, type, state, redirects, origins, emailDomains, actions);
+      row.append(name, type, state, redirects, origins, emailDomains, account, actions);
       rows.appendChild(row);
     }
   }
@@ -3228,6 +3267,8 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
       redirectUris: splitLines(data.get("redirectUris") || ""),
       allowedOrigins: splitLines(data.get("allowedOrigins") || ""),
       allowedEmailDomains: splitLines(data.get("allowedEmailDomains") || ""),
+      accountSharingMode: String(data.get("accountSharingMode") || "global"),
+      accountTenantId: String(data.get("accountTenantId") || "").trim() || undefined,
       confidential: data.get("type") === "confidential",
       disabled: form.elements.disabled.checked
     };
@@ -3709,6 +3750,9 @@ mod tests {
             redirect_uris: vec!["wavey://auth/callback".to_owned()],
             allowed_origins: Vec::new(),
             allowed_email_domains: Vec::new(),
+            account_sharing_mode: "global".to_owned(),
+            account_tenant_id: "global".to_owned(),
+            account_namespace: "global".to_owned(),
             disabled: false,
             has_secret: false,
         });
