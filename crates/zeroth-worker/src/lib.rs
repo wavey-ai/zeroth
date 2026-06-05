@@ -16,6 +16,7 @@ use rsa::{
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 #[cfg(target_arch = "wasm32")]
 use std::cell::RefCell;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -1635,8 +1636,9 @@ pub async fn main(request: Request, env: Env, _ctx: worker::Context) -> worker::
 #[cfg(target_arch = "wasm32")]
 async fn handle_request(request: Request, env: Env) -> worker::Result<Response> {
     let url = request.url()?;
+    let route_path = canonical_route_path(url.path());
 
-    match (request.method(), url.path()) {
+    match (request.method(), route_path.as_ref()) {
         (Method::Options, path) if cors_path(path) => cors_preflight(request, env).await,
         (Method::Get, "/") => redirect_to_path(&url, "/admin"),
         (Method::Get, "/health") => json(&HealthResponse {
@@ -1668,7 +1670,7 @@ async fn handle_request(request: Request, env: Env) -> worker::Result<Response> 
         (Method::Get, "/.well-known/jwks.json") => jwks(env),
         (Method::Get, "/.well-known/apple-app-site-association") => apple_app_site_association(env),
         (Method::Get, "/favicon.ico" | "/favicon.svg") => favicon(),
-        (Method::Get, path) if apple_touch_icon_path(path) => empty_cached_asset(),
+        (Method::Get, path) if quiet_browser_asset_path(path) => empty_cached_asset(),
         (Method::Get, "/site.webmanifest" | "/manifest.json") => web_manifest(&env),
         (Method::Get, "/browserconfig.xml") => browserconfig_xml(),
         (Method::Get, "/robots.txt") => robots_txt(),
@@ -4064,7 +4066,8 @@ async fn cors_preflight(request: Request, env: Env) -> worker::Result<Response> 
     let requested_method = request_header(&request, "Access-Control-Request-Method")?
         .unwrap_or_default()
         .to_ascii_uppercase();
-    if !cors_method_allowed(url.path(), &requested_method) {
+    let route_path = canonical_route_path(url.path());
+    if !cors_method_allowed(route_path.as_ref(), &requested_method) {
         return Response::empty().map(|response| response.with_status(405));
     }
 
@@ -4183,6 +4186,23 @@ fn robots_txt() -> worker::Result<Response> {
         .headers()
         .set("Cache-Control", "public, max-age=3600")?;
     Ok(response)
+}
+
+fn canonical_route_path(path: &str) -> Cow<'_, str> {
+    if path == "/" || !path.ends_with('/') {
+        return Cow::Borrowed(path);
+    }
+
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        Cow::Borrowed("/")
+    } else {
+        Cow::Owned(trimmed.to_owned())
+    }
+}
+
+fn quiet_browser_asset_path(path: &str) -> bool {
+    apple_touch_icon_path(path) || path == "/.well-known/appspecific/com.chrome.devtools.json"
 }
 
 fn apple_touch_icon_path(path: &str) -> bool {
@@ -13806,6 +13826,40 @@ mod tests {
     }
 
     #[test]
+    fn quiet_browser_asset_path_matches_common_browser_probes() {
+        for path in [
+            "/apple-touch-icon.png",
+            "/apple-touch-icon-120x120.png",
+            "/.well-known/appspecific/com.chrome.devtools.json",
+        ] {
+            assert!(quiet_browser_asset_path(path), "{path}");
+        }
+
+        for path in [
+            "/.well-known/openid-configuration",
+            "/favicon.ico",
+            "/assets/com.chrome.devtools.json",
+        ] {
+            assert!(!quiet_browser_asset_path(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn canonical_route_path_trims_trailing_slashes_without_touching_root() {
+        assert_eq!(canonical_route_path("/").as_ref(), "/");
+        assert_eq!(canonical_route_path("/admin").as_ref(), "/admin");
+        assert_eq!(canonical_route_path("/admin/").as_ref(), "/admin");
+        assert_eq!(
+            canonical_route_path("/magic-links//").as_ref(),
+            "/magic-links"
+        );
+        assert_eq!(
+            canonical_route_path("/.well-known/openid-configuration/").as_ref(),
+            "/.well-known/openid-configuration"
+        );
+    }
+
+    #[test]
     fn issuer_readiness_requires_https_url_with_host() {
         let ready = issuer_readiness(&ZerothServerConfig {
             public_base_url: "https://id.example.com".to_owned(),
@@ -16859,6 +16913,12 @@ mod tests {
         assert!(!cors_method_allowed("/password/login", "GET"));
         assert!(cors_method_allowed("/magic-links", "POST"));
         assert!(!cors_method_allowed("/magic-links", "GET"));
+        let magic_links_trailing_slash = canonical_route_path("/magic-links/");
+        assert!(cors_path(magic_links_trailing_slash.as_ref()));
+        assert!(cors_method_allowed(
+            magic_links_trailing_slash.as_ref(),
+            "POST"
+        ));
         assert!(cors_method_allowed("/magic-links/consume", "GET"));
         assert!(cors_method_allowed("/magic-links/consume", "POST"));
         assert!(!cors_method_allowed("/magic-links/consume", "DELETE"));
