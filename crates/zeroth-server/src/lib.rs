@@ -190,6 +190,22 @@ pub const ROUTES: &[Route] = &[
         path: "/identities",
     },
     Route {
+        method: "POST",
+        path: "/passkeys/register/options",
+    },
+    Route {
+        method: "POST",
+        path: "/passkeys/register/verify",
+    },
+    Route {
+        method: "POST",
+        path: "/passkeys/authenticate/options",
+    },
+    Route {
+        method: "POST",
+        path: "/passkeys/authenticate/verify",
+    },
+    Route {
         method: "GET",
         path: "/validate",
     },

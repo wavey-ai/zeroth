@@ -89,7 +89,13 @@ pub mod migrations {
         sql: include_str!("../migrations/0001_init.sql"),
     };
 
-    pub const ALL: &[Migration] = &[INIT];
+    pub const PASSKEYS: Migration = Migration {
+        version: 2,
+        name: "passkeys",
+        sql: include_str!("../migrations/0002_passkeys.sql"),
+    };
+
+    pub const ALL: &[Migration] = &[INIT, PASSKEYS];
 }
 
 pub const REQUIRED_TABLES: &[&str] = &[
@@ -101,6 +107,8 @@ pub const REQUIRED_TABLES: &[&str] = &[
     "zeroth_auth_codes",
     "zeroth_refresh_tokens",
     "zeroth_sessions",
+    "zeroth_passkey_credentials",
+    "zeroth_passkey_challenges",
     "zeroth_signing_keys",
     "zeroth_audit_events",
 ];
@@ -175,9 +183,24 @@ mod tests {
     #[test]
     fn init_migration_contains_auth_tables() {
         let sql = migrations::INIT.sql;
-        for table in super::REQUIRED_TABLES {
+        for table in super::REQUIRED_TABLES
+            .iter()
+            .copied()
+            .filter(|table| !table.starts_with("zeroth_passkey_"))
+        {
             assert!(sql.contains(table), "missing table {table}");
         }
+    }
+
+    #[test]
+    fn passkey_migration_contains_passkey_tables() {
+        let sql = migrations::PASSKEYS.sql;
+
+        for table in ["zeroth_passkey_credentials", "zeroth_passkey_challenges"] {
+            assert!(sql.contains(table), "missing table {table}");
+        }
+        assert_eq!(migrations::ALL.len(), 2);
+        assert_eq!(migrations::ALL[1].version, 2);
     }
 
     #[test]

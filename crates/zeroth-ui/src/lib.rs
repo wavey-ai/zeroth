@@ -1120,6 +1120,33 @@ pub fn ClientsAdminApp(state: ClientsAdminUiState) -> impl IntoView {
                             </div>
                         </section>
 
+                        <section class="zeroth-panel">
+                            <div class="zeroth-panel-header">
+                                <h2 class="zeroth-panel-title">"Passkey"</h2>
+                                <span class="zeroth-status" id="zeroth-passkey-status">"Ready"</span>
+                            </div>
+                            <div class="zeroth-panel-body zeroth-stack">
+                                <form class="zeroth-form" id="zeroth-passkey-register-form">
+                                    <div class="zeroth-field">
+                                        <label for="zeroth-passkey-email">"Email"</label>
+                                        <input id="zeroth-passkey-email" name="email" type="email" autocomplete="email" />
+                                    </div>
+                                    <div class="zeroth-field">
+                                        <label for="zeroth-passkey-display-name">"Name"</label>
+                                        <input id="zeroth-passkey-display-name" name="displayName" type="text" autocomplete="name" />
+                                    </div>
+                                    <div class="zeroth-field">
+                                        <label for="zeroth-passkey-label">"Label"</label>
+                                        <input id="zeroth-passkey-label" name="label" type="text" autocomplete="off" />
+                                    </div>
+                                    <div class="zeroth-form-actions">
+                                        <button class="zeroth-action" id="zeroth-passkey-login" type="button">"Sign in"</button>
+                                        <button class="zeroth-action zeroth-primary" type="submit">"Register"</button>
+                                    </div>
+                                </form>
+                            </div>
+                        </section>
+
                         <section id="database" class="zeroth-panel">
                             <div class="zeroth-panel-header">
                                 <h2 class="zeroth-panel-title">"Database"</h2>
@@ -1785,6 +1812,10 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
   const providersEndpoint = "/providers/status";
   const eventsEndpoint = "/events";
   const dbStatusEndpoint = "/__zeroth/db/status";
+  const passkeyRegisterOptionsEndpoint = "/passkeys/register/options";
+  const passkeyRegisterVerifyEndpoint = "/passkeys/register/verify";
+  const passkeyAuthenticateOptionsEndpoint = "/passkeys/authenticate/options";
+  const passkeyAuthenticateVerifyEndpoint = "/passkeys/authenticate/verify";
   const $ = (id) => document.getElementById(id);
   const rows = $("zeroth-client-rows");
   const userRows = $("zeroth-user-rows");
@@ -1797,9 +1828,11 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
   const dbClientCount = $("zeroth-db-client-count");
   const dbStatus = $("zeroth-db-status");
   const status = $("zeroth-admin-status");
+  const passkeyStatus = $("zeroth-passkey-status");
   const message = $("zeroth-admin-message");
   const tokenInput = $("zeroth-admin-token");
   const form = $("zeroth-client-form");
+  const passkeyForm = $("zeroth-passkey-register-form");
   const eventFilterForm = $("zeroth-events-filter-form");
   const editorMode = $("zeroth-editor-mode");
 
@@ -1809,12 +1842,92 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
     message.setAttribute("aria-invalid", error ? "true" : "false");
   }
 
+  function setPasskeyStatus(value, error = false) {
+    if (!passkeyStatus) return;
+    passkeyStatus.textContent = value;
+    passkeyStatus.className = error ? "zeroth-status zeroth-status-warn" : "zeroth-status zeroth-status-ok";
+  }
+
   function token() {
     return tokenInput.value.trim() || sessionStorage.getItem(tokenKey) || "";
   }
 
   function splitLines(value) {
     return value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  }
+
+  function bufferToBase64url(buffer) {
+    const bytes = new Uint8Array(buffer);
+    let binary = "";
+    for (const byte of bytes) binary += String.fromCharCode(byte);
+    return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+  }
+
+  function base64urlToBuffer(value) {
+    const normalized = value.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = normalized + "=".repeat((4 - (normalized.length % 4)) % 4);
+    const binary = atob(padded);
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index += 1) {
+      bytes[index] = binary.charCodeAt(index);
+    }
+    return bytes.buffer;
+  }
+
+  function creationOptionsFromServer(options) {
+    const publicKey = Object.assign({}, options.publicKey);
+    publicKey.challenge = base64urlToBuffer(publicKey.challenge);
+    publicKey.user = Object.assign({}, publicKey.user, {
+      id: base64urlToBuffer(publicKey.user.id)
+    });
+    publicKey.excludeCredentials = (publicKey.excludeCredentials || []).map((credential) => ({
+      type: credential.type,
+      id: base64urlToBuffer(credential.id)
+    }));
+    return publicKey;
+  }
+
+  function requestOptionsFromServer(options) {
+    const publicKey = Object.assign({}, options.publicKey);
+    publicKey.challenge = base64urlToBuffer(publicKey.challenge);
+    publicKey.allowCredentials = (publicKey.allowCredentials || []).map((credential) => ({
+      type: credential.type,
+      id: base64urlToBuffer(credential.id)
+    }));
+    return publicKey;
+  }
+
+  function registrationCredentialPayload(credential) {
+    return {
+      id: credential.id,
+      rawId: bufferToBase64url(credential.rawId),
+      response: {
+        clientDataJSON: bufferToBase64url(credential.response.clientDataJSON),
+        attestationObject: bufferToBase64url(credential.response.attestationObject),
+        transports: typeof credential.response.getTransports === "function"
+          ? credential.response.getTransports()
+          : []
+      }
+    };
+  }
+
+  function authenticationCredentialPayload(credential) {
+    return {
+      id: credential.id,
+      rawId: bufferToBase64url(credential.rawId),
+      response: {
+        clientDataJSON: bufferToBase64url(credential.response.clientDataJSON),
+        authenticatorData: bufferToBase64url(credential.response.authenticatorData),
+        signature: bufferToBase64url(credential.response.signature),
+        userHandle: credential.response.userHandle
+          ? bufferToBase64url(credential.response.userHandle)
+          : null
+      }
+    };
+  }
+
+  function passkeysAvailable() {
+    return Boolean(window.PublicKeyCredential && navigator.credentials);
   }
 
   function setText(parent, value, className) {
@@ -2212,6 +2325,62 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
     await loadUsers();
   }
 
+  async function registerPasskey(event) {
+    event.preventDefault();
+    if (!passkeysAvailable()) {
+      throw new Error("Passkeys are not available in this browser");
+    }
+    const data = new FormData(passkeyForm);
+    const payload = {
+      email: String(data.get("email") || "").trim() || undefined,
+      displayName: String(data.get("displayName") || "").trim() || undefined,
+      label: String(data.get("label") || "").trim() || undefined,
+      returnTo: `${window.location.origin}/admin`
+    };
+    setPasskeyStatus("Registering");
+    const options = await api(passkeyRegisterOptionsEndpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    const credential = await navigator.credentials.create({
+      publicKey: creationOptionsFromServer(options)
+    });
+    if (!credential) throw new Error("Passkey registration was cancelled");
+    await api(passkeyRegisterVerifyEndpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(registrationCredentialPayload(credential))
+    });
+    setPasskeyStatus("Registered");
+    setMessage("Passkey registered");
+    await loadAdmin();
+  }
+
+  async function signInWithPasskey() {
+    if (!passkeysAvailable()) {
+      throw new Error("Passkeys are not available in this browser");
+    }
+    setPasskeyStatus("Signing in");
+    const options = await api(passkeyAuthenticateOptionsEndpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ returnTo: `${window.location.origin}/admin` })
+    });
+    const credential = await navigator.credentials.get({
+      publicKey: requestOptionsFromServer(options)
+    });
+    if (!credential) throw new Error("Passkey sign in was cancelled");
+    const result = await api(passkeyAuthenticateVerifyEndpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(authenticationCredentialPayload(credential))
+    });
+    setPasskeyStatus("Signed in");
+    setMessage("Signed in");
+    window.location.assign((result && result.returnTo) || "/admin");
+  }
+
   document.addEventListener("DOMContentLoaded", () => {
     const stored = sessionStorage.getItem(tokenKey) || "";
     if (stored) {
@@ -2227,6 +2396,22 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
         renderProviderRows([]);
         renderEventRows([]);
       }
+    });
+  });
+
+  if (passkeyForm) {
+    passkeyForm.addEventListener("submit", (event) => {
+      registerPasskey(event).catch((error) => {
+        setPasskeyStatus("Failed", true);
+        setMessage(error.message, true);
+      });
+    });
+  }
+
+  $("zeroth-passkey-login").addEventListener("click", () => {
+    signInWithPasskey().catch((error) => {
+      setPasskeyStatus("Failed", true);
+      setMessage(error.message, true);
     });
   });
 

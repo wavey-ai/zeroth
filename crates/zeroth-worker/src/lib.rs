@@ -76,6 +76,12 @@ const AUDIT_EVENT_TYPE_MAX_CHARS: usize = 96;
 const AUDIT_EVENT_DETAILS_MAX_BYTES: usize = 1024;
 const SESSION_LIST_LIMIT: i32 = 100;
 const IDENTITY_LIST_LIMIT: i32 = 16;
+const PASSKEY_CHALLENGE_TTL_SECONDS: i32 = 5 * 60;
+const PASSKEY_CHALLENGE_CLEANUP_LIMIT: i32 = 64;
+const PASSKEY_CREDENTIAL_LIST_LIMIT: i32 = 64;
+const PASSKEY_BODY_LIMIT: usize = 16 * 1024;
+const PASSKEY_LABEL_MAX_CHARS: usize = 128;
+const PASSKEY_EMAIL_MAX_BYTES: usize = 320;
 const PROFILE_PATCH_BODY_LIMIT: usize = 4 * 1024;
 const PROFILE_NAME_MAX_CHARS: usize = 128;
 const PROFILE_PICTURE_MAX_BYTES: usize = 2048;
@@ -826,6 +832,235 @@ struct IdentityRow {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
+struct PasskeyCredentialRow {
+    credential_id: String,
+    user_id: String,
+    #[serde(default)]
+    label: Option<String>,
+    public_key_x: String,
+    public_key_y: String,
+    sign_count: i32,
+    created_at: i32,
+    updated_at: i32,
+    #[serde(default)]
+    last_used_at: Option<i32>,
+    #[serde(default)]
+    disabled_at: Option<i32>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+struct PasskeyChallengeRow {
+    challenge_hash: String,
+    kind: String,
+    #[serde(default)]
+    user_id: Option<String>,
+    #[serde(default)]
+    client_id: Option<String>,
+    #[serde(default)]
+    return_to: Option<String>,
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    label: Option<String>,
+    created_at: i32,
+    expires_at: i32,
+    #[serde(default)]
+    consumed_at: Option<i32>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+struct PasskeyRegisterOptionsRequest {
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    return_to: Option<String>,
+    #[serde(default)]
+    client_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+struct PasskeyAuthenticateOptionsRequest {
+    #[serde(default)]
+    return_to: Option<String>,
+    #[serde(default)]
+    client_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+struct PasskeyRegisterVerifyRequest {
+    id: String,
+    raw_id: String,
+    response: PasskeyRegisterCredentialResponse,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+struct PasskeyRegisterCredentialResponse {
+    #[serde(rename = "clientDataJSON")]
+    client_data_json: String,
+    attestation_object: String,
+    #[serde(default)]
+    transports: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+struct PasskeyAuthenticateVerifyRequest {
+    id: String,
+    raw_id: String,
+    response: PasskeyAuthenticateCredentialResponse,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+struct PasskeyAuthenticateCredentialResponse {
+    #[serde(rename = "clientDataJSON")]
+    client_data_json: String,
+    authenticator_data: String,
+    signature: String,
+    #[serde(default)]
+    user_handle: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WebAuthnClientData {
+    #[serde(rename = "type")]
+    ceremony_type: String,
+    challenge: String,
+    origin: String,
+    #[serde(default)]
+    cross_origin: Option<bool>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PasskeyPublicKeyCredentialCreationOptions {
+    challenge: String,
+    rp: PasskeyRpEntity,
+    user: PasskeyUserEntity,
+    pub_key_cred_params: Vec<PasskeyPubKeyCredParam>,
+    timeout: u32,
+    authenticator_selection: PasskeyAuthenticatorSelection,
+    attestation: &'static str,
+    exclude_credentials: Vec<PasskeyCredentialDescriptor>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PasskeyPublicKeyCredentialRequestOptions {
+    challenge: String,
+    rp_id: String,
+    timeout: u32,
+    user_verification: &'static str,
+    allow_credentials: Vec<PasskeyCredentialDescriptor>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+struct PasskeyRpEntity {
+    id: String,
+    name: String,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+struct PasskeyUserEntity {
+    id: String,
+    name: String,
+    #[serde(rename = "displayName")]
+    display_name: String,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+struct PasskeyPubKeyCredParam {
+    #[serde(rename = "type")]
+    credential_type: &'static str,
+    alg: i32,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PasskeyAuthenticatorSelection {
+    resident_key: &'static str,
+    require_resident_key: bool,
+    user_verification: &'static str,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+struct PasskeyCredentialDescriptor {
+    #[serde(rename = "type")]
+    credential_type: &'static str,
+    id: String,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PasskeyOptionsResponse<T> {
+    public_key: T,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PasskeyVerifyResponse {
+    ok: bool,
+    return_to: String,
+    user: UserInfoResponse,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct PasskeyCredentialPublicKey {
+    x: Vec<u8>,
+    y: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct ParsedAuthenticatorData {
+    rp_id_hash: Vec<u8>,
+    flags: u8,
+    sign_count: i32,
+    credential_id: Option<Vec<u8>>,
+    public_key: Option<PasskeyCredentialPublicKey>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct ValidatedPasskeyRegistration {
+    credential_id: String,
+    public_key_x: String,
+    public_key_y: String,
+    sign_count: i32,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum CborValue {
+    Unsigned(u64),
+    Negative(i64),
+    Bytes(Vec<u8>),
+    Text(String),
+    Array(Vec<CborValue>),
+    Map(Vec<(CborValue, CborValue)>),
+    Bool(bool),
+    Null,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
 struct AuthCodeRow {
     code_hash: String,
     client_id: String,
@@ -1264,6 +1499,16 @@ async fn handle_request(request: Request, env: Env) -> worker::Result<Response> 
         (Method::Get | Method::Patch, "/profile") => profile(request, env).await,
         (Method::Get, "/identities/link") => identity_link(request, env).await,
         (Method::Get | Method::Delete, "/identities") => identities(request, env).await,
+        (Method::Post, "/passkeys/register/options") => {
+            passkey_register_options(request, env).await
+        }
+        (Method::Post, "/passkeys/register/verify") => passkey_register_verify(request, env).await,
+        (Method::Post, "/passkeys/authenticate/options") => {
+            passkey_authenticate_options(request, env).await
+        }
+        (Method::Post, "/passkeys/authenticate/verify") => {
+            passkey_authenticate_verify(request, env).await
+        }
         (Method::Get, "/validate") => validate(request, env).await,
         (Method::Get | Method::Post, "/logout") => logout(request, env).await,
         _ => json_status(&serde_json::json!({ "error": "not_found" }), 404),
@@ -2408,13 +2653,24 @@ async fn identities(request: Request, env: Env) -> worker::Result<Response> {
                 return oauth_error_json("invalid_request", "cannot unlink the last identity", 400);
             }
 
-            delete_user_identity(
+            if !delete_user_identity(
                 &db,
                 &current.user.id,
                 &identity.provider_id,
                 &identity.provider_subject,
             )
-            .await?;
+            .await?
+            {
+                return oauth_error_json("invalid_request", "identity could not be unlinked", 409);
+            }
+            if identity.provider_id == "passkey" {
+                disable_passkey_credential(
+                    &db,
+                    &identity.provider_subject,
+                    unix_timestamp_seconds(),
+                )
+                .await?;
+            }
             record_audit_event(
                 &db,
                 &request,
@@ -2431,6 +2687,331 @@ async fn identities(request: Request, env: Env) -> worker::Result<Response> {
         }
         _ => json_status(&serde_json::json!({ "error": "method_not_allowed" }), 405),
     }
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn passkey_register_options(mut request: Request, env: Env) -> worker::Result<Response> {
+    let url = request.url()?;
+    let config = server_config(&env, &url);
+    let db = env.d1(D1_BINDING)?;
+    let now = unix_timestamp_seconds();
+    if let Err(error) = validate_admin_request(&request, &env, &db, &config, now).await {
+        return client_management_error_json(&error);
+    }
+    let body = match passkey_json_from_request::<PasskeyRegisterOptionsRequest>(&mut request).await
+    {
+        Ok(body) => body,
+        Err(error) => return oauth_error_json("invalid_request", error, 400),
+    };
+
+    let current = current_session_from_request(&request, &db, &config, now).await?;
+    let (user_id, email, display_name) = match passkey_registration_subject(current.as_ref(), &body)
+    {
+        Ok(subject) => subject,
+        Err(error) => return oauth_error_json("invalid_request", error, 400),
+    };
+    let client_id = match passkey_client_id_from_request(&env, body.client_id.as_deref()) {
+        Ok(client_id) => client_id,
+        Err(error) => return oauth_error_json("invalid_request", error.to_string(), 400),
+    };
+    let client = match get_client(&db, &client_id).await? {
+        Some(client) => client,
+        None => {
+            return oauth_error_json(
+                "invalid_request",
+                "passkey session client is not registered",
+                400,
+            )
+        }
+    };
+    let return_to = match passkey_return_to(&url, body.return_to.as_deref(), &client, &config) {
+        Ok(return_to) => return_to,
+        Err(error) => return oauth_error_json("invalid_request", error.to_string(), 400),
+    };
+    let label = match validate_passkey_label(body.label.as_deref()) {
+        Ok(label) => label,
+        Err(error) => return oauth_error_json("invalid_request", error, 400),
+    };
+    let challenge = random_token()?;
+
+    cleanup_expired_passkey_challenges(&db, now).await?;
+    put_passkey_challenge(
+        &db,
+        &challenge,
+        "registration",
+        user_id.as_deref(),
+        Some(&client_id),
+        Some(&return_to),
+        Some(&email),
+        display_name.as_deref(),
+        label.as_deref(),
+        now,
+    )
+    .await?;
+
+    let exclude_credentials = if let Some(user_id) = user_id.as_deref() {
+        list_passkey_credentials_for_user(&db, user_id)
+            .await?
+            .into_iter()
+            .map(|credential| PasskeyCredentialDescriptor {
+                credential_type: "public-key",
+                id: credential.credential_id,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let options = match passkey_creation_options(
+        &config,
+        &challenge,
+        user_id.as_deref().unwrap_or(&email),
+        &email,
+        display_name.as_deref().unwrap_or(&email),
+        exclude_credentials,
+    ) {
+        Ok(options) => options,
+        Err(error) => return oauth_error_json("invalid_request", error, 400),
+    };
+
+    json(&PasskeyOptionsResponse {
+        public_key: options,
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn passkey_register_verify(mut request: Request, env: Env) -> worker::Result<Response> {
+    let url = request.url()?;
+    let config = server_config(&env, &url);
+    let db = env.d1(D1_BINDING)?;
+    let now = unix_timestamp_seconds();
+    let body = match passkey_json_from_request::<PasskeyRegisterVerifyRequest>(&mut request).await {
+        Ok(body) => body,
+        Err(error) => return oauth_error_json("invalid_request", error, 400),
+    };
+    let validation = match validate_passkey_registration_response(&config, &body) {
+        Ok(validation) => validation,
+        Err(error) => return oauth_error_json("invalid_request", error, 400),
+    };
+    let challenge_hash =
+        match passkey_challenge_hash_from_client_data(&body.response.client_data_json) {
+            Ok(challenge_hash) => challenge_hash,
+            Err(error) => return oauth_error_json("invalid_request", error, 400),
+        };
+    let Some(challenge) = get_passkey_challenge_by_hash(&db, &challenge_hash).await? else {
+        return oauth_error_json("invalid_request", "passkey challenge was not found", 400);
+    };
+    if let Err(error) = validate_passkey_challenge(&challenge, "registration", now) {
+        return oauth_error_json("invalid_request", error, 400);
+    }
+    if !passkey_challenge_matches_client_data(
+        &challenge.challenge_hash,
+        &body.response.client_data_json,
+    ) {
+        return oauth_error_json("invalid_request", "passkey challenge did not match", 400);
+    }
+    if !consume_passkey_challenge(&db, &challenge.challenge_hash, now).await? {
+        return oauth_error_json("invalid_request", "passkey challenge was already used", 400);
+    }
+
+    let (user_id, email, display_name) =
+        ensure_passkey_registration_user(&db, &challenge, now).await?;
+    put_passkey_credential(&db, &validation, &user_id, challenge.label.as_deref(), now).await?;
+    upsert_passkey_identity(
+        &db,
+        &user_id,
+        &validation.credential_id,
+        Some(&email),
+        display_name.as_deref(),
+        now,
+    )
+    .await?;
+    record_audit_event(
+        &db,
+        &request,
+        "passkey.register",
+        Some(&user_id),
+        challenge.client_id.as_deref(),
+        Some("passkey"),
+        serde_json::json!({
+            "credentialIdHash": hash_secret(&validation.credential_id),
+            "label": challenge.label.as_deref().unwrap_or("")
+        }),
+        now,
+    )
+    .await;
+
+    let Some(user) = get_user(&db, &user_id).await? else {
+        return oauth_error_json("invalid_request", "passkey user was not found", 400);
+    };
+    json(&serde_json::json!({
+        "ok": true,
+        "user": userinfo_response(&user, Some("email profile"))
+    }))
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn passkey_authenticate_options(mut request: Request, env: Env) -> worker::Result<Response> {
+    let url = request.url()?;
+    let config = server_config(&env, &url);
+    let body =
+        match passkey_json_from_request::<PasskeyAuthenticateOptionsRequest>(&mut request).await {
+            Ok(body) => body,
+            Err(error) => return oauth_error_json("invalid_request", error, 400),
+        };
+    let db = env.d1(D1_BINDING)?;
+    let client_id = match passkey_client_id_from_request(&env, body.client_id.as_deref()) {
+        Ok(client_id) => client_id,
+        Err(error) => return oauth_error_json("invalid_request", error.to_string(), 400),
+    };
+    let client = match get_client(&db, &client_id).await? {
+        Some(client) => client,
+        None => {
+            return oauth_error_json(
+                "invalid_request",
+                "passkey session client is not registered",
+                400,
+            )
+        }
+    };
+    let return_to = match passkey_return_to(&url, body.return_to.as_deref(), &client, &config) {
+        Ok(return_to) => return_to,
+        Err(error) => return oauth_error_json("invalid_request", error.to_string(), 400),
+    };
+    let now = unix_timestamp_seconds();
+    let challenge = random_token()?;
+    cleanup_expired_passkey_challenges(&db, now).await?;
+    put_passkey_challenge(
+        &db,
+        &challenge,
+        "authentication",
+        None,
+        Some(&client_id),
+        Some(&return_to),
+        None,
+        None,
+        None,
+        now,
+    )
+    .await?;
+    let allow_credentials = list_active_passkey_credentials(&db)
+        .await?
+        .into_iter()
+        .map(|credential| PasskeyCredentialDescriptor {
+            credential_type: "public-key",
+            id: credential.credential_id,
+        })
+        .collect();
+    let options = match passkey_request_options(&config, &challenge, allow_credentials) {
+        Ok(options) => options,
+        Err(error) => return oauth_error_json("invalid_request", error, 400),
+    };
+
+    json(&PasskeyOptionsResponse {
+        public_key: options,
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn passkey_authenticate_verify(mut request: Request, env: Env) -> worker::Result<Response> {
+    let url = request.url()?;
+    let config = server_config(&env, &url);
+    let db = env.d1(D1_BINDING)?;
+    let now = unix_timestamp_seconds();
+    let body =
+        match passkey_json_from_request::<PasskeyAuthenticateVerifyRequest>(&mut request).await {
+            Ok(body) => body,
+            Err(error) => return oauth_error_json("invalid_request", error, 400),
+        };
+    let challenge_hash =
+        match passkey_challenge_hash_from_client_data(&body.response.client_data_json) {
+            Ok(challenge_hash) => challenge_hash,
+            Err(error) => return oauth_error_json("invalid_request", error, 400),
+        };
+    let Some(challenge) = get_passkey_challenge_by_hash(&db, &challenge_hash).await? else {
+        return oauth_error_json("invalid_request", "passkey challenge was not found", 400);
+    };
+    if let Err(error) = validate_passkey_challenge(&challenge, "authentication", now) {
+        return oauth_error_json("invalid_request", error, 400);
+    }
+    let credential_id = match passkey_raw_id(&body.raw_id) {
+        Ok(credential_id) => credential_id,
+        Err(error) => return oauth_error_json("invalid_request", error, 400),
+    };
+    let Some(credential) = get_passkey_credential(&db, &credential_id).await? else {
+        return oauth_error_json("invalid_request", "passkey credential was not found", 400);
+    };
+    if credential.disabled_at.is_some() {
+        return oauth_error_json("invalid_request", "passkey credential is disabled", 400);
+    }
+    if let Err(error) =
+        validate_passkey_authentication_response(&config, &body, &credential, &challenge)
+    {
+        return oauth_error_json("invalid_request", error, 400);
+    }
+    if !consume_passkey_challenge(&db, &challenge.challenge_hash, now).await? {
+        return oauth_error_json("invalid_request", "passkey challenge was already used", 400);
+    }
+    update_passkey_credential_use(
+        &db,
+        &credential.credential_id,
+        passkey_authenticator_sign_count(&body.response.authenticator_data)?,
+        now,
+    )
+    .await?;
+    let Some(user) = get_user(&db, &credential.user_id).await? else {
+        return oauth_error_json("invalid_request", "passkey user was not found", 400);
+    };
+    if user.disabled_at.is_some() {
+        return oauth_error_json("invalid_request", "passkey user is disabled", 400);
+    }
+    let client_id = challenge
+        .client_id
+        .as_deref()
+        .ok_or_else(|| worker_error("passkey challenge did not include a client_id".to_owned()))?;
+    let session_id = format!("sess_{}", random_token()?);
+    let audit_context = audit_request_context(&request).unwrap_or_default();
+    put_session(
+        &db,
+        &session_id,
+        &user.id,
+        client_id,
+        now,
+        audit_context.user_agent.as_deref(),
+        audit_context.ip_hash.as_deref(),
+    )
+    .await?;
+    record_audit_event(
+        &db,
+        &request,
+        "session.login",
+        Some(&user.id),
+        Some(client_id),
+        Some("passkey"),
+        serde_json::json!({
+            "mode": "passkey",
+            "credentialIdHash": hash_secret(&credential.credential_id)
+        }),
+        now,
+    )
+    .await;
+
+    let return_to = challenge
+        .return_to
+        .unwrap_or_else(|| format!("{}/admin", config.issuer().issuer));
+    let response = json(&PasskeyVerifyResponse {
+        ok: true,
+        return_to,
+        user: userinfo_response(&user, Some("email profile")),
+    })?;
+    with_set_cookie(
+        response,
+        &session_cookie(
+            &config.cookie_name,
+            &session_id,
+            SESSION_TTL_SECONDS,
+            config.cookie_domain.as_deref(),
+        ),
+    )
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -4038,17 +4619,408 @@ async fn delete_user_identity(
     user_id: &str,
     provider_id: &str,
     provider_subject: &str,
-) -> worker::Result<()> {
+) -> worker::Result<bool> {
     let args = [
         worker::d1::D1Type::Text(user_id),
         worker::d1::D1Type::Text(provider_id),
         worker::d1::D1Type::Text(provider_subject),
         worker::d1::D1Type::Text(user_id),
     ];
-    db.prepare(
-        "DELETE FROM zeroth_identities
+    let result = db
+        .prepare(
+            "DELETE FROM zeroth_identities
          WHERE user_id = ? AND provider_id = ? AND provider_subject = ?
            AND (SELECT COUNT(*) FROM zeroth_identities WHERE user_id = ?) > 1",
+        )
+        .bind_refs(&args)?
+        .run()
+        .await?;
+    d1_result_changed_one(result)
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn get_user_by_primary_email(
+    db: &worker::d1::D1Database,
+    email: &str,
+) -> worker::Result<Option<UserRow>> {
+    let args = [worker::d1::D1Type::Text(email)];
+    db.prepare(
+        "SELECT id, primary_email, display_name, picture_url, disabled_at
+         FROM zeroth_users
+         WHERE lower(primary_email) = lower(?)
+         ORDER BY updated_at DESC
+         LIMIT 1",
+    )
+    .bind_refs(&args)?
+    .first::<UserRow>(None)
+    .await
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn insert_passkey_user(
+    db: &worker::d1::D1Database,
+    user_id: &str,
+    email: &str,
+    display_name: Option<&str>,
+    now: i32,
+) -> worker::Result<()> {
+    let display_name = d1_optional_text(display_name);
+    let args = [
+        worker::d1::D1Type::Text(user_id),
+        worker::d1::D1Type::Text(email),
+        display_name,
+        worker::d1::D1Type::Integer(now),
+        worker::d1::D1Type::Integer(now),
+    ];
+    db.prepare(
+        "INSERT INTO zeroth_users (
+             id, primary_email, display_name, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind_refs(&args)?
+    .run()
+    .await?;
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn ensure_passkey_registration_user(
+    db: &worker::d1::D1Database,
+    challenge: &PasskeyChallengeRow,
+    now: i32,
+) -> worker::Result<(String, String, Option<String>)> {
+    if let Some(user_id) = challenge.user_id.as_deref() {
+        let Some(user) = get_user(db, user_id).await? else {
+            return Err(worker_error(
+                "passkey registration user was not found".to_owned(),
+            ));
+        };
+        let email = user
+            .primary_email
+            .or_else(|| challenge.email.clone())
+            .ok_or_else(|| worker_error("passkey registration user has no email".to_owned()))?;
+        let display_name = challenge.display_name.clone().or(user.display_name);
+        return Ok((user_id.to_owned(), email, display_name));
+    }
+
+    let email = challenge
+        .email
+        .as_deref()
+        .ok_or_else(|| worker_error("passkey registration challenge has no email".to_owned()))?;
+    if let Some(user) = get_user_by_primary_email(db, email).await? {
+        return Ok((user.id, email.to_owned(), challenge.display_name.clone()));
+    }
+
+    let user_id = format!("usr_{}", random_token()?);
+    insert_passkey_user(db, &user_id, email, challenge.display_name.as_deref(), now).await?;
+    Ok((user_id, email.to_owned(), challenge.display_name.clone()))
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn upsert_passkey_identity(
+    db: &worker::d1::D1Database,
+    user_id: &str,
+    credential_id: &str,
+    email: Option<&str>,
+    display_name: Option<&str>,
+    now: i32,
+) -> worker::Result<()> {
+    let email = d1_optional_text(email);
+    let display_name = d1_optional_text(display_name);
+    let raw_profile_json = serde_json::json!({
+        "kind": "passkey",
+        "credentialIdHash": hash_secret(credential_id)
+    })
+    .to_string();
+    let args = [
+        worker::d1::D1Type::Text("passkey"),
+        worker::d1::D1Type::Text(credential_id),
+        worker::d1::D1Type::Text(user_id),
+        email,
+        worker::d1::D1Type::Integer(1),
+        display_name,
+        worker::d1::D1Type::Text(&raw_profile_json),
+        worker::d1::D1Type::Integer(now),
+        worker::d1::D1Type::Integer(now),
+    ];
+    db.prepare(
+        "INSERT INTO zeroth_identities (
+             provider_id, provider_subject, user_id, email, email_verified,
+             display_name, raw_profile_json, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(provider_id, provider_subject) DO UPDATE SET
+             email = excluded.email,
+             email_verified = excluded.email_verified,
+             display_name = excluded.display_name,
+             raw_profile_json = excluded.raw_profile_json,
+             updated_at = excluded.updated_at
+         WHERE zeroth_identities.user_id = excluded.user_id",
+    )
+    .bind_refs(&args)?
+    .run()
+    .await?;
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn put_passkey_challenge(
+    db: &worker::d1::D1Database,
+    challenge: &str,
+    kind: &str,
+    user_id: Option<&str>,
+    client_id: Option<&str>,
+    return_to: Option<&str>,
+    email: Option<&str>,
+    display_name: Option<&str>,
+    label: Option<&str>,
+    now: i32,
+) -> worker::Result<()> {
+    let challenge_hash = hash_secret(challenge);
+    let user_id = d1_optional_text(user_id);
+    let client_id = d1_optional_text(client_id);
+    let return_to = d1_optional_text(return_to);
+    let email = d1_optional_text(email);
+    let display_name = d1_optional_text(display_name);
+    let label = d1_optional_text(label);
+    let args = [
+        worker::d1::D1Type::Text(&challenge_hash),
+        worker::d1::D1Type::Text(kind),
+        user_id,
+        client_id,
+        return_to,
+        email,
+        display_name,
+        label,
+        worker::d1::D1Type::Integer(now),
+        worker::d1::D1Type::Integer(now + PASSKEY_CHALLENGE_TTL_SECONDS),
+    ];
+    db.prepare(
+        "INSERT INTO zeroth_passkey_challenges (
+             challenge_hash, kind, user_id, client_id, return_to, email,
+             display_name, label, created_at, expires_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind_refs(&args)?
+    .run()
+    .await?;
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn get_passkey_challenge_by_hash(
+    db: &worker::d1::D1Database,
+    challenge_hash: &str,
+) -> worker::Result<Option<PasskeyChallengeRow>> {
+    let args = [worker::d1::D1Type::Text(challenge_hash)];
+    db.prepare(
+        "SELECT challenge_hash, kind, user_id, client_id, return_to, email,
+                display_name, label, created_at, expires_at, consumed_at
+         FROM zeroth_passkey_challenges
+         WHERE challenge_hash = ?
+         LIMIT 1",
+    )
+    .bind_refs(&args)?
+    .first::<PasskeyChallengeRow>(None)
+    .await
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn consume_passkey_challenge(
+    db: &worker::d1::D1Database,
+    challenge_hash: &str,
+    consumed_at: i32,
+) -> worker::Result<bool> {
+    let args = [
+        worker::d1::D1Type::Integer(consumed_at),
+        worker::d1::D1Type::Text(challenge_hash),
+    ];
+    let result = db
+        .prepare(
+            "UPDATE zeroth_passkey_challenges
+             SET consumed_at = ?
+             WHERE challenge_hash = ? AND consumed_at IS NULL",
+        )
+        .bind_refs(&args)?
+        .run()
+        .await?;
+    d1_result_changed_one(result)
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn cleanup_expired_passkey_challenges(
+    db: &worker::d1::D1Database,
+    now: i32,
+) -> worker::Result<()> {
+    let args = [
+        worker::d1::D1Type::Integer(now),
+        worker::d1::D1Type::Integer(PASSKEY_CHALLENGE_CLEANUP_LIMIT),
+    ];
+    db.prepare(
+        "DELETE FROM zeroth_passkey_challenges
+         WHERE challenge_hash IN (
+             SELECT challenge_hash
+             FROM zeroth_passkey_challenges
+             WHERE expires_at <= ?
+             LIMIT ?
+         )",
+    )
+    .bind_refs(&args)?
+    .run()
+    .await?;
+    Ok(())
+}
+
+fn validate_passkey_challenge(
+    challenge: &PasskeyChallengeRow,
+    expected_kind: &str,
+    now: i32,
+) -> Result<(), String> {
+    if challenge.kind != expected_kind {
+        return Err("passkey challenge kind did not match".to_owned());
+    }
+    if challenge.consumed_at.is_some() {
+        return Err("passkey challenge has already been consumed".to_owned());
+    }
+    if challenge.expires_at <= now {
+        return Err("passkey challenge has expired".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn put_passkey_credential(
+    db: &worker::d1::D1Database,
+    credential: &ValidatedPasskeyRegistration,
+    user_id: &str,
+    label: Option<&str>,
+    now: i32,
+) -> worker::Result<()> {
+    let label = d1_optional_text(label);
+    let args = [
+        worker::d1::D1Type::Text(&credential.credential_id),
+        worker::d1::D1Type::Text(user_id),
+        label,
+        worker::d1::D1Type::Text(&credential.public_key_x),
+        worker::d1::D1Type::Text(&credential.public_key_y),
+        worker::d1::D1Type::Integer(credential.sign_count),
+        worker::d1::D1Type::Integer(now),
+        worker::d1::D1Type::Integer(now),
+    ];
+    db.prepare(
+        "INSERT INTO zeroth_passkey_credentials (
+             credential_id, user_id, label, public_key_x, public_key_y,
+             sign_count, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind_refs(&args)?
+    .run()
+    .await?;
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn get_passkey_credential(
+    db: &worker::d1::D1Database,
+    credential_id: &str,
+) -> worker::Result<Option<PasskeyCredentialRow>> {
+    let args = [worker::d1::D1Type::Text(credential_id)];
+    db.prepare(
+        "SELECT credential_id, user_id, label, public_key_x, public_key_y,
+                sign_count, created_at, updated_at, last_used_at, disabled_at
+         FROM zeroth_passkey_credentials
+         WHERE credential_id = ?
+         LIMIT 1",
+    )
+    .bind_refs(&args)?
+    .first::<PasskeyCredentialRow>(None)
+    .await
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn list_active_passkey_credentials(
+    db: &worker::d1::D1Database,
+) -> worker::Result<Vec<PasskeyCredentialRow>> {
+    let args = [worker::d1::D1Type::Integer(PASSKEY_CREDENTIAL_LIST_LIMIT)];
+    db.prepare(
+        "SELECT credential_id, user_id, label, public_key_x, public_key_y,
+                sign_count, created_at, updated_at, last_used_at, disabled_at
+         FROM zeroth_passkey_credentials
+         WHERE disabled_at IS NULL
+         ORDER BY created_at DESC
+         LIMIT ?",
+    )
+    .bind_refs(&args)?
+    .all()
+    .await?
+    .results::<PasskeyCredentialRow>()
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn list_passkey_credentials_for_user(
+    db: &worker::d1::D1Database,
+    user_id: &str,
+) -> worker::Result<Vec<PasskeyCredentialRow>> {
+    let args = [
+        worker::d1::D1Type::Text(user_id),
+        worker::d1::D1Type::Integer(PASSKEY_CREDENTIAL_LIST_LIMIT),
+    ];
+    db.prepare(
+        "SELECT credential_id, user_id, label, public_key_x, public_key_y,
+                sign_count, created_at, updated_at, last_used_at, disabled_at
+         FROM zeroth_passkey_credentials
+         WHERE user_id = ? AND disabled_at IS NULL
+         ORDER BY created_at DESC
+         LIMIT ?",
+    )
+    .bind_refs(&args)?
+    .all()
+    .await?
+    .results::<PasskeyCredentialRow>()
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn update_passkey_credential_use(
+    db: &worker::d1::D1Database,
+    credential_id: &str,
+    sign_count: i32,
+    now: i32,
+) -> worker::Result<()> {
+    let args = [
+        worker::d1::D1Type::Integer(sign_count),
+        worker::d1::D1Type::Integer(sign_count),
+        worker::d1::D1Type::Integer(now),
+        worker::d1::D1Type::Integer(now),
+        worker::d1::D1Type::Text(credential_id),
+    ];
+    db.prepare(
+        "UPDATE zeroth_passkey_credentials
+         SET sign_count = CASE WHEN ? > sign_count THEN ? ELSE sign_count END,
+             last_used_at = ?,
+             updated_at = ?
+         WHERE credential_id = ?",
+    )
+    .bind_refs(&args)?
+    .run()
+    .await?;
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn disable_passkey_credential(
+    db: &worker::d1::D1Database,
+    credential_id: &str,
+    disabled_at: i32,
+) -> worker::Result<()> {
+    let args = [
+        worker::d1::D1Type::Integer(disabled_at),
+        worker::d1::D1Type::Integer(disabled_at),
+        worker::d1::D1Type::Text(credential_id),
+    ];
+    db.prepare(
+        "UPDATE zeroth_passkey_credentials
+         SET disabled_at = COALESCE(disabled_at, ?),
+             updated_at = ?
+         WHERE credential_id = ?",
     )
     .bind_refs(&args)?
     .run()
@@ -7412,6 +8384,607 @@ fn identities_response(identities: &[IdentityRow]) -> IdentitiesResponse {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+async fn passkey_json_from_request<T: serde::de::DeserializeOwned>(
+    request: &mut Request,
+) -> Result<T, String> {
+    let content_type = request
+        .headers()
+        .get("Content-Type")
+        .map_err(|error| format!("could not read Content-Type header: {error}"))?;
+    if !content_type_is_json(content_type.as_deref()) {
+        return Err("Content-Type must be application/json".to_owned());
+    }
+    let body = request
+        .bytes()
+        .await
+        .map_err(|error| format!("could not read passkey body: {error}"))?;
+    if body.len() > PASSKEY_BODY_LIMIT {
+        return Err("passkey JSON body is too large".to_owned());
+    }
+    serde_json::from_slice::<T>(&body).map_err(|error| format!("invalid passkey JSON: {error}"))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn passkey_registration_subject(
+    current: Option<&CurrentSession>,
+    body: &PasskeyRegisterOptionsRequest,
+) -> Result<(Option<String>, String, Option<String>), String> {
+    if let Some(current) = current {
+        let email = current
+            .user
+            .primary_email
+            .as_deref()
+            .or(body.email.as_deref())
+            .ok_or_else(|| "current user has no email; provide email".to_owned())
+            .and_then(validate_passkey_email)?;
+        let display_name = body
+            .display_name
+            .as_deref()
+            .or(current.user.display_name.as_deref())
+            .map(validate_passkey_display_name)
+            .transpose()?;
+        return Ok((Some(current.user.id.clone()), email, display_name));
+    }
+
+    let email = body
+        .email
+        .as_deref()
+        .ok_or_else(|| "email is required to register the first passkey".to_owned())
+        .and_then(validate_passkey_email)?;
+    let display_name = body
+        .display_name
+        .as_deref()
+        .map(validate_passkey_display_name)
+        .transpose()?;
+    Ok((None, email, display_name))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn passkey_client_id_from_request(env: &Env, client_id: Option<&str>) -> worker::Result<String> {
+    client_id
+        .map(str::trim)
+        .filter(|client_id| !client_id.is_empty())
+        .map(str::to_owned)
+        .or_else(|| env_string(env, "DEFAULT_LOGIN_CLIENT_ID"))
+        .filter(|client_id| !client_id.is_empty())
+        .ok_or_else(|| {
+            worker_error(
+                "missing client_id and DEFAULT_LOGIN_CLIENT_ID is not configured".to_owned(),
+            )
+        })
+}
+
+#[cfg(target_arch = "wasm32")]
+fn passkey_return_to(
+    request_url: &url::Url,
+    return_to: Option<&str>,
+    client: &Client,
+    config: &ZerothServerConfig,
+) -> worker::Result<String> {
+    let value = return_to
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("{}/admin", config.issuer().issuer));
+    let value = if value.starts_with('/') {
+        let mut target = request_url.clone();
+        target.set_path(&value);
+        target.set_query(None);
+        target.set_fragment(None);
+        target.to_string()
+    } else {
+        value
+    };
+    validate_client_return_to(&value, client, Some(&config.public_base_url))
+        .map_err(|error| worker_error(format!("invalid passkey return_to: {error}")))?;
+    Ok(value)
+}
+
+fn validate_passkey_email(value: &str) -> Result<String, String> {
+    let email = value.trim().to_ascii_lowercase();
+    if email.is_empty() {
+        return Err("email must not be empty".to_owned());
+    }
+    if email.len() > PASSKEY_EMAIL_MAX_BYTES {
+        return Err("email is too long".to_owned());
+    }
+    if email.bytes().any(|byte| byte.is_ascii_whitespace()) || !email.contains('@') {
+        return Err("email is not valid".to_owned());
+    }
+    Ok(email)
+}
+
+fn validate_passkey_display_name(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("displayName must not be empty".to_owned());
+    }
+    if value.chars().count() > PROFILE_NAME_MAX_CHARS {
+        return Err(format!(
+            "displayName must be at most {PROFILE_NAME_MAX_CHARS} characters"
+        ));
+    }
+    Ok(value.to_owned())
+}
+
+fn validate_passkey_label(value: Option<&str>) -> Result<Option<String>, String> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    if value.chars().count() > PASSKEY_LABEL_MAX_CHARS {
+        return Err(format!(
+            "label must be at most {PASSKEY_LABEL_MAX_CHARS} characters"
+        ));
+    }
+    Ok(Some(value.to_owned()))
+}
+
+fn passkey_creation_options(
+    config: &ZerothServerConfig,
+    challenge: &str,
+    user_id: &str,
+    email: &str,
+    display_name: &str,
+    exclude_credentials: Vec<PasskeyCredentialDescriptor>,
+) -> Result<PasskeyPublicKeyCredentialCreationOptions, String> {
+    Ok(PasskeyPublicKeyCredentialCreationOptions {
+        challenge: passkey_challenge_for_browser(challenge),
+        rp: PasskeyRpEntity {
+            id: passkey_rp_id(config)?,
+            name: passkey_rp_name(config),
+        },
+        user: PasskeyUserEntity {
+            id: URL_SAFE_NO_PAD.encode(user_id.as_bytes()),
+            name: email.to_owned(),
+            display_name: display_name.to_owned(),
+        },
+        pub_key_cred_params: vec![PasskeyPubKeyCredParam {
+            credential_type: "public-key",
+            alg: -7,
+        }],
+        timeout: 300_000,
+        authenticator_selection: PasskeyAuthenticatorSelection {
+            resident_key: "required",
+            require_resident_key: true,
+            user_verification: "required",
+        },
+        attestation: "none",
+        exclude_credentials,
+    })
+}
+
+fn passkey_request_options(
+    config: &ZerothServerConfig,
+    challenge: &str,
+    allow_credentials: Vec<PasskeyCredentialDescriptor>,
+) -> Result<PasskeyPublicKeyCredentialRequestOptions, String> {
+    Ok(PasskeyPublicKeyCredentialRequestOptions {
+        challenge: passkey_challenge_for_browser(challenge),
+        rp_id: passkey_rp_id(config)?,
+        timeout: 300_000,
+        user_verification: "required",
+        allow_credentials,
+    })
+}
+
+fn passkey_challenge_for_browser(challenge: &str) -> String {
+    URL_SAFE_NO_PAD.encode(challenge.as_bytes())
+}
+
+fn passkey_challenge_from_browser(value: &str) -> Result<String, String> {
+    let bytes = decode_base64url(value)?;
+    String::from_utf8(bytes).map_err(|error| format!("challenge was not UTF-8: {error}"))
+}
+
+fn passkey_challenge_hash_from_client_data(client_data_json: &str) -> Result<String, String> {
+    let client_data = decode_passkey_client_data(client_data_json)?;
+    let challenge = passkey_challenge_from_browser(&client_data.challenge)?;
+    Ok(hash_secret(&challenge))
+}
+
+fn passkey_challenge_matches_client_data(challenge_hash: &str, client_data_json: &str) -> bool {
+    passkey_challenge_hash_from_client_data(client_data_json)
+        .is_ok_and(|actual| actual == challenge_hash)
+}
+
+fn passkey_rp_id(config: &ZerothServerConfig) -> Result<String, String> {
+    let url = url::Url::parse(&config.public_base_url)
+        .map_err(|error| format!("PUBLIC_BASE_URL is invalid: {error}"))?;
+    url.host_str()
+        .map(str::to_owned)
+        .ok_or_else(|| "PUBLIC_BASE_URL must include a host".to_owned())
+}
+
+fn passkey_rp_name(config: &ZerothServerConfig) -> String {
+    url::Url::parse(&config.public_base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .unwrap_or_else(|| "Zeroth".to_owned())
+}
+
+fn passkey_expected_origin(config: &ZerothServerConfig) -> Result<String, String> {
+    let url = url::Url::parse(&config.public_base_url)
+        .map_err(|error| format!("PUBLIC_BASE_URL is invalid: {error}"))?;
+    Ok(url.origin().ascii_serialization())
+}
+
+fn validate_passkey_client_data(
+    config: &ZerothServerConfig,
+    client_data_json: &str,
+    expected_type: &str,
+) -> Result<WebAuthnClientData, String> {
+    let client_data = decode_passkey_client_data(client_data_json)?;
+    if client_data.ceremony_type != expected_type {
+        return Err(format!("passkey client data type must be {expected_type}"));
+    }
+    let expected_origin = passkey_expected_origin(config)?;
+    if client_data.origin != expected_origin {
+        return Err("passkey origin did not match Zeroth issuer".to_owned());
+    }
+    if client_data.cross_origin.unwrap_or(false) {
+        return Err("cross-origin passkey ceremonies are not accepted".to_owned());
+    }
+    Ok(client_data)
+}
+
+fn decode_passkey_client_data(client_data_json: &str) -> Result<WebAuthnClientData, String> {
+    let bytes = decode_base64url(client_data_json)?;
+    serde_json::from_slice::<WebAuthnClientData>(&bytes)
+        .map_err(|error| format!("invalid passkey clientDataJSON: {error}"))
+}
+
+fn validate_passkey_registration_response(
+    config: &ZerothServerConfig,
+    body: &PasskeyRegisterVerifyRequest,
+) -> Result<ValidatedPasskeyRegistration, String> {
+    let raw_id = passkey_raw_id(&body.raw_id)?;
+    if passkey_raw_id(&body.id)? != raw_id {
+        return Err("passkey id and rawId did not match".to_owned());
+    }
+    validate_passkey_client_data(config, &body.response.client_data_json, "webauthn.create")?;
+    let attestation_object = decode_base64url(&body.response.attestation_object)?;
+    let auth_data = parse_passkey_attestation_object(&attestation_object)?;
+    validate_passkey_authenticator_data(config, &auth_data, true)?;
+    let credential_id = auth_data
+        .credential_id
+        .ok_or_else(|| "passkey registration did not include credential data".to_owned())
+        .map(|credential_id| URL_SAFE_NO_PAD.encode(credential_id))?;
+    if credential_id != raw_id {
+        return Err("passkey authenticator credential id did not match rawId".to_owned());
+    }
+    let public_key = auth_data
+        .public_key
+        .ok_or_else(|| "passkey registration did not include a public key".to_owned())?;
+    Ok(ValidatedPasskeyRegistration {
+        credential_id,
+        public_key_x: URL_SAFE_NO_PAD.encode(public_key.x),
+        public_key_y: URL_SAFE_NO_PAD.encode(public_key.y),
+        sign_count: auth_data.sign_count,
+    })
+}
+
+fn validate_passkey_authentication_response(
+    config: &ZerothServerConfig,
+    body: &PasskeyAuthenticateVerifyRequest,
+    credential: &PasskeyCredentialRow,
+    challenge: &PasskeyChallengeRow,
+) -> Result<(), String> {
+    let raw_id = passkey_raw_id(&body.raw_id)?;
+    if passkey_raw_id(&body.id)? != raw_id || raw_id != credential.credential_id {
+        return Err("passkey credential id did not match".to_owned());
+    }
+    let client_data =
+        validate_passkey_client_data(config, &body.response.client_data_json, "webauthn.get")?;
+    let challenge_value = passkey_challenge_from_browser(&client_data.challenge)?;
+    if hash_secret(&challenge_value) != challenge.challenge_hash {
+        return Err("passkey challenge did not match".to_owned());
+    }
+    let authenticator_data_bytes = decode_base64url(&body.response.authenticator_data)?;
+    let auth_data = parse_passkey_authenticator_data(&authenticator_data_bytes)?;
+    validate_passkey_authenticator_data(config, &auth_data, false)?;
+    validate_passkey_sign_count(credential.sign_count, auth_data.sign_count)?;
+    let client_data_bytes = decode_base64url(&body.response.client_data_json)?;
+    let mut signed_data = authenticator_data_bytes;
+    signed_data.extend_from_slice(&Sha256::digest(&client_data_bytes));
+    let signature = decode_base64url(&body.response.signature)?;
+    verify_passkey_es256_signature(credential, &signed_data, &signature)
+}
+
+fn validate_passkey_authenticator_data(
+    config: &ZerothServerConfig,
+    auth_data: &ParsedAuthenticatorData,
+    require_attested_credential: bool,
+) -> Result<(), String> {
+    let rp_id = passkey_rp_id(config)?;
+    let expected_hash = Sha256::digest(rp_id.as_bytes()).to_vec();
+    if auth_data.rp_id_hash != expected_hash {
+        return Err("passkey relying-party id hash did not match".to_owned());
+    }
+    if auth_data.flags & 0x01 == 0 {
+        return Err("passkey user-present flag was not set".to_owned());
+    }
+    if auth_data.flags & 0x04 == 0 {
+        return Err("passkey user-verified flag was not set".to_owned());
+    }
+    if require_attested_credential && auth_data.flags & 0x40 == 0 {
+        return Err("passkey attested-credential flag was not set".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_passkey_sign_count(stored: i32, incoming: i32) -> Result<(), String> {
+    if stored > 0 && incoming > 0 && incoming <= stored {
+        return Err("passkey sign counter did not increase".to_owned());
+    }
+    Ok(())
+}
+
+fn verify_passkey_es256_signature(
+    credential: &PasskeyCredentialRow,
+    signed_data: &[u8],
+    signature: &[u8],
+) -> Result<(), String> {
+    let x = decode_base64url(&credential.public_key_x)?;
+    let y = decode_base64url(&credential.public_key_y)?;
+    if x.len() != 32 || y.len() != 32 {
+        return Err("stored passkey public key is not P-256".to_owned());
+    }
+    let mut sec1 = Vec::with_capacity(65);
+    sec1.push(0x04);
+    sec1.extend_from_slice(&x);
+    sec1.extend_from_slice(&y);
+    let verifying_key = VerifyingKey::from_sec1_bytes(&sec1)
+        .map_err(|error| format!("invalid passkey public key: {error}"))?;
+    let signature = Signature::from_der(signature)
+        .map_err(|error| format!("invalid passkey signature: {error}"))?;
+    verifying_key
+        .verify(signed_data, &signature)
+        .map_err(|_| "passkey signature did not verify".to_owned())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn passkey_authenticator_sign_count(authenticator_data: &str) -> worker::Result<i32> {
+    let authenticator_data = decode_base64url(authenticator_data).map_err(worker_error)?;
+    parse_passkey_authenticator_data(&authenticator_data)
+        .map(|data| data.sign_count)
+        .map_err(worker_error)
+}
+
+fn passkey_raw_id(value: &str) -> Result<String, String> {
+    decode_base64url(value).map(|bytes| URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn decode_base64url(value: &str) -> Result<Vec<u8>, String> {
+    URL_SAFE_NO_PAD
+        .decode(value)
+        .or_else(|_| URL_SAFE.decode(value))
+        .map_err(|error| format!("invalid base64url value: {error}"))
+}
+
+fn parse_passkey_attestation_object(bytes: &[u8]) -> Result<ParsedAuthenticatorData, String> {
+    let value = CborReader::new(bytes).read_single()?;
+    let CborValue::Map(entries) = value else {
+        return Err("passkey attestationObject must be a CBOR map".to_owned());
+    };
+    let auth_data = cbor_map_text_bytes(&entries, "authData")
+        .ok_or_else(|| "passkey attestationObject is missing authData".to_owned())?;
+    parse_passkey_authenticator_data(auth_data)
+}
+
+fn parse_passkey_authenticator_data(bytes: &[u8]) -> Result<ParsedAuthenticatorData, String> {
+    if bytes.len() < 37 {
+        return Err("passkey authenticatorData is too short".to_owned());
+    }
+    let rp_id_hash = bytes[0..32].to_vec();
+    let flags = bytes[32];
+    let sign_count = i32::from_be_bytes([bytes[33], bytes[34], bytes[35], bytes[36]]);
+    let mut credential_id = None;
+    let mut public_key = None;
+
+    if flags & 0x40 != 0 {
+        if bytes.len() < 55 {
+            return Err("passkey attested credential data is too short".to_owned());
+        }
+        let credential_id_len = u16::from_be_bytes([bytes[53], bytes[54]]) as usize;
+        let credential_start = 55;
+        let credential_end = credential_start + credential_id_len;
+        if bytes.len() <= credential_end {
+            return Err("passkey credential public key is missing".to_owned());
+        }
+        credential_id = Some(bytes[credential_start..credential_end].to_vec());
+        public_key = Some(parse_passkey_cose_public_key(&bytes[credential_end..])?);
+    }
+
+    Ok(ParsedAuthenticatorData {
+        rp_id_hash,
+        flags,
+        sign_count,
+        credential_id,
+        public_key,
+    })
+}
+
+fn parse_passkey_cose_public_key(bytes: &[u8]) -> Result<PasskeyCredentialPublicKey, String> {
+    let value = CborReader::new(bytes).read_single()?;
+    let CborValue::Map(entries) = value else {
+        return Err("passkey public key must be a COSE_Key map".to_owned());
+    };
+    if cbor_map_int_i64(&entries, 1) != Some(2) {
+        return Err("passkey public key must be EC2".to_owned());
+    }
+    if cbor_map_int_i64(&entries, 3) != Some(-7) {
+        return Err("passkey public key must use ES256".to_owned());
+    }
+    if cbor_map_int_i64(&entries, -1) != Some(1) {
+        return Err("passkey public key must use P-256".to_owned());
+    }
+    let x = cbor_map_int_bytes(&entries, -2)
+        .ok_or_else(|| "passkey public key is missing x coordinate".to_owned())?
+        .to_vec();
+    let y = cbor_map_int_bytes(&entries, -3)
+        .ok_or_else(|| "passkey public key is missing y coordinate".to_owned())?
+        .to_vec();
+    if x.len() != 32 || y.len() != 32 {
+        return Err("passkey public key coordinates must be 32 bytes".to_owned());
+    }
+    Ok(PasskeyCredentialPublicKey { x, y })
+}
+
+fn cbor_map_text_bytes<'a>(entries: &'a [(CborValue, CborValue)], key: &str) -> Option<&'a [u8]> {
+    entries
+        .iter()
+        .find_map(|(entry_key, value)| match (entry_key, value) {
+            (CborValue::Text(entry_key), CborValue::Bytes(value)) if entry_key == key => {
+                Some(value.as_slice())
+            }
+            _ => None,
+        })
+}
+
+fn cbor_map_int_i64(entries: &[(CborValue, CborValue)], key: i64) -> Option<i64> {
+    entries.iter().find_map(|(entry_key, value)| {
+        if cbor_int(entry_key)? != key {
+            return None;
+        }
+        cbor_int(value)
+    })
+}
+
+fn cbor_map_int_bytes<'a>(entries: &'a [(CborValue, CborValue)], key: i64) -> Option<&'a [u8]> {
+    entries.iter().find_map(|(entry_key, value)| {
+        if cbor_int(entry_key)? != key {
+            return None;
+        }
+        match value {
+            CborValue::Bytes(bytes) => Some(bytes.as_slice()),
+            _ => None,
+        }
+    })
+}
+
+fn cbor_int(value: &CborValue) -> Option<i64> {
+    match value {
+        CborValue::Unsigned(value) => i64::try_from(*value).ok(),
+        CborValue::Negative(value) => Some(*value),
+        _ => None,
+    }
+}
+
+struct CborReader<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> CborReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn read_single(mut self) -> Result<CborValue, String> {
+        let value = self.read_value()?;
+        if self.offset != self.bytes.len() {
+            return Err("CBOR value had trailing bytes".to_owned());
+        }
+        Ok(value)
+    }
+
+    fn read_value(&mut self) -> Result<CborValue, String> {
+        let initial = self.read_u8()?;
+        let major = initial >> 5;
+        let additional = initial & 0x1f;
+        match major {
+            0 => Ok(CborValue::Unsigned(self.read_len(additional)?)),
+            1 => {
+                let value = self.read_len(additional)?;
+                let value = i64::try_from(value)
+                    .map_err(|_| "CBOR negative integer is too large".to_owned())?;
+                Ok(CborValue::Negative(-1 - value))
+            }
+            2 => {
+                let len = self.read_len_usize(additional)?;
+                Ok(CborValue::Bytes(self.read_exact(len)?.to_vec()))
+            }
+            3 => {
+                let len = self.read_len_usize(additional)?;
+                let bytes = self.read_exact(len)?;
+                let text = std::str::from_utf8(bytes)
+                    .map_err(|error| format!("CBOR text was not UTF-8: {error}"))?;
+                Ok(CborValue::Text(text.to_owned()))
+            }
+            4 => {
+                let len = self.read_len_usize(additional)?;
+                let mut values = Vec::with_capacity(len);
+                for _ in 0..len {
+                    values.push(self.read_value()?);
+                }
+                Ok(CborValue::Array(values))
+            }
+            5 => {
+                let len = self.read_len_usize(additional)?;
+                let mut entries = Vec::with_capacity(len);
+                for _ in 0..len {
+                    let key = self.read_value()?;
+                    let value = self.read_value()?;
+                    entries.push((key, value));
+                }
+                Ok(CborValue::Map(entries))
+            }
+            7 => match additional {
+                20 => Ok(CborValue::Bool(false)),
+                21 => Ok(CborValue::Bool(true)),
+                22 => Ok(CborValue::Null),
+                _ => Err("unsupported CBOR simple value".to_owned()),
+            },
+            _ => Err("unsupported CBOR major type".to_owned()),
+        }
+    }
+
+    fn read_len_usize(&mut self, additional: u8) -> Result<usize, String> {
+        let len = self.read_len(additional)?;
+        usize::try_from(len).map_err(|_| "CBOR length is too large".to_owned())
+    }
+
+    fn read_len(&mut self, additional: u8) -> Result<u64, String> {
+        match additional {
+            value @ 0..=23 => Ok(u64::from(value)),
+            24 => Ok(u64::from(self.read_u8()?)),
+            25 => Ok(u64::from(u16::from_be_bytes(self.read_array()?))),
+            26 => Ok(u64::from(u32::from_be_bytes(self.read_array()?))),
+            27 => Ok(u64::from_be_bytes(self.read_array()?)),
+            _ => Err("indefinite or reserved CBOR length is not supported".to_owned()),
+        }
+    }
+
+    fn read_u8(&mut self) -> Result<u8, String> {
+        let Some(byte) = self.bytes.get(self.offset).copied() else {
+            return Err("unexpected end of CBOR data".to_owned());
+        };
+        self.offset += 1;
+        Ok(byte)
+    }
+
+    fn read_array<const N: usize>(&mut self) -> Result<[u8; N], String> {
+        let bytes = self.read_exact(N)?;
+        let mut out = [0u8; N];
+        out.copy_from_slice(bytes);
+        Ok(out)
+    }
+
+    fn read_exact(&mut self, len: usize) -> Result<&'a [u8], String> {
+        let end = self
+            .offset
+            .checked_add(len)
+            .ok_or_else(|| "CBOR length overflow".to_owned())?;
+        if end > self.bytes.len() {
+            return Err("unexpected end of CBOR data".to_owned());
+        }
+        let slice = &self.bytes[self.offset..end];
+        self.offset = end;
+        Ok(slice)
+    }
+}
+
 fn validate_access_token_response(claims: &JwtClaims, user: &UserRow) -> ValidateResponse {
     ValidateResponse {
         valid: true,
@@ -9854,6 +11427,90 @@ mod tests {
         let array = apple_app_site_association_readiness_from_payload(Some("[]"));
         assert!(!array.configured);
         assert_eq!(array.notes, vec!["apple_app_site_association_not_object"]);
+    }
+
+    #[test]
+    fn passkey_challenge_round_trips_through_browser_encoding() {
+        let challenge = "0123456789abcdef";
+        let encoded = passkey_challenge_for_browser(challenge);
+
+        assert_eq!(passkey_challenge_from_browser(&encoded).unwrap(), challenge);
+        assert!(passkey_challenge_matches_client_data(
+            &hash_secret(challenge),
+            &test_passkey_client_data("webauthn.get", challenge, "https://id.example.com")
+        ));
+    }
+
+    #[test]
+    fn passkey_registration_response_extracts_es256_credential() {
+        let config = ZerothServerConfig {
+            public_base_url: "https://id.example.com".to_owned(),
+            ..ZerothServerConfig::default()
+        };
+        let credential_id = b"credential-1";
+        let x = [3u8; 32];
+        let y = [7u8; 32];
+        let auth_data = test_passkey_authenticator_data(
+            "id.example.com",
+            0x45,
+            9,
+            credential_id,
+            &test_passkey_cose_key(&x, &y),
+        );
+        let body = PasskeyRegisterVerifyRequest {
+            id: URL_SAFE_NO_PAD.encode(credential_id),
+            raw_id: URL_SAFE_NO_PAD.encode(credential_id),
+            response: PasskeyRegisterCredentialResponse {
+                client_data_json: test_passkey_client_data(
+                    "webauthn.create",
+                    "challenge-1",
+                    "https://id.example.com",
+                ),
+                attestation_object: URL_SAFE_NO_PAD
+                    .encode(test_passkey_attestation_object(&auth_data)),
+                transports: Vec::new(),
+            },
+        };
+
+        let validated = validate_passkey_registration_response(&config, &body).unwrap();
+
+        assert_eq!(
+            validated.credential_id,
+            URL_SAFE_NO_PAD.encode(credential_id)
+        );
+        assert_eq!(validated.public_key_x, URL_SAFE_NO_PAD.encode(x));
+        assert_eq!(validated.public_key_y, URL_SAFE_NO_PAD.encode(y));
+        assert_eq!(validated.sign_count, 9);
+    }
+
+    #[test]
+    fn passkey_es256_signature_verifies_signed_authenticator_payload() {
+        let signing_key = SigningKey::from_slice(&[11u8; 32]).unwrap();
+        let verifying_key = signing_key.verifying_key();
+        let point = verifying_key.to_encoded_point(false);
+        let x = point.x().unwrap();
+        let y = point.y().unwrap();
+        let credential = PasskeyCredentialRow {
+            credential_id: "cred_1".to_owned(),
+            user_id: "usr_1".to_owned(),
+            label: None,
+            public_key_x: URL_SAFE_NO_PAD.encode(x),
+            public_key_y: URL_SAFE_NO_PAD.encode(y),
+            sign_count: 0,
+            created_at: 1,
+            updated_at: 1,
+            last_used_at: None,
+            disabled_at: None,
+        };
+        let signed_data = b"authenticator-data-and-client-data-hash";
+        let signature: Signature = signing_key.sign(signed_data);
+        let der = signature.to_der();
+
+        verify_passkey_es256_signature(&credential, signed_data, der.as_bytes()).unwrap();
+
+        let error =
+            verify_passkey_es256_signature(&credential, b"tampered", der.as_bytes()).unwrap_err();
+        assert_eq!(error, "passkey signature did not verify");
     }
 
     #[test]
@@ -13095,6 +14752,87 @@ mod tests {
                 n: Some("n".to_owned()),
                 e: Some("e".to_owned()),
             }],
+        }
+    }
+
+    fn test_passkey_client_data(ceremony_type: &str, challenge: &str, origin: &str) -> String {
+        URL_SAFE_NO_PAD.encode(
+            serde_json::json!({
+                "type": ceremony_type,
+                "challenge": passkey_challenge_for_browser(challenge),
+                "origin": origin,
+                "crossOrigin": false
+            })
+            .to_string()
+            .as_bytes(),
+        )
+    }
+
+    fn test_passkey_authenticator_data(
+        rp_id: &str,
+        flags: u8,
+        sign_count: i32,
+        credential_id: &[u8],
+        cose_key: &[u8],
+    ) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&Sha256::digest(rp_id.as_bytes()));
+        data.push(flags);
+        data.extend_from_slice(&sign_count.to_be_bytes());
+        data.extend_from_slice(&[0u8; 16]);
+        data.extend_from_slice(&(credential_id.len() as u16).to_be_bytes());
+        data.extend_from_slice(credential_id);
+        data.extend_from_slice(cose_key);
+        data
+    }
+
+    fn test_passkey_attestation_object(auth_data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.push(0xa3);
+        cbor_text(&mut out, "fmt");
+        cbor_text(&mut out, "none");
+        cbor_text(&mut out, "authData");
+        cbor_bytes(&mut out, auth_data);
+        cbor_text(&mut out, "attStmt");
+        out.push(0xa0);
+        out
+    }
+
+    fn test_passkey_cose_key(x: &[u8; 32], y: &[u8; 32]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.push(0xa5);
+        out.push(0x01);
+        out.push(0x02);
+        out.push(0x03);
+        out.push(0x26);
+        out.push(0x20);
+        out.push(0x01);
+        out.push(0x21);
+        cbor_bytes(&mut out, x);
+        out.push(0x22);
+        cbor_bytes(&mut out, y);
+        out
+    }
+
+    fn cbor_text(out: &mut Vec<u8>, value: &str) {
+        cbor_len(out, 0x60, value.len());
+        out.extend_from_slice(value.as_bytes());
+    }
+
+    fn cbor_bytes(out: &mut Vec<u8>, value: &[u8]) {
+        cbor_len(out, 0x40, value.len());
+        out.extend_from_slice(value);
+    }
+
+    fn cbor_len(out: &mut Vec<u8>, major: u8, len: usize) {
+        if len < 24 {
+            out.push(major | (len as u8));
+        } else if len <= u8::MAX as usize {
+            out.push(major | 24);
+            out.push(len as u8);
+        } else {
+            out.push(major | 25);
+            out.extend_from_slice(&(len as u16).to_be_bytes());
         }
     }
 
