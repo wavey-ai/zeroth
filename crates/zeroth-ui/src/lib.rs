@@ -879,6 +879,16 @@ pub struct ProviderAdminUi {
     pub callback_url: String,
     pub web_domain: Option<String>,
     pub notes: Vec<String>,
+    pub last_failure: Option<ProviderFailureAdminUi>,
+}
+
+/// Bounded provider failure evidence shown in the management UI.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderFailureAdminUi {
+    pub event_type: String,
+    pub created_at: String,
+    pub code: Option<String>,
+    pub description: Option<String>,
 }
 
 /// First-party/local auth method readiness row shown in the management UI.
@@ -1505,6 +1515,7 @@ pub fn ClientsAdminApp(state: ClientsAdminUiState) -> impl IntoView {
                                         <th>"Client ID"</th>
                                         <th>"Client secret"</th>
                                         <th>"Setup"</th>
+                                        <th>"Last failure"</th>
                                         <th>"Notes"</th>
                                     </tr>
                                 </thead>
@@ -1821,6 +1832,7 @@ fn provider_admin_row(provider: ProviderAdminUi) -> impl IntoView {
         "Missing"
     };
     let notes = join_or_dash(provider.notes);
+    let last_failure = provider_failure_text(provider.last_failure.as_ref());
     let initial = provider_initial_by_id(&provider.id);
     let setup = provider_setup_text(
         provider.web_domain.as_deref(),
@@ -1839,12 +1851,43 @@ fn provider_admin_row(provider: ProviderAdminUi) -> impl IntoView {
             <td>{client_id}</td>
             <td>{client_secret}</td>
             <td class="zeroth-code">{setup}</td>
+            <td>{last_failure}</td>
             <td>
                 <span class="zeroth-provider-badge">{initial}</span>
                 " "
                 {notes}
             </td>
         </tr>
+    }
+}
+
+fn provider_failure_text(failure: Option<&ProviderFailureAdminUi>) -> String {
+    let Some(failure) = failure else {
+        return "-".to_owned();
+    };
+
+    let mut parts = Vec::new();
+    if !failure.created_at.is_empty() {
+        parts.push(failure.created_at.as_str());
+    }
+    if !failure.event_type.is_empty() {
+        parts.push(failure.event_type.as_str());
+    }
+    if let Some(code) = failure.code.as_deref().filter(|code| !code.is_empty()) {
+        parts.push(code);
+    }
+    if let Some(description) = failure
+        .description
+        .as_deref()
+        .filter(|description| !description.is_empty())
+    {
+        parts.push(description);
+    }
+
+    if parts.is_empty() {
+        "-".to_owned()
+    } else {
+        parts.join(" · ")
     }
 }
 
@@ -2756,7 +2799,7 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
   function renderProviderRows(providers) {
     providerRows.replaceChildren();
     if (providers.length === 0) {
-      renderEmptyRows(providerRows, 6);
+      renderEmptyRows(providerRows, 7);
       return;
     }
 
@@ -2783,12 +2826,27 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
       setup.className = "zeroth-code";
       setup.textContent = providerSetupText(provider);
 
+      const lastFailure = document.createElement("td");
+      lastFailure.textContent = providerFailureText(provider);
+
       const notes = document.createElement("td");
       notes.textContent = (provider.notes || []).join(", ") || "-";
 
-      row.append(name, state, clientId, secret, setup, notes);
+      row.append(name, state, clientId, secret, setup, lastFailure, notes);
       providerRows.appendChild(row);
     }
+  }
+
+  function providerFailureText(provider) {
+    const failure = provider.lastFailure || provider.last_failure;
+    if (!failure) return "-";
+    const parts = [
+      failure.createdAt || failure.created_at || "",
+      failure.eventType || failure.event_type || "",
+      failure.code || "",
+      failure.description || ""
+    ].filter(Boolean);
+    return parts.join(" · ") || "-";
   }
 
   function renderLocalAuthRows(methods) {
@@ -3549,6 +3607,7 @@ mod tests {
             callback_url: "https://id.example.com/oauth2/callback".to_owned(),
             web_domain: Some("id.example.com".to_owned()),
             notes: Vec::new(),
+            last_failure: None,
         });
         state.providers.push(ProviderAdminUi {
             id: well_known::SPOTIFY.to_owned(),
@@ -3562,6 +3621,12 @@ mod tests {
             callback_url: "https://id.example.com/oauth2/callback".to_owned(),
             web_domain: None,
             notes: vec!["disabled_by_deployment".to_owned()],
+            last_failure: Some(ProviderFailureAdminUi {
+                event_type: "provider.profile.failed".to_owned(),
+                created_at: "1780000400".to_owned(),
+                code: Some("invalid_response".to_owned()),
+                description: Some("Spotify profile endpoint returned HTTP 403".to_owned()),
+            }),
         });
         state.local_auth.push(LocalAuthAdminUi {
             id: "magic_link".to_owned(),
@@ -3623,6 +3688,8 @@ mod tests {
         assert!(html.contains("Spotify"));
         assert!(html.contains("Disabled"));
         assert!(html.contains("disabled_by_deployment"));
+        assert!(html.contains("provider.profile.failed"));
+        assert!(html.contains("Spotify profile endpoint returned HTTP 403"));
         assert!(html.contains("Magic link"));
         assert!(html.contains("zeroth_magic_links"));
         assert!(html.contains("usr_123"));

@@ -45,7 +45,9 @@ use zeroth_ui::{
     SessionUi, UserAdminUi,
 };
 #[cfg(target_arch = "wasm32")]
-use zeroth_ui::{LocalAuthAdminUi, LocalAuthDeliveryAdminUi, ProviderAdminUi};
+use zeroth_ui::{
+    LocalAuthAdminUi, LocalAuthDeliveryAdminUi, ProviderAdminUi, ProviderFailureAdminUi,
+};
 
 #[cfg(target_arch = "wasm32")]
 use zeroth_providers::{OAuthProvider, Provider, ProviderAuthorizeRequest};
@@ -75,6 +77,9 @@ const USER_ID_MAX_CHARS: usize = 128;
 const AUDIT_EVENT_LIST_LIMIT: i32 = 100;
 const AUDIT_EVENT_TYPE_MAX_CHARS: usize = 96;
 const AUDIT_EVENT_DETAILS_MAX_BYTES: usize = 1024;
+const PROVIDER_FAILURE_EVENT_LIST_LIMIT: i32 = 30;
+const PROVIDER_FAILURE_CODE_MAX_CHARS: usize = 96;
+const PROVIDER_FAILURE_DESCRIPTION_MAX_CHARS: usize = 240;
 const SESSION_LIST_LIMIT: i32 = 100;
 const IDENTITY_LIST_LIMIT: i32 = 16;
 const PASSKEY_CHALLENGE_TTL_SECONDS: i32 = 5 * 60;
@@ -475,6 +480,19 @@ struct ProviderStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     web_domain: Option<String>,
     notes: Vec<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_failure: Option<ProviderFailureStatus>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderFailureStatus {
+    event_type: String,
+    created_at: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -601,6 +619,14 @@ struct AuditEventRow {
 
 #[derive(Debug, Clone, Deserialize, Eq, PartialEq)]
 struct MagicLinkDeliveryEventRow {
+    event_type: String,
+    created_at: i32,
+    details_json: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq)]
+struct ProviderFailureEventRow {
+    provider_id: String,
     event_type: String,
     created_at: i32,
     details_json: String,
@@ -2349,8 +2375,9 @@ async fn provider_status(request: Request, env: Env) -> worker::Result<Response>
         return client_management_error_json(&error);
     }
 
+    let provider_failures = provider_failure_statuses(&db).await?;
     json(&ProviderStatusResponse {
-        providers: provider_status_rows(&env, &config, true),
+        providers: provider_status_rows(&env, &config, true, &provider_failures),
     })
 }
 
@@ -4411,13 +4438,15 @@ async fn hosted_clients_admin(request: Request, env: Env) -> worker::Result<Resp
     let config = server_config(&env, &url);
     let mut state = ClientsAdminUiState::new(config.issuer().issuer)
         .with_product_name(product_name_from_env(&env));
-    state.providers = provider_admin_ui_rows(&env, &config);
+    state.providers = provider_admin_ui_rows(&env, &config, &[]);
     state.local_auth = local_auth_admin_ui_rows(&env, None);
     let db = env.d1(D1_BINDING)?;
     let now = unix_timestamp_seconds();
 
     match authorize_admin_request(&request, &env, &db, &config, now).await {
         Ok(_) => {
+            let provider_failures = provider_failure_statuses(&db).await?;
+            state.providers = provider_admin_ui_rows(&env, &config, &provider_failures);
             state.local_auth =
                 local_auth_admin_ui_rows(&env, magic_link_delivery_status(&db).await?);
             let rows = list_client_rows_for_admin(&db).await?;
@@ -4799,11 +4828,12 @@ fn provider_status_rows(
     env: &Env,
     config: &ZerothServerConfig,
     include_disabled: bool,
+    provider_failures: &[(String, ProviderFailureStatus)],
 ) -> Vec<ProviderStatus> {
     [well_known::APPLE, well_known::GOOGLE, well_known::SPOTIFY]
         .into_iter()
         .filter(|provider_id| include_disabled || !provider_disabled(env, provider_id))
-        .filter_map(|provider_id| provider_status_row(env, config, provider_id))
+        .filter_map(|provider_id| provider_status_row(env, config, provider_id, provider_failures))
         .collect()
 }
 
@@ -4899,7 +4929,7 @@ fn signing_readiness(env: &Env) -> ReadinessCheck {
 
 #[cfg(target_arch = "wasm32")]
 fn provider_readiness_rows(env: &Env, config: &ZerothServerConfig) -> Vec<ProviderReadiness> {
-    provider_status_rows(env, config, false)
+    provider_status_rows(env, config, false, &[])
         .into_iter()
         .map(|status| ProviderReadiness {
             id: status.id,
@@ -4974,6 +5004,7 @@ fn provider_status_row(
     env: &Env,
     config: &ZerothServerConfig,
     provider_id: &str,
+    provider_failures: &[(String, ProviderFailureStatus)],
 ) -> Option<ProviderStatus> {
     let (id, label, kind) = match provider_id {
         well_known::APPLE => (well_known::APPLE, "Apple", "oidc"),
@@ -5013,7 +5044,18 @@ fn provider_status_row(
         callback_url: config.issuer().provider_callback_endpoint(),
         web_domain: provider_web_domain(provider_id, config),
         notes,
+        last_failure: provider_failure_for_provider(provider_id, provider_failures),
     })
+}
+
+fn provider_failure_for_provider(
+    provider_id: &str,
+    provider_failures: &[(String, ProviderFailureStatus)],
+) -> Option<ProviderFailureStatus> {
+    provider_failures
+        .iter()
+        .find(|(id, _)| id == provider_id)
+        .map(|(_, failure)| failure.clone())
 }
 
 fn provider_status_enabled(
@@ -5173,8 +5215,12 @@ fn provider_secret_binding_configured(env: &Env, name: &str) -> bool {
 }
 
 #[cfg(target_arch = "wasm32")]
-fn provider_admin_ui_rows(env: &Env, config: &ZerothServerConfig) -> Vec<ProviderAdminUi> {
-    provider_status_rows(env, config, true)
+fn provider_admin_ui_rows(
+    env: &Env,
+    config: &ZerothServerConfig,
+    provider_failures: &[(String, ProviderFailureStatus)],
+) -> Vec<ProviderAdminUi> {
+    provider_status_rows(env, config, true, provider_failures)
         .into_iter()
         .map(|status| ProviderAdminUi {
             id: status.id.to_owned(),
@@ -5192,8 +5238,19 @@ fn provider_admin_ui_rows(env: &Env, config: &ZerothServerConfig) -> Vec<Provide
             callback_url: status.callback_url,
             web_domain: status.web_domain,
             notes: status.notes.iter().map(|note| (*note).to_owned()).collect(),
+            last_failure: status.last_failure.map(provider_failure_admin_ui),
         })
         .collect()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn provider_failure_admin_ui(status: ProviderFailureStatus) -> ProviderFailureAdminUi {
+    ProviderFailureAdminUi {
+        event_type: status.event_type,
+        created_at: status.created_at.to_string(),
+        code: status.code,
+        description: status.description,
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -6816,6 +6873,90 @@ async fn magic_link_delivery_status(
         .await?
         .results::<MagicLinkDeliveryEventRow>()?;
     Ok(magic_link_delivery_status_from_events(&rows))
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn provider_failure_statuses(
+    db: &worker::d1::D1Database,
+) -> worker::Result<Vec<(String, ProviderFailureStatus)>> {
+    let args = [worker::d1::D1Type::Integer(
+        PROVIDER_FAILURE_EVENT_LIST_LIMIT,
+    )];
+    let rows = db
+        .prepare(
+            "SELECT provider_id, event_type, created_at, details_json
+               FROM zeroth_audit_events
+              WHERE provider_id IS NOT NULL
+                AND event_type IN ('provider.token_exchange.failed', 'provider.profile.failed')
+              ORDER BY created_at DESC, id DESC
+              LIMIT ?",
+        )
+        .bind_refs(&args)?
+        .all()
+        .await?
+        .results::<ProviderFailureEventRow>()?;
+    Ok(provider_failure_statuses_from_events(&rows))
+}
+
+fn provider_failure_statuses_from_events(
+    rows: &[ProviderFailureEventRow],
+) -> Vec<(String, ProviderFailureStatus)> {
+    let mut failures = Vec::new();
+    for row in rows {
+        if failures.iter().any(|(id, _)| id == &row.provider_id) {
+            continue;
+        }
+        failures.push((
+            row.provider_id.clone(),
+            provider_failure_status_from_event(row),
+        ));
+    }
+    failures
+}
+
+fn provider_failure_status_from_event(row: &ProviderFailureEventRow) -> ProviderFailureStatus {
+    ProviderFailureStatus {
+        event_type: provider_failure_string(
+            row.event_type.as_str(),
+            PROVIDER_FAILURE_CODE_MAX_CHARS,
+        ),
+        created_at: row.created_at,
+        code: provider_failure_details_string(
+            &row.details_json,
+            &["code", "error"],
+            PROVIDER_FAILURE_CODE_MAX_CHARS,
+        ),
+        description: provider_failure_details_string(
+            &row.details_json,
+            &["description", "errorDescription", "error_description"],
+            PROVIDER_FAILURE_DESCRIPTION_MAX_CHARS,
+        ),
+    }
+}
+
+fn provider_failure_details_string(
+    details_json: &str,
+    keys: &[&str],
+    max_chars: usize,
+) -> Option<String> {
+    let details = serde_json::from_str::<serde_json::Value>(details_json).ok()?;
+    keys.iter()
+        .find_map(|key| details.get(*key).and_then(serde_json::Value::as_str))
+        .map(|value| provider_failure_string(value, max_chars))
+        .filter(|value| !value.is_empty())
+}
+
+fn provider_failure_string(value: &str, max_chars: usize) -> String {
+    let value = value.trim();
+    if value.chars().count() <= max_chars {
+        return value.to_owned();
+    }
+    if max_chars <= 3 {
+        return value.chars().take(max_chars).collect();
+    }
+    let mut truncated = value.chars().take(max_chars - 3).collect::<String>();
+    truncated.push_str("...");
+    truncated
 }
 
 fn magic_link_delivery_status_from_events(
@@ -13801,6 +13942,63 @@ mod tests {
         assert!(!provider_status_enabled(true, true, true));
         assert!(!provider_status_enabled(true, false, false));
         assert!(!provider_status_enabled(false, true, false));
+    }
+
+    #[test]
+    fn provider_failure_status_summarizes_latest_safe_details_per_provider() {
+        let long_description = "Spotify profile endpoint returned HTTP 403: ".to_owned()
+            + &"premium subscription required ".repeat(20);
+        let rows = vec![
+            ProviderFailureEventRow {
+                provider_id: well_known::SPOTIFY.to_owned(),
+                event_type: "provider.profile.failed".to_owned(),
+                created_at: 1_780_000_400,
+                details_json: serde_json::json!({
+                    "code": "invalid_response",
+                    "description": long_description,
+                    "accessToken": "must-not-appear"
+                })
+                .to_string(),
+            },
+            ProviderFailureEventRow {
+                provider_id: well_known::SPOTIFY.to_owned(),
+                event_type: "provider.token_exchange.failed".to_owned(),
+                created_at: 1_780_000_300,
+                details_json: serde_json::json!({
+                    "code": "invalid_grant",
+                    "description": "older failure"
+                })
+                .to_string(),
+            },
+            ProviderFailureEventRow {
+                provider_id: well_known::GOOGLE.to_owned(),
+                event_type: "provider.token_exchange.failed".to_owned(),
+                created_at: 1_780_000_200,
+                details_json: serde_json::json!({
+                    "error": "invalid_client",
+                    "error_description": "bad client secret"
+                })
+                .to_string(),
+            },
+        ];
+
+        let failures = provider_failure_statuses_from_events(&rows);
+
+        assert_eq!(failures.len(), 2);
+        assert_eq!(failures[0].0, well_known::SPOTIFY);
+        assert_eq!(failures[0].1.event_type, "provider.profile.failed");
+        assert_eq!(failures[0].1.created_at, 1_780_000_400);
+        assert_eq!(failures[0].1.code.as_deref(), Some("invalid_response"));
+        let description = failures[0].1.description.as_deref().unwrap();
+        assert!(description.starts_with("Spotify profile endpoint returned HTTP 403"));
+        assert!(description.len() <= PROVIDER_FAILURE_DESCRIPTION_MAX_CHARS);
+        assert!(!description.contains("must-not-appear"));
+        assert_eq!(failures[1].0, well_known::GOOGLE);
+        assert_eq!(failures[1].1.code.as_deref(), Some("invalid_client"));
+        assert_eq!(
+            failures[1].1.description.as_deref(),
+            Some("bad client secret")
+        );
     }
 
     #[test]
