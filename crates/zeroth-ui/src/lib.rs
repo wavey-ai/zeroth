@@ -910,6 +910,7 @@ pub struct LocalAuthDeliveryAdminUi {
     pub last_sent_at: Option<String>,
     pub last_failed_at: Option<String>,
     pub last_error: Option<String>,
+    pub last_error_detail: Option<String>,
 }
 
 /// User row shown in the Zeroth management UI.
@@ -1948,6 +1949,9 @@ fn local_auth_delivery_evidence(status: Option<&LocalAuthDeliveryAdminUi>) -> St
     }
     if let Some(value) = status.last_error.as_deref() {
         parts.push(format!("error {value}"));
+    }
+    if let Some(value) = status.last_error_detail.as_deref() {
+        parts.push(format!("detail {value}"));
     }
     join_or_dash(parts)
 }
@@ -3639,6 +3643,7 @@ mod tests {
                 last_sent_at: None,
                 last_failed_at: Some("1780000300".to_owned()),
                 last_error: Some("email_internal_server_error".to_owned()),
+                last_error_detail: Some("email.sending.error.internal_server [code: 10002]".to_owned()),
             }),
             notes: vec!["delivery_failed_recently".to_owned()],
         });

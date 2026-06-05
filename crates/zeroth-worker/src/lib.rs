@@ -98,6 +98,7 @@ const PASSWORD_PBKDF2_MIN_ITERATIONS: u32 = 1_000;
 const PASSWORD_PBKDF2_MAX_ITERATIONS: u32 = 100_000;
 const MAGIC_LINK_TTL_SECONDS: i32 = 10 * 60;
 const MAGIC_LINK_CLEANUP_LIMIT: i32 = 64;
+const MAGIC_LINK_EMAIL_ERROR_DETAIL_MAX_CHARS: usize = 160;
 const PROFILE_PATCH_BODY_LIMIT: usize = 4 * 1024;
 const PROFILE_NAME_MAX_CHARS: usize = 128;
 const PROFILE_PICTURE_MAX_BYTES: usize = 2048;
@@ -433,6 +434,8 @@ struct LocalAuthDeliveryStatus {
     last_failed_at: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     last_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_error_detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3768,7 +3771,7 @@ async fn magic_link_request(mut request: Request, env: Env) -> worker::Result<Re
                 user_id.as_deref(),
                 Some(&client.id.0),
                 Some(LOCAL_AUTH_PROVIDER_ID),
-                serde_json::json!({ "errorClass": error_class }),
+                magic_link_email_failed_details(error_class, &error),
                 now,
             )
             .await;
@@ -5353,6 +5356,7 @@ fn local_auth_delivery_admin_ui(status: LocalAuthDeliveryStatus) -> LocalAuthDel
         last_sent_at: status.last_sent_at.map(|value| value.to_string()),
         last_failed_at: status.last_failed_at.map(|value| value.to_string()),
         last_error: status.last_error,
+        last_error_detail: status.last_error_detail,
     }
 }
 
@@ -7062,12 +7066,30 @@ fn magic_link_delivery_status_from_events(
                 if status.last_error.is_none() {
                     status.last_error = Some(magic_link_email_error_class(&row.details_json));
                 }
+                if status.last_error_detail.is_none() {
+                    status.last_error_detail = magic_link_email_error_detail(&row.details_json);
+                }
             }
             _ => {}
         }
     }
 
     Some(status)
+}
+
+fn magic_link_email_failed_details(error_class: &str, error: &str) -> serde_json::Value {
+    let mut details = serde_json::Map::new();
+    details.insert(
+        "errorClass".to_owned(),
+        serde_json::Value::String(error_class.to_owned()),
+    );
+    if let Some(error_detail) = sanitize_magic_link_email_error_detail(error) {
+        details.insert(
+            "errorDetail".to_owned(),
+            serde_json::Value::String(error_detail),
+        );
+    }
+    serde_json::Value::Object(details)
 }
 
 fn magic_link_issue_sent(details_json: &str) -> bool {
@@ -7089,6 +7111,75 @@ fn magic_link_email_error_class(details_json: &str) -> String {
         })
         .unwrap_or_default();
     classify_magic_link_email_error(&error).to_owned()
+}
+
+fn magic_link_email_error_detail(details_json: &str) -> Option<String> {
+    let detail = serde_json::from_str::<serde_json::Value>(details_json)
+        .ok()
+        .and_then(|details| {
+            details
+                .get("errorDetail")
+                .or_else(|| details.get("errorDescription"))
+                .or_else(|| details.get("error_description"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })?;
+    sanitize_magic_link_email_error_detail(&detail)
+}
+
+fn sanitize_magic_link_email_error_detail(error: &str) -> Option<String> {
+    let mut sanitized = error
+        .trim()
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect::<String>()
+        .split_whitespace()
+        .map(redact_magic_link_email_error_token)
+        .collect::<Vec<_>>()
+        .join(" ");
+    if sanitized.is_empty() {
+        return None;
+    }
+    if sanitized.chars().count() > MAGIC_LINK_EMAIL_ERROR_DETAIL_MAX_CHARS {
+        sanitized = sanitized
+            .chars()
+            .take(MAGIC_LINK_EMAIL_ERROR_DETAIL_MAX_CHARS.saturating_sub(3))
+            .collect::<String>();
+        sanitized.push_str("...");
+    }
+    Some(sanitized)
+}
+
+fn redact_magic_link_email_error_token(token: &str) -> Cow<'_, str> {
+    let probe = token.trim_matches(|ch: char| {
+        ch.is_ascii_punctuation() && !matches!(ch, '_' | '-' | '.')
+    });
+    if magic_link_error_token_is_url(probe) {
+        Cow::Borrowed("[url]")
+    } else if magic_link_error_token_is_email(probe) {
+        Cow::Borrowed("[email]")
+    } else {
+        Cow::Borrowed(token)
+    }
+}
+
+fn magic_link_error_token_is_url(token: &str) -> bool {
+    let lower = token.to_ascii_lowercase();
+    lower.starts_with("https://") || lower.starts_with("http://")
+}
+
+fn magic_link_error_token_is_email(token: &str) -> bool {
+    let Some((local, domain)) = token.split_once('@') else {
+        return false;
+    };
+    !local.is_empty()
+        && domain.contains('.')
+        && !domain.contains('/')
+        && token.bytes().all(|byte| {
+            byte.is_ascii()
+                && !byte.is_ascii_whitespace()
+                && !matches!(byte, b'<' | b'>' | b'"' | b'\'')
+        })
 }
 
 fn classify_magic_link_email_error(error: &str) -> &'static str {
@@ -14249,6 +14340,7 @@ mod tests {
             last_sent_at: Some(18),
             last_failed_at: Some(20),
             last_error: Some("email_internal_server_error".to_owned()),
+            last_error_detail: Some("email.sending.error.internal_server [code: 10002]".to_owned()),
         };
         let methods = local_auth_status_rows_from_config(true, None, true, false, Some(delivery));
         let magic_link = methods
@@ -14262,6 +14354,10 @@ mod tests {
             magic_link.delivery_status.as_ref().unwrap().last_error,
             Some("email_internal_server_error".to_owned())
         );
+        assert_eq!(
+            magic_link.delivery_status.as_ref().unwrap().last_error_detail,
+            Some("email.sending.error.internal_server [code: 10002]".to_owned())
+        );
     }
 
     #[test]
@@ -14270,7 +14366,7 @@ mod tests {
             MagicLinkDeliveryEventRow {
                 event_type: "magic_link.email.failed".to_owned(),
                 created_at: 30,
-                details_json: r#"{"errorClass":"email_internal_server_error"}"#.to_owned(),
+                details_json: r#"{"errorClass":"email_internal_server_error","errorDetail":"email.sending.error.internal_server [code: 10002]"}"#.to_owned(),
             },
             MagicLinkDeliveryEventRow {
                 event_type: "magic_link.issue".to_owned(),
@@ -14293,6 +14389,10 @@ mod tests {
             status.last_error,
             Some("email_internal_server_error".to_owned())
         );
+        assert_eq!(
+            status.last_error_detail,
+            Some("email.sending.error.internal_server [code: 10002]".to_owned())
+        );
     }
 
     #[test]
@@ -14310,6 +14410,29 @@ mod tests {
             "email_internal_server_error"
         );
         assert_eq!(classify_magic_link_email_error(""), "email_send_failed");
+    }
+
+    #[test]
+    fn magic_link_email_error_detail_is_bounded_and_single_line() {
+        assert_eq!(
+            sanitize_magic_link_email_error_detail("  first\nsecond\tthird  "),
+            Some("first second third".to_owned())
+        );
+        assert_eq!(
+            sanitize_magic_link_email_error_detail(
+                "failed for jamie@wavey.ai at https://id.wavey.ai/magic-links/consume?token=secret"
+            ),
+            Some("failed for [email] at [url]".to_owned())
+        );
+        assert_eq!(sanitize_magic_link_email_error_detail(" \n\t "), None);
+
+        let long = "x".repeat(MAGIC_LINK_EMAIL_ERROR_DETAIL_MAX_CHARS + 10);
+        let sanitized = sanitize_magic_link_email_error_detail(&long).unwrap();
+        assert_eq!(
+            sanitized.chars().count(),
+            MAGIC_LINK_EMAIL_ERROR_DETAIL_MAX_CHARS
+        );
+        assert!(sanitized.ends_with("..."));
     }
 
     #[test]
