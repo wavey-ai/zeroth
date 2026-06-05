@@ -1487,6 +1487,7 @@ pub fn ClientsAdminApp(state: ClientsAdminUiState) -> impl IntoView {
                         <span class="zeroth-status"><span id="zeroth-user-count">{user_count}</span> " users"</span>
                         <span class="zeroth-status"><span id="zeroth-event-count">{event_count}</span> " events"</span>
                         <span class="zeroth-status"><span id="zeroth-client-count">{client_count}</span> " clients"</span>
+                        <button class="zeroth-action" id="zeroth-admin-logout" type="button">"Sign out"</button>
                     </div>
                 </header>
 
@@ -2686,6 +2687,7 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
   const tokenInput = $("zeroth-admin-token");
   const form = $("zeroth-client-form");
   const passkeyForm = $("zeroth-passkey-register-form");
+  const logoutButton = $("zeroth-admin-logout");
   const eventFilterForm = $("zeroth-events-filter-form");
   const editorMode = $("zeroth-editor-mode");
 
@@ -3439,6 +3441,20 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
     });
   });
 
+  if (logoutButton) {
+    logoutButton.addEventListener("click", () => {
+      sessionStorage.removeItem(tokenKey);
+      if (tokenInput) tokenInput.value = "";
+      fetch("/logout", {
+        method: "POST",
+        credentials: "include",
+        headers: { "Accept": "application/json" }
+      }).finally(() => {
+        window.location.assign("/login");
+      });
+    });
+  }
+
   $("zeroth-db-refresh").addEventListener("click", () => {
     loadDbStatus().catch((error) => setMessage(error.message, true));
   });
@@ -3880,6 +3896,8 @@ mod tests {
 
         assert!(html.contains("Admin token"));
         assert!(html.contains("Sign in"));
+        assert!(html.contains("zeroth-admin-logout"));
+        assert!(html.contains("Sign out"));
         assert!(html.contains(
             "https://id.example.com/login?return_to=https%3A%2F%2Fid.example.com%2Fadmin"
         ));
@@ -3935,6 +3953,8 @@ mod tests {
         assert!(document.contains("/events"));
         assert!(document.contains("URLSearchParams"));
         assert!(document.contains("event_type"));
+        assert!(document.contains("fetch(\"/logout\""));
+        assert!(document.contains("window.location.assign(\"/login\")"));
     }
 
     #[test]
