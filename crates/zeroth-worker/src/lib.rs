@@ -4269,35 +4269,96 @@ fn canonical_route_path(path: &str) -> Cow<'_, str> {
 
 fn compatibility_route_path(path: &str) -> Cow<'_, str> {
     match path {
+        "/api/health" => Cow::Borrowed("/health"),
+        "/api/ready" => Cow::Borrowed("/ready"),
+        "/api/providers" => Cow::Borrowed("/providers"),
         "/api/providers/status" => Cow::Borrowed("/providers/status"),
         "/api/local-auth/status" => Cow::Borrowed("/local-auth/status"),
         "/api/clients" => Cow::Borrowed("/clients"),
         "/api/users" => Cow::Borrowed("/users"),
         "/api/events" => Cow::Borrowed("/events"),
+        "/api/routes" => Cow::Borrowed("/routes"),
         "/api/__zeroth/db/status" => Cow::Borrowed("/__zeroth/db/status"),
-        "/api/password/register" | "/local-auth/password/register" => {
-            Cow::Borrowed("/password/register")
+        "/api/authorize" => Cow::Borrowed("/authorize"),
+        "/api/oauth/token" => Cow::Borrowed("/oauth/token"),
+        "/api/oauth/revoke" => Cow::Borrowed("/oauth/revoke"),
+        "/api/oauth/introspect" => Cow::Borrowed("/oauth/introspect"),
+        "/api/userinfo" => Cow::Borrowed("/userinfo"),
+        "/api/session" => Cow::Borrowed("/session"),
+        "/api/sessions" => Cow::Borrowed("/sessions"),
+        "/api/profile" => Cow::Borrowed("/profile"),
+        "/api/identities/link" => Cow::Borrowed("/identities/link"),
+        "/api/identities" => Cow::Borrowed("/identities"),
+        "/api/validate" => Cow::Borrowed("/validate"),
+        "/api/logout" => Cow::Borrowed("/logout"),
+        "/api/password/register"
+        | "/api/local-auth/password/register"
+        | "/local-auth/password/register" => Cow::Borrowed("/password/register"),
+        "/api/password/login" | "/api/local-auth/password/login" | "/local-auth/password/login" => {
+            Cow::Borrowed("/password/login")
         }
-        "/api/password/login" | "/local-auth/password/login" => Cow::Borrowed("/password/login"),
         "/magic-link"
         | "/magic_link"
         | "/magic-links/request"
+        | "/magic-links/send"
+        | "/magic-link/send"
+        | "/magic_link/send"
         | "/api/magic-links"
         | "/api/magic-link"
         | "/api/magic_link"
         | "/api/magic-links/request"
+        | "/api/magic-links/send"
+        | "/api/magic-link/send"
+        | "/api/magic_link/send"
+        | "/api/local-auth/magic-links"
+        | "/api/local-auth/magic-link"
+        | "/api/local-auth/magic_link"
+        | "/api/local-auth/magic-links/request"
+        | "/api/local-auth/magic-links/send"
+        | "/api/local-auth/magic-link/send"
+        | "/api/local-auth/magic_link/send"
         | "/local-auth/magic-links"
         | "/local-auth/magic-link"
         | "/local-auth/magic_link"
-        | "/local-auth/magic-links/request" => Cow::Borrowed("/magic-links"),
+        | "/local-auth/magic-links/request"
+        | "/local-auth/magic-links/send"
+        | "/local-auth/magic-link/send"
+        | "/local-auth/magic_link/send" => Cow::Borrowed("/magic-links"),
         "/magic-link/consume"
         | "/magic_link/consume"
+        | "/magic-links/verify"
+        | "/magic-link/verify"
+        | "/magic_link/verify"
+        | "/magic-links/login"
+        | "/magic-link/login"
+        | "/magic_link/login"
         | "/api/magic-links/consume"
         | "/api/magic-link/consume"
         | "/api/magic_link/consume"
+        | "/api/magic-links/verify"
+        | "/api/magic-link/verify"
+        | "/api/magic_link/verify"
+        | "/api/magic-links/login"
+        | "/api/magic-link/login"
+        | "/api/magic_link/login"
+        | "/api/local-auth/magic-links/consume"
+        | "/api/local-auth/magic-link/consume"
+        | "/api/local-auth/magic_link/consume"
+        | "/api/local-auth/magic-links/verify"
+        | "/api/local-auth/magic-link/verify"
+        | "/api/local-auth/magic_link/verify"
+        | "/api/local-auth/magic-links/login"
+        | "/api/local-auth/magic-link/login"
+        | "/api/local-auth/magic_link/login"
         | "/local-auth/magic-links/consume"
         | "/local-auth/magic-link/consume"
-        | "/local-auth/magic_link/consume" => Cow::Borrowed("/magic-links/consume"),
+        | "/local-auth/magic_link/consume"
+        | "/local-auth/magic-links/verify"
+        | "/local-auth/magic-link/verify"
+        | "/local-auth/magic_link/verify"
+        | "/local-auth/magic-links/login"
+        | "/local-auth/magic-link/login"
+        | "/local-auth/magic_link/login" => Cow::Borrowed("/magic-links/consume"),
         "/api/passkeys/register/options" => Cow::Borrowed("/passkeys/register/options"),
         "/api/passkeys/registration/options" => Cow::Borrowed("/passkeys/registration/options"),
         "/api/passkeys/register/verify" | "/api/passkeys/registration/verify" => {
@@ -17256,16 +17317,32 @@ mod tests {
     #[test]
     fn compatibility_route_path_maps_bounded_aliases_to_canonical_routes() {
         assert_eq!(compatibility_route_path("/admin/users").as_ref(), "/admin");
+        assert_eq!(compatibility_route_path("/api/health").as_ref(), "/health");
+        assert_eq!(compatibility_route_path("/api/ready").as_ref(), "/ready");
         assert_eq!(
             compatibility_route_path("/api/clients").as_ref(),
             "/clients"
         );
+        assert_eq!(compatibility_route_path("/api/routes").as_ref(), "/routes");
         assert_eq!(
             compatibility_route_path("/api/local-auth/status").as_ref(),
             "/local-auth/status"
         );
         assert_eq!(
+            compatibility_route_path("/api/profile").as_ref(),
+            "/profile"
+        );
+        assert_eq!(
+            compatibility_route_path("/api/session").as_ref(),
+            "/session"
+        );
+        assert_eq!(compatibility_route_path("/api/logout").as_ref(), "/logout");
+        assert_eq!(
             compatibility_route_path("/local-auth/magic-links").as_ref(),
+            "/magic-links"
+        );
+        assert_eq!(
+            compatibility_route_path("/api/local-auth/magic-links").as_ref(),
             "/magic-links"
         );
         assert_eq!(
@@ -17277,7 +17354,19 @@ mod tests {
             "/magic-links"
         );
         assert_eq!(
+            compatibility_route_path("/api/magic-links/send").as_ref(),
+            "/magic-links"
+        );
+        assert_eq!(
             compatibility_route_path("/local-auth/magic-links/consume").as_ref(),
+            "/magic-links/consume"
+        );
+        assert_eq!(
+            compatibility_route_path("/api/local-auth/magic-link/consume").as_ref(),
+            "/magic-links/consume"
+        );
+        assert_eq!(
+            compatibility_route_path("/magic-link/verify").as_ref(),
             "/magic-links/consume"
         );
         assert_eq!(
