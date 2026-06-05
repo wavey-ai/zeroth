@@ -1011,13 +1011,13 @@ struct MagicLinkRow {
 struct PasskeyRegisterOptionsRequest {
     #[serde(default)]
     email: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "display_name")]
     display_name: Option<String>,
     #[serde(default)]
     label: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "return_to")]
     return_to: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "client_id")]
     client_id: Option<String>,
 }
 
@@ -1025,9 +1025,9 @@ struct PasskeyRegisterOptionsRequest {
 #[serde(deny_unknown_fields)]
 #[serde(rename_all = "camelCase")]
 struct PasskeyAuthenticateOptionsRequest {
-    #[serde(default)]
+    #[serde(default, alias = "return_to")]
     return_to: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "client_id")]
     client_id: Option<String>,
 }
 
@@ -1037,11 +1037,11 @@ struct PasskeyAuthenticateOptionsRequest {
 struct PasswordRegisterRequest {
     email: String,
     password: String,
-    #[serde(default)]
+    #[serde(default, alias = "display_name")]
     display_name: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "return_to")]
     return_to: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "client_id")]
     client_id: Option<String>,
 }
 
@@ -1051,9 +1051,9 @@ struct PasswordRegisterRequest {
 struct PasswordLoginRequest {
     email: String,
     password: String,
-    #[serde(default)]
+    #[serde(default, alias = "return_to")]
     return_to: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "client_id")]
     client_id: Option<String>,
 }
 
@@ -1062,9 +1062,9 @@ struct PasswordLoginRequest {
 #[serde(rename_all = "camelCase")]
 struct MagicLinkRequest {
     email: String,
-    #[serde(default)]
+    #[serde(default, alias = "return_to")]
     return_to: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "client_id")]
     client_id: Option<String>,
 }
 
@@ -16997,6 +16997,57 @@ mod tests {
         let error = profile_patch_from_value(serde_json::json!({ "picture": "ftp://x.test/a" }))
             .unwrap_err();
         assert_eq!(error.description, "picture must use http or https");
+    }
+
+    #[test]
+    fn local_auth_forms_accept_snake_case_field_aliases() {
+        let magic_link: MagicLinkRequest = serde_urlencoded::from_str(
+            "email=user%40example.com&client_id=ios&return_to=https%3A%2F%2Fapp.example.com%2Fhome",
+        )
+        .unwrap();
+
+        assert_eq!(magic_link.email, "user@example.com");
+        assert_eq!(magic_link.client_id.as_deref(), Some("ios"));
+        assert_eq!(
+            magic_link.return_to.as_deref(),
+            Some("https://app.example.com/home")
+        );
+
+        let login: PasswordLoginRequest = serde_urlencoded::from_str(
+            "email=user%40example.com&password=correct-horse&client_id=ios&return_to=wavey%3A%2F%2Fauth%2Fcallback",
+        )
+        .unwrap();
+
+        assert_eq!(login.client_id.as_deref(), Some("ios"));
+        assert_eq!(login.return_to.as_deref(), Some("wavey://auth/callback"));
+    }
+
+    #[test]
+    fn passkey_json_accepts_snake_case_field_aliases() {
+        let register: PasskeyRegisterOptionsRequest = serde_json::from_value(serde_json::json!({
+            "email": "user@example.com",
+            "display_name": "Example User",
+            "client_id": "ios",
+            "return_to": "wavey://auth/callback"
+        }))
+        .unwrap();
+
+        assert_eq!(register.display_name.as_deref(), Some("Example User"));
+        assert_eq!(register.client_id.as_deref(), Some("ios"));
+        assert_eq!(register.return_to.as_deref(), Some("wavey://auth/callback"));
+
+        let authenticate: PasskeyAuthenticateOptionsRequest =
+            serde_json::from_value(serde_json::json!({
+                "client_id": "ios",
+                "return_to": "wavey://auth/callback"
+            }))
+            .unwrap();
+
+        assert_eq!(authenticate.client_id.as_deref(), Some("ios"));
+        assert_eq!(
+            authenticate.return_to.as_deref(),
+            Some("wavey://auth/callback")
+        );
     }
 
     #[test]
