@@ -473,6 +473,8 @@ struct AdminUserRow {
     disabled_at: Option<i32>,
     #[serde(default)]
     email_verified: i32,
+    #[serde(default)]
+    admin_membership_active: i32,
     identity_count: i32,
     active_session_count: i32,
 }
@@ -496,6 +498,7 @@ struct AdminUserResponse {
     created_at: i32,
     updated_at: i32,
     disabled: bool,
+    admin: bool,
     identity_count: i32,
     active_session_count: i32,
 }
@@ -518,7 +521,10 @@ struct AdminUserDetailResponse {
 #[serde(deny_unknown_fields)]
 #[serde(rename_all = "camelCase")]
 struct AdminUserPatchRequest {
-    disabled: bool,
+    #[serde(default)]
+    disabled: Option<bool>,
+    #[serde(default)]
+    admin: Option<bool>,
 }
 
 #[allow(dead_code)]
@@ -2002,9 +2008,11 @@ async fn users(mut request: Request, env: Env) -> worker::Result<Response> {
     let db = env.d1(D1_BINDING)?;
     let config = server_config(&env, &request_url);
     let now = unix_timestamp_seconds();
-    if let Err(error) = validate_admin_request(&request, &env, &db, &config, now).await {
-        return client_management_error_json(&error);
-    }
+    let admin_authorization = match authorize_admin_request(&request, &env, &db, &config, now).await
+    {
+        Ok(admin_authorization) => admin_authorization,
+        Err(error) => return client_management_error_json(&error),
+    };
 
     match request.method() {
         Method::Get => {
@@ -2044,26 +2052,73 @@ async fn users(mut request: Request, env: Env) -> worker::Result<Response> {
                 Ok(patch) => patch,
                 Err(error) => return client_management_error_json(&error),
             };
-            set_admin_user_disabled(&db, &user_id, patch.disabled, now).await?;
-            if patch.disabled {
-                revoke_active_sessions_for_user(&db, &user_id, now).await?;
-                revoke_active_refresh_tokens_for_user(&db, &user_id, now).await?;
+            if patch.disabled.is_none() && patch.admin.is_none() {
+                return client_management_error_json(&ClientManagementError::invalid_request(
+                    "user patch must include disabled or admin",
+                ));
             }
-            record_audit_event(
-                &db,
-                &request,
-                if patch.disabled {
-                    "user.disable"
+            if matches!(
+                (&admin_authorization, patch.admin),
+                (AdminAuthorization::Session { user_id: current_user_id }, Some(false))
+                    if current_user_id.as_str() == user_id.as_str()
+            ) {
+                return client_management_error_json(&ClientManagementError::invalid_request(
+                    "cannot revoke the active admin session membership",
+                ));
+            }
+
+            if let Some(disabled) = patch.disabled {
+                set_admin_user_disabled(&db, &user_id, disabled, now).await?;
+                if disabled {
+                    revoke_active_sessions_for_user(&db, &user_id, now).await?;
+                    revoke_active_refresh_tokens_for_user(&db, &user_id, now).await?;
+                }
+                record_audit_event(
+                    &db,
+                    &request,
+                    if disabled {
+                        "user.disable"
+                    } else {
+                        "user.enable"
+                    },
+                    Some(&user_id),
+                    None,
+                    None,
+                    serde_json::json!({}),
+                    now,
+                )
+                .await;
+            }
+            if let Some(admin) = patch.admin {
+                if admin {
+                    let granted_by = admin_authorization_granted_by(&admin_authorization);
+                    upsert_admin_membership(&db, &user_id, &granted_by, now).await?;
+                    record_audit_event(
+                        &db,
+                        &request,
+                        "admin.membership.grant",
+                        Some(&user_id),
+                        None,
+                        None,
+                        serde_json::json!({ "grantedBy": granted_by, "mode": "admin_ui" }),
+                        now,
+                    )
+                    .await;
                 } else {
-                    "user.enable"
-                },
-                Some(&user_id),
-                None,
-                None,
-                serde_json::json!({}),
-                now,
-            )
-            .await;
+                    disable_admin_membership(&db, &user_id, now).await?;
+                    record_audit_event(
+                        &db,
+                        &request,
+                        "admin.membership.revoke",
+                        Some(&user_id),
+                        None,
+                        None,
+                        serde_json::json!({ "mode": "admin_ui" }),
+                        now,
+                    )
+                    .await;
+                }
+            }
 
             let response = admin_user_detail_response(&db, &user_id, now)
                 .await?
@@ -5128,7 +5183,14 @@ async fn get_admin_user_row(
                       AND i.email = u.primary_email
                       AND i.email_verified != 0
                     LIMIT 1
-                ) AS email_verified
+                ) AS email_verified,
+                EXISTS (
+                    SELECT 1
+                    FROM zeroth_admin_memberships am
+                    WHERE am.user_id = u.id
+                      AND am.disabled_at IS NULL
+                    LIMIT 1
+                ) AS admin_membership_active
            FROM zeroth_users u
           WHERE u.id = ?
           LIMIT 1",
@@ -5165,7 +5227,14 @@ async fn list_admin_user_rows(
                       AND i.email = u.primary_email
                       AND i.email_verified != 0
                     LIMIT 1
-                ) AS email_verified
+                ) AS email_verified,
+                EXISTS (
+                    SELECT 1
+                    FROM zeroth_admin_memberships am
+                    WHERE am.user_id = u.id
+                      AND am.disabled_at IS NULL
+                    LIMIT 1
+                ) AS admin_membership_active
            FROM zeroth_users u
           ORDER BY u.updated_at DESC, u.id
           LIMIT ?",
@@ -5218,6 +5287,29 @@ async fn upsert_admin_membership(
              granted_by = excluded.granted_by,
              updated_at = excluded.updated_at,
              disabled_at = NULL",
+    )
+    .bind_refs(&args)?
+    .run()
+    .await?;
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn disable_admin_membership(
+    db: &worker::d1::D1Database,
+    user_id: &str,
+    now: i32,
+) -> worker::Result<()> {
+    let args = [
+        worker::d1::D1Type::Integer(now),
+        worker::d1::D1Type::Integer(now),
+        worker::d1::D1Type::Text(user_id),
+    ];
+    db.prepare(
+        "UPDATE zeroth_admin_memberships
+         SET disabled_at = COALESCE(disabled_at, ?),
+             updated_at = ?
+         WHERE user_id = ?",
     )
     .bind_refs(&args)?
     .run()
@@ -8323,6 +8415,7 @@ fn admin_user_response_from_row(row: AdminUserRow) -> AdminUserResponse {
         created_at: row.created_at,
         updated_at: row.updated_at,
         disabled: row.disabled_at.is_some(),
+        admin: row.admin_membership_active != 0,
         identity_count: row.identity_count,
         active_session_count: row.active_session_count,
     }
@@ -8376,6 +8469,7 @@ fn user_admin_ui_from_row(row: AdminUserRow) -> UserAdminUi {
         email: row.primary_email,
         display_name: row.display_name,
         disabled: row.disabled_at.is_some(),
+        admin: row.admin_membership_active != 0,
         identity_count: row.identity_count,
         active_session_count: row.active_session_count,
         created_at: Some(row.created_at.to_string()),
@@ -12096,6 +12190,7 @@ mod tests {
             updated_at: 1_780_000_100,
             disabled_at: Some(1_780_000_200),
             email_verified: 1,
+            admin_membership_active: 1,
             identity_count: 2,
             active_session_count: 3,
         });
@@ -12103,6 +12198,7 @@ mod tests {
         assert_eq!(response.id, "usr_123");
         assert_eq!(response.email.as_deref(), Some("user@example.com"));
         assert!(response.disabled);
+        assert!(response.admin);
         assert_eq!(response.identity_count, 2);
         assert_eq!(response.active_session_count, 3);
     }

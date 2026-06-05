@@ -704,6 +704,7 @@ pub struct UserAdminUi {
     pub email: Option<String>,
     pub display_name: Option<String>,
     pub disabled: bool,
+    pub admin: bool,
     pub identity_count: i32,
     pub active_session_count: i32,
     pub created_at: Option<String>,
@@ -1197,6 +1198,7 @@ pub fn ClientsAdminApp(state: ClientsAdminUiState) -> impl IntoView {
                                     <tr>
                                         <th>"User"</th>
                                         <th>"Status"</th>
+                                        <th>"Admin"</th>
                                         <th>"Identities"</th>
                                         <th>"Sessions"</th>
                                         <th>"Updated"</th>
@@ -1496,6 +1498,22 @@ fn user_admin_row(user: UserAdminUi) -> impl IntoView {
     } else {
         "zeroth-status zeroth-status-ok"
     };
+    let admin_status = if user.admin { "Admin" } else { "Member" };
+    let admin_status_class = if user.admin {
+        "zeroth-status zeroth-status-ok"
+    } else {
+        "zeroth-status"
+    };
+    let admin_action = if user.admin {
+        "Revoke admin"
+    } else {
+        "Grant admin"
+    };
+    let admin_action_class = if user.admin {
+        "zeroth-action zeroth-danger"
+    } else {
+        "zeroth-action"
+    };
     let action = if user.disabled { "Enable" } else { "Disable" };
     let action_class = if user.disabled {
         "zeroth-action"
@@ -1511,17 +1529,19 @@ fn user_admin_row(user: UserAdminUi) -> impl IntoView {
     let updated_at = user.updated_at.unwrap_or_else(|| "-".to_owned());
     let created_at = user.created_at.unwrap_or_else(|| "-".to_owned());
     let disabled = user.disabled.to_string();
+    let admin = user.admin.to_string();
     let user_id = user.user_id;
     let user_id_attr = user_id.clone();
 
     view! {
-        <tr data-user-id=user_id_attr data-user-disabled=disabled>
+        <tr data-user-id=user_id_attr data-user-disabled=disabled data-user-admin=admin>
             <td>
                 <div class="zeroth-row-title">{name}</div>
                 <div class="zeroth-row-meta">{email}</div>
                 <div class="zeroth-row-meta zeroth-code">{user_id}</div>
             </td>
             <td><span class=status_class>{status}</span></td>
+            <td><span class=admin_status_class>{admin_status}</span></td>
             <td>{user.identity_count.to_string()}</td>
             <td>{user.active_session_count.to_string()}</td>
             <td>
@@ -1530,6 +1550,8 @@ fn user_admin_row(user: UserAdminUi) -> impl IntoView {
             </td>
             <td>
                 <button class=action_class type="button" data-zeroth-toggle-user="true">{action}</button>
+                " "
+                <button class=admin_action_class type="button" data-zeroth-toggle-admin="true">{admin_action}</button>
             </td>
         </tr>
     }
@@ -2146,7 +2168,7 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
     userRows.replaceChildren();
     userCount.textContent = String(users.length);
     if (users.length === 0) {
-      renderEmptyRows(userRows, 6);
+      renderEmptyRows(userRows, 7);
       return;
     }
 
@@ -2154,6 +2176,7 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
       const row = document.createElement("tr");
       row.dataset.userId = user.id;
       row.dataset.userDisabled = String(user.disabled);
+      row.dataset.userAdmin = String(user.admin);
 
       const profile = document.createElement("td");
       setText(profile, user.displayName || user.email || "Unnamed user", "zeroth-row-title");
@@ -2165,6 +2188,12 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
       statePill.className = user.disabled ? "zeroth-status zeroth-status-warn" : "zeroth-status zeroth-status-ok";
       statePill.textContent = user.disabled ? "Disabled" : "Active";
       state.appendChild(statePill);
+
+      const admin = document.createElement("td");
+      const adminPill = document.createElement("span");
+      adminPill.className = user.admin ? "zeroth-status zeroth-status-ok" : "zeroth-status";
+      adminPill.textContent = user.admin ? "Admin" : "Member";
+      admin.appendChild(adminPill);
 
       const identities = document.createElement("td");
       identities.textContent = String(user.identityCount || 0);
@@ -2184,7 +2213,15 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
       toggle.textContent = user.disabled ? "Enable" : "Disable";
       actions.appendChild(toggle);
 
-      row.append(profile, state, identities, sessions, updated, actions);
+      const adminToggle = document.createElement("button");
+      adminToggle.className = user.admin ? "zeroth-action zeroth-danger" : "zeroth-action";
+      adminToggle.type = "button";
+      adminToggle.dataset.zerothToggleAdmin = "true";
+      adminToggle.textContent = user.admin ? "Revoke admin" : "Grant admin";
+      actions.appendChild(document.createTextNode(" "));
+      actions.appendChild(adminToggle);
+
+      row.append(profile, state, admin, identities, sessions, updated, actions);
       userRows.appendChild(row);
     }
   }
@@ -2322,6 +2359,18 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
       body: JSON.stringify({ disabled: !disabled })
     });
     setMessage(disabled ? "Enabled" : "Disabled");
+    await loadUsers();
+  }
+
+  async function toggleAdmin(row) {
+    const userId = row.dataset.userId || "";
+    const admin = row.dataset.userAdmin === "true";
+    await api(`${usersEndpoint}?user_id=${encodeURIComponent(userId)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ admin: !admin })
+    });
+    setMessage(admin ? "Admin revoked" : "Admin granted");
     await loadUsers();
   }
 
@@ -2477,10 +2526,14 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
   userRows.addEventListener("click", (event) => {
     const target = event.target instanceof Element ? event.target : event.target.parentElement;
     const button = target && target.closest("button");
-    if (!button || !button.dataset.zerothToggleUser) return;
+    if (!button || (!button.dataset.zerothToggleUser && !button.dataset.zerothToggleAdmin)) return;
     const row = button.closest("tr");
     if (!row) return;
-    toggleUser(row).catch((error) => setMessage(error.message, true));
+    if (button.dataset.zerothToggleAdmin) {
+      toggleAdmin(row).catch((error) => setMessage(error.message, true));
+    } else {
+      toggleUser(row).catch((error) => setMessage(error.message, true));
+    }
   });
 
   rows.addEventListener("click", (event) => {
@@ -2689,6 +2742,7 @@ mod tests {
             email: Some("user@example.com".to_owned()),
             display_name: Some("Example User".to_owned()),
             disabled: false,
+            admin: true,
             identity_count: 1,
             active_session_count: 1,
             created_at: Some("1780000000".to_owned()),
