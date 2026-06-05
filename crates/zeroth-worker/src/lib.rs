@@ -124,7 +124,7 @@ const DEFAULT_NATIVE_TOKEN_SCOPE: &str = "openid profile email";
 const CORS_ALLOW_METHODS: &str = "GET, POST, PATCH, DELETE, OPTIONS";
 const CORS_ALLOW_HEADERS: &str = "Authorization, Content-Type";
 const CORS_MAX_AGE_SECONDS: &str = "600";
-const ZEROTH_FAVICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="12" fill="#111827"/><path d="M17 16h30L25 48h25" fill="none" stroke="#ff6a00" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/></svg>"##;
+const ZEROTH_FAVICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><defs><linearGradient id="g" x1="0" x2="1" y1="0" y2="1"><stop stop-color="#2d333b"/><stop offset="0.58" stop-color="#1f2328"/><stop offset="1" stop-color="#0b0f19"/></linearGradient></defs><rect width="64" height="64" rx="12" fill="url(#g)"/><path d="M17 16h30L25 48h25" fill="none" stroke="#f9fafb" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/></svg>"##;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1725,7 +1725,7 @@ async fn handle_request(request: Request, env: Env) -> worker::Result<Response> 
 
     match (request.method(), route_path.as_ref()) {
         (Method::Options, path) if cors_path(path) => cors_preflight(request, env).await,
-        (Method::Get, "/") => redirect_to_path(&url, "/admin"),
+        (Method::Get, "/") => redirect_to_path(&url, "/login"),
         (Method::Get, "/health") => json(&HealthResponse {
             ok: true,
             service: "zeroth",
@@ -3659,7 +3659,9 @@ async fn password_register(mut request: Request, env: Env) -> worker::Result<Res
                 insert_passkey_user(&db, &user_id, &email, display_name.as_deref(), now).await?;
                 user_id
             }
-            Err(error) => return oauth_error_json("invalid_request", error, 409),
+            Err(error) => {
+                return oauth_error_json(local_auth_registration_error_code(&error), error, 409)
+            }
         };
     if let Some(user) = get_user(&db, &user_id).await? {
         if user.disabled_at.is_some() {
@@ -4256,7 +4258,7 @@ fn web_manifest(env: &Env) -> worker::Result<Response> {
         "start_url": "/admin",
         "display": "standalone",
         "background_color": "#f8fafc",
-        "theme_color": "#ff6a00",
+        "theme_color": "#111827",
         "icons": [
             {
                 "src": "/favicon.svg",
@@ -4278,7 +4280,7 @@ fn web_manifest(env: &Env) -> worker::Result<Response> {
 #[cfg(target_arch = "wasm32")]
 fn browserconfig_xml() -> worker::Result<Response> {
     let response = Response::ok(
-        r#"<?xml version="1.0" encoding="utf-8"?><browserconfig><msapplication><tile><TileColor>#ff6a00</TileColor></tile></msapplication></browserconfig>"#,
+        r#"<?xml version="1.0" encoding="utf-8"?><browserconfig><msapplication><tile><TileColor>#111827</TileColor></tile></msapplication></browserconfig>"#,
     )?;
     response
         .headers()
@@ -9288,7 +9290,7 @@ fn session_login_return_to_from_url(
 ) -> Result<String, String> {
     let return_to = query_param(url, "return_to")
         .or_else(|| query_param(url, "redirect_uri"))
-        .unwrap_or_else(|| format!("{}/admin", issuer_base_url.trim_end_matches('/')));
+        .unwrap_or_else(|| format!("{}/account", issuer_base_url.trim_end_matches('/')));
 
     validate_client_return_to(&return_to, client, Some(issuer_base_url))?;
     Ok(return_to)
@@ -11499,6 +11501,14 @@ fn local_auth_registration_user_id(
     Ok(None)
 }
 
+fn local_auth_registration_error_code(error: &str) -> &'static str {
+    if error == "account already exists; sign in instead" {
+        "account_exists"
+    } else {
+        "invalid_request"
+    }
+}
+
 #[cfg(target_arch = "wasm32")]
 fn password_iterations_from_env(env: &Env) -> Result<u32, String> {
     let Some(value) = binding_value_from_env(env, "PASSWORD_PBKDF2_ITERATIONS") else {
@@ -12166,7 +12176,7 @@ fn passkey_return_to(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
-        .unwrap_or_else(|| format!("{}/admin", config.issuer().issuer));
+        .unwrap_or_else(|| format!("{}/account", config.issuer().issuer));
     let value = if value.starts_with('/') {
         let mut target = request_url.clone();
         target.set_path(&value);
@@ -15357,9 +15367,11 @@ mod tests {
     }
 
     #[test]
-    fn favicon_uses_lastcommit_orange_mark() {
-        assert!(ZEROTH_FAVICON_SVG.contains(r##"stroke="#ff6a00""##));
-        assert!(!ZEROTH_FAVICON_SVG.contains(r##"stroke="#f9fafb""##));
+    fn favicon_uses_subtle_black_mark() {
+        assert!(ZEROTH_FAVICON_SVG.contains(r##"stop-color="#2d333b""##));
+        assert!(ZEROTH_FAVICON_SVG.contains(r##"stop-color="#0b0f19""##));
+        assert!(ZEROTH_FAVICON_SVG.contains(r##"stroke="#f9fafb""##));
+        assert!(!ZEROTH_FAVICON_SVG.contains(r##"stroke="#ff6a00""##));
     }
 
     #[test]
@@ -17122,7 +17134,7 @@ mod tests {
     }
 
     #[test]
-    fn session_login_return_to_defaults_to_hosted_admin() {
+    fn session_login_return_to_defaults_to_hosted_account() {
         let client = Client {
             id: ClientId("wavey-browser".to_owned()),
             name: "Wavey Browser SSO".to_owned(),
@@ -17135,7 +17147,7 @@ mod tests {
 
         assert_eq!(
             session_login_return_to_from_url(&url, &client, "https://id.example.com").unwrap(),
-            "https://id.example.com/admin"
+            "https://id.example.com/account"
         );
     }
 
@@ -18824,9 +18836,22 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error, "account already exists; sign in instead");
+        assert_eq!(local_auth_registration_error_code(&error), "account_exists");
         assert_eq!(
             local_auth_registration_user_id(None, None, "new@example.com").unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn local_auth_accepts_plus_addressing() {
+        assert_eq!(
+            validate_local_auth_email("Jamie+Zeroth@Wavey.ai").unwrap(),
+            "jamie+zeroth@wavey.ai"
+        );
+        assert_eq!(
+            validate_passkey_email("person+product@example.com").unwrap(),
+            "person+product@example.com"
         );
     }
 

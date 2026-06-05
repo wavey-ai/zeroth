@@ -24,11 +24,11 @@ pub const ZEROTH_UI_CSS: &str = r#"
   --z-blue-soft: #ddf4ff;
   --z-green: #1a7f37;
   --z-green-soft: #dafbe1;
-  --z-orange: #ff6a00;
-  --z-orange-strong: #ff5300;
+  --z-orange: #bc4c00;
   --z-orange-soft: #fff1e5;
   --z-red: #cf222e;
   --z-ink: #1f2328;
+  --z-ink-deep: #0b0f19;
 }
 
 * {
@@ -81,10 +81,10 @@ a:hover {
   width: 28px;
   height: 28px;
   border-radius: 6px;
-  background: linear-gradient(145deg, #ff7c12 0%, var(--z-orange) 52%, var(--z-orange-strong) 100%);
+  background: linear-gradient(145deg, #2d333b 0%, var(--z-ink) 55%, var(--z-ink-deep) 100%);
   color: #ffffff;
   font-weight: 800;
-  box-shadow: 0 8px 18px rgba(255, 106, 0, 0.2);
+  box-shadow: 0 8px 18px rgba(31, 35, 40, 0.16);
 }
 
 .zeroth-hidden {
@@ -113,8 +113,8 @@ a:hover {
   width: 34px;
   height: 34px;
   border-radius: 8px;
-  background: linear-gradient(145deg, #ff7c12 0%, var(--z-orange) 52%, var(--z-orange-strong) 100%);
-  box-shadow: 0 8px 24px rgba(255, 106, 0, 0.26);
+  background: linear-gradient(145deg, #2d333b 0%, var(--z-ink) 55%, var(--z-ink-deep) 100%);
+  box-shadow: 0 8px 24px rgba(31, 35, 40, 0.2);
 }
 
 .zeroth-login-mode .zeroth-nav,
@@ -144,12 +144,12 @@ a:hover {
   height: 88px;
   border-radius: 20px;
   background:
-    linear-gradient(145deg, #ff7c12 0%, var(--z-orange) 50%, var(--z-orange-strong) 100%);
+    linear-gradient(145deg, #2d333b 0%, var(--z-ink) 55%, var(--z-ink-deep) 100%);
   color: #ffffff;
   font-size: 50px;
   line-height: 1;
   font-weight: 900;
-  box-shadow: 0 20px 50px rgba(255, 106, 0, 0.24);
+  box-shadow: 0 20px 50px rgba(31, 35, 40, 0.2);
 }
 
 .zeroth-kicker {
@@ -2411,6 +2411,11 @@ function zerothBase64urlToBuffer(value) {
   return bytes.buffer;
 }
 
+function zerothErrorMessage(body, fallback) {
+  if (!body || typeof body !== "object") return fallback;
+  return body.errorDescription || body.error_description || body.description || body.error || fallback;
+}
+
 function zerothCreationOptionsFromServer(options) {
   const publicKey = Object.assign({}, options.publicKey);
   publicKey.challenge = zerothBase64urlToBuffer(publicKey.challenge);
@@ -2478,7 +2483,7 @@ async function zerothPasskeyApi(path, payload) {
     body = await response.json();
   } catch (_) {}
   if (!response.ok) {
-    throw new Error(body.error_description || body.error || `HTTP ${response.status}`);
+    throw new Error(zerothErrorMessage(body, `HTTP ${response.status}`));
   }
   return body;
 }
@@ -2578,11 +2583,11 @@ document.addEventListener("submit", async (event) => {
       return;
     }
     if (response.ok) {
-      window.alert(body.sent ? "Magic link sent" : "Email delivery is not configured");
+      window.alert(body.sent ? "Magic link sent" : "Magic link email could not be sent");
       if (body.devLink) window.location.assign(body.devLink);
       return;
     }
-    window.alert(body.error_description || body.error || "Sign in failed");
+    window.alert(zerothErrorMessage(body, "Sign in failed"));
     return;
   }
   if (form instanceof HTMLFormElement && form.id === "zeroth-account-passkey-register-form") {
@@ -2632,7 +2637,7 @@ document.addEventListener("submit", async (event) => {
   let message = "Request failed";
   try {
     const body = await response.json();
-    message = body.error_description || body.error || message;
+    message = zerothErrorMessage(body, message);
   } catch (_) {}
   window.alert(message);
 });
@@ -3696,11 +3701,25 @@ mod tests {
     }
 
     #[test]
-    fn default_css_uses_lastcommit_orange_brand_mark() {
-        assert!(ZEROTH_UI_CSS.contains("--z-orange: #ff6a00"));
-        assert!(ZEROTH_UI_CSS.contains("#ff7c12 0%, var(--z-orange)"));
-        assert!(ZEROTH_UI_CSS.contains("rgba(255, 106, 0"));
+    fn default_css_uses_subtle_black_brand_mark() {
+        assert!(ZEROTH_UI_CSS.contains("--z-ink-deep: #0b0f19"));
+        assert!(ZEROTH_UI_CSS.contains("#2d333b 0%, var(--z-ink)"));
+        assert!(ZEROTH_UI_CSS.contains("rgba(31, 35, 40"));
+        assert!(!ZEROTH_UI_CSS.contains("#ff7c12 0%, var(--z-orange)"));
         assert!(!ZEROTH_UI_CSS.contains("#0550ae 55%, #1a7f37"));
+    }
+
+    #[test]
+    fn account_document_prefers_camel_case_error_descriptions() {
+        let document = render_account_document(ZerothUiState::new(ZerothUiConfig::new(
+            "https://id.example.com",
+            "browser-client",
+            "https://app.example.com/callback",
+        )));
+
+        assert!(document.contains("function zerothErrorMessage(body, fallback)"));
+        assert!(document.contains("body.errorDescription || body.error_description"));
+        assert!(document.contains("Magic link email could not be sent"));
     }
 
     #[test]
