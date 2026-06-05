@@ -101,7 +101,13 @@ pub mod migrations {
         sql: include_str!("../migrations/0003_admin_memberships.sql"),
     };
 
-    pub const ALL: &[Migration] = &[INIT, PASSKEYS, ADMIN_MEMBERSHIPS];
+    pub const LOCAL_AUTH: Migration = Migration {
+        version: 4,
+        name: "local_auth",
+        sql: include_str!("../migrations/0004_local_auth.sql"),
+    };
+
+    pub const ALL: &[Migration] = &[INIT, PASSKEYS, ADMIN_MEMBERSHIPS, LOCAL_AUTH];
 }
 
 pub const REQUIRED_TABLES: &[&str] = &[
@@ -116,6 +122,8 @@ pub const REQUIRED_TABLES: &[&str] = &[
     "zeroth_passkey_credentials",
     "zeroth_passkey_challenges",
     "zeroth_admin_memberships",
+    "zeroth_local_credentials",
+    "zeroth_magic_links",
     "zeroth_signing_keys",
     "zeroth_audit_events",
 ];
@@ -191,7 +199,10 @@ mod tests {
     fn init_migration_contains_auth_tables() {
         let sql = migrations::INIT.sql;
         for table in super::REQUIRED_TABLES.iter().copied().filter(|table| {
-            !table.starts_with("zeroth_passkey_") && *table != "zeroth_admin_memberships"
+            !table.starts_with("zeroth_passkey_")
+                && *table != "zeroth_admin_memberships"
+                && *table != "zeroth_local_credentials"
+                && *table != "zeroth_magic_links"
         }) {
             assert!(sql.contains(table), "missing table {table}");
         }
@@ -204,7 +215,7 @@ mod tests {
         for table in ["zeroth_passkey_credentials", "zeroth_passkey_challenges"] {
             assert!(sql.contains(table), "missing table {table}");
         }
-        assert_eq!(migrations::ALL.len(), 3);
+        assert_eq!(migrations::ALL.len(), 4);
         assert_eq!(migrations::ALL[1].version, 2);
     }
 
@@ -215,6 +226,17 @@ mod tests {
         assert!(sql.contains("zeroth_admin_memberships"));
         assert!(sql.contains("granted_by TEXT NOT NULL"));
         assert_eq!(migrations::ALL[2].version, 3);
+    }
+
+    #[test]
+    fn local_auth_migration_contains_password_and_magic_link_tables() {
+        let sql = migrations::LOCAL_AUTH.sql;
+
+        assert!(sql.contains("zeroth_local_credentials"));
+        assert!(sql.contains("password_iterations INTEGER NOT NULL"));
+        assert!(sql.contains("zeroth_magic_links"));
+        assert!(sql.contains("token_hash TEXT PRIMARY KEY"));
+        assert_eq!(migrations::ALL[3].version, 4);
     }
 
     #[test]

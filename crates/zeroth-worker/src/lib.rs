@@ -82,6 +82,16 @@ const PASSKEY_CREDENTIAL_LIST_LIMIT: i32 = 64;
 const PASSKEY_BODY_LIMIT: usize = 16 * 1024;
 const PASSKEY_LABEL_MAX_CHARS: usize = 128;
 const PASSKEY_EMAIL_MAX_BYTES: usize = 320;
+const LOCAL_AUTH_BODY_LIMIT: usize = 8 * 1024;
+const LOCAL_AUTH_PROVIDER_ID: &str = "zeroth";
+const PASSWORD_MIN_BYTES: usize = 8;
+const PASSWORD_MAX_BYTES: usize = 1024;
+const PASSWORD_PBKDF2_ALG: &str = "pbkdf2-sha256";
+const PASSWORD_PBKDF2_DEFAULT_ITERATIONS: u32 = 8_192;
+const PASSWORD_PBKDF2_MIN_ITERATIONS: u32 = 1_000;
+const PASSWORD_PBKDF2_MAX_ITERATIONS: u32 = 100_000;
+const MAGIC_LINK_TTL_SECONDS: i32 = 10 * 60;
+const MAGIC_LINK_CLEANUP_LIMIT: i32 = 64;
 const PROFILE_PATCH_BODY_LIMIT: usize = 4 * 1024;
 const PROFILE_NAME_MAX_CHARS: usize = 128;
 const PROFILE_PICTURE_MAX_BYTES: usize = 2048;
@@ -892,6 +902,42 @@ struct PasskeyChallengeRow {
     consumed_at: Option<i32>,
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+struct LocalCredentialRow {
+    email: String,
+    user_id: String,
+    password_hash: String,
+    password_salt: String,
+    password_alg: String,
+    password_iterations: i32,
+    created_at: i32,
+    updated_at: i32,
+    #[serde(default)]
+    last_used_at: Option<i32>,
+    #[serde(default)]
+    disabled_at: Option<i32>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+struct MagicLinkRow {
+    token_hash: String,
+    email: String,
+    #[serde(default)]
+    user_id: Option<String>,
+    client_id: String,
+    return_to: String,
+    created_at: i32,
+    expires_at: i32,
+    #[serde(default)]
+    consumed_at: Option<i32>,
+    #[serde(default)]
+    ip_hash: Option<String>,
+    #[serde(default)]
+    user_agent: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[serde(rename_all = "camelCase")]
@@ -916,6 +962,74 @@ struct PasskeyAuthenticateOptionsRequest {
     return_to: Option<String>,
     #[serde(default)]
     client_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+struct PasswordRegisterRequest {
+    email: String,
+    password: String,
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    return_to: Option<String>,
+    #[serde(default)]
+    client_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+struct PasswordLoginRequest {
+    email: String,
+    password: String,
+    #[serde(default)]
+    return_to: Option<String>,
+    #[serde(default)]
+    client_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+struct MagicLinkRequest {
+    email: String,
+    #[serde(default)]
+    return_to: Option<String>,
+    #[serde(default)]
+    client_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+struct MagicLinkConsumeRequest {
+    token: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalAuthResponse {
+    ok: bool,
+    return_to: String,
+    user: UserInfoResponse,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MagicLinkResponse {
+    ok: bool,
+    sent: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dev_link: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct LocalAuthSessionIssue {
+    session_id: String,
+    return_to: String,
+    user: UserRow,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1551,6 +1665,12 @@ async fn handle_request(request: Request, env: Env) -> worker::Result<Response> 
         }
         (Method::Post, "/passkeys/authenticate/verify") => {
             passkey_authenticate_verify(request, env).await
+        }
+        (Method::Post, "/password/register") => password_register(request, env).await,
+        (Method::Post, "/password/login") => password_login(request, env).await,
+        (Method::Post, "/magic-links") => magic_link_request(request, env).await,
+        (Method::Get | Method::Post, "/magic-links/consume") => {
+            magic_link_consume(request, env).await
         }
         (Method::Get, "/validate") => validate(request, env).await,
         (Method::Get | Method::Post, "/logout") => logout(request, env).await,
@@ -3284,6 +3404,350 @@ async fn passkey_authenticate_verify(mut request: Request, env: Env) -> worker::
 }
 
 #[cfg(target_arch = "wasm32")]
+async fn password_register(mut request: Request, env: Env) -> worker::Result<Response> {
+    let url = request.url()?;
+    let config = server_config(&env, &url);
+    let db = env.d1(D1_BINDING)?;
+    let now = unix_timestamp_seconds();
+    let body = match local_auth_json_from_request::<PasswordRegisterRequest>(&mut request).await {
+        Ok(body) => body,
+        Err(error) => return oauth_error_json("invalid_request", error, 400),
+    };
+    let email = match validate_local_auth_email(&body.email) {
+        Ok(email) => email,
+        Err(error) => return oauth_error_json("invalid_request", error, 400),
+    };
+    if let Err(error) = validate_local_auth_password(&body.password) {
+        return oauth_error_json("invalid_request", error, 400);
+    }
+    let display_name = match body
+        .display_name
+        .as_deref()
+        .map(validate_passkey_display_name)
+        .transpose()
+    {
+        Ok(display_name) => display_name,
+        Err(error) => return oauth_error_json("invalid_request", error, 400),
+    };
+    let (client, return_to) = match local_auth_client_and_return_to(
+        &env,
+        &url,
+        &db,
+        body.client_id.as_deref(),
+        body.return_to.as_deref(),
+        &config,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => return oauth_error_json("invalid_request", error, 400),
+    };
+    if let Err(error) = validate_local_auth_origin(&request, &db, &client, &config).await? {
+        return oauth_error_json("invalid_request", error, 403);
+    }
+    if let Err(error) = validate_local_auth_client_email_policy(&client, &email) {
+        return oauth_error_json(&error.code, &error.description, 403);
+    }
+
+    let current = current_session_from_request(&request, &db, &config, now).await?;
+    let existing_user = get_user_by_primary_email(&db, &email).await?;
+    let user_id =
+        match local_auth_registration_user_id(current.as_ref(), existing_user.as_ref(), &email) {
+            Ok(Some(user_id)) => user_id,
+            Ok(None) => {
+                let user_id = format!("usr_{}", random_token()?);
+                insert_passkey_user(&db, &user_id, &email, display_name.as_deref(), now).await?;
+                user_id
+            }
+            Err(error) => return oauth_error_json("invalid_request", error, 409),
+        };
+    if let Some(user) = get_user(&db, &user_id).await? {
+        if user.disabled_at.is_some() {
+            return oauth_error_json("invalid_request", "user is disabled", 403);
+        }
+    }
+
+    let salt = random_token()?;
+    let iterations = password_iterations_from_env(&env).map_err(worker_error)?;
+    let password_hash = password_hash(&body.password, &salt, iterations).await?;
+    upsert_local_credential(
+        &db,
+        &email,
+        &user_id,
+        &password_hash,
+        &salt,
+        iterations,
+        now,
+    )
+    .await?;
+    upsert_local_auth_identity(
+        &db,
+        &user_id,
+        &email,
+        display_name.as_deref(),
+        "password",
+        now,
+    )
+    .await?;
+    let response = issue_local_auth_session_response(
+        &request,
+        &db,
+        &config,
+        &client.id.0,
+        &user_id,
+        &return_to,
+        "password.register",
+        "password_register",
+        now,
+    )
+    .await?;
+    Ok(response)
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn password_login(mut request: Request, env: Env) -> worker::Result<Response> {
+    let url = request.url()?;
+    let config = server_config(&env, &url);
+    let db = env.d1(D1_BINDING)?;
+    let now = unix_timestamp_seconds();
+    let body = match local_auth_json_from_request::<PasswordLoginRequest>(&mut request).await {
+        Ok(body) => body,
+        Err(error) => return oauth_error_json("invalid_request", error, 400),
+    };
+    let email = match validate_local_auth_email(&body.email) {
+        Ok(email) => email,
+        Err(_) => return oauth_error_json("invalid_grant", "invalid email or password", 401),
+    };
+    let (client, return_to) = match local_auth_client_and_return_to(
+        &env,
+        &url,
+        &db,
+        body.client_id.as_deref(),
+        body.return_to.as_deref(),
+        &config,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => return oauth_error_json("invalid_request", error, 400),
+    };
+    if let Err(error) = validate_local_auth_origin(&request, &db, &client, &config).await? {
+        return oauth_error_json("invalid_request", error, 403);
+    }
+    if let Err(error) = validate_local_auth_client_email_policy(&client, &email) {
+        return oauth_error_json(&error.code, &error.description, 403);
+    }
+
+    let Some(credential) = get_local_credential(&db, &email).await? else {
+        return oauth_error_json("invalid_grant", "invalid email or password", 401);
+    };
+    let password_valid = local_auth_password_matches(&credential, &body.password).await?;
+    if credential.disabled_at.is_some() || !password_valid {
+        return oauth_error_json("invalid_grant", "invalid email or password", 401);
+    }
+    let Some(user) = get_user(&db, &credential.user_id).await? else {
+        return oauth_error_json("invalid_grant", "invalid email or password", 401);
+    };
+    if user.disabled_at.is_some() {
+        return oauth_error_json("invalid_grant", "invalid email or password", 401);
+    }
+    mark_local_credential_used(&db, &credential.email, now).await?;
+    let response = issue_local_auth_session_response(
+        &request,
+        &db,
+        &config,
+        &client.id.0,
+        &user.id,
+        &return_to,
+        "session.login",
+        "password",
+        now,
+    )
+    .await?;
+    Ok(response)
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn magic_link_request(mut request: Request, env: Env) -> worker::Result<Response> {
+    let url = request.url()?;
+    let config = server_config(&env, &url);
+    let db = env.d1(D1_BINDING)?;
+    let now = unix_timestamp_seconds();
+    let body = match local_auth_json_from_request::<MagicLinkRequest>(&mut request).await {
+        Ok(body) => body,
+        Err(error) => return oauth_error_json("invalid_request", error, 400),
+    };
+    let email = match validate_local_auth_email(&body.email) {
+        Ok(email) => email,
+        Err(error) => return oauth_error_json("invalid_request", error, 400),
+    };
+    let (client, return_to) = match local_auth_client_and_return_to(
+        &env,
+        &url,
+        &db,
+        body.client_id.as_deref(),
+        body.return_to.as_deref(),
+        &config,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => return oauth_error_json("invalid_request", error, 400),
+    };
+    if let Err(error) = validate_local_auth_origin(&request, &db, &client, &config).await? {
+        return oauth_error_json("invalid_request", error, 403);
+    }
+    if let Err(error) = validate_local_auth_client_email_policy(&client, &email) {
+        return oauth_error_json(&error.code, &error.description, 403);
+    }
+
+    cleanup_expired_magic_links(&db, now).await?;
+    let user_id = get_user_by_primary_email(&db, &email)
+        .await?
+        .and_then(|user| user.disabled_at.is_none().then_some(user.id));
+    let token = random_token()?;
+    let token_hash = hash_secret(&token);
+    let audit_context = audit_request_context(&request).unwrap_or_default();
+    put_magic_link(
+        &db,
+        &token_hash,
+        &email,
+        user_id.as_deref(),
+        &client.id.0,
+        &return_to,
+        now,
+        audit_context.user_agent.as_deref(),
+        audit_context.ip_hash.as_deref(),
+    )
+    .await?;
+    let link = magic_link_url(&config, &token)?;
+    let sent = match send_magic_link_email(&env, &email, &link).await {
+        Ok(sent) => sent,
+        Err(error) => {
+            record_audit_event(
+                &db,
+                &request,
+                "magic_link.email.failed",
+                user_id.as_deref(),
+                Some(&client.id.0),
+                Some(LOCAL_AUTH_PROVIDER_ID),
+                serde_json::json!({ "error": error }),
+                now,
+            )
+            .await;
+            false
+        }
+    };
+    record_audit_event(
+        &db,
+        &request,
+        "magic_link.issue",
+        user_id.as_deref(),
+        Some(&client.id.0),
+        Some(LOCAL_AUTH_PROVIDER_ID),
+        serde_json::json!({ "sent": sent }),
+        now,
+    )
+    .await;
+    let dev_link = magic_link_dev_echo_enabled(&env).then_some(link);
+    json_status(
+        &MagicLinkResponse {
+            ok: true,
+            sent,
+            dev_link,
+        },
+        202,
+    )
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn magic_link_consume(mut request: Request, env: Env) -> worker::Result<Response> {
+    let url = request.url()?;
+    let config = server_config(&env, &url);
+    let db = env.d1(D1_BINDING)?;
+    let now = unix_timestamp_seconds();
+    let token = match request.method() {
+        Method::Get => query_param(&url, "token"),
+        Method::Post => {
+            match local_auth_json_from_request::<MagicLinkConsumeRequest>(&mut request).await {
+                Ok(body) => Some(body.token),
+                Err(error) => return oauth_error_json("invalid_request", error, 400),
+            }
+        }
+        _ => None,
+    };
+    let Some(token) = token.filter(|token| !token.trim().is_empty()) else {
+        return oauth_error_json("invalid_request", "missing magic link token", 400);
+    };
+    let token_hash = hash_secret(token.trim());
+    let Some(row) = get_magic_link(&db, &token_hash).await? else {
+        return oauth_error_json("invalid_request", "magic link is invalid or expired", 400);
+    };
+    if let Err(error) = validate_magic_link(&row, now) {
+        return oauth_error_json("invalid_request", error, 400);
+    }
+    if !consume_magic_link(&db, &token_hash, now).await? {
+        return oauth_error_json("invalid_request", "magic link is invalid or expired", 400);
+    }
+    let Some(client) = get_client(&db, &row.client_id).await? else {
+        return oauth_error_json(
+            "invalid_request",
+            "magic link client is not registered",
+            400,
+        );
+    };
+    if let Err(error) = validate_local_auth_client_email_policy(&client, &row.email) {
+        return oauth_error_json(&error.code, &error.description, 403);
+    }
+    let user_id = ensure_magic_link_user(&db, &row, now).await?;
+    if let Some(user) = get_user(&db, &user_id).await? {
+        if user.disabled_at.is_some() {
+            return oauth_error_json("invalid_request", "user is disabled", 403);
+        }
+    }
+    upsert_local_auth_identity(&db, &user_id, &row.email, None, "magic_link", now).await?;
+    let issue = issue_local_auth_session(
+        &request,
+        &db,
+        &row.client_id,
+        &user_id,
+        &row.return_to,
+        "session.login",
+        "magic_link",
+        now,
+    )
+    .await?;
+    if request.method() == Method::Get {
+        let target = url::Url::parse(&row.return_to)
+            .map_err(|error| worker_error(format!("invalid magic link return_to: {error}")))?;
+        let response = Response::redirect(target)?;
+        return with_set_cookie(
+            response,
+            &session_cookie(
+                &config.cookie_name,
+                &issue.session_id,
+                SESSION_TTL_SECONDS,
+                config.cookie_domain.as_deref(),
+            ),
+        );
+    }
+    let response = json(&LocalAuthResponse {
+        ok: true,
+        return_to: issue.return_to,
+        user: userinfo_response(&issue.user, Some("email profile")),
+    })?;
+    with_set_cookie(
+        response,
+        &session_cookie(
+            &config.cookie_name,
+            &issue.session_id,
+            SESSION_TTL_SECONDS,
+            config.cookie_domain.as_deref(),
+        ),
+    )
+}
+
+#[cfg(target_arch = "wasm32")]
 async fn identity_link(request: Request, env: Env) -> worker::Result<Response> {
     let request_url = request.url()?;
     let origin = request_origin(&request)?;
@@ -3766,10 +4230,6 @@ async fn hosted_clients_admin(request: Request, env: Env) -> worker::Result<Resp
                 .collect();
         }
         Err(error) => {
-            if query_param(&url, "bootstrap").as_deref() == Some("1") {
-                return html(render_clients_admin_document(state));
-            }
-
             let current = current_session_from_request(&request, &db, &config, now).await?;
             if current.is_none()
                 && error.status == 401
@@ -5081,6 +5541,222 @@ async fn upsert_passkey_identity(
     .run()
     .await?;
     Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn get_local_credential(
+    db: &worker::d1::D1Database,
+    email: &str,
+) -> worker::Result<Option<LocalCredentialRow>> {
+    let args = [worker::d1::D1Type::Text(email)];
+    db.prepare(
+        "SELECT email, user_id, password_hash, password_salt, password_alg,
+                password_iterations, created_at, updated_at, last_used_at, disabled_at
+         FROM zeroth_local_credentials
+         WHERE lower(email) = lower(?)
+         LIMIT 1",
+    )
+    .bind_refs(&args)?
+    .first::<LocalCredentialRow>(None)
+    .await
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn upsert_local_credential(
+    db: &worker::d1::D1Database,
+    email: &str,
+    user_id: &str,
+    password_hash: &str,
+    password_salt: &str,
+    password_iterations: u32,
+    now: i32,
+) -> worker::Result<()> {
+    let password_iterations = i32::try_from(password_iterations)
+        .map_err(|_| worker_error("password iteration count is too large".to_owned()))?;
+    let args = [
+        worker::d1::D1Type::Text(email),
+        worker::d1::D1Type::Text(user_id),
+        worker::d1::D1Type::Text(password_hash),
+        worker::d1::D1Type::Text(password_salt),
+        worker::d1::D1Type::Text(PASSWORD_PBKDF2_ALG),
+        worker::d1::D1Type::Integer(password_iterations),
+        worker::d1::D1Type::Integer(now),
+        worker::d1::D1Type::Integer(now),
+    ];
+    db.prepare(
+        "INSERT INTO zeroth_local_credentials (
+             email, user_id, password_hash, password_salt, password_alg,
+             password_iterations, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(email) DO UPDATE SET
+             password_hash = excluded.password_hash,
+             password_salt = excluded.password_salt,
+             password_alg = excluded.password_alg,
+             password_iterations = excluded.password_iterations,
+             updated_at = excluded.updated_at,
+             disabled_at = NULL
+         WHERE zeroth_local_credentials.user_id = excluded.user_id",
+    )
+    .bind_refs(&args)?
+    .run()
+    .await?;
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn mark_local_credential_used(
+    db: &worker::d1::D1Database,
+    email: &str,
+    now: i32,
+) -> worker::Result<()> {
+    let args = [
+        worker::d1::D1Type::Integer(now),
+        worker::d1::D1Type::Text(email),
+    ];
+    db.prepare(
+        "UPDATE zeroth_local_credentials
+         SET last_used_at = ?
+         WHERE lower(email) = lower(?)",
+    )
+    .bind_refs(&args)?
+    .run()
+    .await?;
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn upsert_local_auth_identity(
+    db: &worker::d1::D1Database,
+    user_id: &str,
+    email: &str,
+    display_name: Option<&str>,
+    mode: &str,
+    now: i32,
+) -> worker::Result<()> {
+    let profile = local_auth_profile(email, display_name, mode == "magic_link");
+    let raw_profile_json = serde_json::json!({
+        "kind": "local_auth",
+        "mode": mode
+    })
+    .to_string();
+    upsert_identity_from_profile(db, user_id, &profile, Some(&raw_profile_json), now).await
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn put_magic_link(
+    db: &worker::d1::D1Database,
+    token_hash: &str,
+    email: &str,
+    user_id: Option<&str>,
+    client_id: &str,
+    return_to: &str,
+    now: i32,
+    user_agent: Option<&str>,
+    ip_hash: Option<&str>,
+) -> worker::Result<()> {
+    let user_id = d1_optional_text(user_id);
+    let user_agent = d1_optional_text(user_agent);
+    let ip_hash = d1_optional_text(ip_hash);
+    let args = [
+        worker::d1::D1Type::Text(token_hash),
+        worker::d1::D1Type::Text(email),
+        user_id,
+        worker::d1::D1Type::Text(client_id),
+        worker::d1::D1Type::Text(return_to),
+        worker::d1::D1Type::Integer(now),
+        worker::d1::D1Type::Integer(now + MAGIC_LINK_TTL_SECONDS),
+        ip_hash,
+        user_agent,
+    ];
+    db.prepare(
+        "INSERT INTO zeroth_magic_links (
+             token_hash, email, user_id, client_id, return_to, created_at,
+             expires_at, ip_hash, user_agent
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind_refs(&args)?
+    .run()
+    .await?;
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn get_magic_link(
+    db: &worker::d1::D1Database,
+    token_hash: &str,
+) -> worker::Result<Option<MagicLinkRow>> {
+    let args = [worker::d1::D1Type::Text(token_hash)];
+    db.prepare(
+        "SELECT token_hash, email, user_id, client_id, return_to, created_at,
+                expires_at, consumed_at, ip_hash, user_agent
+         FROM zeroth_magic_links
+         WHERE token_hash = ?
+         LIMIT 1",
+    )
+    .bind_refs(&args)?
+    .first::<MagicLinkRow>(None)
+    .await
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn consume_magic_link(
+    db: &worker::d1::D1Database,
+    token_hash: &str,
+    now: i32,
+) -> worker::Result<bool> {
+    let args = [
+        worker::d1::D1Type::Integer(now),
+        worker::d1::D1Type::Text(token_hash),
+        worker::d1::D1Type::Integer(now),
+    ];
+    let result = db
+        .prepare(
+            "UPDATE zeroth_magic_links
+             SET consumed_at = ?
+             WHERE token_hash = ? AND consumed_at IS NULL AND expires_at > ?",
+        )
+        .bind_refs(&args)?
+        .run()
+        .await?;
+    d1_result_changed_one(result)
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn cleanup_expired_magic_links(db: &worker::d1::D1Database, now: i32) -> worker::Result<()> {
+    let args = [
+        worker::d1::D1Type::Integer(now),
+        worker::d1::D1Type::Integer(MAGIC_LINK_CLEANUP_LIMIT),
+    ];
+    db.prepare(
+        "DELETE FROM zeroth_magic_links
+         WHERE token_hash IN (
+             SELECT token_hash FROM zeroth_magic_links
+             WHERE expires_at <= ? OR consumed_at IS NOT NULL
+             ORDER BY expires_at
+             LIMIT ?
+         )",
+    )
+    .bind_refs(&args)?
+    .run()
+    .await?;
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn ensure_magic_link_user(
+    db: &worker::d1::D1Database,
+    row: &MagicLinkRow,
+    now: i32,
+) -> worker::Result<String> {
+    if let Some(user_id) = row.user_id.as_deref() {
+        return Ok(user_id.to_owned());
+    }
+    if let Some(user) = get_user_by_primary_email(db, &row.email).await? {
+        return Ok(user.id);
+    }
+    let user_id = format!("usr_{}", random_token()?);
+    insert_passkey_user(db, &user_id, &row.email, None, now).await?;
+    Ok(user_id)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -9050,6 +9726,395 @@ async fn passkey_json_from_request<T: serde::de::DeserializeOwned>(
 }
 
 #[cfg(target_arch = "wasm32")]
+async fn local_auth_json_from_request<T: serde::de::DeserializeOwned>(
+    request: &mut Request,
+) -> Result<T, String> {
+    let content_type = request_header(request, "Content-Type")
+        .map_err(|error| format!("could not read Content-Type header: {error}"))?;
+    if !content_type_is_json(content_type.as_deref()) {
+        return Err("Content-Type must be application/json".to_owned());
+    }
+    let body = request
+        .bytes()
+        .await
+        .map_err(|error| format!("could not read local auth body: {error}"))?;
+    if body.len() > LOCAL_AUTH_BODY_LIMIT {
+        return Err("local auth JSON body is too large".to_owned());
+    }
+    serde_json::from_slice::<T>(&body).map_err(|error| format!("invalid local auth JSON: {error}"))
+}
+
+fn validate_local_auth_email(value: &str) -> Result<String, String> {
+    validate_passkey_email(value)
+}
+
+fn validate_local_auth_password(value: &str) -> Result<(), String> {
+    let len = value.as_bytes().len();
+    if len < PASSWORD_MIN_BYTES {
+        return Err(format!(
+            "password must be at least {PASSWORD_MIN_BYTES} bytes"
+        ));
+    }
+    if len > PASSWORD_MAX_BYTES {
+        return Err(format!(
+            "password must be at most {PASSWORD_MAX_BYTES} bytes"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn local_auth_client_and_return_to(
+    env: &Env,
+    request_url: &url::Url,
+    db: &worker::d1::D1Database,
+    client_id: Option<&str>,
+    return_to: Option<&str>,
+    config: &ZerothServerConfig,
+) -> Result<(Client, String), String> {
+    let client_id =
+        passkey_client_id_from_request(env, client_id).map_err(|error| error.to_string())?;
+    let client = get_client(db, &client_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "local auth client is not registered".to_owned())?;
+    let return_to = passkey_return_to(request_url, return_to, &client, config)
+        .map_err(|error| error.to_string())?;
+    Ok((client, return_to))
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn validate_local_auth_origin(
+    request: &Request,
+    _db: &worker::d1::D1Database,
+    client: &Client,
+    config: &ZerothServerConfig,
+) -> worker::Result<Result<(), String>> {
+    let origin = request_origin_for_config(request, config)?;
+    Ok(validate_cors_origin(
+        origin.as_deref(),
+        &client.allowed_origins,
+    ))
+}
+
+fn validate_local_auth_client_email_policy(
+    client: &Client,
+    email: &str,
+) -> Result<(), ProviderCallbackError> {
+    let profile = local_auth_profile(email, None, true);
+    validate_client_email_domain_policy(client, &profile)
+}
+
+fn local_auth_profile(
+    email: &str,
+    display_name: Option<&str>,
+    email_verified: bool,
+) -> ProviderProfile {
+    ProviderProfile {
+        provider_id: ProviderId(LOCAL_AUTH_PROVIDER_ID.to_owned()),
+        subject: Subject(email.to_owned()),
+        email: Some(email.to_owned()),
+        email_verified,
+        display_name: display_name.map(str::to_owned),
+        picture_url: None,
+    }
+}
+
+fn local_auth_registration_user_id(
+    current: Option<&CurrentSession>,
+    existing_user: Option<&UserRow>,
+    email: &str,
+) -> Result<Option<String>, String> {
+    if let Some(current) = current {
+        if current.user.disabled_at.is_some() {
+            return Err("current user is disabled".to_owned());
+        }
+        if let Some(primary_email) = current.user.primary_email.as_deref() {
+            if !primary_email.eq_ignore_ascii_case(email) {
+                return Err("password email must match the signed-in user".to_owned());
+            }
+        }
+        if let Some(existing_user) = existing_user {
+            if existing_user.id != current.user.id {
+                return Err("email is already attached to another user".to_owned());
+            }
+        }
+        return Ok(Some(current.user.id.clone()));
+    }
+
+    if existing_user.is_some() {
+        return Err("sign in before adding a password to an existing user".to_owned());
+    }
+    Ok(None)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn password_iterations_from_env(env: &Env) -> Result<u32, String> {
+    let Some(value) = binding_value_from_env(env, "PASSWORD_PBKDF2_ITERATIONS") else {
+        return Ok(PASSWORD_PBKDF2_DEFAULT_ITERATIONS);
+    };
+    let iterations = value
+        .trim()
+        .parse::<u32>()
+        .map_err(|error| format!("PASSWORD_PBKDF2_ITERATIONS must be an integer: {error}"))?;
+    if !(PASSWORD_PBKDF2_MIN_ITERATIONS..=PASSWORD_PBKDF2_MAX_ITERATIONS).contains(&iterations) {
+        return Err(format!(
+            "PASSWORD_PBKDF2_ITERATIONS must be between {PASSWORD_PBKDF2_MIN_ITERATIONS} and {PASSWORD_PBKDF2_MAX_ITERATIONS}"
+        ));
+    }
+    Ok(iterations)
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn password_hash(password: &str, salt: &str, iterations: u32) -> worker::Result<String> {
+    let digest = pbkdf2_sha256(password.as_bytes(), salt.as_bytes(), iterations, 32).await?;
+    Ok(bytes_to_hex(&digest))
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn local_auth_password_matches(
+    credential: &LocalCredentialRow,
+    password: &str,
+) -> worker::Result<bool> {
+    if credential.password_alg != PASSWORD_PBKDF2_ALG {
+        return Ok(false);
+    }
+    let Ok(iterations) = u32::try_from(credential.password_iterations) else {
+        return Ok(false);
+    };
+    if !(PASSWORD_PBKDF2_MIN_ITERATIONS..=PASSWORD_PBKDF2_MAX_ITERATIONS).contains(&iterations) {
+        return Ok(false);
+    }
+    let actual = password_hash(password, &credential.password_salt, iterations).await?;
+    Ok(constant_time_eq(&credential.password_hash, &actual))
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn pbkdf2_sha256(
+    password: &[u8],
+    salt: &[u8],
+    iterations: u32,
+    output_len: usize,
+) -> worker::Result<Vec<u8>> {
+    let subtle = worker_global_subtle().map_err(worker_error)?;
+    let password_bytes = worker::js_sys::Uint8Array::from(password);
+    let key_usages = single_js_string_array("deriveBits");
+    let key_value = JsFuture::from(
+        subtle
+            .import_key_with_str(
+                "raw",
+                password_bytes.unchecked_ref(),
+                "PBKDF2",
+                false,
+                &key_usages,
+            )
+            .map_err(js_worker_error)?,
+    )
+    .await
+    .map_err(js_worker_error)?;
+    let key = key_value
+        .dyn_into::<worker::web_sys::CryptoKey>()
+        .map_err(js_worker_error)?;
+
+    let params = worker::js_sys::Object::new();
+    set_js_value_property_for_worker(&params, "name", &JsValue::from_str("PBKDF2"))?;
+    let salt = worker::js_sys::Uint8Array::from(salt);
+    set_js_value_property_for_worker(&params, "salt", salt.as_ref())?;
+    set_js_value_property_for_worker(&params, "iterations", &JsValue::from_f64(iterations as f64))?;
+    set_js_value_property_for_worker(&params, "hash", &JsValue::from_str("SHA-256"))?;
+    let bit_len = u32::try_from(output_len)
+        .ok()
+        .and_then(|len| len.checked_mul(8))
+        .ok_or_else(|| worker_error("password hash output length is too large".to_owned()))?;
+    let bits = JsFuture::from(
+        subtle
+            .derive_bits_with_object(&params, &key, bit_len)
+            .map_err(js_worker_error)?,
+    )
+    .await
+    .map_err(js_worker_error)?;
+    let array = worker::js_sys::Uint8Array::new(&bits);
+    Ok(array.to_vec())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn worker_global_subtle() -> Result<worker::web_sys::SubtleCrypto, String> {
+    let global: worker::web_sys::WorkerGlobalScope = worker::js_sys::global().unchecked_into();
+    let crypto = global
+        .crypto()
+        .map_err(|error| js_error_string("could not access Worker crypto", error))?;
+    Ok(crypto.subtle())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn set_js_value_property_for_worker(
+    target: &worker::js_sys::Object,
+    name: &str,
+    value: &JsValue,
+) -> worker::Result<()> {
+    let ok = worker::js_sys::Reflect::set(target, &JsValue::from_str(name), value)
+        .map_err(js_worker_error)?;
+    if ok {
+        Ok(())
+    } else {
+        Err(worker_error(format!(
+            "could not set JavaScript property: {name}"
+        )))
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn js_worker_error(error: JsValue) -> worker::Error {
+    worker_error(js_error_string("JavaScript error", error))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn js_error_string(context: &str, error: JsValue) -> String {
+    let detail = error
+        .dyn_ref::<worker::js_sys::Error>()
+        .map(|error| error.message().into())
+        .or_else(|| error.as_string())
+        .unwrap_or_else(|| "unknown error".to_owned());
+    format!("{context}: {detail}")
+}
+
+fn html_escape_text(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn issue_local_auth_session(
+    request: &Request,
+    db: &worker::d1::D1Database,
+    client_id: &str,
+    user_id: &str,
+    return_to: &str,
+    event_type: &str,
+    mode: &str,
+    now: i32,
+) -> worker::Result<LocalAuthSessionIssue> {
+    let session_id = format!("sess_{}", random_token()?);
+    let audit_context = audit_request_context(request).unwrap_or_default();
+    put_session(
+        db,
+        &session_id,
+        user_id,
+        client_id,
+        now,
+        audit_context.user_agent.as_deref(),
+        audit_context.ip_hash.as_deref(),
+    )
+    .await?;
+    record_audit_event(
+        db,
+        request,
+        event_type,
+        Some(user_id),
+        Some(client_id),
+        Some(LOCAL_AUTH_PROVIDER_ID),
+        serde_json::json!({ "mode": mode }),
+        now,
+    )
+    .await;
+    let user = get_user(db, user_id)
+        .await?
+        .ok_or_else(|| worker_error("local auth user was not found".to_owned()))?;
+    Ok(LocalAuthSessionIssue {
+        session_id,
+        return_to: return_to.to_owned(),
+        user,
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn issue_local_auth_session_response(
+    request: &Request,
+    db: &worker::d1::D1Database,
+    config: &ZerothServerConfig,
+    client_id: &str,
+    user_id: &str,
+    return_to: &str,
+    event_type: &str,
+    mode: &str,
+    now: i32,
+) -> worker::Result<Response> {
+    let issue = issue_local_auth_session(
+        request, db, client_id, user_id, return_to, event_type, mode, now,
+    )
+    .await?;
+    let response = json(&LocalAuthResponse {
+        ok: true,
+        return_to: issue.return_to,
+        user: userinfo_response(&issue.user, Some("email profile")),
+    })?;
+    with_set_cookie(
+        response,
+        &session_cookie(
+            &config.cookie_name,
+            &issue.session_id,
+            SESSION_TTL_SECONDS,
+            config.cookie_domain.as_deref(),
+        ),
+    )
+}
+
+#[cfg(target_arch = "wasm32")]
+fn magic_link_url(config: &ZerothServerConfig, token: &str) -> worker::Result<String> {
+    let mut url = url::Url::parse(&format!(
+        "{}/magic-links/consume",
+        config.public_base_url.trim_end_matches('/')
+    ))
+    .map_err(|error| worker_error(format!("invalid magic link base URL: {error}")))?;
+    url.query_pairs_mut().append_pair("token", token);
+    Ok(url.to_string())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn send_magic_link_email(env: &Env, email: &str, link: &str) -> Result<bool, String> {
+    let Some(from) = binding_value_from_env(env, "MAGIC_LINK_FROM")
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(false);
+    };
+    let Ok(sender) = env.send_email("EMAIL") else {
+        return Ok(false);
+    };
+    let text = format!("Sign in to Zeroth:\n\n{link}\n\nThis link expires in 10 minutes.");
+    let html_link = html_escape_text(link);
+    let html = format!(
+        r#"<p>Sign in to Zeroth:</p><p><a href="{html_link}">{html_link}</a></p><p>This link expires in 10 minutes.</p>"#
+    );
+    let builder = worker::email::SendEmailBuilder::builder(&from, email, "Sign in to Zeroth")
+        .text(&text)
+        .html(&html)
+        .build();
+    sender
+        .send_with_builder(&builder)
+        .await
+        .map(|_| true)
+        .map_err(|error| String::from(error.message()))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn magic_link_dev_echo_enabled(env: &Env) -> bool {
+    binding_value_from_env(env, "MAGIC_LINK_DEV_ECHO")
+        .as_deref()
+        .is_some_and(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn validate_magic_link(row: &MagicLinkRow, now: i32) -> Result<(), String> {
+    if row.consumed_at.is_some() || row.expires_at <= now {
+        return Err("magic link is invalid or expired".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
 fn passkey_registration_subject(
     current: Option<&CurrentSession>,
     body: &PasskeyRegisterOptionsRequest,
@@ -9788,6 +10853,10 @@ fn cors_path(path: &str) -> bool {
             | "/profile"
             | "/identities/link"
             | "/identities"
+            | "/password/register"
+            | "/password/login"
+            | "/magic-links"
+            | "/magic-links/consume"
             | "/validate"
             | "/logout"
     )
@@ -9800,6 +10869,10 @@ fn cors_method_allowed(path: &str, method: &str) -> bool {
         "/profile" => method == "GET" || method == "PATCH",
         "/identities/link" => method == "GET",
         "/identities" => method == "GET" || method == "DELETE",
+        "/password/register" => method == "POST",
+        "/password/login" => method == "POST",
+        "/magic-links" => method == "POST",
+        "/magic-links/consume" => method == "GET" || method == "POST",
         "/sessions" => method == "GET" || method == "DELETE",
         "/logout" => method == "GET" || method == "POST",
         _ => false,
@@ -14918,6 +15991,10 @@ mod tests {
         assert!(cors_path("/sessions"));
         assert!(cors_path("/profile"));
         assert!(cors_path("/identities"));
+        assert!(cors_path("/password/register"));
+        assert!(cors_path("/password/login"));
+        assert!(cors_path("/magic-links"));
+        assert!(cors_path("/magic-links/consume"));
         assert!(cors_path("/validate"));
         assert!(cors_path("/logout"));
         assert!(!cors_path("/authorize"));
@@ -14938,6 +16015,15 @@ mod tests {
         assert!(cors_method_allowed("/identities", "GET"));
         assert!(cors_method_allowed("/identities", "DELETE"));
         assert!(!cors_method_allowed("/identities", "POST"));
+        assert!(cors_method_allowed("/password/register", "POST"));
+        assert!(!cors_method_allowed("/password/register", "GET"));
+        assert!(cors_method_allowed("/password/login", "POST"));
+        assert!(!cors_method_allowed("/password/login", "GET"));
+        assert!(cors_method_allowed("/magic-links", "POST"));
+        assert!(!cors_method_allowed("/magic-links", "GET"));
+        assert!(cors_method_allowed("/magic-links/consume", "GET"));
+        assert!(cors_method_allowed("/magic-links/consume", "POST"));
+        assert!(!cors_method_allowed("/magic-links/consume", "DELETE"));
         assert!(cors_method_allowed("/validate", "GET"));
         assert!(cors_method_allowed("/logout", "GET"));
         assert!(cors_method_allowed("/logout", "POST"));

@@ -206,6 +206,42 @@ pub const ROUTES: &[Route] = &[
         path: "/passkeys/authenticate/verify",
     },
     Route {
+        method: "POST",
+        path: "/password/register",
+    },
+    Route {
+        method: "OPTIONS",
+        path: "/password/register",
+    },
+    Route {
+        method: "POST",
+        path: "/password/login",
+    },
+    Route {
+        method: "OPTIONS",
+        path: "/password/login",
+    },
+    Route {
+        method: "POST",
+        path: "/magic-links",
+    },
+    Route {
+        method: "OPTIONS",
+        path: "/magic-links",
+    },
+    Route {
+        method: "GET",
+        path: "/magic-links/consume",
+    },
+    Route {
+        method: "POST",
+        path: "/magic-links/consume",
+    },
+    Route {
+        method: "OPTIONS",
+        path: "/magic-links/consume",
+    },
+    Route {
         method: "GET",
         path: "/validate",
     },
@@ -261,5 +297,20 @@ mod tests {
         assert!(ROUTES
             .iter()
             .any(|route| route.method == "GET" && route.path == "/__zeroth/db/status"));
+    }
+
+    #[test]
+    fn routes_include_first_party_auth_endpoints() {
+        for (method, path) in [
+            ("POST", "/password/register"),
+            ("POST", "/password/login"),
+            ("POST", "/magic-links"),
+            ("GET", "/magic-links/consume"),
+            ("POST", "/magic-links/consume"),
+        ] {
+            assert!(ROUTES
+                .iter()
+                .any(|route| route.method == method && route.path == path));
+        }
     }
 }

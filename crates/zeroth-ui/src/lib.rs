@@ -118,7 +118,7 @@ a:hover {
 }
 
 .zeroth-login-mode .zeroth-main {
-  width: min(760px, 100%);
+  width: min(880px, 100%);
   margin: 0 auto;
   padding: 44px 20px 28px;
 }
@@ -128,21 +128,23 @@ a:hover {
   grid-template-columns: auto minmax(0, 1fr);
   align-items: center;
   gap: 18px;
-  margin-bottom: 18px;
+  margin: 0 auto 18px;
+  width: min(680px, 100%);
 }
 
 .zeroth-hero-mark {
   display: grid;
   place-items: center;
-  width: 82px;
-  height: 82px;
-  border-radius: 18px;
-  background: #1f2328;
+  width: 88px;
+  height: 88px;
+  border-radius: 20px;
+  background:
+    linear-gradient(145deg, #1f2328 0%, #0550ae 55%, #1a7f37 100%);
   color: #ffffff;
-  font-size: 48px;
+  font-size: 50px;
   line-height: 1;
   font-weight: 900;
-  box-shadow: 0 18px 44px rgba(31, 35, 40, 0.18);
+  box-shadow: 0 20px 50px rgba(9, 105, 218, 0.2);
 }
 
 .zeroth-kicker {
@@ -173,6 +175,52 @@ a:hover {
 .zeroth-login-mode .zeroth-panel {
   border-color: var(--z-line-strong);
   box-shadow: 0 20px 54px rgba(31, 35, 40, 0.1);
+}
+
+.zeroth-login-card {
+  margin: 0 auto;
+  width: min(520px, 100%);
+}
+
+.zeroth-login-card .zeroth-panel-header {
+  padding: 13px 14px;
+}
+
+.zeroth-login-card .zeroth-panel-title {
+  font-size: 16px;
+}
+
+.zeroth-login-card .zeroth-panel-body {
+  padding: 14px;
+}
+
+.zeroth-local-auth {
+  display: grid;
+  gap: 12px;
+}
+
+.zeroth-login-actions {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px;
+  align-items: end;
+}
+
+.zeroth-divider {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  gap: 10px;
+  color: var(--z-muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.zeroth-divider::before,
+.zeroth-divider::after {
+  content: "";
+  height: 1px;
+  background: var(--z-line);
 }
 
 .zeroth-login-mode .zeroth-provider {
@@ -650,6 +698,10 @@ a:hover {
     justify-items: start;
   }
 
+  .zeroth-login-actions {
+    grid-template-columns: 1fr;
+  }
+
   .zeroth-hero-mark {
     width: 68px;
     height: 68px;
@@ -1059,7 +1111,19 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
     } else {
         "zeroth-panel"
     };
+    let login_panel_class = if login_mode {
+        "zeroth-panel zeroth-login-card"
+    } else {
+        "zeroth-panel"
+    };
     let login_panel_title = if login_mode { "Sign in" } else { "Login" };
+    let login_return_to = config
+        .return_to
+        .clone()
+        .unwrap_or(config.redirect_uri.clone());
+    let password_login_action = endpoint_url(&config, "/password/login");
+    let password_register_action = endpoint_url(&config, "/password/register");
+    let magic_link_action = endpoint_url(&config, "/magic-links");
 
     let provider_rows = providers
         .into_iter()
@@ -1110,12 +1174,44 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
 
                 <div class="zeroth-grid">
                     <div class="zeroth-stack">
-                        <section id="login" class="zeroth-panel">
+                        <section id="login" class=login_panel_class>
                             <div class="zeroth-panel-header">
                                 <h2 class="zeroth-panel-title">{login_panel_title}</h2>
                                 <span class="zeroth-status">{config.client_id.clone()}</span>
                             </div>
-                            <div class="zeroth-panel-body">
+                            <div class="zeroth-panel-body zeroth-local-auth">
+                                <form class="zeroth-form zeroth-login-form" method="post" action=password_login_action data-zeroth-local-auth="password-login">
+                                    <input type="hidden" name="clientId" value=config.client_id.clone() />
+                                    <input type="hidden" name="returnTo" value=login_return_to.clone() />
+                                    <div class="zeroth-field">
+                                        <label for="zeroth-login-email">"Email"</label>
+                                        <input id="zeroth-login-email" name="email" type="email" autocomplete="email" />
+                                    </div>
+                                    <div class="zeroth-login-actions">
+                                        <div class="zeroth-field">
+                                            <label for="zeroth-login-password">"Password"</label>
+                                            <input id="zeroth-login-password" name="password" type="password" autocomplete="current-password" />
+                                        </div>
+                                        <button class="zeroth-action zeroth-primary" type="submit">"Sign in"</button>
+                                    </div>
+                                    <div class="zeroth-form-actions">
+                                        <button class="zeroth-action" type="submit" formaction=password_register_action data-zeroth-local-mode="password-register">"Create password"</button>
+                                    </div>
+                                </form>
+
+                                <form class="zeroth-form zeroth-login-form" method="post" action=magic_link_action data-zeroth-local-auth="magic-link">
+                                    <input type="hidden" name="clientId" value=config.client_id.clone() />
+                                    <input type="hidden" name="returnTo" value=login_return_to />
+                                    <div class="zeroth-login-actions">
+                                        <div class="zeroth-field">
+                                            <label for="zeroth-magic-email">"Magic link"</label>
+                                            <input id="zeroth-magic-email" name="email" type="email" autocomplete="email" />
+                                        </div>
+                                        <button class="zeroth-action" type="submit">"Send link"</button>
+                                    </div>
+                                </form>
+
+                                <div class="zeroth-divider">"SSO"</div>
                                 <div class="zeroth-provider-list">{provider_rows}</div>
                             </div>
                         </section>
@@ -1984,6 +2080,49 @@ fn escape_text(value: &str) -> String {
 const ZEROTH_UI_SCRIPT: &str = r#"
 document.addEventListener("submit", async (event) => {
   const form = event.target;
+  if (form instanceof HTMLFormElement && form.dataset.zerothLocalAuth) {
+    event.preventDefault();
+    const submitter = event.submitter;
+    const mode = submitter instanceof HTMLElement && submitter.dataset.zerothLocalMode
+      ? submitter.dataset.zerothLocalMode
+      : form.dataset.zerothLocalAuth;
+    const data = new FormData(form);
+    const payload = {
+      email: String(data.get("email") || "").trim(),
+      clientId: String(data.get("clientId") || "").trim(),
+      returnTo: String(data.get("returnTo") || "").trim()
+    };
+    if (mode !== "magic-link") {
+      payload.password = String(data.get("password") || "");
+    }
+    const action = submitter instanceof HTMLButtonElement && submitter.formAction
+      ? submitter.formAction
+      : form.action;
+    const response = await fetch(action, {
+      method: "POST",
+      credentials: "include",
+      headers: {
+        "Accept": "application/json",
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(payload)
+    });
+    let body = {};
+    try {
+      body = await response.json();
+    } catch (_) {}
+    if (response.ok && body.returnTo) {
+      window.location.assign(body.returnTo);
+      return;
+    }
+    if (response.ok) {
+      window.alert(body.sent ? "Magic link sent" : "Email delivery is not configured");
+      if (body.devLink) window.location.assign(body.devLink);
+      return;
+    }
+    window.alert(body.error_description || body.error || "Sign in failed");
+    return;
+  }
   if (!(form instanceof HTMLFormElement) || !form.dataset.zerothMethod) {
     return;
   }
@@ -2899,6 +3038,10 @@ mod tests {
         assert!(html.contains("zeroth-hero-mark"));
         assert!(html.contains(">Z<"));
         assert!(html.contains("Sign in"));
+        assert!(html.contains("/password/login"));
+        assert!(html.contains("/password/register"));
+        assert!(html.contains("/magic-links"));
+        assert!(html.contains("zeroth-login-card"));
         assert!(html.contains("zeroth-panel zeroth-hidden"));
         assert!(html.contains("provider=apple"));
     }
