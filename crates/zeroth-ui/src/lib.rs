@@ -212,7 +212,7 @@ a:hover {
 
 .zeroth-login-actions {
   display: grid;
-  grid-template-columns: 1fr auto;
+  grid-template-columns: minmax(0, 1fr) auto auto;
   gap: 8px;
   align-items: end;
 }
@@ -1491,8 +1491,6 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
                                                 <input id="zeroth-login-password" name="password" type="password" autocomplete="current-password" />
                                             </div>
                                             <button class="zeroth-action zeroth-primary" type="submit">"Sign in"</button>
-                                        </div>
-                                        <div class="zeroth-form-actions">
                                             <button class="zeroth-action" type="submit" formaction=password_register_action data-zeroth-local-mode="password-register">"Create account"</button>
                                         </div>
                                     </form>
