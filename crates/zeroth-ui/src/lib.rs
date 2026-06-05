@@ -1116,6 +1116,11 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
     } else {
         "zeroth-panel"
     };
+    let passkey_register_class = if signed_in {
+        "zeroth-form zeroth-passkey-register-form"
+    } else {
+        "zeroth-form zeroth-passkey-register-form zeroth-hidden"
+    };
     let login_panel_title = if login_mode { "Sign in" } else { "Login" };
     let login_return_to = config
         .return_to
@@ -1201,13 +1206,41 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
 
                                 <form class="zeroth-form zeroth-login-form" method="post" action=magic_link_action data-zeroth-local-auth="magic-link">
                                     <input type="hidden" name="clientId" value=config.client_id.clone() />
-                                    <input type="hidden" name="returnTo" value=login_return_to />
+                                    <input type="hidden" name="returnTo" value=login_return_to.clone() />
                                     <div class="zeroth-login-actions">
                                         <div class="zeroth-field">
                                             <label for="zeroth-magic-email">"Magic link"</label>
                                             <input id="zeroth-magic-email" name="email" type="email" autocomplete="email" />
                                         </div>
                                         <button class="zeroth-action" type="submit">"Send link"</button>
+                                    </div>
+                                </form>
+
+                                <div class="zeroth-divider">"Passkey"</div>
+                                <div class="zeroth-login-actions">
+                                    <div>
+                                        <div class="zeroth-row-title">"Passkey"</div>
+                                        <div class="zeroth-row-meta" id="zeroth-account-passkey-status">"Ready"</div>
+                                    </div>
+                                    <button
+                                        class="zeroth-action"
+                                        id="zeroth-account-passkey-login"
+                                        type="button"
+                                        data-client-id=config.client_id.clone()
+                                        data-return-to=login_return_to.clone()
+                                    >
+                                        "Use passkey"
+                                    </button>
+                                </div>
+                                <form class=passkey_register_class id="zeroth-account-passkey-register-form">
+                                    <input type="hidden" name="clientId" value=config.client_id.clone() />
+                                    <input type="hidden" name="returnTo" value=login_return_to />
+                                    <div class="zeroth-login-actions">
+                                        <div class="zeroth-field">
+                                            <label for="zeroth-account-passkey-label">"New passkey"</label>
+                                            <input id="zeroth-account-passkey-label" name="label" type="text" autocomplete="off" />
+                                        </div>
+                                        <button class="zeroth-action" type="submit">"Save passkey"</button>
                                     </div>
                                 </form>
 
@@ -2078,6 +2111,159 @@ fn escape_text(value: &str) -> String {
 }
 
 const ZEROTH_UI_SCRIPT: &str = r#"
+const zerothPasskeyRegisterOptionsEndpoint = "/passkeys/register/options";
+const zerothPasskeyRegisterVerifyEndpoint = "/passkeys/register/verify";
+const zerothPasskeyAuthenticateOptionsEndpoint = "/passkeys/authenticate/options";
+const zerothPasskeyAuthenticateVerifyEndpoint = "/passkeys/authenticate/verify";
+
+function zerothSetPasskeyStatus(value, error = false) {
+  const status = document.getElementById("zeroth-account-passkey-status");
+  if (!status) return;
+  status.textContent = value;
+  status.setAttribute("aria-invalid", error ? "true" : "false");
+}
+
+function zerothPasskeysAvailable() {
+  return Boolean(window.PublicKeyCredential && navigator.credentials);
+}
+
+function zerothBufferToBase64url(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function zerothBase64urlToBuffer(value) {
+  const normalized = value.replace(/-/g, "+").replace(/_/g, "/");
+  const padded = normalized + "=".repeat((4 - (normalized.length % 4)) % 4);
+  const binary = atob(padded);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return bytes.buffer;
+}
+
+function zerothCreationOptionsFromServer(options) {
+  const publicKey = Object.assign({}, options.publicKey);
+  publicKey.challenge = zerothBase64urlToBuffer(publicKey.challenge);
+  publicKey.user = Object.assign({}, publicKey.user, {
+    id: zerothBase64urlToBuffer(publicKey.user.id)
+  });
+  publicKey.excludeCredentials = (publicKey.excludeCredentials || []).map((credential) => ({
+    type: credential.type,
+    id: zerothBase64urlToBuffer(credential.id)
+  }));
+  return publicKey;
+}
+
+function zerothRequestOptionsFromServer(options) {
+  const publicKey = Object.assign({}, options.publicKey);
+  publicKey.challenge = zerothBase64urlToBuffer(publicKey.challenge);
+  publicKey.allowCredentials = (publicKey.allowCredentials || []).map((credential) => ({
+    type: credential.type,
+    id: zerothBase64urlToBuffer(credential.id)
+  }));
+  return publicKey;
+}
+
+function zerothRegistrationCredentialPayload(credential) {
+  return {
+    id: credential.id,
+    rawId: zerothBufferToBase64url(credential.rawId),
+    response: {
+      clientDataJSON: zerothBufferToBase64url(credential.response.clientDataJSON),
+      attestationObject: zerothBufferToBase64url(credential.response.attestationObject),
+      transports: typeof credential.response.getTransports === "function"
+        ? credential.response.getTransports()
+        : []
+    }
+  };
+}
+
+function zerothAuthenticationCredentialPayload(credential) {
+  return {
+    id: credential.id,
+    rawId: zerothBufferToBase64url(credential.rawId),
+    response: {
+      clientDataJSON: zerothBufferToBase64url(credential.response.clientDataJSON),
+      authenticatorData: zerothBufferToBase64url(credential.response.authenticatorData),
+      signature: zerothBufferToBase64url(credential.response.signature),
+      userHandle: credential.response.userHandle
+        ? zerothBufferToBase64url(credential.response.userHandle)
+        : null
+    }
+  };
+}
+
+async function zerothPasskeyApi(path, payload) {
+  const response = await fetch(path, {
+    method: "POST",
+    credentials: "include",
+    headers: {
+      "Accept": "application/json",
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(payload)
+  });
+  let body = {};
+  try {
+    body = await response.json();
+  } catch (_) {}
+  if (!response.ok) {
+    throw new Error(body.error_description || body.error || `HTTP ${response.status}`);
+  }
+  return body;
+}
+
+async function zerothRegisterPasskey(form) {
+  if (!zerothPasskeysAvailable()) {
+    throw new Error("Passkeys are not available in this browser");
+  }
+  const data = new FormData(form);
+  const payload = {
+    clientId: String(data.get("clientId") || "").trim(),
+    returnTo: String(data.get("returnTo") || "").trim()
+  };
+  const label = String(data.get("label") || "").trim();
+  if (label) payload.label = label;
+  zerothSetPasskeyStatus("Registering");
+  const options = await zerothPasskeyApi(zerothPasskeyRegisterOptionsEndpoint, payload);
+  const credential = await navigator.credentials.create({
+    publicKey: zerothCreationOptionsFromServer(options)
+  });
+  if (!credential) throw new Error("Passkey registration was cancelled");
+  await zerothPasskeyApi(
+    zerothPasskeyRegisterVerifyEndpoint,
+    zerothRegistrationCredentialPayload(credential)
+  );
+  zerothSetPasskeyStatus("Saved");
+  window.location.reload();
+}
+
+async function zerothSignInWithPasskey(button) {
+  if (!zerothPasskeysAvailable()) {
+    throw new Error("Passkeys are not available in this browser");
+  }
+  const payload = {
+    clientId: String(button.dataset.clientId || "").trim(),
+    returnTo: String(button.dataset.returnTo || "").trim()
+  };
+  zerothSetPasskeyStatus("Signing in");
+  const options = await zerothPasskeyApi(zerothPasskeyAuthenticateOptionsEndpoint, payload);
+  const credential = await navigator.credentials.get({
+    publicKey: zerothRequestOptionsFromServer(options)
+  });
+  if (!credential) throw new Error("Passkey sign in was cancelled");
+  const result = await zerothPasskeyApi(
+    zerothPasskeyAuthenticateVerifyEndpoint,
+    zerothAuthenticationCredentialPayload(credential)
+  );
+  zerothSetPasskeyStatus("Signed in");
+  window.location.assign((result && result.returnTo) || payload.returnTo || "/account");
+}
+
 document.addEventListener("submit", async (event) => {
   const form = event.target;
   if (form instanceof HTMLFormElement && form.dataset.zerothLocalAuth) {
@@ -2123,6 +2309,16 @@ document.addEventListener("submit", async (event) => {
     window.alert(body.error_description || body.error || "Sign in failed");
     return;
   }
+  if (form instanceof HTMLFormElement && form.id === "zeroth-account-passkey-register-form") {
+    event.preventDefault();
+    try {
+      await zerothRegisterPasskey(form);
+    } catch (error) {
+      zerothSetPasskeyStatus("Failed", true);
+      window.alert(error instanceof Error ? error.message : "Passkey registration failed");
+    }
+    return;
+  }
   if (!(form instanceof HTMLFormElement) || !form.dataset.zerothMethod) {
     return;
   }
@@ -2163,6 +2359,18 @@ document.addEventListener("submit", async (event) => {
     message = body.error_description || body.error || message;
   } catch (_) {}
   window.alert(message);
+});
+
+document.addEventListener("click", (event) => {
+  const target = event.target;
+  if (!(target instanceof Element)) return;
+  const button = document.getElementById("zeroth-account-passkey-login");
+  if (!(button instanceof HTMLButtonElement) || (target !== button && !button.contains(target))) return;
+  event.preventDefault();
+  zerothSignInWithPasskey(button).catch((error) => {
+    zerothSetPasskeyStatus("Failed", true);
+    window.alert(error instanceof Error ? error.message : "Passkey sign in failed");
+  });
 });
 "#;
 
@@ -3041,6 +3249,8 @@ mod tests {
         assert!(html.contains("/password/login"));
         assert!(html.contains("/password/register"));
         assert!(html.contains("/magic-links"));
+        assert!(html.contains("zeroth-account-passkey-login"));
+        assert!(html.contains("Use passkey"));
         assert!(html.contains("zeroth-login-card"));
         assert!(html.contains("zeroth-panel zeroth-hidden"));
         assert!(html.contains("provider=apple"));
@@ -3058,6 +3268,8 @@ mod tests {
         assert!(document.contains("if (displayName) payload.displayName = displayName;"));
         assert!(document.contains("payload.pictureUrl = null;"));
         assert!(document.contains("JSON.stringify(payload)"));
+        assert!(document.contains("navigator.credentials.get"));
+        assert!(document.contains("/passkeys/authenticate/options"));
     }
 
     #[test]

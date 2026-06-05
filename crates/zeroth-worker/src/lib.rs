@@ -3053,9 +3053,6 @@ async fn passkey_register_options(mut request: Request, env: Env) -> worker::Res
     let config = server_config(&env, &url);
     let db = env.d1(D1_BINDING)?;
     let now = unix_timestamp_seconds();
-    if let Err(error) = validate_admin_request(&request, &env, &db, &config, now).await {
-        return client_management_error_json(&error);
-    }
     let body = match passkey_json_from_request::<PasskeyRegisterOptionsRequest>(&mut request).await
     {
         Ok(body) => body,
@@ -3063,6 +3060,11 @@ async fn passkey_register_options(mut request: Request, env: Env) -> worker::Res
     };
 
     let current = current_session_from_request(&request, &db, &config, now).await?;
+    if current.is_none() {
+        if let Err(error) = validate_admin_request(&request, &env, &db, &config, now).await {
+            return client_management_error_json(&error);
+        }
+    }
     let (user_id, email, display_name) = match passkey_registration_subject(current.as_ref(), &body)
     {
         Ok(subject) => subject,
