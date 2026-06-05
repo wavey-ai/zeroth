@@ -36,8 +36,6 @@ use zeroth_providers::{
 };
 use zeroth_server::ZerothServerConfig;
 #[cfg(target_arch = "wasm32")]
-use zeroth_ui::ProviderAdminUi;
-#[cfg(target_arch = "wasm32")]
 use zeroth_ui::{render_account_document, ZerothUiConfig, ZerothUiState};
 #[cfg(target_arch = "wasm32")]
 use zeroth_ui::{render_clients_admin_document, ClientsAdminUiState};
@@ -45,6 +43,8 @@ use zeroth_ui::{
     ApplicationUi, ClientAdminUi, EventAdminUi, IdentityUi, ProfileUi, ProviderKind, ProviderUi,
     SessionUi, UserAdminUi,
 };
+#[cfg(target_arch = "wasm32")]
+use zeroth_ui::{LocalAuthAdminUi, ProviderAdminUi};
 
 #[cfg(target_arch = "wasm32")]
 use zeroth_providers::{OAuthProvider, Provider, ProviderAuthorizeRequest};
@@ -394,6 +394,23 @@ struct ClientsResponse {
 #[serde(rename_all = "camelCase")]
 struct ProviderStatusResponse {
     providers: Vec<ProviderStatus>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalAuthStatusResponse {
+    methods: Vec<LocalAuthStatus>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalAuthStatus {
+    id: &'static str,
+    label: &'static str,
+    enabled: bool,
+    credential_storage: &'static str,
+    delivery: &'static str,
+    notes: Vec<&'static str>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1606,6 +1623,7 @@ async fn handle_request(request: Request, env: Env) -> worker::Result<Response> 
         (Method::Get, "/ready") => ready(request, env),
         (Method::Get, "/providers") => json(&provider_responses(&env)),
         (Method::Get, "/providers/status") => provider_status(request, env).await,
+        (Method::Get, "/local-auth/status") => local_auth_status(request, env).await,
         (Method::Get | Method::Post | Method::Delete, "/clients") => clients(request, env).await,
         (Method::Get | Method::Patch, "/users") => users(request, env).await,
         (Method::Get, "/events") => events(request, env).await,
@@ -2289,6 +2307,22 @@ async fn provider_status(request: Request, env: Env) -> worker::Result<Response>
 
     json(&ProviderStatusResponse {
         providers: provider_status_rows(&env, &config),
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn local_auth_status(request: Request, env: Env) -> worker::Result<Response> {
+    let url = request.url()?;
+    let db = env.d1(D1_BINDING)?;
+    let config = server_config(&env, &url);
+    if let Err(error) =
+        validate_admin_request(&request, &env, &db, &config, unix_timestamp_seconds()).await
+    {
+        return client_management_error_json(&error);
+    }
+
+    json(&LocalAuthStatusResponse {
+        methods: local_auth_status_rows(&env),
     })
 }
 
@@ -4211,6 +4245,7 @@ async fn hosted_clients_admin(request: Request, env: Env) -> worker::Result<Resp
     let mut state = ClientsAdminUiState::new(config.issuer().issuer)
         .with_product_name(product_name_from_env(&env));
     state.providers = provider_admin_ui_rows(&env, &config);
+    state.local_auth = local_auth_admin_ui_rows(&env);
     let db = env.d1(D1_BINDING)?;
     let now = unix_timestamp_seconds();
 
@@ -4827,6 +4862,78 @@ fn provider_web_domain(provider_id: &str, config: &ZerothServerConfig) -> Option
 }
 
 #[cfg(target_arch = "wasm32")]
+fn local_auth_status_rows(env: &Env) -> Vec<LocalAuthStatus> {
+    let password_ready = password_iterations_from_env(env).is_ok();
+    let magic_link_from_note = config_value_note(
+        binding_value_from_env(env, "MAGIC_LINK_FROM").as_deref(),
+        "missing_magic_link_from",
+        "placeholder_magic_link_from",
+    );
+    let email_binding_configured = env.send_email("EMAIL").is_ok();
+
+    local_auth_status_rows_from_config(
+        password_ready,
+        magic_link_from_note,
+        email_binding_configured,
+        magic_link_dev_echo_enabled(env),
+    )
+}
+
+fn local_auth_status_rows_from_config(
+    password_ready: bool,
+    magic_link_from_note: Option<&'static str>,
+    email_binding_configured: bool,
+    magic_link_dev_echo_enabled: bool,
+) -> Vec<LocalAuthStatus> {
+    let mut password_notes = Vec::new();
+    if !password_ready {
+        password_notes.push("invalid_password_iterations");
+    }
+
+    let mut magic_link_notes = Vec::new();
+    if let Some(note) = magic_link_from_note {
+        magic_link_notes.push(note);
+    }
+    if !email_binding_configured {
+        magic_link_notes.push("missing_email_binding");
+    }
+    if email_binding_configured && magic_link_from_note.is_none() {
+        magic_link_notes.push("cloudflare_email_sending_must_be_enabled");
+        magic_link_notes.push("delivery_not_proven");
+    }
+    if magic_link_dev_echo_enabled {
+        magic_link_notes.push("dev_echo_enabled");
+    }
+
+    vec![
+        LocalAuthStatus {
+            id: "password",
+            label: "Password",
+            enabled: password_ready,
+            credential_storage: "zeroth_local_credentials",
+            delivery: "none",
+            notes: password_notes,
+        },
+        LocalAuthStatus {
+            id: "passkey",
+            label: "Passkey",
+            enabled: true,
+            credential_storage: "zeroth_passkey_credentials",
+            delivery: "browser_webauthn",
+            notes: vec!["requires_webauthn_browser"],
+        },
+        LocalAuthStatus {
+            id: "magic_link",
+            label: "Magic link",
+            enabled: magic_link_from_note.is_none() && email_binding_configured,
+            credential_storage: "zeroth_magic_links",
+            delivery: "cloudflare_email",
+            notes: magic_link_notes,
+        },
+    ]
+}
+
+#[cfg(target_arch = "wasm32")]
 fn provider_client_secret_configured(env: &Env, provider_id: &str) -> bool {
     match provider_id {
         well_known::APPLE => apple_client_secret_configured(env),
@@ -4870,6 +4977,21 @@ fn provider_admin_ui_rows(env: &Env, config: &ZerothServerConfig) -> Vec<Provide
                 .collect(),
             callback_url: status.callback_url,
             web_domain: status.web_domain,
+            notes: status.notes.iter().map(|note| (*note).to_owned()).collect(),
+        })
+        .collect()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn local_auth_admin_ui_rows(env: &Env) -> Vec<LocalAuthAdminUi> {
+    local_auth_status_rows(env)
+        .into_iter()
+        .map(|status| LocalAuthAdminUi {
+            id: status.id.to_owned(),
+            label: status.label.to_owned(),
+            enabled: status.enabled,
+            credential_storage: status.credential_storage.to_owned(),
+            delivery: status.delivery.to_owned(),
             notes: status.notes.iter().map(|note| (*note).to_owned()).collect(),
         })
         .collect()
@@ -13320,6 +13442,41 @@ mod tests {
         let array = apple_app_site_association_readiness_from_payload(Some("[]"));
         assert!(!array.configured);
         assert_eq!(array.notes, vec!["apple_app_site_association_not_object"]);
+    }
+
+    #[test]
+    fn local_auth_status_reports_magic_link_delivery_dependencies() {
+        let methods = local_auth_status_rows_from_config(true, None, true, false);
+        let password = methods
+            .iter()
+            .find(|method| method.id == "password")
+            .unwrap();
+        assert!(password.enabled);
+        assert_eq!(password.credential_storage, "zeroth_local_credentials");
+        assert!(password.notes.is_empty());
+
+        let magic_link = methods
+            .iter()
+            .find(|method| method.id == "magic_link")
+            .unwrap();
+        assert!(magic_link.enabled);
+        assert_eq!(magic_link.delivery, "cloudflare_email");
+        assert!(magic_link
+            .notes
+            .contains(&"cloudflare_email_sending_must_be_enabled"));
+        assert!(magic_link.notes.contains(&"delivery_not_proven"));
+
+        let missing =
+            local_auth_status_rows_from_config(true, Some("missing_magic_link_from"), false, false);
+        let missing_magic_link = missing
+            .iter()
+            .find(|method| method.id == "magic_link")
+            .unwrap();
+        assert!(!missing_magic_link.enabled);
+        assert!(missing_magic_link
+            .notes
+            .contains(&"missing_magic_link_from"));
+        assert!(missing_magic_link.notes.contains(&"missing_email_binding"));
     }
 
     #[test]

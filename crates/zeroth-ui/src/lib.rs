@@ -878,6 +878,17 @@ pub struct ProviderAdminUi {
     pub notes: Vec<String>,
 }
 
+/// First-party/local auth method readiness row shown in the management UI.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalAuthAdminUi {
+    pub id: String,
+    pub label: String,
+    pub enabled: bool,
+    pub credential_storage: String,
+    pub delivery: String,
+    pub notes: Vec<String>,
+}
+
 /// User row shown in the Zeroth management UI.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UserAdminUi {
@@ -912,6 +923,7 @@ pub struct ClientsAdminUiState {
     pub admin_login_url: String,
     pub clients: Vec<ClientAdminUi>,
     pub providers: Vec<ProviderAdminUi>,
+    pub local_auth: Vec<LocalAuthAdminUi>,
     pub users: Vec<UserAdminUi>,
     pub events: Vec<EventAdminUi>,
 }
@@ -926,6 +938,7 @@ impl ClientsAdminUiState {
             admin_login_url,
             clients: Vec::new(),
             providers: Vec::new(),
+            local_auth: Vec::new(),
             users: Vec::new(),
             events: Vec::new(),
         }
@@ -1344,6 +1357,7 @@ pub fn ClientsAdminApp(state: ClientsAdminUiState) -> impl IntoView {
         admin_login_url,
         clients,
         providers,
+        local_auth,
         users,
         events,
     } = state;
@@ -1351,6 +1365,10 @@ pub fn ClientsAdminApp(state: ClientsAdminUiState) -> impl IntoView {
     let user_count = users.len().to_string();
     let event_count = events.len().to_string();
     let provider_rows = providers.into_iter().map(provider_admin_row).collect_view();
+    let local_auth_rows = local_auth
+        .into_iter()
+        .map(local_auth_admin_row)
+        .collect_view();
     let user_rows = users.into_iter().map(user_admin_row).collect_view();
     let event_rows = events.into_iter().map(event_admin_row).collect_view();
     let client_rows = clients.into_iter().map(client_admin_row).collect_view();
@@ -1365,6 +1383,7 @@ pub fn ClientsAdminApp(state: ClientsAdminUiState) -> impl IntoView {
                 <nav class="zeroth-nav" aria-label="Management sections">
                     <a href="#database">"Database"</a>
                     <a href="#providers">"Providers"</a>
+                    <a href="#local-auth">"Local auth"</a>
                     <a href="#users">"Users"</a>
                     <a href="#events">"Events"</a>
                     <a href="#clients" aria-current="page">"Clients"</a>
@@ -1470,6 +1489,25 @@ pub fn ClientsAdminApp(state: ClientsAdminUiState) -> impl IntoView {
                                     </tr>
                                 </thead>
                                 <tbody id="zeroth-provider-rows">{provider_rows}</tbody>
+                            </table>
+                        </section>
+
+                        <section id="local-auth" class="zeroth-panel">
+                            <div class="zeroth-panel-header">
+                                <h2 class="zeroth-panel-title">"Local auth"</h2>
+                                <button class="zeroth-action" id="zeroth-local-auth-refresh" type="button">"Refresh"</button>
+                            </div>
+                            <table class="zeroth-table">
+                                <thead>
+                                    <tr>
+                                        <th>"Method"</th>
+                                        <th>"Status"</th>
+                                        <th>"Storage"</th>
+                                        <th>"Delivery"</th>
+                                        <th>"Notes"</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="zeroth-local-auth-rows">{local_auth_rows}</tbody>
                             </table>
                         </section>
 
@@ -1779,6 +1817,33 @@ fn provider_admin_row(provider: ProviderAdminUi) -> impl IntoView {
                 " "
                 {notes}
             </td>
+        </tr>
+    }
+}
+
+fn local_auth_admin_row(method: LocalAuthAdminUi) -> impl IntoView {
+    let status = if method.enabled {
+        "Ready"
+    } else {
+        "Needs setup"
+    };
+    let status_class = if method.enabled {
+        "zeroth-status zeroth-status-ok"
+    } else {
+        "zeroth-status zeroth-status-warn"
+    };
+    let notes = join_or_dash(method.notes);
+
+    view! {
+        <tr>
+            <td>
+                <div class="zeroth-row-title">{method.label}</div>
+                <div class="zeroth-row-meta zeroth-code">{method.id}</div>
+            </td>
+            <td><span class=status_class>{status}</span></td>
+            <td class="zeroth-code">{method.credential_storage}</td>
+            <td>{method.delivery}</td>
+            <td>{notes}</td>
         </tr>
     }
 }
@@ -2380,6 +2445,7 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
   const clientsEndpoint = "/clients";
   const usersEndpoint = "/users";
   const providersEndpoint = "/providers/status";
+  const localAuthEndpoint = "/local-auth/status";
   const eventsEndpoint = "/events";
   const dbStatusEndpoint = "/__zeroth/db/status";
   const passkeyRegisterOptionsEndpoint = "/passkeys/register/options";
@@ -2390,6 +2456,7 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
   const rows = $("zeroth-client-rows");
   const userRows = $("zeroth-user-rows");
   const providerRows = $("zeroth-provider-rows");
+  const localAuthRows = $("zeroth-local-auth-rows");
   const eventRows = $("zeroth-event-rows");
   const dbStatusRows = $("zeroth-db-status-rows");
   const count = $("zeroth-client-count");
@@ -2662,6 +2729,40 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
     }
   }
 
+  function renderLocalAuthRows(methods) {
+    localAuthRows.replaceChildren();
+    if (methods.length === 0) {
+      renderEmptyRows(localAuthRows, 5);
+      return;
+    }
+
+    for (const method of methods) {
+      const row = document.createElement("tr");
+      const name = document.createElement("td");
+      setText(name, method.label || method.id || "-", "zeroth-row-title");
+      setText(name, method.id || "-", "zeroth-row-meta zeroth-code");
+
+      const state = document.createElement("td");
+      const statePill = document.createElement("span");
+      statePill.className = method.enabled ? "zeroth-status zeroth-status-ok" : "zeroth-status zeroth-status-warn";
+      statePill.textContent = method.enabled ? "Ready" : "Needs setup";
+      state.appendChild(statePill);
+
+      const storage = document.createElement("td");
+      storage.className = "zeroth-code";
+      storage.textContent = method.credentialStorage || "-";
+
+      const delivery = document.createElement("td");
+      delivery.textContent = method.delivery || "-";
+
+      const notes = document.createElement("td");
+      notes.textContent = (method.notes || []).join(", ") || "-";
+
+      row.append(name, state, storage, delivery, notes);
+      localAuthRows.appendChild(row);
+    }
+  }
+
   function providerSetupText(provider) {
     const parts = [];
     if (provider.webDomain) parts.push(`Domain ${provider.webDomain}`);
@@ -2850,6 +2951,12 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
     status.textContent = "Connected";
   }
 
+  async function loadLocalAuth() {
+    const body = await api(localAuthEndpoint);
+    renderLocalAuthRows(body.methods || []);
+    status.textContent = "Connected";
+  }
+
   async function loadDbStatus() {
     const body = await api(dbStatusEndpoint, { allowError: true });
     if (body && (body.error || body.error_description)) {
@@ -2874,7 +2981,7 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
 
   async function loadAdmin() {
     const dbReady = await loadDbStatus();
-    await loadProviders();
+    await Promise.all([loadProviders(), loadLocalAuth()]);
     if (!dbReady) {
       setMessage("Database setup incomplete", true);
       return;
@@ -3061,6 +3168,10 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
 
   $("zeroth-providers-refresh").addEventListener("click", () => {
     loadProviders().catch((error) => setMessage(error.message, true));
+  });
+
+  $("zeroth-local-auth-refresh").addEventListener("click", () => {
+    loadLocalAuth().catch((error) => setMessage(error.message, true));
   });
 
   $("zeroth-users-refresh").addEventListener("click", () => {
@@ -3352,6 +3463,14 @@ mod tests {
             web_domain: Some("id.example.com".to_owned()),
             notes: Vec::new(),
         });
+        state.local_auth.push(LocalAuthAdminUi {
+            id: "magic_link".to_owned(),
+            label: "Magic link".to_owned(),
+            enabled: false,
+            credential_storage: "zeroth_magic_links".to_owned(),
+            delivery: "cloudflare_email".to_owned(),
+            notes: vec!["missing_email_binding".to_owned()],
+        });
         state.users.push(UserAdminUi {
             user_id: "usr_123".to_owned(),
             email: Some("user@example.com".to_owned()),
@@ -3381,8 +3500,10 @@ mod tests {
             "https://id.example.com/login?return_to=https%3A%2F%2Fid.example.com%2Fadmin"
         ));
         assert!(html.contains("Providers"));
+        assert!(html.contains("Local auth"));
         assert!(html.contains("Database"));
         assert!(html.contains("zeroth-db-status-rows"));
+        assert!(html.contains("zeroth-local-auth-rows"));
         assert!(html.contains("Users"));
         assert!(html.contains("Events"));
         assert!(html.contains("zeroth-events-filter-form"));
@@ -3391,6 +3512,8 @@ mod tests {
         assert!(html.contains("Registered clients"));
         assert!(html.contains("Client editor"));
         assert!(html.contains("Apple"));
+        assert!(html.contains("Magic link"));
+        assert!(html.contains("zeroth_magic_links"));
         assert!(html.contains("usr_123"));
         assert!(html.contains("session.login"));
         assert!(html.contains("wavey-ios"));
@@ -3408,6 +3531,7 @@ mod tests {
         assert!(document.contains("fetch(path"));
         assert!(document.contains("loadAdmin().catch"));
         assert!(document.contains("/__zeroth/db/status"));
+        assert!(document.contains("/local-auth/status"));
         assert!(document.contains("allowError"));
         assert!(document.contains("Database setup incomplete"));
         assert!(document.contains("renderDbStatus"));

@@ -35,6 +35,10 @@ pub const ROUTES: &[Route] = &[
     },
     Route {
         method: "GET",
+        path: "/local-auth/status",
+    },
+    Route {
+        method: "GET",
         path: "/clients",
     },
     Route {
@@ -314,6 +318,7 @@ mod tests {
     #[test]
     fn routes_include_first_party_auth_endpoints() {
         for (method, path) in [
+            ("GET", "/local-auth/status"),
             ("GET", "/password/register"),
             ("POST", "/password/register"),
             ("GET", "/password/login"),
