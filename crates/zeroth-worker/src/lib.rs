@@ -16,10 +16,10 @@ use rsa::{
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
-use std::borrow::Cow;
 #[cfg(target_arch = "wasm32")]
 use std::cell::RefCell;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{borrow::Cow, collections::BTreeMap};
 use zeroth_core::{AuthTransaction, Client, ClientId, ProviderId, ScopeSet, Subject, UserId};
 use zeroth_oidc::authorization_request_redirect_uri_registered_for_client;
 #[cfg(target_arch = "wasm32")]
@@ -43,7 +43,7 @@ use zeroth_ui::{render_account_document, ZerothUiConfig, ZerothUiState};
 use zeroth_ui::{render_clients_admin_document, ClientsAdminUiState};
 use zeroth_ui::{
     ApplicationUi, ClientAdminUi, EventAdminUi, IdentityUi, ProfileUi, ProviderKind, ProviderUi,
-    SessionUi, UserAdminUi,
+    SessionUi, UserAdminUi, ZerothUiTheme,
 };
 #[cfg(target_arch = "wasm32")]
 use zeroth_ui::{
@@ -449,6 +449,64 @@ struct MagicLinkDeliveryConfig {
     transport: &'static str,
     enabled: bool,
     notes: Vec<&'static str>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct LoginThemeOverride {
+    name: Option<String>,
+    #[serde(default, alias = "backgroundColor")]
+    header_background_from: Option<String>,
+    #[serde(default, alias = "backgroundToColor")]
+    header_background_to: Option<String>,
+    #[serde(default, alias = "textColor")]
+    header_text_color: Option<String>,
+}
+
+impl LoginThemeOverride {
+    fn merge_from(&mut self, other: &LoginThemeOverride) {
+        if other.name.is_some() {
+            self.name.clone_from(&other.name);
+        }
+        if other.header_background_from.is_some() {
+            self.header_background_from
+                .clone_from(&other.header_background_from);
+        }
+        if other.header_background_to.is_some() {
+            self.header_background_to
+                .clone_from(&other.header_background_to);
+        }
+        if other.header_text_color.is_some() {
+            self.header_text_color.clone_from(&other.header_text_color);
+        }
+    }
+
+    fn trimmed_name(&self) -> Option<String> {
+        self.name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct LoginThemeCatalog {
+    #[serde(default)]
+    default: LoginThemeOverride,
+    #[serde(default)]
+    clients: BTreeMap<String, LoginThemeOverride>,
+    #[serde(default)]
+    domains: BTreeMap<String, LoginThemeOverride>,
+}
+
+impl LoginThemeCatalog {
+    fn merge_from(&mut self, other: LoginThemeCatalog) {
+        self.default.merge_from(&other.default);
+        self.clients.extend(other.clients);
+        self.domains.extend(other.domains);
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -4976,8 +5034,9 @@ async fn hosted_session_login_document(
         Vec::new()
     };
 
+    let issuer_base_url = config.issuer().issuer;
     let mut ui_config = ZerothUiConfig::new(
-        config.issuer().issuer,
+        issuer_base_url.clone(),
         client.id.0.clone(),
         return_to.clone(),
     );
@@ -4988,8 +5047,15 @@ async fn hosted_session_login_document(
     ui_config.code_challenge_method = None;
     ui_config.link_identities = false;
     ui_config.provider_authorize_path = "/login".to_owned();
+    let target_url = ui_config.return_to.clone();
 
-    let mut state = ZerothUiState::new(ui_config).with_product_name(product_name_from_env(env));
+    let mut state = themed_login_state(
+        ZerothUiState::new(ui_config),
+        env,
+        client,
+        &issuer_base_url,
+        target_url.as_deref(),
+    );
     state.providers = provider_ui_rows(env, &identities, true);
     state.profile = current
         .as_ref()
@@ -5024,8 +5090,18 @@ async fn hosted_authorization_document(
     let mut ui_config = ui_config_from_authorization_request(&config, authorization_request);
     ui_config.return_to = query_param(url, "return_to");
     ui_config.link_identities = false;
+    let target_url = ui_config
+        .return_to
+        .clone()
+        .unwrap_or_else(|| authorization_request.redirect_uri.clone());
 
-    let mut state = ZerothUiState::new(ui_config).with_product_name(product_name_from_env(env));
+    let mut state = themed_login_state(
+        ZerothUiState::new(ui_config),
+        env,
+        client,
+        &config.issuer().issuer,
+        Some(&target_url),
+    );
     state.providers = provider_ui_rows(env, &identities, true);
     state.profile = current
         .as_ref()
@@ -5917,6 +5993,132 @@ fn provider_alias_id_valid(provider_id: &str) -> bool {
 #[cfg(target_arch = "wasm32")]
 fn product_name_from_env(env: &Env) -> String {
     env_string(env, "PRODUCT_NAME").unwrap_or_else(|| "Zeroth".to_owned())
+}
+
+fn login_theme_for_client(
+    product_name: &str,
+    client: &Client,
+    issuer_base_url: &str,
+    target_url: Option<&str>,
+    catalog: &LoginThemeCatalog,
+) -> (String, ZerothUiTheme) {
+    let mut merged = catalog.default.clone();
+    if let Some(theme) = catalog.clients.get(&client.id.0) {
+        merged.merge_from(theme);
+    }
+    if let Some(target_host) = target_url.and_then(url_host) {
+        if let Some(theme) = theme_domain_match(&catalog.domains, &target_host) {
+            merged.merge_from(theme);
+        }
+    }
+
+    let explicit_name = merged.trimmed_name();
+    let mut display_name = product_name.to_owned();
+    if explicit_name.is_none() && target_is_external(issuer_base_url, target_url) {
+        let client_name = client.name.trim();
+        if !client_name.is_empty() {
+            display_name = client_name.to_owned();
+        }
+    }
+    if let Some(name) = explicit_name {
+        display_name = name;
+    }
+
+    (
+        display_name,
+        ZerothUiTheme {
+            header_background_from: merged.header_background_from,
+            header_background_to: merged.header_background_to,
+            header_text_color: merged.header_text_color,
+        },
+    )
+}
+
+fn target_is_external(issuer_base_url: &str, target_url: Option<&str>) -> bool {
+    let Some(issuer_host) = url_host(issuer_base_url) else {
+        return false;
+    };
+    let Some(target_host) = target_url.and_then(url_host) else {
+        return false;
+    };
+    issuer_host != target_host
+}
+
+fn url_host(value: &str) -> Option<String> {
+    url::Url::parse(value)
+        .ok()?
+        .host_str()
+        .map(|host| host.trim_end_matches('.').to_ascii_lowercase())
+        .filter(|host| !host.is_empty())
+}
+
+fn theme_domain_match<'a>(
+    domains: &'a BTreeMap<String, LoginThemeOverride>,
+    host: &str,
+) -> Option<&'a LoginThemeOverride> {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    domains
+        .iter()
+        .filter_map(|(domain, theme)| {
+            let domain = normalized_theme_domain(domain)?;
+            let matches = host == domain || host.ends_with(&format!(".{domain}"));
+            matches.then_some((domain.len(), theme))
+        })
+        .max_by_key(|(len, _)| *len)
+        .map(|(_, theme)| theme)
+}
+
+fn normalized_theme_domain(value: &str) -> Option<String> {
+    let domain = value
+        .trim()
+        .trim_start_matches('.')
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    (!domain.is_empty()).then_some(domain)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn login_theme_catalog_from_env(env: &Env) -> LoginThemeCatalog {
+    let mut catalog = LoginThemeCatalog::default();
+    catalog.default.merge_from(&LoginThemeOverride {
+        name: env_string(env, "LOGIN_BRAND_NAME").or_else(|| env_string(env, "LOGIN_NAME")),
+        header_background_from: env_string(env, "LOGIN_HEADER_BACKGROUND_FROM")
+            .or_else(|| env_string(env, "LOGIN_HEADER_GRADIENT_FROM"))
+            .or_else(|| env_string(env, "LOGIN_BACKGROUND_COLOR")),
+        header_background_to: env_string(env, "LOGIN_HEADER_BACKGROUND_TO")
+            .or_else(|| env_string(env, "LOGIN_HEADER_GRADIENT_TO")),
+        header_text_color: env_string(env, "LOGIN_HEADER_TEXT_COLOR")
+            .or_else(|| env_string(env, "LOGIN_TEXT_COLOR")),
+    });
+
+    if let Some(raw) =
+        env_string(env, "LOGIN_THEMES_JSON").or_else(|| env_string(env, "ZEROTH_LOGIN_THEMES_JSON"))
+    {
+        if let Ok(parsed) = serde_json::from_str::<LoginThemeCatalog>(&raw) {
+            catalog.merge_from(parsed);
+        }
+    }
+
+    catalog
+}
+
+#[cfg(target_arch = "wasm32")]
+fn themed_login_state(
+    state: ZerothUiState,
+    env: &Env,
+    client: &Client,
+    issuer_base_url: &str,
+    target_url: Option<&str>,
+) -> ZerothUiState {
+    let catalog = login_theme_catalog_from_env(env);
+    let (product_name, theme) = login_theme_for_client(
+        &product_name_from_env(env),
+        client,
+        issuer_base_url,
+        target_url,
+        &catalog,
+    );
+    state.with_product_name(product_name).with_theme(theme)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -15829,6 +16031,110 @@ mod tests {
         let error =
             verify_passkey_es256_signature(&credential, b"tampered", der.as_bytes()).unwrap_err();
         assert_eq!(error, "passkey signature did not verify");
+    }
+
+    #[test]
+    fn login_theme_uses_client_name_for_external_target_without_override() {
+        let client = Client {
+            id: ClientId("app-web".to_owned()),
+            name: "App Web".to_owned(),
+            redirect_uris: vec!["https://app.example.com/callback".to_owned()],
+            allowed_origins: vec!["https://app.example.com".to_owned()],
+            allowed_email_domains: Vec::new(),
+            confidential: false,
+        };
+
+        let (name, theme) = login_theme_for_client(
+            "Wavey ID",
+            &client,
+            "https://id.example.com",
+            Some("https://app.example.com/home"),
+            &LoginThemeCatalog::default(),
+        );
+
+        assert_eq!(name, "App Web");
+        assert_eq!(theme, ZerothUiTheme::default());
+    }
+
+    #[test]
+    fn login_theme_domain_override_wins_over_client_override() {
+        let client = Client {
+            id: ClientId("app-web".to_owned()),
+            name: "App Web".to_owned(),
+            redirect_uris: vec!["https://app.example.com/callback".to_owned()],
+            allowed_origins: vec!["https://app.example.com".to_owned()],
+            allowed_email_domains: Vec::new(),
+            confidential: false,
+        };
+        let mut catalog = LoginThemeCatalog::default();
+        catalog.clients.insert(
+            "app-web".to_owned(),
+            LoginThemeOverride {
+                name: Some("Client Name".to_owned()),
+                header_background_from: Some("#111111".to_owned()),
+                header_background_to: Some("#222222".to_owned()),
+                header_text_color: None,
+            },
+        );
+        catalog.domains.insert(
+            "example.com".to_owned(),
+            LoginThemeOverride {
+                name: Some("Domain Name".to_owned()),
+                header_background_from: Some("#ffffff".to_owned()),
+                header_background_to: Some("#f6f8fa".to_owned()),
+                header_text_color: Some("#101820".to_owned()),
+            },
+        );
+
+        let (name, theme) = login_theme_for_client(
+            "Wavey ID",
+            &client,
+            "https://id.example.com",
+            Some("https://sub.example.com/home"),
+            &catalog,
+        );
+
+        assert_eq!(name, "Domain Name");
+        assert_eq!(theme.header_background_from.as_deref(), Some("#ffffff"));
+        assert_eq!(theme.header_background_to.as_deref(), Some("#f6f8fa"));
+        assert_eq!(theme.header_text_color.as_deref(), Some("#101820"));
+    }
+
+    #[test]
+    fn login_theme_prefers_most_specific_domain() {
+        let client = Client {
+            id: ClientId("app-web".to_owned()),
+            name: "App Web".to_owned(),
+            redirect_uris: vec!["https://app.example.com/callback".to_owned()],
+            allowed_origins: vec!["https://app.example.com".to_owned()],
+            allowed_email_domains: Vec::new(),
+            confidential: false,
+        };
+        let mut catalog = LoginThemeCatalog::default();
+        catalog.domains.insert(
+            "example.com".to_owned(),
+            LoginThemeOverride {
+                name: Some("Example".to_owned()),
+                ..LoginThemeOverride::default()
+            },
+        );
+        catalog.domains.insert(
+            "app.example.com".to_owned(),
+            LoginThemeOverride {
+                name: Some("App Example".to_owned()),
+                ..LoginThemeOverride::default()
+            },
+        );
+
+        let (name, _) = login_theme_for_client(
+            "Wavey ID",
+            &client,
+            "https://id.example.com",
+            Some("https://app.example.com/home"),
+            &catalog,
+        );
+
+        assert_eq!(name, "App Example");
     }
 
     #[test]

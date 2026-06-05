@@ -34,6 +34,9 @@ pub const ZEROTH_UI_CSS: &str = r#"
   --z-sidebar-muted: #8c959f;
   --z-sidebar-line: #30363d;
   --z-sidebar-active: #1f6feb;
+  --z-login-header-from: #ffffff;
+  --z-login-header-to: #f6f8fa;
+  --z-login-header-text: var(--z-ink);
 }
 
 * {
@@ -134,16 +137,18 @@ a:hover {
   position: static;
   border-right: 0;
   border-bottom: 1px solid var(--z-line);
-  background: rgba(255, 255, 255, 0.92);
+  background:
+    linear-gradient(135deg, var(--z-login-header-from) 0%, var(--z-login-header-to) 100%);
 }
 
 .zeroth-login-mode .zeroth-brand {
-  color: var(--z-ink);
+  color: var(--z-login-header-text);
   margin-bottom: 0;
 }
 
 .zeroth-login-mode .zeroth-brand-subtitle {
-  color: var(--z-muted);
+  color: var(--z-login-header-text);
+  opacity: 0.66;
 }
 
 .zeroth-login-mode .zeroth-sidebar-footer {
@@ -167,51 +172,6 @@ a:hover {
   width: min(680px, 100%);
   margin: 0 auto;
   padding: 38px 20px 28px;
-}
-
-.zeroth-login-intro {
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr);
-  align-items: center;
-  gap: 18px;
-  margin: 0 auto 18px;
-  width: min(680px, 100%);
-}
-
-.zeroth-hero-mark {
-  display: grid;
-  place-items: center;
-  width: 88px;
-  height: 88px;
-  border-radius: 20px;
-  background:
-    linear-gradient(145deg, #2d333b 0%, var(--z-ink) 55%, var(--z-ink-deep) 100%);
-  color: #ffffff;
-  font-size: 50px;
-  line-height: 1;
-  font-weight: 900;
-  box-shadow: 0 20px 50px rgba(31, 35, 40, 0.2);
-}
-
-.zeroth-kicker {
-  color: var(--z-green);
-  font-size: 12px;
-  font-weight: 800;
-  text-transform: uppercase;
-}
-
-.zeroth-login-title {
-  margin: 1px 0 0;
-  color: var(--z-ink);
-  font-size: 34px;
-  line-height: 1.1;
-  letter-spacing: 0;
-}
-
-.zeroth-login-subtitle {
-  margin-top: 5px;
-  color: var(--z-muted);
-  font-size: 14px;
 }
 
 .zeroth-login-mode .zeroth-grid {
@@ -872,24 +832,8 @@ a:hover {
     grid-template-columns: 1fr;
   }
 
-  .zeroth-login-intro {
-    grid-template-columns: 1fr;
-    justify-items: start;
-  }
-
   .zeroth-login-actions {
     grid-template-columns: 1fr;
-  }
-
-  .zeroth-hero-mark {
-    width: 68px;
-    height: 68px;
-    border-radius: 14px;
-    font-size: 40px;
-  }
-
-  .zeroth-login-title {
-    font-size: 28px;
   }
 }
 "#;
@@ -932,6 +876,47 @@ impl ZerothUiConfig {
             csrf_token: None,
             link_identities: true,
             provider_authorize_path: "/authorize".to_owned(),
+        }
+    }
+}
+
+/// Safe colour customisation for the hosted login header.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ZerothUiTheme {
+    pub header_background_from: Option<String>,
+    pub header_background_to: Option<String>,
+    pub header_text_color: Option<String>,
+}
+
+impl ZerothUiTheme {
+    fn css(&self) -> String {
+        let mut rules = Vec::new();
+        if let Some(value) = self
+            .header_background_from
+            .as_deref()
+            .and_then(normalized_hex_color)
+        {
+            rules.push(format!("--z-login-header-from: {value};"));
+        }
+        if let Some(value) = self
+            .header_background_to
+            .as_deref()
+            .and_then(normalized_hex_color)
+        {
+            rules.push(format!("--z-login-header-to: {value};"));
+        }
+        if let Some(value) = self
+            .header_text_color
+            .as_deref()
+            .and_then(normalized_hex_color)
+        {
+            rules.push(format!("--z-login-header-text: {value};"));
+        }
+
+        if rules.is_empty() {
+            String::new()
+        } else {
+            format!(":root{{{}}}", rules.join(""))
         }
     }
 }
@@ -1164,6 +1149,7 @@ impl ClientsAdminUiState {
 pub struct ZerothUiState {
     pub config: ZerothUiConfig,
     pub product_name: String,
+    pub theme: ZerothUiTheme,
     pub profile: Option<ProfileUi>,
     pub providers: Vec<ProviderUi>,
     pub identities: Vec<IdentityUi>,
@@ -1176,6 +1162,7 @@ impl ZerothUiState {
         Self {
             config,
             product_name: "Zeroth".to_owned(),
+            theme: ZerothUiTheme::default(),
             profile: None,
             providers: vec![
                 ProviderUi::apple(false),
@@ -1190,6 +1177,11 @@ impl ZerothUiState {
 
     pub fn with_product_name(mut self, product_name: impl Into<String>) -> Self {
         self.product_name = product_name.into();
+        self
+    }
+
+    pub fn with_theme(mut self, theme: ZerothUiTheme) -> Self {
+        self.theme = theme;
         self
     }
 }
@@ -1211,17 +1203,17 @@ pub fn render_account_html(state: ZerothUiState) -> String {
 
 /// Renders a complete HTML document with the default Zeroth stylesheet.
 pub fn render_account_document(state: ZerothUiState) -> String {
+    let title = escape_text(&state.product_name);
+    let theme_css = state.theme.css();
+    let html = render_account_html(state);
     format!(
         concat!(
             "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">",
             "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">",
             "<link rel=\"icon\" href=\"/favicon.svg\" type=\"image/svg+xml\">",
-            "<title>{}</title><style>{}</style></head><body>{}<script>{}</script></body></html>"
+            "<title>{}</title><style>{}{}</style></head><body>{}<script>{}</script></body></html>"
         ),
-        escape_text(&state.product_name),
-        ZEROTH_UI_CSS,
-        render_account_html(state),
-        ZEROTH_UI_SCRIPT
+        title, ZEROTH_UI_CSS, theme_css, html, ZEROTH_UI_SCRIPT
     )
 }
 
@@ -1252,6 +1244,7 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
     let ZerothUiState {
         config,
         product_name,
+        theme: _,
         profile,
         providers,
         identities,
@@ -1336,11 +1329,6 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
         "zeroth-nav zeroth-hidden"
     } else {
         "zeroth-nav"
-    };
-    let login_intro_class = if login_mode {
-        "zeroth-login-intro"
-    } else {
-        "zeroth-login-intro zeroth-hidden"
     };
     let account_panel_class = if login_mode {
         "zeroth-panel zeroth-hidden"
@@ -1449,15 +1437,6 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
             </aside>
 
             <main class="zeroth-main">
-                <section class=login_intro_class aria-label="Zeroth sign in">
-                    <span class="zeroth-hero-mark">"Z"</span>
-                    <div>
-                        <div class="zeroth-kicker">"SSO"</div>
-                        <h1 class="zeroth-login-title">{product_name.clone()}</h1>
-                        <div class="zeroth-login-subtitle">{config.issuer_base_url.clone()}</div>
-                    </div>
-                </section>
-
                 <header class="zeroth-topbar">
                     <div>
                         <h1 class="zeroth-title">{product_name}</h1>
@@ -2649,6 +2628,18 @@ fn escape_text(value: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+}
+
+fn normalized_hex_color(value: &str) -> Option<String> {
+    let value = value.trim();
+    let hex = value.strip_prefix('#')?;
+    if !matches!(hex.len(), 3 | 6 | 8) {
+        return None;
+    }
+    if !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(format!("#{hex}"))
 }
 
 const ZEROTH_UI_SCRIPT: &str = r#"
@@ -3984,8 +3975,12 @@ mod tests {
         let password_index = html.find("zeroth-login-form").unwrap();
 
         assert!(html.contains("zeroth-login-mode"));
-        assert!(html.contains("zeroth-hero-mark"));
+        assert!(html.contains("zeroth-brand"));
         assert!(html.contains(">Z<"));
+        assert!(html.contains("Identity"));
+        assert!(!html.contains("zeroth-hero-mark"));
+        assert!(!html.contains("zeroth-login-intro"));
+        assert!(!html.contains(">SSO<"));
         assert!(html.contains("Sign in"));
         assert!(provider_index < password_index);
         assert!(html.contains("Continue with Apple"));
@@ -4049,6 +4044,49 @@ mod tests {
         assert!(document.contains("submitter.hasAttribute(\"formaction\")"));
         assert!(document.contains("zerothSubmitAction(form, submitter)"));
         assert!(document.contains("function zerothBindSectionNav()"));
+    }
+
+    #[test]
+    fn account_document_injects_login_theme_css() {
+        let document = render_account_document(
+            ZerothUiState::new(ZerothUiConfig::new(
+                "https://id.example.com",
+                "browser-client",
+                "https://app.example.com/callback",
+            ))
+            .with_product_name("Acme")
+            .with_theme(ZerothUiTheme {
+                header_background_from: Some("#101820".to_owned()),
+                header_background_to: Some("#203a43".to_owned()),
+                header_text_color: Some("#f7fafc".to_owned()),
+            }),
+        );
+
+        assert!(document.contains("<title>Acme</title>"));
+        assert!(document.contains("--z-login-header-from: #101820;"));
+        assert!(document.contains("--z-login-header-to: #203a43;"));
+        assert!(document.contains("--z-login-header-text: #f7fafc;"));
+    }
+
+    #[test]
+    fn account_document_rejects_unsafe_theme_css() {
+        let document = render_account_document(
+            ZerothUiState::new(ZerothUiConfig::new(
+                "https://id.example.com",
+                "browser-client",
+                "https://app.example.com/callback",
+            ))
+            .with_theme(ZerothUiTheme {
+                header_background_from: Some("red;background:url(javascript:alert(1))".to_owned()),
+                header_background_to: Some("#f60".to_owned()),
+                header_text_color: Some("var(--unsafe-login-text)".to_owned()),
+            }),
+        );
+
+        assert!(document.contains("--z-login-header-to: #f60;"));
+        assert!(!document.contains("javascript"));
+        assert!(!document.contains("red;background"));
+        assert!(!document.contains("var(--unsafe-login-text)"));
     }
 
     #[test]
