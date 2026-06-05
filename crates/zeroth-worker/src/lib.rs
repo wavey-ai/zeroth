@@ -4290,7 +4290,7 @@ fn canonical_route_path(path: &str) -> Cow<'_, str> {
 fn compatibility_route_path(path: &str) -> Cow<'_, str> {
     match path {
         "/api/health" => Cow::Borrowed("/health"),
-        "/api/ready" => Cow::Borrowed("/ready"),
+        "/status" | "/api/status" | "/api/ready" => Cow::Borrowed("/ready"),
         "/api/providers" => Cow::Borrowed("/providers"),
         "/api/providers/status" => Cow::Borrowed("/providers/status"),
         "/api/local-auth/status" => Cow::Borrowed("/local-auth/status"),
@@ -4311,18 +4311,36 @@ fn compatibility_route_path(path: &str) -> Cow<'_, str> {
         "/api/identities" => Cow::Borrowed("/identities"),
         "/api/validate" => Cow::Borrowed("/validate"),
         "/api/logout" => Cow::Borrowed("/logout"),
-        "/api/password/register"
+        "/auth/password/register"
+        | "/api/auth/password/register"
+        | "/api/password/register"
         | "/api/local-auth/password/register"
         | "/local-auth/password/register" => Cow::Borrowed("/password/register"),
-        "/api/password/login" | "/api/local-auth/password/login" | "/local-auth/password/login" => {
-            Cow::Borrowed("/password/login")
-        }
+        "/auth/password/login"
+        | "/api/auth/password/login"
+        | "/api/password/login"
+        | "/api/local-auth/password/login"
+        | "/local-auth/password/login" => Cow::Borrowed("/password/login"),
         "/magic-link"
         | "/magic_link"
         | "/magic-links/request"
         | "/magic-links/send"
         | "/magic-link/send"
         | "/magic_link/send"
+        | "/auth/magic-links"
+        | "/auth/magic-link"
+        | "/auth/magic_link"
+        | "/auth/magic-links/request"
+        | "/auth/magic-links/send"
+        | "/auth/magic-link/send"
+        | "/auth/magic_link/send"
+        | "/api/auth/magic-links"
+        | "/api/auth/magic-link"
+        | "/api/auth/magic_link"
+        | "/api/auth/magic-links/request"
+        | "/api/auth/magic-links/send"
+        | "/api/auth/magic-link/send"
+        | "/api/auth/magic_link/send"
         | "/api/magic-links"
         | "/api/magic-link"
         | "/api/magic_link"
@@ -4352,6 +4370,24 @@ fn compatibility_route_path(path: &str) -> Cow<'_, str> {
         | "/magic-links/login"
         | "/magic-link/login"
         | "/magic_link/login"
+        | "/auth/magic-links/consume"
+        | "/auth/magic-link/consume"
+        | "/auth/magic_link/consume"
+        | "/auth/magic-links/verify"
+        | "/auth/magic-link/verify"
+        | "/auth/magic_link/verify"
+        | "/auth/magic-links/login"
+        | "/auth/magic-link/login"
+        | "/auth/magic_link/login"
+        | "/api/auth/magic-links/consume"
+        | "/api/auth/magic-link/consume"
+        | "/api/auth/magic_link/consume"
+        | "/api/auth/magic-links/verify"
+        | "/api/auth/magic-link/verify"
+        | "/api/auth/magic_link/verify"
+        | "/api/auth/magic-links/login"
+        | "/api/auth/magic-link/login"
+        | "/api/auth/magic_link/login"
         | "/api/magic-links/consume"
         | "/api/magic-link/consume"
         | "/api/magic_link/consume"
@@ -4405,6 +4441,7 @@ fn compatibility_route_path(path: &str) -> Cow<'_, str> {
             Cow::Borrowed("/passkeys/authenticate/finish")
         }
         _ if admin_console_alias_path(path) => Cow::Borrowed("/admin"),
+        _ if provider_callback_alias_path(path) => Cow::Borrowed("/oauth2/callback"),
         _ => Cow::Borrowed(path),
     }
 }
@@ -5772,7 +5809,10 @@ fn provider_authorize_alias_path(path: &str) -> bool {
 fn admin_console_alias_path(path: &str) -> bool {
     matches!(
         path,
-        "/admin/users"
+        "/ui"
+            | "/dashboard"
+            | "/console"
+            | "/admin/users"
             | "/admin/events"
             | "/admin/providers"
             | "/admin/local-auth"
@@ -5783,6 +5823,8 @@ fn admin_console_alias_path(path: &str) -> bool {
 fn provider_callback_alias_path(path: &str) -> bool {
     provider_segment_alias(path, "/oauth/callback/", "").is_some()
         || provider_segment_alias(path, "/oauth2/callback/", "").is_some()
+        || provider_segment_alias(path, "/callback/", "").is_some()
+        || path == "/callback"
 }
 
 fn provider_authorize_alias_url(request_url: &url::Url) -> Option<url::Url> {
@@ -17971,14 +18013,20 @@ mod tests {
         assert!(provider_authorize_alias_path("/providers/google/authorize"));
         assert!(provider_callback_alias_path("/oauth/callback/apple"));
         assert!(provider_callback_alias_path("/oauth2/callback/apple"));
+        assert!(provider_callback_alias_path("/callback"));
+        assert!(provider_callback_alias_path("/callback/apple"));
         assert!(!provider_authorize_alias_path(
             "/providers/google/extra/authorize"
         ));
         assert!(!provider_callback_alias_path("/oauth/callback/apple/extra"));
+        assert!(!provider_callback_alias_path("/callback/apple/extra"));
     }
 
     #[test]
     fn admin_console_alias_paths_are_bounded() {
+        assert!(admin_console_alias_path("/ui"));
+        assert!(admin_console_alias_path("/dashboard"));
+        assert!(admin_console_alias_path("/console"));
         assert!(admin_console_alias_path("/admin/users"));
         assert!(admin_console_alias_path("/admin/events"));
         assert!(admin_console_alias_path("/admin/providers"));
@@ -17990,6 +18038,14 @@ mod tests {
 
     #[test]
     fn compatibility_route_path_maps_bounded_aliases_to_canonical_routes() {
+        assert_eq!(compatibility_route_path("/status").as_ref(), "/ready");
+        assert_eq!(compatibility_route_path("/api/status").as_ref(), "/ready");
+        assert_eq!(compatibility_route_path("/ui").as_ref(), "/admin");
+        assert_eq!(compatibility_route_path("/dashboard").as_ref(), "/admin");
+        assert_eq!(
+            compatibility_route_path("/callback/apple").as_ref(),
+            "/oauth2/callback"
+        );
         assert_eq!(compatibility_route_path("/admin/users").as_ref(), "/admin");
         assert_eq!(compatibility_route_path("/api/health").as_ref(), "/health");
         assert_eq!(compatibility_route_path("/api/ready").as_ref(), "/ready");
@@ -18032,7 +18088,19 @@ mod tests {
             "/magic-links"
         );
         assert_eq!(
+            compatibility_route_path("/auth/magic-link/send").as_ref(),
+            "/magic-links"
+        );
+        assert_eq!(
+            compatibility_route_path("/api/auth/magic-link/send").as_ref(),
+            "/magic-links"
+        );
+        assert_eq!(
             compatibility_route_path("/local-auth/magic-links/consume").as_ref(),
+            "/magic-links/consume"
+        );
+        assert_eq!(
+            compatibility_route_path("/auth/magic-link/verify").as_ref(),
             "/magic-links/consume"
         );
         assert_eq!(
@@ -18049,6 +18117,10 @@ mod tests {
         );
         assert_eq!(
             compatibility_route_path("/api/password/login").as_ref(),
+            "/password/login"
+        );
+        assert_eq!(
+            compatibility_route_path("/auth/password/login").as_ref(),
             "/password/login"
         );
         assert_eq!(
@@ -18079,6 +18151,13 @@ mod tests {
 
     #[test]
     fn known_route_path_covers_aliases_after_normalization() {
+        assert!(known_route_path(
+            compatibility_route_path("/status").as_ref()
+        ));
+        assert!(known_route_path(compatibility_route_path("/ui").as_ref()));
+        assert!(known_route_path(
+            compatibility_route_path("/callback/apple").as_ref()
+        ));
         assert!(known_route_path(
             compatibility_route_path("/api/passkeys/login/options").as_ref()
         ));
@@ -18440,6 +18519,9 @@ mod tests {
         let local_auth_magic_links = compatibility_route_path("/local-auth/magic-links");
         assert!(cors_path(local_auth_magic_links.as_ref()));
         assert!(cors_method_allowed(local_auth_magic_links.as_ref(), "POST"));
+        let auth_magic_link_send = compatibility_route_path("/auth/magic-link/send");
+        assert!(cors_path(auth_magic_link_send.as_ref()));
+        assert!(cors_method_allowed(auth_magic_link_send.as_ref(), "POST"));
     }
 
     #[test]
