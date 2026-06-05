@@ -119,6 +119,11 @@ Implemented so far:
   verification, code lookup, expiry/reuse checks, redirect URI matching, S256
   `code_verifier` validation when the authorization code used PKCE, and
   conditional one-time D1 code consumption before credentials are minted
+- Worker `/oauth/token` native Apple token exchange for Swift/iOS apps that use
+  `ASAuthorizationAppleIDProvider`: Zeroth verifies the Apple `identityToken`
+  against Apple JWKS, requires its `aud` to match `APPLE_NATIVE_CLIENT_IDS`,
+  persists the Apple identity in D1, applies the registered Zeroth client's
+  email-domain policy, and returns Zeroth-owned access/ID tokens
 - registered-client CORS/preflight support for browser calls to token,
   revocation, introspection, userinfo, session, sessions, profile, identities,
   validate, and logout

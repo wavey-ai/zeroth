@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 #[cfg(target_arch = "wasm32")]
 use std::cell::RefCell;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use zeroth_core::{AuthTransaction, Client, ClientId, ProviderId, ScopeSet, UserId};
+use zeroth_core::{AuthTransaction, Client, ClientId, ProviderId, ScopeSet, Subject, UserId};
 use zeroth_oidc::authorization_request_redirect_uri_registered_for_client;
 #[cfg(target_arch = "wasm32")]
 use zeroth_oidc::parse_authorization_request;
@@ -89,6 +89,9 @@ const APPLE_CLIENT_SECRET_DEFAULT_TTL_SECONDS: i64 = 60 * 60 * 24 * 180;
 const APPLE_CLIENT_SECRET_MAX_TTL_SECONDS: i64 = 60 * 60 * 24 * 180;
 const APPLE_CLIENT_SECRET_CACHE_REFRESH_SECONDS: i64 = 60 * 60;
 const PROVIDER_JWKS_CACHE_TTL_SECONDS: i32 = 60 * 60;
+const TOKEN_EXCHANGE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
+const ID_TOKEN_SUBJECT_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:id_token";
+const DEFAULT_NATIVE_TOKEN_SCOPE: &str = "openid profile email";
 const CORS_ALLOW_METHODS: &str = "GET, POST, PATCH, DELETE, OPTIONS";
 const CORS_ALLOW_HEADERS: &str = "Authorization, Content-Type";
 const CORS_MAX_AGE_SECONDS: &str = "600";
@@ -1109,6 +1112,12 @@ struct TokenExchangeForm {
     code: Option<String>,
     code_verifier: Option<String>,
     refresh_token: Option<String>,
+    scope: Option<String>,
+    subject_token: Option<String>,
+    subject_token_type: Option<String>,
+    provider: Option<String>,
+    provider_client_id: Option<String>,
+    nonce: Option<String>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -1165,6 +1174,14 @@ struct AuthorizationCodeFields<'a> {
     redirect_uri: &'a str,
     code: &'a str,
     code_verifier: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct NativeAppleTokenFields<'a> {
+    scope: Option<&'a str>,
+    subject_token: &'a str,
+    provider_client_id: Option<&'a str>,
+    nonce: Option<&'a str>,
 }
 
 #[allow(dead_code)]
@@ -2222,9 +2239,21 @@ async fn oauth_token(mut request: Request, env: Env) -> worker::Result<Response>
             authorization_code_token(&db, &config, &signing_key, &form, now).await
         }
         "refresh_token" => refresh_token_token(&db, &config, &signing_key, &form, now).await,
+        TOKEN_EXCHANGE_GRANT_TYPE => {
+            native_apple_token(
+                &db,
+                &env,
+                &config,
+                &signing_key,
+                &registered_client.client,
+                &form,
+                now,
+            )
+            .await
+        }
         _ => token_exchange_error_json(
             &TokenExchangeError::unsupported_grant_type(
-                "grant_type must be authorization_code or refresh_token",
+                "grant_type must be authorization_code, refresh_token, or token exchange",
             ),
             400,
         ),
@@ -2373,6 +2402,98 @@ async fn refresh_token_token(
         now,
     )
     .map_err(worker_error)?;
+    json(&response)
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn native_apple_token(
+    db: &worker::d1::D1Database,
+    env: &Env,
+    config: &ZerothServerConfig,
+    signing_key: &Es256SigningKey,
+    client: &Client,
+    form: &TokenExchangeForm,
+    now: i32,
+) -> worker::Result<Response> {
+    let fields = match native_apple_token_fields(form) {
+        Ok(fields) => fields,
+        Err(error) => return token_exchange_error_json(&error, 400),
+    };
+    let provider_client_id = match native_apple_provider_client_id(env, fields.provider_client_id) {
+        Ok(provider_client_id) => provider_client_id,
+        Err(error) => return token_exchange_error_json(&error, 400),
+    };
+    let scope = match native_token_scope(fields.scope) {
+        Ok(scope) => scope,
+        Err(error) => return token_exchange_error_json(&error, 400),
+    };
+    let jwks = match cached_provider_jwks(well_known::APPLE, now).await {
+        Ok(jwks) => jwks,
+        Err(error) => {
+            return provider_profile_error_json(
+                &ProviderProfileError::invalid_response(format!(
+                    "could not load Apple JWKS: {}",
+                    error.description
+                )),
+                502,
+            )
+        }
+    };
+    let verified = match verify_provider_id_token_with_web_crypto(
+        fields.subject_token,
+        &jwks,
+        ProviderIdTokenValidation {
+            provider_id: well_known::APPLE,
+            client_id: &provider_client_id,
+            nonce: fields.nonce,
+            now,
+        },
+    )
+    .await
+    {
+        Ok(verified) => verified,
+        Err(error) => return provider_profile_error_json(&error, 401),
+    };
+
+    let resolved = native_apple_profile_from_verified_token(verified);
+    if let Err(error) = validate_client_email_domain_policy(client, &resolved.profile) {
+        return provider_callback_error_json(&error, 403);
+    }
+
+    let user_id = upsert_provider_profile(
+        db,
+        &resolved.profile,
+        resolved.raw_profile_json.as_deref(),
+        now,
+    )
+    .await?;
+    let user_claims = match get_user_token_claims(db, &user_id).await? {
+        Some(user_claims) => user_claims,
+        None => {
+            return token_exchange_error_json(
+                &TokenExchangeError::invalid_grant("Apple identity user was not found"),
+                400,
+            )
+        }
+    };
+    if user_claims.disabled_at.is_some() {
+        return token_exchange_error_json(
+            &TokenExchangeError::invalid_grant("Apple identity user is disabled"),
+            400,
+        );
+    }
+
+    let issue = TokenIssue::from_native_provider(&form.client_id, &user_id, &scope, now)
+        .with_user_claims(&user_claims);
+    let refresh_token = if scope_contains(Some(&scope), "offline_access") {
+        let token = random_token()?;
+        put_refresh_token_row(db, &hash_secret(&token), &issue, now).await?;
+        Some(token)
+    } else {
+        None
+    };
+    let response =
+        token_response(config, signing_key, &issue, refresh_token, now).map_err(worker_error)?;
     json(&response)
 }
 
@@ -7089,6 +7210,14 @@ async fn token_exchange_form_from_request(
         code: optional_form_field(&form, "code"),
         code_verifier: optional_form_field(&form, "code_verifier"),
         refresh_token: optional_form_field(&form, "refresh_token"),
+        scope: optional_form_field(&form, "scope"),
+        subject_token: optional_form_field(&form, "subject_token")
+            .or_else(|| optional_form_field(&form, "identity_token")),
+        subject_token_type: optional_form_field(&form, "subject_token_type"),
+        provider: optional_form_field(&form, "provider"),
+        provider_client_id: optional_form_field(&form, "provider_client_id")
+            .or_else(|| optional_form_field(&form, "apple_client_id")),
+        nonce: optional_form_field(&form, "nonce"),
     })
 }
 
@@ -7412,9 +7541,12 @@ fn validate_token_exchange_form(form: &TokenExchangeForm) -> Result<(), TokenExc
         "refresh_token" => {
             refresh_token_field(form)?;
         }
+        TOKEN_EXCHANGE_GRANT_TYPE => {
+            native_apple_token_fields(form)?;
+        }
         _ => {
             return Err(TokenExchangeError::unsupported_grant_type(
-                "grant_type must be authorization_code or refresh_token",
+                "grant_type must be authorization_code, refresh_token, or token exchange",
             ))
         }
     }
@@ -7548,6 +7680,34 @@ fn authorization_code_fields(
         redirect_uri: required_token_form_value(form.redirect_uri.as_deref(), "redirect_uri")?,
         code: required_token_form_value(form.code.as_deref(), "code")?,
         code_verifier: form.code_verifier.as_deref(),
+    })
+}
+
+fn native_apple_token_fields(
+    form: &TokenExchangeForm,
+) -> Result<NativeAppleTokenFields<'_>, TokenExchangeError> {
+    match form.provider.as_deref() {
+        Some(provider) if provider == well_known::APPLE => {}
+        Some(_) => {
+            return Err(TokenExchangeError::invalid_request(
+                "token exchange provider must be apple",
+            ))
+        }
+        None => {}
+    }
+    match form.subject_token_type.as_deref() {
+        Some(ID_TOKEN_SUBJECT_TOKEN_TYPE) | None => {}
+        Some(_) => {
+            return Err(TokenExchangeError::unsupported_token_type(
+                "subject_token_type must be urn:ietf:params:oauth:token-type:id_token",
+            ))
+        }
+    }
+    Ok(NativeAppleTokenFields {
+        scope: form.scope.as_deref(),
+        subject_token: required_token_form_value(form.subject_token.as_deref(), "subject_token")?,
+        provider_client_id: form.provider_client_id.as_deref(),
+        nonce: form.nonce.as_deref(),
     })
 }
 
@@ -8350,6 +8510,123 @@ fn provider_profile_email_domain(
         ));
     }
     Ok(domain.to_ascii_lowercase())
+}
+
+fn native_token_scope(scope: Option<&str>) -> Result<String, TokenExchangeError> {
+    let raw = scope.unwrap_or(DEFAULT_NATIVE_TOKEN_SCOPE);
+    let mut scopes = Vec::new();
+    for scope in raw.split_whitespace() {
+        if scope.len() > 64
+            || !scope.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':')
+            })
+        {
+            return Err(TokenExchangeError::invalid_request(
+                "scope contains unsupported characters",
+            ));
+        }
+        push_unique(&mut scopes, scope.to_owned());
+    }
+    if scopes.is_empty() {
+        return Err(TokenExchangeError::invalid_request(
+            "scope must not be empty",
+        ));
+    }
+    if !scopes.iter().any(|scope| scope == "openid") {
+        return Err(TokenExchangeError::invalid_request(
+            "scope must include openid",
+        ));
+    }
+    Ok(scopes.join(" "))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn native_apple_provider_client_id(
+    env: &Env,
+    requested_client_id: Option<&str>,
+) -> Result<String, TokenExchangeError> {
+    let configured = native_apple_client_ids_from_env(env);
+    native_apple_provider_client_id_from_list(&configured, requested_client_id)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn native_apple_client_ids_from_env(env: &Env) -> Vec<String> {
+    binding_value_from_env(env, "APPLE_NATIVE_CLIENT_IDS")
+        .or_else(|| binding_value_from_env(env, "APPLE_BUNDLE_ID"))
+        .map(|value| split_token_list(&value))
+        .unwrap_or_default()
+}
+
+fn native_apple_provider_client_id_from_list(
+    configured: &[String],
+    requested_client_id: Option<&str>,
+) -> Result<String, TokenExchangeError> {
+    if configured.is_empty() {
+        return Err(TokenExchangeError::invalid_request(
+            "APPLE_NATIVE_CLIENT_IDS is not configured",
+        ));
+    }
+    if let Some(requested_client_id) = requested_client_id {
+        if token_list_slice_contains(configured, requested_client_id, false) {
+            return Ok(requested_client_id.to_owned());
+        }
+        return Err(TokenExchangeError::invalid_request(
+            "provider_client_id is not allowed",
+        ));
+    }
+    if configured.len() == 1 {
+        return Ok(configured[0].clone());
+    }
+    Err(TokenExchangeError::invalid_request(
+        "provider_client_id is required when multiple Apple native client IDs are configured",
+    ))
+}
+
+fn split_token_list(value: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    for token in value
+        .split(|ch: char| ch == ',' || ch == ';' || ch.is_whitespace())
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+    {
+        push_unique(&mut values, token.to_owned());
+    }
+    values
+}
+
+fn token_list_slice_contains(
+    values: &[String],
+    needle: &str,
+    ascii_case_insensitive: bool,
+) -> bool {
+    let needle = needle.trim();
+    if needle.is_empty() {
+        return false;
+    }
+    values.iter().any(|value| {
+        if ascii_case_insensitive {
+            value.eq_ignore_ascii_case(needle)
+        } else {
+            value == needle
+        }
+    })
+}
+
+fn native_apple_profile_from_verified_token(
+    verified: VerifiedProviderIdToken,
+) -> ResolvedProviderProfile {
+    let claims = verified.claims;
+    ResolvedProviderProfile {
+        profile: ProviderProfile {
+            provider_id: ProviderId(well_known::APPLE.to_owned()),
+            subject: Subject(claims.sub),
+            email: claims.email,
+            email_verified: boolish_claim(claims.email_verified.as_ref()).unwrap_or(false),
+            display_name: claims.name,
+            picture_url: claims.picture,
+        },
+        raw_profile_json: Some(verified.raw_claims_json),
+    }
 }
 
 fn validated_client_secret_hash(
@@ -9500,6 +9777,21 @@ impl TokenIssue {
         }
     }
 
+    fn from_native_provider(client_id: &str, user_id: &str, scope: &str, auth_time: i32) -> Self {
+        Self {
+            client_id: client_id.to_owned(),
+            user_id: user_id.to_owned(),
+            session_id: None,
+            scope: scope.to_owned(),
+            auth_time: Some(auth_time),
+            nonce: None,
+            email: None,
+            email_verified: None,
+            name: None,
+            picture: None,
+        }
+    }
+
     fn from_refresh_token(row: &RefreshTokenRow) -> Self {
         Self {
             client_id: row.client_id.clone(),
@@ -9833,7 +10125,11 @@ fn discovery_response(config: &ZerothServerConfig) -> DiscoveryResponse {
         response_types_supported: vec!["code"],
         response_modes_supported: vec!["query"],
         prompt_values_supported: vec!["none", "login", "consent", "select_account"],
-        grant_types_supported: vec!["authorization_code", "refresh_token"],
+        grant_types_supported: vec![
+            "authorization_code",
+            "refresh_token",
+            TOKEN_EXCHANGE_GRANT_TYPE,
+        ],
         scopes_supported: vec!["openid", "profile", "email", "offline_access"],
         code_challenge_methods_supported: vec!["S256"],
         token_endpoint_auth_methods_supported: vec![
@@ -13043,9 +13339,81 @@ mod tests {
             code: None,
             code_verifier: None,
             refresh_token: Some("refresh-token".to_owned()),
+            scope: None,
+            subject_token: None,
+            subject_token_type: None,
+            provider: None,
+            provider_client_id: None,
+            nonce: None,
         };
 
         validate_token_exchange_form(&form).unwrap();
+    }
+
+    #[test]
+    fn token_exchange_form_accepts_native_apple_id_token_grant() {
+        let form = valid_native_apple_token_exchange_form();
+
+        let fields = native_apple_token_fields(&form).unwrap();
+
+        assert_eq!(fields.subject_token, "apple.id.token");
+        assert_eq!(fields.provider_client_id, Some("ai.wavey.id"));
+        assert_eq!(
+            native_token_scope(fields.scope).unwrap(),
+            DEFAULT_NATIVE_TOKEN_SCOPE
+        );
+        validate_token_exchange_form(&form).unwrap();
+    }
+
+    #[test]
+    fn native_apple_id_token_grant_requires_apple_provider() {
+        let mut form = valid_native_apple_token_exchange_form();
+        form.provider = Some(well_known::GOOGLE.to_owned());
+
+        let error = validate_token_exchange_form(&form).unwrap_err();
+
+        assert_eq!(error.code, "invalid_request");
+        assert_eq!(error.description, "token exchange provider must be apple");
+    }
+
+    #[test]
+    fn native_apple_client_id_selects_single_configured_audience() {
+        let configured = vec!["ai.wavey.id".to_owned()];
+
+        assert_eq!(
+            native_apple_provider_client_id_from_list(&configured, None).unwrap(),
+            "ai.wavey.id"
+        );
+        assert_eq!(
+            native_apple_provider_client_id_from_list(&configured, Some("ai.wavey.id")).unwrap(),
+            "ai.wavey.id"
+        );
+    }
+
+    #[test]
+    fn native_apple_client_id_requires_allowed_requested_audience() {
+        let configured = vec!["ai.wavey.id".to_owned(), "ai.bitneedle.app".to_owned()];
+
+        let missing = native_apple_provider_client_id_from_list(&configured, None).unwrap_err();
+        assert_eq!(
+            missing.description,
+            "provider_client_id is required when multiple Apple native client IDs are configured"
+        );
+
+        let denied =
+            native_apple_provider_client_id_from_list(&configured, Some("evil.app")).unwrap_err();
+        assert_eq!(denied.description, "provider_client_id is not allowed");
+    }
+
+    #[test]
+    fn native_token_scope_defaults_to_openid_profile_email() {
+        assert_eq!(
+            native_token_scope(None).unwrap(),
+            DEFAULT_NATIVE_TOKEN_SCOPE.to_owned()
+        );
+
+        let error = native_token_scope(Some("email profile")).unwrap_err();
+        assert_eq!(error.description, "scope must include openid");
     }
 
     #[test]
@@ -13160,6 +13528,12 @@ mod tests {
             code: Some("zeroth-code".to_owned()),
             code_verifier: None,
             refresh_token: None,
+            scope: None,
+            subject_token: None,
+            subject_token_type: None,
+            provider: None,
+            provider_client_id: None,
+            nonce: None,
         };
         let fields = authorization_code_fields(&form).unwrap();
 
@@ -14779,6 +15153,30 @@ mod tests {
             code: Some("zeroth-code".to_owned()),
             code_verifier: Some("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk".to_owned()),
             refresh_token: None,
+            scope: None,
+            subject_token: None,
+            subject_token_type: None,
+            provider: None,
+            provider_client_id: None,
+            nonce: None,
+        }
+    }
+
+    fn valid_native_apple_token_exchange_form() -> TokenExchangeForm {
+        TokenExchangeForm {
+            grant_type: TOKEN_EXCHANGE_GRANT_TYPE.to_owned(),
+            client_id: "wavey-ios".to_owned(),
+            client_auth: ClientAuth::None,
+            redirect_uri: None,
+            code: None,
+            code_verifier: None,
+            refresh_token: None,
+            scope: None,
+            subject_token: Some("apple.id.token".to_owned()),
+            subject_token_type: Some(ID_TOKEN_SUBJECT_TOKEN_TYPE.to_owned()),
+            provider: Some(well_known::APPLE.to_owned()),
+            provider_client_id: Some("ai.wavey.id".to_owned()),
+            nonce: None,
         }
     }
 
