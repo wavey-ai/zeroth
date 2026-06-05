@@ -132,8 +132,14 @@ Implemented so far:
   validate, and logout
   endpoints
 - ES256 Zeroth-owned access/ID token issuance, standard scoped OIDC ID-token
-  claims for `email`/`profile`, session-bound `sid` claims, refresh-token
-  persistence for `offline_access`, and Worker `/.well-known/jwks.json`
+  claims for `email`/`profile`, conservative `roles` claims (`user`, plus
+  `admin` for active Zeroth admin memberships), session-bound `sid` claims,
+  refresh-token persistence for `offline_access`, and Worker
+  `/.well-known/jwks.json`
+- `zeroth-oidc` relying-party helpers for sub-10 ms product gating: match
+  multiple exact/prefix protected paths locally, verify the Zeroth access token
+  from cached JWKS, and check role/scope claims without calling Zeroth on every
+  request
 - OIDC discovery metadata for query-mode code responses, rejection of
   unsupported downstream `response_mode` values, the
   `authorization_response_iss_parameter_supported` flag, Zeroth-owned

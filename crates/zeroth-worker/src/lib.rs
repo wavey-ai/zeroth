@@ -29,6 +29,7 @@ use zeroth_oidc::validate_authorization_request_for_client;
 #[cfg(any(test, target_arch = "wasm32"))]
 use zeroth_oidc::AuthorizationPrompt;
 use zeroth_oidc::{AuthorizationRequest, AuthorizationRequestError};
+use zeroth_oidc::{ZerothJwk, ZerothJwks, ZerothJwtClaims, ZerothTokenUse, ZerothTokenValidation};
 use zeroth_providers::well_known;
 #[cfg(any(test, target_arch = "wasm32"))]
 use zeroth_providers::TokenAuth;
@@ -237,25 +238,14 @@ struct JwtClaims {
     name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     picture: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct SignedJwtHeader {
-    alg: String,
-    #[serde(default)]
-    kid: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    roles: Vec<String>,
 }
 
 #[derive(Clone)]
 struct Es256SigningKey {
     kid: String,
     signing_key: SigningKey,
-}
-
-#[derive(Clone)]
-struct Es256VerificationKey {
-    kid: String,
-    verifying_key: VerifyingKey,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -265,7 +255,6 @@ struct CachedSigningMaterial {
     private_key: String,
     previous_public_jwks: Option<String>,
     signing_key: Es256SigningKey,
-    verification_keys: Vec<Es256VerificationKey>,
     jwks: JwksResponse,
 }
 
@@ -1444,6 +1433,7 @@ struct TokenIssue {
     email_verified: Option<bool>,
     name: Option<String>,
     picture: Option<String>,
+    roles: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1473,6 +1463,8 @@ struct UserTokenClaimsRow {
     disabled_at: Option<i32>,
     #[serde(default)]
     email_verified: i32,
+    #[serde(default)]
+    admin_membership_active: i32,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1588,6 +1580,8 @@ struct TokenIntrospectionResponse {
     exp: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     sid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    roles: Option<Vec<String>>,
 }
 
 impl TokenIntrospectionResponse {
@@ -1604,6 +1598,7 @@ impl TokenIntrospectionResponse {
             iat: None,
             exp: None,
             sid: None,
+            roles: None,
         }
     }
 
@@ -1620,6 +1615,7 @@ impl TokenIntrospectionResponse {
             iat: Some(claims.iat),
             exp: Some(claims.exp),
             sid: claims.sid.clone(),
+            roles: (!claims.roles.is_empty()).then_some(claims.roles.clone()),
         }
     }
 
@@ -1636,6 +1632,7 @@ impl TokenIntrospectionResponse {
             iat: Some(row.created_at),
             exp: Some(row.expires_at),
             sid: row.session_id.clone(),
+            roles: None,
         }
     }
 }
@@ -2934,7 +2931,7 @@ async fn oauth_introspect(mut request: Request, env: Env) -> worker::Result<Resp
     let response = introspection_response_for_token(
         &db,
         &config,
-        &material.verification_keys,
+        &material.jwks,
         &form,
         unix_timestamp_seconds(),
     )
@@ -2954,12 +2951,7 @@ async fn userinfo(request: Request, env: Env) -> worker::Result<Response> {
     let material = signing_material_from_env(&env)?;
     let config = server_config(&env, &request_url);
     let now = unix_timestamp_seconds();
-    let claims = match verify_zeroth_access_token(
-        &bearer_token,
-        &config,
-        &material.verification_keys,
-        now,
-    ) {
+    let claims = match verify_zeroth_access_token(&bearer_token, &config, &material.jwks, now) {
         Ok(claims) => claims,
         Err(error) => return oauth_error_json("invalid_token", error, 401),
     };
@@ -4032,12 +4024,7 @@ async fn validate(request: Request, env: Env) -> worker::Result<Response> {
         let material = signing_material_from_env(&env)?;
         let config = server_config(&env, &request_url);
         let now = unix_timestamp_seconds();
-        let claims = match verify_zeroth_access_token(
-            &bearer_token,
-            &config,
-            &material.verification_keys,
-            now,
-        ) {
+        let claims = match verify_zeroth_access_token(&bearer_token, &config, &material.jwks, now) {
             Ok(claims) => claims,
             Err(error) => return oauth_error_json("invalid_token", error, 401),
         };
@@ -7034,7 +7021,14 @@ async fn get_user_token_claims(
                       AND i.email = u.primary_email
                       AND i.email_verified != 0
                     LIMIT 1
-                ) AS email_verified
+                ) AS email_verified,
+                EXISTS (
+                    SELECT 1
+                    FROM zeroth_admin_memberships am
+                    WHERE am.user_id = u.id
+                      AND am.disabled_at IS NULL
+                    LIMIT 1
+                ) AS admin_membership_active
          FROM zeroth_users u
          WHERE u.id = ?
          LIMIT 1",
@@ -9125,8 +9119,7 @@ async fn logout_redirect_target(
         client_id
     } else if let Some(id_token_hint) = query_param(url, "id_token_hint") {
         let material = signing_material_from_env(env)?;
-        match verify_zeroth_id_token_hint(&id_token_hint, config, &material.verification_keys, now)
-        {
+        match verify_zeroth_id_token_hint(&id_token_hint, config, &material.jwks, now) {
             Ok(claims) => claims.aud,
             Err(error) => return Ok(Err(error)),
         }
@@ -9942,6 +9935,7 @@ fn token_response(
         email_verified: None,
         name: None,
         picture: None,
+        roles: issue.roles.clone(),
     };
     let id_claims = JwtClaims {
         iss: config.issuer().issuer,
@@ -9959,6 +9953,7 @@ fn token_response(
         email_verified: issue.email_verified,
         name: issue.name.clone(),
         picture: issue.picture.clone(),
+        roles: issue.roles.clone(),
     };
 
     Ok(TokenResponse {
@@ -9974,122 +9969,110 @@ fn token_response(
 fn verify_zeroth_access_token(
     token: &str,
     config: &ZerothServerConfig,
-    verification_keys: &[Es256VerificationKey],
+    jwks: &JwksResponse,
     now: i32,
 ) -> Result<JwtClaims, String> {
-    let claims = verify_zeroth_signed_jwt(token, config, verification_keys, now, "access token")?;
-    validate_zeroth_access_token_claims(&claims)?;
-    Ok(claims)
+    let claims = zeroth_oidc::verify_zeroth_token(
+        token,
+        &zeroth_jwks_from_response(jwks),
+        &ZerothTokenValidation::issuer_token(
+            config.issuer().issuer,
+            ZerothTokenUse::Access,
+            now as i64,
+        ),
+    )
+    .map_err(|error| zeroth_token_error_description(error, Some("access")))?;
+    jwt_claims_from_zeroth(claims)
 }
 
 fn verify_zeroth_id_token_hint(
     token: &str,
     config: &ZerothServerConfig,
-    verification_keys: &[Es256VerificationKey],
+    jwks: &JwksResponse,
     now: i32,
 ) -> Result<JwtClaims, String> {
-    let claims = verify_zeroth_signed_jwt(token, config, verification_keys, now, "id_token_hint")?;
-    validate_zeroth_id_token_hint_claims(&claims)?;
-    Ok(claims)
+    let claims = zeroth_oidc::verify_zeroth_token(
+        token,
+        &zeroth_jwks_from_response(jwks),
+        &ZerothTokenValidation::issuer_token(
+            config.issuer().issuer,
+            ZerothTokenUse::Id,
+            now as i64,
+        ),
+    )
+    .map_err(|error| zeroth_token_error_description(error, Some("id")))?;
+    jwt_claims_from_zeroth(claims)
 }
 
-fn verify_zeroth_signed_jwt(
-    token: &str,
-    config: &ZerothServerConfig,
-    verification_keys: &[Es256VerificationKey],
-    now: i32,
-    token_label: &str,
-) -> Result<JwtClaims, String> {
-    let segments = token.split('.').collect::<Vec<_>>();
-    if segments.len() != 3 || segments.iter().any(|segment| segment.is_empty()) {
-        return Err(format!(
-            "{token_label} must have three non-empty JWT segments"
-        ));
+fn zeroth_jwks_from_response(jwks: &JwksResponse) -> ZerothJwks {
+    ZerothJwks {
+        keys: jwks
+            .keys
+            .iter()
+            .map(|key| ZerothJwk {
+                kty: key.kty.clone(),
+                key_use: key.key_use.clone(),
+                kid: key.kid.clone(),
+                alg: key.alg.clone(),
+                crv: key.crv.clone(),
+                x: key.x.clone(),
+                y: key.y.clone(),
+            })
+            .collect(),
     }
-
-    let header = decode_zeroth_jwt_segment::<SignedJwtHeader>(segments[0])?;
-    if header.alg != "ES256" {
-        return Err(format!("unsupported {token_label} alg: {}", header.alg));
-    }
-    let Some(kid) = header.kid.as_deref() else {
-        return Err(format!("{token_label} kid is missing"));
-    };
-    let Some(verification_key) = verification_keys.iter().find(|key| key.kid == kid) else {
-        return Err(format!(
-            "{token_label} kid did not match configured verification keys"
-        ));
-    };
-
-    let signature_bytes = decode_zeroth_jwt_segment_bytes(segments[2])?;
-    let signature = Signature::try_from(signature_bytes.as_slice())
-        .map_err(|error| format!("invalid ES256 {token_label} signature: {error}"))?;
-    let signing_input = format!("{}.{}", segments[0], segments[1]);
-    verification_key
-        .verifying_key
-        .verify(signing_input.as_bytes(), &signature)
-        .map_err(|_| format!("{token_label} signature did not verify"))?;
-
-    let claims = decode_zeroth_jwt_segment::<JwtClaims>(segments[1])?;
-    if claims.iss != config.issuer().issuer {
-        return Err(format!("{token_label} issuer did not match Zeroth issuer"));
-    }
-    if claims.exp <= now {
-        return Err(format!("{token_label} has expired"));
-    }
-    Ok(claims)
 }
 
-fn decode_zeroth_jwt_segment<T: serde::de::DeserializeOwned>(segment: &str) -> Result<T, String> {
-    let bytes = decode_zeroth_jwt_segment_bytes(segment)?;
-    serde_json::from_slice(&bytes).map_err(|error| format!("invalid Zeroth JWT JSON: {error}"))
+fn jwt_claims_from_zeroth(claims: ZerothJwtClaims) -> Result<JwtClaims, String> {
+    Ok(JwtClaims {
+        iss: claims.iss,
+        sub: claims.sub,
+        aud: claims.aud,
+        exp: jwt_i32_claim(claims.exp, "exp")?,
+        iat: jwt_i32_claim(claims.iat, "iat")?,
+        auth_time: claims
+            .auth_time
+            .map(|value| jwt_i32_claim(value, "auth_time"))
+            .transpose()?,
+        sid: claims.sid,
+        nonce: claims.nonce,
+        scope: claims.scope,
+        client_id: claims.client_id,
+        token_use: claims.token_use,
+        email: claims.email,
+        email_verified: claims.email_verified,
+        name: claims.name,
+        picture: claims.picture,
+        roles: claims.roles,
+    })
 }
 
-fn decode_zeroth_jwt_segment_bytes(segment: &str) -> Result<Vec<u8>, String> {
-    URL_SAFE_NO_PAD
-        .decode(segment)
-        .or_else(|_| URL_SAFE.decode(segment))
-        .map_err(|error| format!("invalid Zeroth JWT base64url segment: {error}"))
+fn jwt_i32_claim(value: i64, name: &str) -> Result<i32, String> {
+    i32::try_from(value).map_err(|_| format!("JWT {name} claim is outside supported range"))
 }
 
-fn validate_zeroth_access_token_claims(claims: &JwtClaims) -> Result<(), String> {
-    if claims.token_use != "access" {
-        return Err("token is not an access token".to_owned());
+fn zeroth_token_error_description(
+    error: zeroth_oidc::ZerothTokenError,
+    token_use: Option<&str>,
+) -> String {
+    match (token_use, error.description.as_str()) {
+        (Some("access"), "JWT token_use was not access") => {
+            "token is not an access token".to_owned()
+        }
+        (Some("id"), "JWT token_use was not id") => "id_token_hint is not an ID token".to_owned(),
+        _ => error.description,
     }
-    if claims.sub.is_empty() {
-        return Err("access token subject is empty".to_owned());
-    }
-    if claims.client_id.as_deref() != Some(&claims.aud) {
-        return Err("access token client_id did not match audience".to_owned());
-    }
-
-    Ok(())
-}
-
-fn validate_zeroth_id_token_hint_claims(claims: &JwtClaims) -> Result<(), String> {
-    if claims.token_use != "id" {
-        return Err("id_token_hint is not an ID token".to_owned());
-    }
-    if claims.sub.is_empty() {
-        return Err("id_token_hint subject is empty".to_owned());
-    }
-    if claims.aud.is_empty() {
-        return Err("id_token_hint audience is empty".to_owned());
-    }
-
-    Ok(())
 }
 
 #[cfg(target_arch = "wasm32")]
 async fn introspection_response_for_token(
     db: &worker::d1::D1Database,
     config: &ZerothServerConfig,
-    verification_keys: &[Es256VerificationKey],
+    jwks: &JwksResponse,
     form: &TokenIntrospectionForm,
     now: i32,
 ) -> worker::Result<TokenIntrospectionResponse> {
     if form.token_type_hint.as_deref() != Some("refresh_token") {
-        if let Ok(claims) = verify_zeroth_access_token(&form.token, config, verification_keys, now)
-        {
+        if let Ok(claims) = verify_zeroth_access_token(&form.token, config, jwks, now) {
             return introspection_response_for_access_token_claims(db, &claims, now).await;
         }
     }
@@ -12698,6 +12681,7 @@ impl TokenIssue {
             email_verified: None,
             name: None,
             picture: None,
+            roles: Vec::new(),
         }
     }
 
@@ -12713,6 +12697,7 @@ impl TokenIssue {
             email_verified: None,
             name: None,
             picture: None,
+            roles: Vec::new(),
         }
     }
 
@@ -12728,10 +12713,12 @@ impl TokenIssue {
             email_verified: None,
             name: None,
             picture: None,
+            roles: Vec::new(),
         }
     }
 
     fn with_user_claims(mut self, user: &UserTokenClaimsRow) -> Self {
+        self.roles = user_token_roles(user);
         if scope_contains(Some(&self.scope), "email") {
             self.email = user.primary_email.clone();
             self.email_verified = user
@@ -12745,6 +12732,14 @@ impl TokenIssue {
         }
         self
     }
+}
+
+fn user_token_roles(user: &UserTokenClaimsRow) -> Vec<String> {
+    let mut roles = vec!["user".to_owned()];
+    if user.admin_membership_active != 0 {
+        roles.push("admin".to_owned());
+    }
+    roles
 }
 
 fn sign_jwt<T: Serialize>(signing_key: &Es256SigningKey, claims: &T) -> Result<String, String> {
@@ -12907,32 +12902,6 @@ fn decode_public_jwk_coordinate(
         })
 }
 
-fn es256_verification_keys_from_jwks(
-    jwks: &JwksResponse,
-) -> Result<Vec<Es256VerificationKey>, String> {
-    let mut keys = Vec::with_capacity(jwks.keys.len());
-    for key in &jwks.keys {
-        keys.push(es256_verification_key_from_jwk(key)?);
-    }
-    Ok(keys)
-}
-
-fn es256_verification_key_from_jwk(key: &JwkKey) -> Result<Es256VerificationKey, String> {
-    validate_es256_public_jwk(key, "ES256 public JWK")?;
-    let x = decode_public_jwk_coordinate(&key.x, "x", "ES256 public JWK")?;
-    let y = decode_public_jwk_coordinate(&key.y, "y", "ES256 public JWK")?;
-    let mut point = Vec::with_capacity(65);
-    point.push(0x04);
-    point.extend_from_slice(&x);
-    point.extend_from_slice(&y);
-    let verifying_key = VerifyingKey::from_sec1_bytes(&point)
-        .map_err(|error| format!("invalid ES256 public key {}: {error}", key.kid))?;
-    Ok(Es256VerificationKey {
-        kid: key.kid.clone(),
-        verifying_key,
-    })
-}
-
 #[cfg(target_arch = "wasm32")]
 fn signing_key_from_env(env: &Env) -> worker::Result<Es256SigningKey> {
     Ok(signing_material_from_env(env)?.signing_key)
@@ -12961,13 +12930,11 @@ fn signing_material_from_env(env: &Env) -> worker::Result<CachedSigningMaterial>
             es256_signing_key_from_config(kid.clone(), &private_key).map_err(worker_error)?;
         let jwks =
             jwks_response(&signing_key, previous_public_jwks.as_deref()).map_err(worker_error)?;
-        let verification_keys = es256_verification_keys_from_jwks(&jwks).map_err(worker_error)?;
         let material = CachedSigningMaterial {
             kid,
             private_key,
             previous_public_jwks,
             signing_key,
-            verification_keys,
             jwks,
         };
         *cache.borrow_mut() = Some(material.clone());
@@ -13085,6 +13052,7 @@ fn discovery_response(config: &ZerothServerConfig) -> DiscoveryResponse {
             "email_verified",
             "name",
             "picture",
+            "roles",
         ],
         authorization_response_iss_parameter_supported: true,
     }
@@ -17381,6 +17349,7 @@ mod tests {
             email_verified: None,
             name: None,
             picture: None,
+            roles: vec!["user".to_owned(), "admin".to_owned()],
         };
 
         let value =
@@ -17397,6 +17366,8 @@ mod tests {
         assert_eq!(value["iat"], 1_780_000_000);
         assert_eq!(value["exp"], 1_780_003_600);
         assert_eq!(value["sid"], "sess_123");
+        assert_eq!(value["roles"][0], "user");
+        assert_eq!(value["roles"][1], "admin");
         assert!(value.get("clientId").is_none());
     }
 
@@ -17506,6 +17477,7 @@ mod tests {
             email_verified: None,
             name: None,
             picture: None,
+            roles: Vec::new(),
         };
 
         let jwt = sign_jwt(&signing_key, &claims).unwrap();
@@ -17633,16 +17605,37 @@ mod tests {
         );
         assert_eq!(access_claims["client_id"], "ios");
         assert_eq!(access_claims["sid"], "sess_123");
+        assert_eq!(access_claims["roles"][0], "user");
         assert!(access_claims.get("email").is_none());
         assert!(access_claims.get("name").is_none());
         assert_eq!(id_claims["token_use"], "id");
         assert_eq!(id_claims["nonce"], "nonce-1");
         assert_eq!(id_claims["auth_time"], 1_780_000_000);
         assert_eq!(id_claims["sid"], "sess_123");
+        assert_eq!(id_claims["roles"][0], "user");
         assert_eq!(id_claims["email"], "user@example.com");
         assert_eq!(id_claims["email_verified"], true);
         assert_eq!(id_claims["name"], "Example User");
         assert_eq!(id_claims["picture"], "https://example.com/avatar.png");
+    }
+
+    #[test]
+    fn token_response_includes_admin_role_for_admin_memberships() {
+        let config = ZerothServerConfig {
+            public_base_url: "https://id.example.com".to_owned(),
+            ..ZerothServerConfig::default()
+        };
+        let signing_key = test_signing_key();
+        let code = valid_auth_code_row("challenge".to_owned());
+        let mut user_claims = valid_user_token_claims_row();
+        user_claims.admin_membership_active = 1;
+        let issue = TokenIssue::from_auth_code(&code).with_user_claims(&user_claims);
+
+        let response = token_response(&config, &signing_key, &issue, None, 1_780_000_000).unwrap();
+        let access_claims = decode_jwt_claims(&response.access_token);
+
+        assert_eq!(access_claims["roles"][0], "user");
+        assert_eq!(access_claims["roles"][1], "admin");
     }
 
     #[test]
@@ -17685,17 +17678,14 @@ mod tests {
             email_verified: None,
             name: None,
             picture: None,
+            roles: vec!["user".to_owned()],
         };
         let response = token_response(&config, &signing_key, &issue, None, 1_780_000_100).unwrap();
-        let verification_keys = test_verification_keys(&signing_key);
+        let jwks = jwks_response(&signing_key, None).unwrap();
 
-        let claims = verify_zeroth_access_token(
-            &response.access_token,
-            &config,
-            &verification_keys,
-            1_780_000_200,
-        )
-        .unwrap();
+        let claims =
+            verify_zeroth_access_token(&response.access_token, &config, &jwks, 1_780_000_200)
+                .unwrap();
 
         assert_eq!(claims.sub, "usr_123");
         assert_eq!(claims.token_use, "access");
@@ -17717,7 +17707,6 @@ mod tests {
         let previous_jwks = jwks_response(&previous_signing_key, None).unwrap();
         let previous_json = serde_json::to_string(&previous_jwks).unwrap();
         let jwks = jwks_response(&active_signing_key, Some(&previous_json)).unwrap();
-        let verification_keys = es256_verification_keys_from_jwks(&jwks).unwrap();
         let issue = TokenIssue {
             client_id: "ios".to_owned(),
             user_id: "usr_123".to_owned(),
@@ -17729,17 +17718,14 @@ mod tests {
             email_verified: None,
             name: None,
             picture: None,
+            roles: vec!["user".to_owned()],
         };
         let response =
             token_response(&config, &previous_signing_key, &issue, None, 1_780_000_100).unwrap();
 
-        let claims = verify_zeroth_access_token(
-            &response.access_token,
-            &config,
-            &verification_keys,
-            1_780_000_200,
-        )
-        .unwrap();
+        let claims =
+            verify_zeroth_access_token(&response.access_token, &config, &jwks, 1_780_000_200)
+                .unwrap();
 
         assert_eq!(claims.sub, "usr_123");
         assert_eq!(claims.token_use, "access");
@@ -17763,17 +17749,13 @@ mod tests {
             email_verified: None,
             name: None,
             picture: None,
+            roles: vec!["user".to_owned()],
         };
         let response = token_response(&config, &signing_key, &issue, None, 1_780_000_100).unwrap();
-        let verification_keys = test_verification_keys(&signing_key);
+        let jwks = jwks_response(&signing_key, None).unwrap();
 
-        let error = verify_zeroth_access_token(
-            &response.id_token,
-            &config,
-            &verification_keys,
-            1_780_000_200,
-        )
-        .unwrap_err();
+        let error = verify_zeroth_access_token(&response.id_token, &config, &jwks, 1_780_000_200)
+            .unwrap_err();
 
         assert_eq!(error, "token is not an access token");
     }
@@ -17790,26 +17772,17 @@ mod tests {
         let issue =
             TokenIssue::from_auth_code(&code).with_user_claims(&valid_user_token_claims_row());
         let response = token_response(&config, &signing_key, &issue, None, 1_780_000_100).unwrap();
-        let verification_keys = test_verification_keys(&signing_key);
+        let jwks = jwks_response(&signing_key, None).unwrap();
 
-        let claims = verify_zeroth_id_token_hint(
-            &response.id_token,
-            &config,
-            &verification_keys,
-            1_780_000_200,
-        )
-        .unwrap();
+        let claims =
+            verify_zeroth_id_token_hint(&response.id_token, &config, &jwks, 1_780_000_200).unwrap();
         assert_eq!(claims.token_use, "id");
         assert_eq!(claims.aud, "ios");
         assert_eq!(claims.sub, "usr_123");
 
-        let error = verify_zeroth_id_token_hint(
-            &response.access_token,
-            &config,
-            &verification_keys,
-            1_780_000_200,
-        )
-        .unwrap_err();
+        let error =
+            verify_zeroth_id_token_hint(&response.access_token, &config, &jwks, 1_780_000_200)
+                .unwrap_err();
         assert_eq!(error, "id_token_hint is not an ID token");
     }
 
@@ -17853,6 +17826,7 @@ mod tests {
             email_verified: None,
             name: None,
             picture: None,
+            roles: vec!["user".to_owned()],
         };
 
         let value = serde_json::to_value(validate_access_token_response(&claims, &user)).unwrap();
@@ -19281,6 +19255,7 @@ mod tests {
             picture_url: Some("https://example.com/avatar.png".to_owned()),
             disabled_at: None,
             email_verified: 1,
+            admin_membership_active: 0,
         }
     }
 
@@ -19301,6 +19276,7 @@ mod tests {
             email_verified: None,
             name: None,
             picture: None,
+            roles: vec!["user".to_owned()],
         }
     }
 
@@ -19310,11 +19286,6 @@ mod tests {
             "0000000000000000000000000000000000000000000000000000000000000001",
         )
         .unwrap()
-    }
-
-    fn test_verification_keys(signing_key: &Es256SigningKey) -> Vec<Es256VerificationKey> {
-        let jwks = jwks_response(signing_key, None).unwrap();
-        es256_verification_keys_from_jwks(&jwks).unwrap()
     }
 
     fn decode_jwt_claims(jwt: &str) -> serde_json::Value {

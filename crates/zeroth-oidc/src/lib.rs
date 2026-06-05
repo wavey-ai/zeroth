@@ -178,12 +178,14 @@ pub struct ZerothJwtClaims {
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub picture: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roles: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ZerothTokenValidation {
     pub issuer: String,
-    pub audience: String,
+    pub audience: Option<String>,
     pub token_use: ZerothTokenUse,
     pub nonce: Option<String>,
     pub now: i64,
@@ -197,6 +199,25 @@ pub enum ZerothTokenUse {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ZerothTokenError {
+    pub code: &'static str,
+    pub description: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ZerothProtectedPath {
+    pub pattern: ZerothPathPattern,
+    pub allowed_roles: Vec<String>,
+    pub required_scopes: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ZerothPathPattern {
+    Exact(String),
+    Prefix(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ZerothPathAuthorizationError {
     pub code: &'static str,
     pub description: String,
 }
@@ -459,7 +480,7 @@ impl ZerothTokenValidation {
     pub fn access_token(issuer: impl Into<String>, audience: impl Into<String>, now: i64) -> Self {
         Self {
             issuer: issuer.into(),
-            audience: audience.into(),
+            audience: Some(audience.into()),
             token_use: ZerothTokenUse::Access,
             nonce: None,
             now,
@@ -474,7 +495,7 @@ impl ZerothTokenValidation {
     ) -> Self {
         Self {
             issuer: issuer.into(),
-            audience: audience.into(),
+            audience: Some(audience.into()),
             token_use: ZerothTokenUse::Id,
             nonce: Some(nonce.into()),
             now,
@@ -488,8 +509,18 @@ impl ZerothTokenValidation {
     ) -> Self {
         Self {
             issuer: issuer.into(),
-            audience: audience.into(),
+            audience: Some(audience.into()),
             token_use: ZerothTokenUse::Id,
+            nonce: None,
+            now,
+        }
+    }
+
+    pub fn issuer_token(issuer: impl Into<String>, token_use: ZerothTokenUse, now: i64) -> Self {
+        Self {
+            issuer: issuer.into(),
+            audience: None,
+            token_use,
             nonce: None,
             now,
         }
@@ -519,6 +550,122 @@ impl ZerothTokenError {
             description: description.into(),
         }
     }
+}
+
+impl ZerothProtectedPath {
+    pub fn exact(path: impl Into<String>) -> Self {
+        Self {
+            pattern: ZerothPathPattern::Exact(path.into()),
+            allowed_roles: Vec::new(),
+            required_scopes: Vec::new(),
+        }
+    }
+
+    pub fn prefix(path_prefix: impl Into<String>) -> Self {
+        Self {
+            pattern: ZerothPathPattern::Prefix(path_prefix.into()),
+            allowed_roles: Vec::new(),
+            required_scopes: Vec::new(),
+        }
+    }
+
+    pub fn with_roles(mut self, roles: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.allowed_roles = roles.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn with_scopes(mut self, scopes: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.required_scopes = scopes.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn matches(&self, path: &str) -> bool {
+        self.pattern.matches(path)
+    }
+
+    pub fn authorize(&self, claims: &ZerothJwtClaims) -> Result<(), ZerothPathAuthorizationError> {
+        if !self.allowed_roles.is_empty()
+            && !self
+                .allowed_roles
+                .iter()
+                .any(|role| zeroth_claims_have_role(claims, role))
+        {
+            return Err(ZerothPathAuthorizationError {
+                code: "missing_role",
+                description: "Zeroth token did not include an accepted role".to_owned(),
+            });
+        }
+
+        for scope in &self.required_scopes {
+            if !zeroth_claims_have_scope(claims, scope) {
+                return Err(ZerothPathAuthorizationError {
+                    code: "missing_scope",
+                    description: format!("Zeroth token did not include required scope: {scope}"),
+                });
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl ZerothPathPattern {
+    pub fn matches(&self, path: &str) -> bool {
+        match self {
+            Self::Exact(expected) => path == expected,
+            Self::Prefix(prefix) => path_prefix_matches(prefix, path),
+        }
+    }
+}
+
+pub fn matching_protected_path<'a>(
+    path: &str,
+    protected_paths: &'a [ZerothProtectedPath],
+) -> Option<&'a ZerothProtectedPath> {
+    protected_paths.iter().find(|rule| rule.matches(path))
+}
+
+pub fn authorize_protected_path<'a>(
+    path: &str,
+    protected_paths: &'a [ZerothProtectedPath],
+    claims: &ZerothJwtClaims,
+) -> Result<Option<&'a ZerothProtectedPath>, ZerothPathAuthorizationError> {
+    let Some(rule) = matching_protected_path(path, protected_paths) else {
+        return Ok(None);
+    };
+    rule.authorize(claims)?;
+    Ok(Some(rule))
+}
+
+pub fn zeroth_claims_have_role(claims: &ZerothJwtClaims, role: &str) -> bool {
+    claims.roles.iter().any(|candidate| candidate == role)
+}
+
+pub fn zeroth_claims_have_scope(claims: &ZerothJwtClaims, scope: &str) -> bool {
+    claims
+        .scope
+        .as_deref()
+        .map(|scope_claim| {
+            scope_claim
+                .split_whitespace()
+                .any(|candidate| candidate == scope)
+        })
+        .unwrap_or(false)
+}
+
+fn path_prefix_matches(prefix: &str, path: &str) -> bool {
+    if prefix == "/" {
+        return path.starts_with('/');
+    }
+    let prefix = prefix.trim_end_matches('/');
+    if prefix.is_empty() {
+        return false;
+    }
+    path == prefix
+        || path
+            .strip_prefix(prefix)
+            .map(|remaining| remaining.starts_with('/'))
+            .unwrap_or(false)
 }
 
 pub fn verify_zeroth_access_token(
@@ -613,10 +760,14 @@ fn validate_zeroth_claims(
             "JWT issuer did not match expected Zeroth issuer",
         ));
     }
-    if claims.aud != validation.audience {
-        return Err(ZerothTokenError::invalid_token(
-            "JWT audience did not match expected client",
-        ));
+    if let Some(audience) = &validation.audience {
+        if claims.aud != *audience {
+            return Err(ZerothTokenError::invalid_token(
+                "JWT audience did not match expected client",
+            ));
+        }
+    } else if claims.aud.is_empty() {
+        return Err(ZerothTokenError::invalid_token("JWT audience is empty"));
     }
     if claims.exp <= validation.now {
         return Err(ZerothTokenError::invalid_token("JWT has expired"));
@@ -1352,6 +1503,78 @@ mod tests {
     }
 
     #[test]
+    fn zeroth_token_verifier_can_defer_audience_check_to_issuer() {
+        let signing_key = test_signing_key();
+        let jwks = test_jwks(&signing_key, "test-key");
+        let claims = access_token_claims(1_780_000_100);
+        let token = signed_test_token(&signing_key, "test-key", &claims);
+
+        let verified = verify_zeroth_token(
+            &token,
+            &jwks,
+            &ZerothTokenValidation::issuer_token(
+                "https://id.example.com",
+                ZerothTokenUse::Access,
+                1_780_000_200,
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(verified.aud, "wavey-browser");
+        assert_eq!(verified.client_id, Some("wavey-browser".to_owned()));
+    }
+
+    #[test]
+    fn protected_path_matching_supports_multiple_exact_and_prefix_rules() {
+        let rules = vec![
+            ZerothProtectedPath::exact("/account"),
+            ZerothProtectedPath::prefix("/admin").with_roles(["admin"]),
+            ZerothProtectedPath::prefix("/api/private").with_scopes(["email"]),
+        ];
+
+        assert_eq!(
+            matching_protected_path("/account", &rules).unwrap().pattern,
+            ZerothPathPattern::Exact("/account".to_owned())
+        );
+        assert_eq!(
+            matching_protected_path("/admin/users", &rules)
+                .unwrap()
+                .pattern,
+            ZerothPathPattern::Prefix("/admin".to_owned())
+        );
+        assert!(matching_protected_path("/administrator", &rules).is_none());
+        assert!(matching_protected_path("/public", &rules).is_none());
+    }
+
+    #[test]
+    fn protected_path_authorization_checks_roles_and_scopes() {
+        let mut claims = access_token_claims(1_780_000_100);
+        claims.roles = vec!["user".to_owned(), "admin".to_owned()];
+        let rules = vec![
+            ZerothProtectedPath::prefix("/admin").with_roles(["admin"]),
+            ZerothProtectedPath::prefix("/api/private").with_scopes(["email"]),
+        ];
+
+        assert!(authorize_protected_path("/admin", &rules, &claims)
+            .unwrap()
+            .is_some());
+        assert!(
+            authorize_protected_path("/api/private/report", &rules, &claims)
+                .unwrap()
+                .is_some()
+        );
+
+        claims.roles = vec!["user".to_owned()];
+        let role_error = authorize_protected_path("/admin", &rules, &claims).unwrap_err();
+        assert_eq!(role_error.code, "missing_role");
+
+        claims.scope = Some("openid profile".to_owned());
+        let scope_error =
+            authorize_protected_path("/api/private/report", &rules, &claims).unwrap_err();
+        assert_eq!(scope_error.code, "missing_scope");
+    }
+
+    #[test]
     fn zeroth_token_verifier_rejects_bad_signature_or_key() {
         let signing_key = test_signing_key();
         let jwks = test_jwks(&signing_key, "test-key");
@@ -1679,6 +1902,7 @@ mod tests {
             email_verified: None,
             name: None,
             picture: None,
+            roles: vec!["user".to_owned()],
         }
     }
 
@@ -1699,6 +1923,7 @@ mod tests {
             email_verified: Some(true),
             name: Some("Example User".to_owned()),
             picture: None,
+            roles: vec!["user".to_owned()],
         }
     }
 }

@@ -12,9 +12,17 @@ use it to:
 - deserialize token responses
 - verify Zeroth ES256 access and ID tokens against Zeroth's JWKS, issuer,
   audience, expiry, token use, and nonce
+- check multiple protected path rules with exact/prefix matching, accepted
+  roles, and required scopes after local token verification
 
 Server-side product gates should redirect users to Zeroth, exchange the returned
 code with the original `code_verifier`, validate the returned Zeroth token for
 the product client, then issue a product-local session cookie. The crate does
 not fetch discovery, JWKS, or token endpoints; product Workers decide how to
 fetch and cache those HTTP responses.
+
+For the low-latency path, product Workers should match the request path first,
+verify the Zeroth access token locally from cached JWKS, then call
+`authorize_protected_path` to enforce route roles/scopes. Calling Zeroth
+`/validate` on every request gives immediate session-revocation awareness, but
+adds a network and D1 hop, so reserve it for sensitive actions.
