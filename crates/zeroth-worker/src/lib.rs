@@ -91,6 +91,7 @@ const APPLE_CLIENT_SECRET_CACHE_REFRESH_SECONDS: i64 = 60 * 60;
 const PROVIDER_JWKS_CACHE_TTL_SECONDS: i32 = 60 * 60;
 const TOKEN_EXCHANGE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
 const ID_TOKEN_SUBJECT_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:id_token";
+const ACCESS_TOKEN_SUBJECT_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:access_token";
 const DEFAULT_NATIVE_TOKEN_SCOPE: &str = "openid profile email";
 const CORS_ALLOW_METHODS: &str = "GET, POST, PATCH, DELETE, OPTIONS";
 const CORS_ALLOW_HEADERS: &str = "Authorization, Content-Type";
@@ -1177,9 +1178,11 @@ struct AuthorizationCodeFields<'a> {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
-struct NativeAppleTokenFields<'a> {
+struct NativeProviderTokenFields<'a> {
+    provider_id: &'a str,
     scope: Option<&'a str>,
     subject_token: &'a str,
+    subject_token_type: &'a str,
     provider_client_id: Option<&'a str>,
     nonce: Option<&'a str>,
 }
@@ -2240,7 +2243,7 @@ async fn oauth_token(mut request: Request, env: Env) -> worker::Result<Response>
         }
         "refresh_token" => refresh_token_token(&db, &config, &signing_key, &form, now).await,
         TOKEN_EXCHANGE_GRANT_TYPE => {
-            native_apple_token(
+            native_provider_token(
                 &db,
                 &env,
                 &config,
@@ -2406,7 +2409,7 @@ async fn refresh_token_token(
 }
 
 #[cfg(target_arch = "wasm32")]
-async fn native_apple_token(
+async fn native_provider_token(
     db: &worker::d1::D1Database,
     env: &Env,
     config: &ZerothServerConfig,
@@ -2415,47 +2418,24 @@ async fn native_apple_token(
     form: &TokenExchangeForm,
     now: i32,
 ) -> worker::Result<Response> {
-    let fields = match native_apple_token_fields(form) {
+    let fields = match native_provider_token_fields(form) {
         Ok(fields) => fields,
-        Err(error) => return token_exchange_error_json(&error, 400),
-    };
-    let provider_client_id = match native_apple_provider_client_id(env, fields.provider_client_id) {
-        Ok(provider_client_id) => provider_client_id,
         Err(error) => return token_exchange_error_json(&error, 400),
     };
     let scope = match native_token_scope(fields.scope) {
         Ok(scope) => scope,
         Err(error) => return token_exchange_error_json(&error, 400),
     };
-    let jwks = match cached_provider_jwks(well_known::APPLE, now).await {
-        Ok(jwks) => jwks,
-        Err(error) => {
-            return provider_profile_error_json(
-                &ProviderProfileError::invalid_response(format!(
-                    "could not load Apple JWKS: {}",
-                    error.description
-                )),
-                502,
-            )
-        }
-    };
-    let verified = match verify_provider_id_token_with_web_crypto(
-        fields.subject_token,
-        &jwks,
-        ProviderIdTokenValidation {
-            provider_id: well_known::APPLE,
-            client_id: &provider_client_id,
-            nonce: fields.nonce,
-            now,
-        },
-    )
-    .await
-    {
-        Ok(verified) => verified,
-        Err(error) => return provider_profile_error_json(&error, 401),
-    };
+    let provider_client_id =
+        match native_provider_client_id(env, fields.provider_id, fields.provider_client_id) {
+            Ok(provider_client_id) => provider_client_id,
+            Err(error) => return token_exchange_error_json(&error, 400),
+        };
 
-    let resolved = native_apple_profile_from_verified_token(verified);
+    let resolved = match resolve_native_provider_profile(&fields, &provider_client_id, now).await {
+        Ok(resolved) => resolved,
+        Err((error, status)) => return provider_profile_error_json(&error, status),
+    };
     if let Err(error) = validate_client_email_domain_policy(client, &resolved.profile) {
         return provider_callback_error_json(&error, 403);
     }
@@ -2471,14 +2451,14 @@ async fn native_apple_token(
         Some(user_claims) => user_claims,
         None => {
             return token_exchange_error_json(
-                &TokenExchangeError::invalid_grant("Apple identity user was not found"),
+                &TokenExchangeError::invalid_grant("provider identity user was not found"),
                 400,
             )
         }
     };
     if user_claims.disabled_at.is_some() {
         return token_exchange_error_json(
-            &TokenExchangeError::invalid_grant("Apple identity user is disabled"),
+            &TokenExchangeError::invalid_grant("provider identity user is disabled"),
             400,
         );
     }
@@ -2495,6 +2475,81 @@ async fn native_apple_token(
     let response =
         token_response(config, signing_key, &issue, refresh_token, now).map_err(worker_error)?;
     json(&response)
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn resolve_native_provider_profile(
+    fields: &NativeProviderTokenFields<'_>,
+    provider_client_id: &str,
+    now: i32,
+) -> Result<ResolvedProviderProfile, (ProviderProfileError, u16)> {
+    match fields.provider_id {
+        well_known::APPLE | well_known::GOOGLE => {
+            resolve_native_oidc_provider_profile(fields, provider_client_id, now).await
+        }
+        well_known::SPOTIFY => resolve_native_spotify_profile(fields, provider_client_id).await,
+        provider_id => Err((
+            ProviderProfileError::invalid_response(format!(
+                "unsupported native provider: {provider_id}"
+            )),
+            400,
+        )),
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn resolve_native_oidc_provider_profile(
+    fields: &NativeProviderTokenFields<'_>,
+    provider_client_id: &str,
+    now: i32,
+) -> Result<ResolvedProviderProfile, (ProviderProfileError, u16)> {
+    let jwks = cached_provider_jwks(fields.provider_id, now)
+        .await
+        .map_err(|error| {
+            (
+                ProviderProfileError::invalid_response(format!(
+                    "could not load {} JWKS: {}",
+                    provider_label(fields.provider_id),
+                    error.description
+                )),
+                502,
+            )
+        })?;
+    let verified = verify_provider_id_token_with_web_crypto(
+        fields.subject_token,
+        &jwks,
+        ProviderIdTokenValidation {
+            provider_id: fields.provider_id,
+            client_id: provider_client_id,
+            nonce: fields.nonce,
+            now,
+        },
+    )
+    .await
+    .map_err(|error| (error, 401))?;
+
+    Ok(native_oidc_profile_from_verified_token(
+        fields.provider_id,
+        verified,
+    ))
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn resolve_native_spotify_profile(
+    fields: &NativeProviderTokenFields<'_>,
+    provider_client_id: &str,
+) -> Result<ResolvedProviderProfile, (ProviderProfileError, u16)> {
+    let provider = OAuthProvider::spotify(provider_client_id);
+    let token_set = ProviderTokenSet {
+        access_token: Some(fields.subject_token.to_owned()),
+        id_token: None,
+        refresh_token: None,
+        expires_in: None,
+    };
+
+    fetch_spotify_profile(&provider, &token_set)
+        .await
+        .map_err(|error| (error, 401))
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -7212,7 +7267,8 @@ async fn token_exchange_form_from_request(
         refresh_token: optional_form_field(&form, "refresh_token"),
         scope: optional_form_field(&form, "scope"),
         subject_token: optional_form_field(&form, "subject_token")
-            .or_else(|| optional_form_field(&form, "identity_token")),
+            .or_else(|| optional_form_field(&form, "identity_token"))
+            .or_else(|| optional_form_field(&form, "access_token")),
         subject_token_type: optional_form_field(&form, "subject_token_type"),
         provider: optional_form_field(&form, "provider"),
         provider_client_id: optional_form_field(&form, "provider_client_id")
@@ -7542,7 +7598,7 @@ fn validate_token_exchange_form(form: &TokenExchangeForm) -> Result<(), TokenExc
             refresh_token_field(form)?;
         }
         TOKEN_EXCHANGE_GRANT_TYPE => {
-            native_apple_token_fields(form)?;
+            native_provider_token_fields(form)?;
         }
         _ => {
             return Err(TokenExchangeError::unsupported_grant_type(
@@ -7683,32 +7739,49 @@ fn authorization_code_fields(
     })
 }
 
-fn native_apple_token_fields(
+fn native_provider_token_fields(
     form: &TokenExchangeForm,
-) -> Result<NativeAppleTokenFields<'_>, TokenExchangeError> {
-    match form.provider.as_deref() {
-        Some(provider) if provider == well_known::APPLE => {}
-        Some(_) => {
-            return Err(TokenExchangeError::invalid_request(
-                "token exchange provider must be apple",
-            ))
-        }
-        None => {}
+) -> Result<NativeProviderTokenFields<'_>, TokenExchangeError> {
+    let provider_id = form.provider.as_deref().unwrap_or(well_known::APPLE);
+    if !is_native_token_exchange_provider(provider_id) {
+        return Err(TokenExchangeError::invalid_request(
+            "token exchange provider must be apple, google, or spotify",
+        ));
     }
-    match form.subject_token_type.as_deref() {
-        Some(ID_TOKEN_SUBJECT_TOKEN_TYPE) | None => {}
-        Some(_) => {
-            return Err(TokenExchangeError::unsupported_token_type(
+    let subject_token_type = match (provider_id, form.subject_token_type.as_deref()) {
+        (well_known::APPLE | well_known::GOOGLE, Some(ID_TOKEN_SUBJECT_TOKEN_TYPE) | None) => {
+            ID_TOKEN_SUBJECT_TOKEN_TYPE
+        }
+        (well_known::APPLE | well_known::GOOGLE, Some(_)) => {
+            return Err(TokenExchangeError::invalid_request(
                 "subject_token_type must be urn:ietf:params:oauth:token-type:id_token",
             ))
         }
-    }
-    Ok(NativeAppleTokenFields {
+        (well_known::SPOTIFY, Some(ACCESS_TOKEN_SUBJECT_TOKEN_TYPE)) => {
+            ACCESS_TOKEN_SUBJECT_TOKEN_TYPE
+        }
+        (well_known::SPOTIFY, _) => {
+            return Err(TokenExchangeError::invalid_request(
+                "subject_token_type must be urn:ietf:params:oauth:token-type:access_token",
+            ))
+        }
+        _ => unreachable!("native provider was checked above"),
+    };
+    Ok(NativeProviderTokenFields {
+        provider_id,
         scope: form.scope.as_deref(),
         subject_token: required_token_form_value(form.subject_token.as_deref(), "subject_token")?,
+        subject_token_type,
         provider_client_id: form.provider_client_id.as_deref(),
         nonce: form.nonce.as_deref(),
     })
+}
+
+fn is_native_token_exchange_provider(provider_id: &str) -> bool {
+    matches!(
+        provider_id,
+        well_known::APPLE | well_known::GOOGLE | well_known::SPOTIFY
+    )
 }
 
 fn refresh_token_field(form: &TokenExchangeForm) -> Result<&str, TokenExchangeError> {
@@ -8541,30 +8614,48 @@ fn native_token_scope(scope: Option<&str>) -> Result<String, TokenExchangeError>
 }
 
 #[cfg(target_arch = "wasm32")]
-fn native_apple_provider_client_id(
+fn native_provider_client_id(
     env: &Env,
+    provider_id: &str,
     requested_client_id: Option<&str>,
 ) -> Result<String, TokenExchangeError> {
-    let configured = native_apple_client_ids_from_env(env);
-    native_apple_provider_client_id_from_list(&configured, requested_client_id)
+    let configured = native_provider_client_ids_from_env(env, provider_id);
+    native_provider_client_id_from_list(provider_id, &configured, requested_client_id)
 }
 
 #[cfg(target_arch = "wasm32")]
-fn native_apple_client_ids_from_env(env: &Env) -> Vec<String> {
-    binding_value_from_env(env, "APPLE_NATIVE_CLIENT_IDS")
-        .or_else(|| binding_value_from_env(env, "APPLE_BUNDLE_ID"))
+fn native_provider_client_ids_from_env(env: &Env, provider_id: &str) -> Vec<String> {
+    let (native_binding, fallback_binding) = match provider_id {
+        well_known::APPLE => ("APPLE_NATIVE_CLIENT_IDS", "APPLE_BUNDLE_ID"),
+        well_known::GOOGLE => ("GOOGLE_NATIVE_CLIENT_IDS", "GOOGLE_CLIENT_ID"),
+        well_known::SPOTIFY => ("SPOTIFY_NATIVE_CLIENT_IDS", "SPOTIFY_CLIENT_ID"),
+        _ => return Vec::new(),
+    };
+    binding_value_from_env(env, native_binding)
+        .filter(|value| config_value_configured(Some(value)))
+        .or_else(|| provider_client_id_from_env(env, fallback_binding))
         .map(|value| split_token_list(&value))
         .unwrap_or_default()
 }
 
+#[cfg(any(test, not(target_arch = "wasm32")))]
 fn native_apple_provider_client_id_from_list(
     configured: &[String],
     requested_client_id: Option<&str>,
 ) -> Result<String, TokenExchangeError> {
+    native_provider_client_id_from_list(well_known::APPLE, configured, requested_client_id)
+}
+
+fn native_provider_client_id_from_list(
+    provider_id: &str,
+    configured: &[String],
+    requested_client_id: Option<&str>,
+) -> Result<String, TokenExchangeError> {
     if configured.is_empty() {
-        return Err(TokenExchangeError::invalid_request(
-            "APPLE_NATIVE_CLIENT_IDS is not configured",
-        ));
+        return Err(TokenExchangeError::invalid_request(format!(
+            "{} is not configured",
+            native_provider_client_ids_binding(provider_id)
+        )));
     }
     if let Some(requested_client_id) = requested_client_id {
         if token_list_slice_contains(configured, requested_client_id, false) {
@@ -8577,9 +8668,28 @@ fn native_apple_provider_client_id_from_list(
     if configured.len() == 1 {
         return Ok(configured[0].clone());
     }
-    Err(TokenExchangeError::invalid_request(
-        "provider_client_id is required when multiple Apple native client IDs are configured",
-    ))
+    Err(TokenExchangeError::invalid_request(format!(
+        "provider_client_id is required when multiple {} native client IDs are configured",
+        provider_label(provider_id)
+    )))
+}
+
+fn native_provider_client_ids_binding(provider_id: &str) -> &'static str {
+    match provider_id {
+        well_known::APPLE => "APPLE_NATIVE_CLIENT_IDS",
+        well_known::GOOGLE => "GOOGLE_NATIVE_CLIENT_IDS",
+        well_known::SPOTIFY => "SPOTIFY_NATIVE_CLIENT_IDS",
+        _ => "PROVIDER_NATIVE_CLIENT_IDS",
+    }
+}
+
+fn provider_label(provider_id: &str) -> &'static str {
+    match provider_id {
+        well_known::APPLE => "Apple",
+        well_known::GOOGLE => "Google",
+        well_known::SPOTIFY => "Spotify",
+        _ => "provider",
+    }
 }
 
 fn split_token_list(value: &str) -> Vec<String> {
@@ -8612,13 +8722,14 @@ fn token_list_slice_contains(
     })
 }
 
-fn native_apple_profile_from_verified_token(
+fn native_oidc_profile_from_verified_token(
+    provider_id: &str,
     verified: VerifiedProviderIdToken,
 ) -> ResolvedProviderProfile {
     let claims = verified.claims;
     ResolvedProviderProfile {
         profile: ProviderProfile {
-            provider_id: ProviderId(well_known::APPLE.to_owned()),
+            provider_id: ProviderId(provider_id.to_owned()),
             subject: Subject(claims.sub),
             email: claims.email,
             email_verified: boolish_claim(claims.email_verified.as_ref()).unwrap_or(false),
@@ -13354,10 +13465,12 @@ mod tests {
     fn token_exchange_form_accepts_native_apple_id_token_grant() {
         let form = valid_native_apple_token_exchange_form();
 
-        let fields = native_apple_token_fields(&form).unwrap();
+        let fields = native_provider_token_fields(&form).unwrap();
 
+        assert_eq!(fields.provider_id, well_known::APPLE);
         assert_eq!(fields.subject_token, "apple.id.token");
         assert_eq!(fields.provider_client_id, Some("ai.wavey.id"));
+        assert_eq!(fields.subject_token_type, ID_TOKEN_SUBJECT_TOKEN_TYPE);
         assert_eq!(
             native_token_scope(fields.scope).unwrap(),
             DEFAULT_NATIVE_TOKEN_SCOPE
@@ -13366,14 +13479,64 @@ mod tests {
     }
 
     #[test]
-    fn native_apple_id_token_grant_requires_apple_provider() {
+    fn token_exchange_form_accepts_native_google_id_token_grant() {
         let mut form = valid_native_apple_token_exchange_form();
         form.provider = Some(well_known::GOOGLE.to_owned());
+        form.subject_token = Some("google.id.token".to_owned());
+        form.provider_client_id = Some("google-ios-client".to_owned());
+
+        let fields = native_provider_token_fields(&form).unwrap();
+
+        assert_eq!(fields.provider_id, well_known::GOOGLE);
+        assert_eq!(fields.subject_token, "google.id.token");
+        assert_eq!(fields.provider_client_id, Some("google-ios-client"));
+        assert_eq!(fields.subject_token_type, ID_TOKEN_SUBJECT_TOKEN_TYPE);
+        validate_token_exchange_form(&form).unwrap();
+    }
+
+    #[test]
+    fn token_exchange_form_accepts_native_spotify_access_token_grant() {
+        let mut form = valid_native_apple_token_exchange_form();
+        form.provider = Some(well_known::SPOTIFY.to_owned());
+        form.subject_token = Some("spotify.access.token".to_owned());
+        form.subject_token_type = Some(ACCESS_TOKEN_SUBJECT_TOKEN_TYPE.to_owned());
+        form.provider_client_id = Some("spotify-ios-client".to_owned());
+
+        let fields = native_provider_token_fields(&form).unwrap();
+
+        assert_eq!(fields.provider_id, well_known::SPOTIFY);
+        assert_eq!(fields.subject_token, "spotify.access.token");
+        assert_eq!(fields.provider_client_id, Some("spotify-ios-client"));
+        assert_eq!(fields.subject_token_type, ACCESS_TOKEN_SUBJECT_TOKEN_TYPE);
+        validate_token_exchange_form(&form).unwrap();
+    }
+
+    #[test]
+    fn native_provider_token_grant_rejects_unsupported_provider() {
+        let mut form = valid_native_apple_token_exchange_form();
+        form.provider = Some("github".to_owned());
 
         let error = validate_token_exchange_form(&form).unwrap_err();
 
         assert_eq!(error.code, "invalid_request");
-        assert_eq!(error.description, "token exchange provider must be apple");
+        assert_eq!(
+            error.description,
+            "token exchange provider must be apple, google, or spotify"
+        );
+    }
+
+    #[test]
+    fn native_spotify_token_grant_requires_access_token_type() {
+        let mut form = valid_native_apple_token_exchange_form();
+        form.provider = Some(well_known::SPOTIFY.to_owned());
+
+        let error = validate_token_exchange_form(&form).unwrap_err();
+
+        assert_eq!(error.code, "invalid_request");
+        assert_eq!(
+            error.description,
+            "subject_token_type must be urn:ietf:params:oauth:token-type:access_token"
+        );
     }
 
     #[test]
@@ -13403,6 +13566,37 @@ mod tests {
         let denied =
             native_apple_provider_client_id_from_list(&configured, Some("evil.app")).unwrap_err();
         assert_eq!(denied.description, "provider_client_id is not allowed");
+    }
+
+    #[test]
+    fn native_google_client_id_selects_allowed_audience() {
+        let configured = vec!["google-ios-client".to_owned()];
+
+        assert_eq!(
+            native_provider_client_id_from_list(well_known::GOOGLE, &configured, None).unwrap(),
+            "google-ios-client"
+        );
+        assert_eq!(
+            native_provider_client_id_from_list(
+                well_known::GOOGLE,
+                &configured,
+                Some("google-ios-client")
+            )
+            .unwrap(),
+            "google-ios-client"
+        );
+    }
+
+    #[test]
+    fn native_spotify_client_id_requires_configured_audience() {
+        let error =
+            native_provider_client_id_from_list(well_known::SPOTIFY, &[], None).unwrap_err();
+
+        assert_eq!(error.code, "invalid_request");
+        assert_eq!(
+            error.description,
+            "SPOTIFY_NATIVE_CLIENT_IDS is not configured"
+        );
     }
 
     #[test]

@@ -256,8 +256,8 @@ wrangler secret put APPLE_APP_SITE_ASSOCIATION_JSON # optional public AASA paylo
 ```
 
 Non-secret deployment vars include `PUBLIC_BASE_URL`, `SESSION_COOKIE_NAME`,
-`TX_COOKIE_NAME`, `APPLE_NATIVE_CLIENT_IDS`, and optional
-`SESSION_COOKIE_DOMAIN`. Leave
+`TX_COOKIE_NAME`, `APPLE_NATIVE_CLIENT_IDS`, `GOOGLE_NATIVE_CLIENT_IDS`,
+`SPOTIFY_NATIVE_CLIENT_IDS`, and optional `SESSION_COOKIE_DOMAIN`. Leave
 `SESSION_COOKIE_DOMAIN` unset for a host-only Zeroth session cookie, or set it
 to a parent domain such as `.example.com` when one first-party registrable
 domain owns multiple subdomain apps. This is the Zeroth-native equivalent of
@@ -265,7 +265,12 @@ the useful shared-cookie behavior from a deployment-specific identity broker;
 unrelated domains still need OIDC redirects and app-local sessions.
 `APPLE_NATIVE_CLIENT_IDS` is a comma/space separated allowlist of Apple app
 Bundle IDs whose native Sign in with Apple `identityToken` values Zeroth may
-accept, for example `ai.wavey.id`.
+accept, for example `ai.wavey.id`. `GOOGLE_NATIVE_CLIENT_IDS` allowlists Google
+native OAuth client IDs whose ID-token `aud` values Zeroth may accept.
+`SPOTIFY_NATIVE_CLIENT_IDS` records the Spotify native app client IDs allowed to
+request native access-token exchange; Spotify access tokens are validated by
+calling Spotify's profile endpoint because Spotify does not expose an OIDC ID
+token for that mobile SDK path.
 
 Apple can be configured in either of two ways:
 
@@ -467,8 +472,9 @@ Current guardrails:
   session-scoped refresh-token family before returning `invalid_grant`. Legacy
   refresh-token rows without a stored session id are still accepted and
   replay-revoked within their null-session user/client family.
-  The same endpoint also accepts native Apple ID-token exchange for Swift/iOS
-  apps:
+  The same endpoint also accepts native provider token exchange for Swift/mobile
+  apps. Apple and Google use provider ID tokens; Spotify uses a provider access
+  token:
 
 ```sh
 curl -X POST "https://id.example.com/oauth/token" \
@@ -488,6 +494,39 @@ curl -X POST "https://id.example.com/oauth/token" \
   `APPLE_NATIVE_CLIENT_IDS`; it can be omitted when exactly one native Apple
   client ID is configured. `nonce` is optional and, when supplied, must match the
   Apple ID-token nonce claim.
+
+```sh
+curl -X POST "https://id.example.com/oauth/token" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  --data-urlencode "grant_type=urn:ietf:params:oauth:grant-type:token-exchange" \
+  --data-urlencode "client_id=wavey-ios" \
+  --data-urlencode "provider=google" \
+  --data-urlencode "subject_token_type=urn:ietf:params:oauth:token-type:id_token" \
+  --data-urlencode "subject_token=$GOOGLE_ID_TOKEN" \
+  --data-urlencode "provider_client_id=$GOOGLE_IOS_CLIENT_ID" \
+  --data-urlencode "scope=openid email profile offline_access"
+```
+
+  Google `subject_token` must be an RS256 ID token whose `aud` is allowlisted by
+  `GOOGLE_NATIVE_CLIENT_IDS`. `nonce` is optional and, when supplied, must match
+  the ID-token nonce claim.
+
+```sh
+curl -X POST "https://id.example.com/oauth/token" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  --data-urlencode "grant_type=urn:ietf:params:oauth:grant-type:token-exchange" \
+  --data-urlencode "client_id=wavey-ios" \
+  --data-urlencode "provider=spotify" \
+  --data-urlencode "subject_token_type=urn:ietf:params:oauth:token-type:access_token" \
+  --data-urlencode "subject_token=$SPOTIFY_ACCESS_TOKEN" \
+  --data-urlencode "provider_client_id=$SPOTIFY_IOS_CLIENT_ID" \
+  --data-urlencode "scope=openid email profile offline_access"
+```
+
+  Spotify `subject_token` is a bearer access token with profile/email access.
+  Zeroth verifies it by fetching Spotify's current-user profile, persists the
+  Spotify user identity in D1, and issues Zeroth-owned tokens for the registered
+  client.
 - `GET /.well-known/openid-configuration` advertises the authorization,
   token, revocation, introspection, userinfo, JWKS, and end-session endpoints,
   ES256 token signing, `query` response mode, supported prompt values, and
