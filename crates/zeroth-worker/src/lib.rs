@@ -11769,6 +11769,19 @@ fn cors_path(path: &str) -> bool {
             | "/profile"
             | "/identities/link"
             | "/identities"
+            | "/passkeys/register/options"
+            | "/passkeys/registration/options"
+            | "/passkeys/register/verify"
+            | "/passkeys/register/finish"
+            | "/passkeys/registration/finish"
+            | "/passkeys/authenticate/options"
+            | "/passkeys/authentication/options"
+            | "/passkeys/login/options"
+            | "/passkeys/authenticate/verify"
+            | "/passkeys/authenticate/finish"
+            | "/passkeys/authentication/finish"
+            | "/passkeys/login/verify"
+            | "/passkeys/login/finish"
             | "/password/register"
             | "/password/login"
             | "/magic-links"
@@ -11790,6 +11803,19 @@ fn cors_method_allowed(path: &str, method: &str) -> bool {
         "/profile" => method == "GET" || method == "PATCH",
         "/identities/link" => method == "GET",
         "/identities" => method == "GET" || method == "DELETE",
+        "/passkeys/register/options"
+        | "/passkeys/registration/options"
+        | "/passkeys/register/verify"
+        | "/passkeys/register/finish"
+        | "/passkeys/registration/finish"
+        | "/passkeys/authenticate/options"
+        | "/passkeys/authentication/options"
+        | "/passkeys/login/options"
+        | "/passkeys/authenticate/verify"
+        | "/passkeys/authenticate/finish"
+        | "/passkeys/authentication/finish"
+        | "/passkeys/login/verify"
+        | "/passkeys/login/finish" => method == "POST",
         "/password/register" => method == "POST",
         "/password/login" => method == "POST",
         "/magic-links" | "/magic-link" | "/magic_link" | "/magic-links/request" => {
@@ -17407,6 +17433,9 @@ mod tests {
         assert!(cors_path("/sessions"));
         assert!(cors_path("/profile"));
         assert!(cors_path("/identities"));
+        assert!(cors_path("/passkeys/register/options"));
+        assert!(cors_path("/passkeys/authenticate/options"));
+        assert!(cors_path("/passkeys/login/options"));
         assert!(cors_path("/password/register"));
         assert!(cors_path("/password/login"));
         assert!(cors_path("/magic-links"));
@@ -17436,6 +17465,10 @@ mod tests {
         assert!(cors_method_allowed("/identities", "GET"));
         assert!(cors_method_allowed("/identities", "DELETE"));
         assert!(!cors_method_allowed("/identities", "POST"));
+        assert!(cors_method_allowed("/passkeys/register/options", "POST"));
+        assert!(cors_method_allowed("/passkeys/authenticate/options", "POST"));
+        assert!(cors_method_allowed("/passkeys/login/options", "POST"));
+        assert!(!cors_method_allowed("/passkeys/login/options", "GET"));
         assert!(cors_method_allowed("/password/register", "POST"));
         assert!(!cors_method_allowed("/password/register", "GET"));
         assert!(cors_method_allowed("/password/login", "POST"));
