@@ -10600,8 +10600,9 @@ fn request_header(request: &Request, name: &str) -> worker::Result<Option<String
 
 #[cfg(target_arch = "wasm32")]
 fn with_set_cookie(response: Response, cookie: &str) -> worker::Result<Response> {
-    response.headers().append("Set-Cookie", cookie)?;
-    Ok(response)
+    let headers = response.headers().clone();
+    headers.append("Set-Cookie", cookie)?;
+    Ok(response.with_headers(headers))
 }
 
 #[cfg(target_arch = "wasm32")]
