@@ -1735,9 +1735,11 @@ async fn provider_callback(mut request: Request, env: Env) -> worker::Result<Res
         );
     }
     let Some(provider_code) = callback.code.as_deref() else {
-        let response = provider_callback_error_json(
-            &ProviderCallbackError::invalid_request("missing code"),
-            400,
+        let error = ProviderCallbackError::invalid_request("missing code");
+        let response = redirect_to_provider_callback_error(
+            &record.transaction,
+            &config.issuer().issuer,
+            &error,
         )?;
         return with_set_cookie(
             response,
@@ -1772,7 +1774,12 @@ async fn provider_callback(mut request: Request, env: Env) -> worker::Result<Res
                 now,
             )
             .await;
-            let response = provider_token_exchange_error_json(&error, 502)?;
+            let callback_error = provider_callback_error_from_token_exchange_error(&error);
+            let response = redirect_to_provider_callback_error(
+                &record.transaction,
+                &config.issuer().issuer,
+                &callback_error,
+            )?;
             return with_set_cookie(
                 response,
                 &clear_transaction_cookie(&config.transaction_cookie_name),
@@ -1798,7 +1805,12 @@ async fn provider_callback(mut request: Request, env: Env) -> worker::Result<Res
                     now,
                 )
                 .await;
-                let response = provider_profile_error_json(&error, 502)?;
+                let callback_error = provider_callback_error_from_profile_error(&error);
+                let response = redirect_to_provider_callback_error(
+                    &record.transaction,
+                    &config.issuer().issuer,
+                    &callback_error,
+                )?;
                 return with_set_cookie(
                     response,
                     &clear_transaction_cookie(&config.transaction_cookie_name),
@@ -4069,7 +4081,7 @@ async fn hosted_session_login(request: Request, env: Env) -> worker::Result<Resp
             )
         }
     };
-    let return_to = match client_return_to_from_url(&url, &client, Some(&config.public_base_url)) {
+    let return_to = match session_login_return_to_from_url(&url, &client, &config.public_base_url) {
         Ok(return_to) => return_to,
         Err(error) => {
             return auth_error_json(&AuthorizationRequestError::invalid_request(error), 400)
@@ -7825,6 +7837,19 @@ fn client_return_to_from_url(
         .ok_or_else(|| "missing return_to".to_owned())?;
 
     validate_client_return_to(&return_to, client, issuer_base_url)?;
+    Ok(return_to)
+}
+
+fn session_login_return_to_from_url(
+    url: &url::Url,
+    client: &Client,
+    issuer_base_url: &str,
+) -> Result<String, String> {
+    let return_to = query_param(url, "return_to")
+        .or_else(|| query_param(url, "redirect_uri"))
+        .unwrap_or_else(|| format!("{}/admin", issuer_base_url.trim_end_matches('/')));
+
+    validate_client_return_to(&return_to, client, Some(issuer_base_url))?;
     Ok(return_to)
 }
 
@@ -12010,14 +12035,6 @@ fn provider_callback_error_json(
 }
 
 #[cfg(target_arch = "wasm32")]
-fn provider_token_exchange_error_json(
-    error: &ProviderTokenExchangeError,
-    status: u16,
-) -> worker::Result<Response> {
-    oauth_error_json(&error.code, &error.description, status)
-}
-
-#[cfg(target_arch = "wasm32")]
 fn provider_profile_error_json(
     error: &ProviderProfileError,
     status: u16,
@@ -12894,6 +12911,30 @@ impl ProviderCallbackError {
             code: "access_denied".to_owned(),
             description: description.into(),
         }
+    }
+}
+
+fn provider_callback_error_from_token_exchange_error(
+    error: &ProviderTokenExchangeError,
+) -> ProviderCallbackError {
+    ProviderCallbackError {
+        code: "temporarily_unavailable".to_owned(),
+        description: format!(
+            "provider token exchange failed ({}): {}",
+            error.code, error.description
+        ),
+    }
+}
+
+fn provider_callback_error_from_profile_error(
+    error: &ProviderProfileError,
+) -> ProviderCallbackError {
+    ProviderCallbackError {
+        code: "temporarily_unavailable".to_owned(),
+        description: format!(
+            "provider profile lookup failed ({}): {}",
+            error.code, error.description
+        ),
     }
 }
 
@@ -14446,6 +14487,32 @@ mod tests {
     }
 
     #[test]
+    fn provider_upstream_failures_map_to_oauth_callback_errors() {
+        let token_error = provider_callback_error_from_token_exchange_error(
+            &ProviderTokenExchangeError::invalid_response("provider token endpoint returned 502"),
+        );
+        assert_eq!(token_error.code, "temporarily_unavailable");
+        assert!(token_error
+            .description
+            .contains("provider token exchange failed"));
+        assert!(token_error
+            .description
+            .contains("provider token endpoint returned 502"));
+
+        let profile_error =
+            provider_callback_error_from_profile_error(&ProviderProfileError::invalid_response(
+                "Spotify profile endpoint returned HTTP 403: premium required",
+            ));
+        assert_eq!(profile_error.code, "temporarily_unavailable");
+        assert!(profile_error
+            .description
+            .contains("provider profile lookup failed"));
+        assert!(profile_error
+            .description
+            .contains("Spotify profile endpoint returned HTTP 403"));
+    }
+
+    #[test]
     fn client_redirect_url_includes_auth_code_and_app_state() {
         let transaction = AuthTransaction {
             provider_state: "provider-state".to_owned(),
@@ -14555,6 +14622,54 @@ mod tests {
         assert_eq!(
             clients_url.as_str(),
             "https://id.example.com/login?return_to=https%3A%2F%2Fid.example.com%2Fadmin%2Fclients"
+        );
+    }
+
+    #[test]
+    fn session_login_return_to_defaults_to_hosted_admin() {
+        let client = Client {
+            id: ClientId("wavey-browser".to_owned()),
+            name: "Wavey Browser SSO".to_owned(),
+            redirect_uris: vec!["https://wavey.ai/auth/callback".to_owned()],
+            allowed_origins: vec!["https://wavey.ai".to_owned()],
+            allowed_email_domains: vec![],
+            confidential: false,
+        };
+        let url = url::Url::parse("https://id.example.com/login").unwrap();
+
+        assert_eq!(
+            session_login_return_to_from_url(&url, &client, "https://id.example.com").unwrap(),
+            "https://id.example.com/admin"
+        );
+    }
+
+    #[test]
+    fn session_login_return_to_keeps_explicit_product_target() {
+        let client = Client {
+            id: ClientId("wavey-browser".to_owned()),
+            name: "Wavey Browser SSO".to_owned(),
+            redirect_uris: vec!["https://wavey.ai/auth/callback".to_owned()],
+            allowed_origins: vec!["https://wavey.ai".to_owned()],
+            allowed_email_domains: vec![],
+            confidential: false,
+        };
+        let url = url::Url::parse(
+            "https://id.example.com/login?return_to=https%3A%2F%2Fwavey.ai%2Fsettings",
+        )
+        .unwrap();
+
+        assert_eq!(
+            session_login_return_to_from_url(&url, &client, "https://id.example.com").unwrap(),
+            "https://wavey.ai/settings"
+        );
+
+        let url = url::Url::parse(
+            "https://id.example.com/login?redirect_uri=https%3A%2F%2Fwavey.ai%2Fauth%2Fcallback",
+        )
+        .unwrap();
+        assert_eq!(
+            session_login_return_to_from_url(&url, &client, "https://id.example.com").unwrap(),
+            "https://wavey.ai/auth/callback"
         );
     }
 
