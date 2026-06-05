@@ -270,7 +270,9 @@ native OAuth client IDs whose ID-token `aud` values Zeroth may accept.
 `SPOTIFY_NATIVE_CLIENT_IDS` records the Spotify native app client IDs allowed to
 request native access-token exchange; Spotify access tokens are validated by
 calling Spotify's profile endpoint because Spotify does not expose an OIDC ID
-token for that mobile SDK path.
+token for that mobile SDK path. When Spotify returns `account_id`, Zeroth uses
+that immutable profile value for account linking and falls back to legacy `id`
+only for older responses.
 
 Apple can be configured in either of two ways:
 
@@ -525,8 +527,8 @@ curl -X POST "https://id.example.com/oauth/token" \
 
   Spotify `subject_token` is a bearer access token with profile/email access.
   Zeroth verifies it by fetching Spotify's current-user profile, persists the
-  Spotify user identity in D1, and issues Zeroth-owned tokens for the registered
-  client.
+  Spotify user identity in D1 using `account_id` when present, and issues
+  Zeroth-owned tokens for the registered client.
 - `GET /.well-known/openid-configuration` advertises the authorization,
   token, revocation, introspection, userinfo, JWKS, and end-session endpoints,
   ES256 token signing, `query` response mode, supported prompt values, and

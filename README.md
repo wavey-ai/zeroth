@@ -104,7 +104,8 @@ Implemented so far:
 - Provider-side callback errors such as user cancellation redirect back to the
   stored OIDC, browser-login, or identity-link return URL with error details and
   original app state
-- Spotify profile fetch and D1 user/identity upsert
+- Spotify profile fetch and D1 user/identity upsert using Spotify `account_id`
+  as the stable account-linking subject when present, with legacy `id` fallback
 - Google/Apple RS256 ID-token verification against provider JWKS and D1
   user/identity upsert from verified OIDC claims
 - provider callback completion that either creates a D1-backed browser session
@@ -122,9 +123,10 @@ Implemented so far:
 - Worker `/oauth/token` native provider token exchange for Swift/mobile apps:
   Apple and Google ID tokens are verified against provider JWKS and configured
   native client-ID allowlists, Spotify access tokens are validated through
-  Spotify's profile endpoint, and all three persist the provider identity in D1,
-  apply the registered Zeroth client's email-domain policy, and return
-  Zeroth-owned access/ID tokens
+  Spotify's profile endpoint, Spotify profile `account_id` is used as the
+  stable account-linking subject when present, and all three persist the
+  provider identity in D1, apply the registered Zeroth client's email-domain
+  policy, and return Zeroth-owned access/ID tokens
 - registered-client CORS/preflight support for browser calls to token,
   revocation, introspection, userinfo, session, sessions, profile, identities,
   validate, and logout

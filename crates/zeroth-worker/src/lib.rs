@@ -745,6 +745,9 @@ struct ProviderTokenExchangeError {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct SpotifyApiProfile {
+    #[serde(default)]
+    account_id: Option<String>,
+    #[serde(default)]
     id: String,
     #[serde(default)]
     email: Option<String>,
@@ -13430,18 +13433,28 @@ async fn fetch_spotify_profile(
 fn spotify_profile_source(
     profile: SpotifyApiProfile,
 ) -> Result<ProviderProfileSource, ProviderProfileError> {
-    if profile.id.is_empty() {
-        return Err(ProviderProfileError::invalid_response(
-            "Spotify profile did not include an id",
-        ));
-    }
+    let subject = spotify_profile_subject(&profile)?;
 
     Ok(ProviderProfileSource::SpotifyProfile {
-        id: profile.id,
+        id: subject,
         email: profile.email,
         display_name: profile.display_name,
         image_url: spotify_profile_image_url(&profile.images),
     })
+}
+
+fn spotify_profile_subject(profile: &SpotifyApiProfile) -> Result<String, ProviderProfileError> {
+    profile
+        .account_id
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .or_else(|| (!profile.id.is_empty()).then_some(profile.id.as_str()))
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            ProviderProfileError::invalid_response(
+                "Spotify profile did not include an account_id or id",
+            )
+        })
 }
 
 fn spotify_profile_image_url(images: &[SpotifyApiImage]) -> Option<String> {
@@ -17622,6 +17635,7 @@ mod tests {
     #[test]
     fn spotify_profile_source_uses_first_image() {
         let source = spotify_profile_source(SpotifyApiProfile {
+            account_id: Some("spotify-account".to_owned()),
             id: "spotify-user".to_owned(),
             email: Some("listener@example.com".to_owned()),
             display_name: Some("Listener".to_owned()),
@@ -17639,7 +17653,7 @@ mod tests {
         assert_eq!(
             source,
             ProviderProfileSource::SpotifyProfile {
-                id: "spotify-user".to_owned(),
+                id: "spotify-account".to_owned(),
                 email: Some("listener@example.com".to_owned()),
                 display_name: Some("Listener".to_owned()),
                 image_url: Some("https://i.scdn.co/image/1".to_owned()),
@@ -17651,6 +17665,7 @@ mod tests {
     fn spotify_profile_json_allows_null_images() {
         let profile = serde_json::from_str::<SpotifyApiProfile>(
             r#"{
+                "account_id": "spotify-account",
                 "id": "spotify-user",
                 "email": "listener@example.com",
                 "display_name": "Listener",
@@ -17659,9 +17674,32 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(profile.account_id.as_deref(), Some("spotify-account"));
         assert_eq!(profile.id, "spotify-user");
         assert_eq!(profile.email.as_deref(), Some("listener@example.com"));
         assert!(profile.images.is_empty());
+    }
+
+    #[test]
+    fn spotify_profile_source_falls_back_to_legacy_id() {
+        let source = spotify_profile_source(SpotifyApiProfile {
+            account_id: None,
+            id: "spotify-user".to_owned(),
+            email: None,
+            display_name: None,
+            images: vec![],
+        })
+        .unwrap();
+
+        assert_eq!(
+            source,
+            ProviderProfileSource::SpotifyProfile {
+                id: "spotify-user".to_owned(),
+                email: None,
+                display_name: None,
+                image_url: None,
+            }
+        );
     }
 
     #[test]
@@ -17678,6 +17716,7 @@ mod tests {
     #[test]
     fn spotify_profile_source_requires_id() {
         let error = spotify_profile_source(SpotifyApiProfile {
+            account_id: None,
             id: String::new(),
             email: None,
             display_name: None,
@@ -17686,7 +17725,10 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error.code, "invalid_response");
-        assert_eq!(error.description, "Spotify profile did not include an id");
+        assert_eq!(
+            error.description,
+            "Spotify profile did not include an account_id or id"
+        );
     }
 
     fn valid_token_exchange_form() -> TokenExchangeForm {
