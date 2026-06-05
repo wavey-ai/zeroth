@@ -254,6 +254,8 @@ wrangler secret put ADMIN_USER_IDS # optional first-party admin session allowlis
 wrangler secret put ADMIN_EMAILS # optional verified primary-email allowlist
 wrangler secret put APPLE_APP_SITE_ASSOCIATION_JSON # optional public AASA payload
 wrangler secret put MAGIC_LINK_WEBHOOK_BEARER # optional webhook auth
+wrangler secret put RESEND_API_KEY # optional for MAGIC_LINK_DELIVERY=resend
+wrangler secret put MAILCHANNELS_API_KEY # optional for MAGIC_LINK_DELIVERY=mailchannels
 ```
 
 Non-secret deployment vars include `PUBLIC_BASE_URL`, `SESSION_COOKIE_NAME`,
@@ -283,9 +285,18 @@ Set `MAGIC_LINK_DELIVERY=webhook` to use a generic HTTPS email sender instead;
 Zeroth will POST JSON containing `kind`, `to`, `from`, `fromName`, `subject`,
 `text`, `html`, `link`, and `productName` to `MAGIC_LINK_WEBHOOK_URL`. If
 `MAGIC_LINK_WEBHOOK_BEARER` or `MAGIC_LINK_WEBHOOK_TOKEN` is configured as a
-secret, Zeroth sends it as `Authorization: Bearer ...`. Webhook delivery treats
-any 2xx response as sent and records only bounded transport error classes in
-audit events.
+secret, Zeroth sends it as `Authorization: Bearer ...`.
+
+Zeroth can also send magic links directly through provider REST APIs:
+
+- `MAGIC_LINK_DELIVERY=resend` requires `RESEND_API_KEY` or
+  `MAGIC_LINK_RESEND_API_KEY` and a Resend-verified sender domain.
+- `MAGIC_LINK_DELIVERY=mailchannels` requires `MAILCHANNELS_API_KEY` or
+  `MAGIC_LINK_MAILCHANNELS_API_KEY`, MailChannels Domain Lockdown for the sender
+  domain, and SPF that authorizes MailChannels.
+
+Webhook, Resend, and MailChannels delivery treat any 2xx response as sent and
+record only bounded transport error classes in audit events.
 
 Apple can be configured in either of two ways:
 

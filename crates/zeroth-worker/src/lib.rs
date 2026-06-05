@@ -101,6 +101,8 @@ const MAGIC_LINK_CLEANUP_LIMIT: i32 = 64;
 const MAGIC_LINK_EMAIL_ERROR_DETAIL_MAX_CHARS: usize = 160;
 const MAGIC_LINK_DELIVERY_CLOUDFLARE_EMAIL: &str = "cloudflare_email";
 const MAGIC_LINK_DELIVERY_WEBHOOK: &str = "webhook";
+const MAGIC_LINK_DELIVERY_RESEND: &str = "resend";
+const MAGIC_LINK_DELIVERY_MAILCHANNELS: &str = "mailchannels";
 const MAGIC_LINK_DELIVERY_UNSUPPORTED: &str = "unsupported";
 const PROFILE_PATCH_BODY_LIMIT: usize = 4 * 1024;
 const PROFILE_NAME_MAX_CHARS: usize = 128;
@@ -452,6 +454,8 @@ struct MagicLinkDeliveryConfig {
 enum MagicLinkDeliveryTransport {
     CloudflareEmail,
     Webhook,
+    Resend,
+    MailChannels,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -5386,6 +5390,16 @@ fn magic_link_delivery_config_from_env(env: &Env) -> MagicLinkDeliveryConfig {
         magic_link_from_note,
         env.send_email("EMAIL").is_ok(),
         webhook_url_note,
+        config_value_note(
+            magic_link_resend_api_key_from_env(env).as_deref(),
+            "missing_resend_api_key",
+            "placeholder_resend_api_key",
+        ),
+        config_value_note(
+            magic_link_mailchannels_api_key_from_env(env).as_deref(),
+            "missing_mailchannels_api_key",
+            "placeholder_mailchannels_api_key",
+        ),
     )
 }
 
@@ -5465,6 +5479,8 @@ fn magic_link_delivery_config_from_values(
     magic_link_from_note: Option<&'static str>,
     email_binding_configured: bool,
     webhook_url_note: Option<&'static str>,
+    resend_api_key_note: Option<&'static str>,
+    mailchannels_api_key_note: Option<&'static str>,
 ) -> MagicLinkDeliveryConfig {
     match magic_link_delivery_transport_from_value(transport_value) {
         Ok(MagicLinkDeliveryTransport::CloudflareEmail) => {
@@ -5503,6 +5519,42 @@ fn magic_link_delivery_config_from_values(
                 notes,
             }
         }
+        Ok(MagicLinkDeliveryTransport::Resend) => {
+            let mut notes = Vec::new();
+            if let Some(note) = magic_link_from_note {
+                notes.push(note);
+            }
+            if let Some(note) = resend_api_key_note {
+                notes.push(note);
+            }
+            let enabled = magic_link_from_note.is_none() && resend_api_key_note.is_none();
+            if enabled {
+                notes.push("resend_domain_must_be_verified");
+            }
+            MagicLinkDeliveryConfig {
+                transport: MAGIC_LINK_DELIVERY_RESEND,
+                enabled,
+                notes,
+            }
+        }
+        Ok(MagicLinkDeliveryTransport::MailChannels) => {
+            let mut notes = Vec::new();
+            if let Some(note) = magic_link_from_note {
+                notes.push(note);
+            }
+            if let Some(note) = mailchannels_api_key_note {
+                notes.push(note);
+            }
+            let enabled = magic_link_from_note.is_none() && mailchannels_api_key_note.is_none();
+            if enabled {
+                notes.push("mailchannels_domain_lockdown_must_be_configured");
+            }
+            MagicLinkDeliveryConfig {
+                transport: MAGIC_LINK_DELIVERY_MAILCHANNELS,
+                enabled,
+                notes,
+            }
+        }
         Err(note) => MagicLinkDeliveryConfig {
             transport: MAGIC_LINK_DELIVERY_UNSUPPORTED,
             enabled: false,
@@ -5520,6 +5572,8 @@ fn magic_link_delivery_transport_from_value(
     match value.to_ascii_lowercase().as_str() {
         "cloudflare" | "cloudflare_email" => Ok(MagicLinkDeliveryTransport::CloudflareEmail),
         "webhook" => Ok(MagicLinkDeliveryTransport::Webhook),
+        "resend" => Ok(MagicLinkDeliveryTransport::Resend),
+        "mailchannels" | "mail_channels" => Ok(MagicLinkDeliveryTransport::MailChannels),
         _ => Err("unsupported_magic_link_delivery"),
     }
 }
@@ -7475,6 +7529,8 @@ fn classify_magic_link_email_error(error: &str) -> &'static str {
         | "email_validation_error"
         | "email_internal_server_error"
         | "email_webhook_failed"
+        | "email_resend_failed"
+        | "email_mailchannels_failed"
         | "email_send_failed" => return matching_magic_link_email_error_class(&lower),
         _ => {}
     }
@@ -7496,6 +7552,12 @@ fn classify_magic_link_email_error(error: &str) -> &'static str {
     if lower.contains("email_webhook_failed") {
         return "email_webhook_failed";
     }
+    if lower.contains("email_resend_failed") {
+        return "email_resend_failed";
+    }
+    if lower.contains("email_mailchannels_failed") {
+        return "email_mailchannels_failed";
+    }
     "email_send_failed"
 }
 
@@ -7506,6 +7568,8 @@ fn matching_magic_link_email_error_class(error: &str) -> &'static str {
         "email_validation_error" => "email_validation_error",
         "email_internal_server_error" => "email_internal_server_error",
         "email_webhook_failed" => "email_webhook_failed",
+        "email_resend_failed" => "email_resend_failed",
+        "email_mailchannels_failed" => "email_mailchannels_failed",
         _ => "email_send_failed",
     }
 }
@@ -11290,6 +11354,12 @@ async fn send_magic_link_email(env: &Env, email: &str, link: &str) -> Result<boo
         MagicLinkDeliveryTransport::Webhook => {
             send_magic_link_webhook_email(env, email, link, &content).await
         }
+        MagicLinkDeliveryTransport::Resend => {
+            send_magic_link_resend_email(env, email, &content).await
+        }
+        MagicLinkDeliveryTransport::MailChannels => {
+            send_magic_link_mailchannels_email(env, email, &content).await
+        }
     }
 }
 
@@ -11370,6 +11440,46 @@ struct MagicLinkWebhookPayload<'a> {
 }
 
 #[cfg(target_arch = "wasm32")]
+#[derive(Serialize)]
+struct ResendEmailPayload<'a> {
+    from: String,
+    to: [&'a str; 1],
+    subject: &'a str,
+    text: &'a str,
+    html: &'a str,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Serialize)]
+struct MailChannelsEmailAddress<'a> {
+    email: &'a str,
+    name: &'a str,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Serialize)]
+struct MailChannelsPersonalization<'a> {
+    to: [MailChannelsEmailAddress<'a>; 1],
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Serialize)]
+struct MailChannelsEmailContent<'a> {
+    #[serde(rename = "type")]
+    content_type: &'a str,
+    value: &'a str,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Serialize)]
+struct MailChannelsEmailPayload<'a> {
+    personalizations: [MailChannelsPersonalization<'a>; 1],
+    from: MailChannelsEmailAddress<'a>,
+    subject: &'a str,
+    content: [MailChannelsEmailContent<'a>; 2],
+}
+
+#[cfg(target_arch = "wasm32")]
 async fn send_magic_link_webhook_email(
     env: &Env,
     email: &str,
@@ -11423,6 +11533,122 @@ async fn send_magic_link_webhook_email(
 }
 
 #[cfg(target_arch = "wasm32")]
+async fn send_magic_link_resend_email(
+    env: &Env,
+    email: &str,
+    content: &MagicLinkEmailContent,
+) -> Result<bool, String> {
+    let Some(api_key) = magic_link_resend_api_key_from_env(env) else {
+        return Ok(false);
+    };
+    let payload = ResendEmailPayload {
+        from: friendly_sender_address(&content.product_name, &content.from),
+        to: [email],
+        subject: &content.subject,
+        text: &content.text,
+        html: &content.html,
+    };
+    let body = serde_json::to_string(&payload)
+        .map_err(|error| format!("email_resend_failed JSON serialization: {error}"))?;
+    let headers = Headers::new();
+    headers
+        .set("Content-Type", "application/json")
+        .map_err(|error| format!("email_resend_failed header: {error}"))?;
+    headers
+        .set("Accept", "application/json")
+        .map_err(|error| format!("email_resend_failed header: {error}"))?;
+    headers
+        .set("Authorization", &format!("Bearer {api_key}"))
+        .map_err(|error| format!("email_resend_failed header: {error}"))?;
+
+    post_magic_link_email_json(
+        "https://api.resend.com/emails",
+        Method::Post,
+        headers,
+        body,
+        "email_resend_failed",
+    )
+    .await
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn send_magic_link_mailchannels_email(
+    env: &Env,
+    email: &str,
+    content: &MagicLinkEmailContent,
+) -> Result<bool, String> {
+    let Some(api_key) = magic_link_mailchannels_api_key_from_env(env) else {
+        return Ok(false);
+    };
+    let payload = MailChannelsEmailPayload {
+        personalizations: [MailChannelsPersonalization {
+            to: [MailChannelsEmailAddress { email, name: "" }],
+        }],
+        from: MailChannelsEmailAddress {
+            email: &content.from,
+            name: &content.product_name,
+        },
+        subject: &content.subject,
+        content: [
+            MailChannelsEmailContent {
+                content_type: "text/plain",
+                value: &content.text,
+            },
+            MailChannelsEmailContent {
+                content_type: "text/html",
+                value: &content.html,
+            },
+        ],
+    };
+    let body = serde_json::to_string(&payload)
+        .map_err(|error| format!("email_mailchannels_failed JSON serialization: {error}"))?;
+    let headers = Headers::new();
+    headers
+        .set("Content-Type", "application/json")
+        .map_err(|error| format!("email_mailchannels_failed header: {error}"))?;
+    headers
+        .set("Accept", "application/json")
+        .map_err(|error| format!("email_mailchannels_failed header: {error}"))?;
+    headers
+        .set("X-Api-Key", &api_key)
+        .map_err(|error| format!("email_mailchannels_failed header: {error}"))?;
+
+    post_magic_link_email_json(
+        "https://api.mailchannels.net/tx/v1/send",
+        Method::Post,
+        headers,
+        body,
+        "email_mailchannels_failed",
+    )
+    .await
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn post_magic_link_email_json(
+    endpoint: &str,
+    method: Method,
+    headers: Headers,
+    body: String,
+    error_class: &str,
+) -> Result<bool, String> {
+    let mut init = RequestInit::new();
+    init.with_method(method)
+        .with_headers(headers)
+        .with_body(Some(worker::wasm_bindgen::JsValue::from_str(&body)));
+    let outbound = Request::new_with_init(endpoint, &init)
+        .map_err(|error| format!("{error_class} request: {error}"))?;
+    let response = Fetch::Request(outbound)
+        .send()
+        .await
+        .map_err(|error| format!("{error_class} fetch: {error}"))?;
+    let status = response.status_code();
+    if !(200..300).contains(&status) {
+        return Err(format!("{error_class} HTTP {status}"));
+    }
+    Ok(true)
+}
+
+#[cfg(target_arch = "wasm32")]
 fn magic_link_webhook_url_from_env(env: &Env) -> Option<String> {
     binding_value_from_env(env, "MAGIC_LINK_WEBHOOK_URL")
         .map(|value| value.trim().to_owned())
@@ -11438,6 +11664,42 @@ fn magic_link_webhook_bearer_from_env(env: &Env) -> Option<String> {
                 .map(|value| value.trim().to_owned())
                 .filter(|value| config_value_configured(Some(value)))
         })
+}
+
+#[cfg(target_arch = "wasm32")]
+fn magic_link_resend_api_key_from_env(env: &Env) -> Option<String> {
+    ["MAGIC_LINK_RESEND_API_KEY", "RESEND_API_KEY"]
+        .into_iter()
+        .find_map(|name| {
+            binding_value_from_env(env, name)
+                .map(|value| value.trim().to_owned())
+                .filter(|value| config_value_configured(Some(value)))
+        })
+}
+
+#[cfg(target_arch = "wasm32")]
+fn magic_link_mailchannels_api_key_from_env(env: &Env) -> Option<String> {
+    ["MAGIC_LINK_MAILCHANNELS_API_KEY", "MAILCHANNELS_API_KEY"]
+        .into_iter()
+        .find_map(|name| {
+            binding_value_from_env(env, name)
+                .map(|value| value.trim().to_owned())
+                .filter(|value| config_value_configured(Some(value)))
+        })
+}
+
+#[cfg(target_arch = "wasm32")]
+fn friendly_sender_address(name: &str, email: &str) -> String {
+    let name = name.trim();
+    if name.is_empty()
+        || name
+            .chars()
+            .any(|character| matches!(character, '\r' | '\n' | '<' | '>' | '"'))
+    {
+        email.to_owned()
+    } else {
+        format!("{name} <{email}>")
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -14766,7 +15028,7 @@ mod tests {
     fn local_auth_status_reports_magic_link_delivery_dependencies() {
         let methods = local_auth_status_rows_from_config(
             true,
-            magic_link_delivery_config_from_values(None, None, true, None),
+            magic_link_delivery_config_from_values(None, None, true, None, None, None),
             false,
             None,
         );
@@ -14796,6 +15058,8 @@ mod tests {
                 Some("missing_magic_link_from"),
                 false,
                 None,
+                None,
+                None,
             ),
             false,
             None,
@@ -14820,6 +15084,8 @@ mod tests {
                 None,
                 false,
                 magic_link_webhook_url_note(Some("https://mail.example.com/zeroth")),
+                None,
+                None,
             ),
             false,
             None,
@@ -14843,6 +15109,8 @@ mod tests {
                 None,
                 true,
                 magic_link_webhook_url_note(None),
+                None,
+                None,
             ),
             false,
             None,
@@ -14861,6 +15129,8 @@ mod tests {
             None,
             true,
             magic_link_webhook_url_note(Some("http://mail.example.com/zeroth")),
+            None,
+            None,
         );
         assert!(!invalid_url.enabled);
         assert!(invalid_url
@@ -14868,12 +15138,81 @@ mod tests {
             .contains(&"invalid_magic_link_webhook_url"));
 
         let unsupported =
-            magic_link_delivery_config_from_values(Some("postmark"), None, true, None);
+            magic_link_delivery_config_from_values(Some("postmark"), None, true, None, None, None);
         assert!(!unsupported.enabled);
         assert_eq!(unsupported.transport, "unsupported");
         assert!(unsupported
             .notes
             .contains(&"unsupported_magic_link_delivery"));
+    }
+
+    #[test]
+    fn local_auth_status_reports_direct_email_provider_dependencies() {
+        let resend = local_auth_status_rows_from_config(
+            true,
+            magic_link_delivery_config_from_values(Some("resend"), None, false, None, None, None),
+            false,
+            None,
+        );
+        let magic_link = resend
+            .iter()
+            .find(|method| method.id == "magic_link")
+            .unwrap();
+        assert!(magic_link.enabled);
+        assert_eq!(magic_link.delivery, "resend");
+        assert!(magic_link.notes.contains(&"resend_domain_must_be_verified"));
+        assert!(magic_link.notes.contains(&"delivery_not_proven"));
+        assert!(!magic_link.notes.contains(&"missing_email_binding"));
+
+        let missing_resend = magic_link_delivery_config_from_values(
+            Some("resend"),
+            None,
+            false,
+            None,
+            Some("missing_resend_api_key"),
+            None,
+        );
+        assert!(!missing_resend.enabled);
+        assert_eq!(missing_resend.transport, "resend");
+        assert!(missing_resend.notes.contains(&"missing_resend_api_key"));
+
+        let mailchannels = local_auth_status_rows_from_config(
+            true,
+            magic_link_delivery_config_from_values(
+                Some("mailchannels"),
+                None,
+                false,
+                None,
+                None,
+                None,
+            ),
+            false,
+            None,
+        );
+        let magic_link = mailchannels
+            .iter()
+            .find(|method| method.id == "magic_link")
+            .unwrap();
+        assert!(magic_link.enabled);
+        assert_eq!(magic_link.delivery, "mailchannels");
+        assert!(magic_link
+            .notes
+            .contains(&"mailchannels_domain_lockdown_must_be_configured"));
+        assert!(magic_link.notes.contains(&"delivery_not_proven"));
+
+        let missing_mailchannels = magic_link_delivery_config_from_values(
+            Some("mail_channels"),
+            None,
+            false,
+            None,
+            None,
+            Some("missing_mailchannels_api_key"),
+        );
+        assert!(!missing_mailchannels.enabled);
+        assert_eq!(missing_mailchannels.transport, "mailchannels");
+        assert!(missing_mailchannels
+            .notes
+            .contains(&"missing_mailchannels_api_key"));
     }
 
     #[test]
@@ -14887,7 +15226,7 @@ mod tests {
         };
         let methods = local_auth_status_rows_from_config(
             true,
-            magic_link_delivery_config_from_values(None, None, true, None),
+            magic_link_delivery_config_from_values(None, None, true, None, None, None),
             false,
             Some(delivery),
         );
@@ -14964,6 +15303,14 @@ mod tests {
         assert_eq!(
             classify_magic_link_email_error("email_webhook_failed HTTP 500"),
             "email_webhook_failed"
+        );
+        assert_eq!(
+            classify_magic_link_email_error("email_resend_failed HTTP 422"),
+            "email_resend_failed"
+        );
+        assert_eq!(
+            classify_magic_link_email_error("email_mailchannels_failed HTTP 403"),
+            "email_mailchannels_failed"
         );
         assert_eq!(classify_magic_link_email_error(""), "email_send_failed");
     }
