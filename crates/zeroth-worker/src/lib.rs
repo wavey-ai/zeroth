@@ -412,6 +412,21 @@ struct LocalAuthStatus {
     credential_storage: &'static str,
     delivery: &'static str,
     notes: Vec<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delivery_status: Option<LocalAuthDeliveryStatus>,
+}
+
+#[derive(Debug, Clone, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalAuthDeliveryStatus {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_issue_at: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_sent_at: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_failed_at: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -580,6 +595,13 @@ struct AuditEventRow {
     ip_hash: Option<String>,
     #[serde(default)]
     user_agent: Option<String>,
+    details_json: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq)]
+struct MagicLinkDeliveryEventRow {
+    event_type: String,
+    created_at: i32,
     details_json: String,
 }
 
@@ -2341,8 +2363,9 @@ async fn local_auth_status(request: Request, env: Env) -> worker::Result<Respons
         return client_management_error_json(&error);
     }
 
+    let magic_link_delivery = magic_link_delivery_status(&db).await?;
     json(&LocalAuthStatusResponse {
-        methods: local_auth_status_rows(&env),
+        methods: local_auth_status_rows(&env, magic_link_delivery),
     })
 }
 
@@ -3682,6 +3705,7 @@ async fn magic_link_request(mut request: Request, env: Env) -> worker::Result<Re
     let sent = match send_magic_link_email(&env, &email, &link).await {
         Ok(sent) => sent,
         Err(error) => {
+            let error_class = classify_magic_link_email_error(&error);
             record_audit_event(
                 &db,
                 &request,
@@ -3689,7 +3713,7 @@ async fn magic_link_request(mut request: Request, env: Env) -> worker::Result<Re
                 user_id.as_deref(),
                 Some(&client.id.0),
                 Some(LOCAL_AUTH_PROVIDER_ID),
-                serde_json::json!({ "error": error }),
+                serde_json::json!({ "errorClass": error_class }),
                 now,
             )
             .await;
@@ -5001,7 +5025,10 @@ fn provider_web_domain(provider_id: &str, config: &ZerothServerConfig) -> Option
 }
 
 #[cfg(target_arch = "wasm32")]
-fn local_auth_status_rows(env: &Env) -> Vec<LocalAuthStatus> {
+fn local_auth_status_rows(
+    env: &Env,
+    magic_link_delivery: Option<LocalAuthDeliveryStatus>,
+) -> Vec<LocalAuthStatus> {
     let password_ready = password_iterations_from_env(env).is_ok();
     let magic_link_from_note = config_value_note(
         binding_value_from_env(env, "MAGIC_LINK_FROM").as_deref(),
@@ -5015,6 +5042,7 @@ fn local_auth_status_rows(env: &Env) -> Vec<LocalAuthStatus> {
         magic_link_from_note,
         email_binding_configured,
         magic_link_dev_echo_enabled(env),
+        magic_link_delivery,
     )
 }
 
@@ -5023,6 +5051,7 @@ fn local_auth_status_rows_from_config(
     magic_link_from_note: Option<&'static str>,
     email_binding_configured: bool,
     magic_link_dev_echo_enabled: bool,
+    magic_link_delivery: Option<LocalAuthDeliveryStatus>,
 ) -> Vec<LocalAuthStatus> {
     let mut password_notes = Vec::new();
     if !password_ready {
@@ -5038,7 +5067,28 @@ fn local_auth_status_rows_from_config(
     }
     if email_binding_configured && magic_link_from_note.is_none() {
         magic_link_notes.push("cloudflare_email_sending_must_be_enabled");
-        magic_link_notes.push("delivery_not_proven");
+        let delivery_proven = magic_link_delivery
+            .as_ref()
+            .and_then(|status| status.last_sent_at)
+            .is_some();
+        if !delivery_proven {
+            magic_link_notes.push("delivery_not_proven");
+        }
+        let recent_failure = magic_link_delivery
+            .as_ref()
+            .and_then(|status| status.last_failed_at)
+            .is_some_and(|failed_at| {
+                match magic_link_delivery
+                    .as_ref()
+                    .and_then(|status| status.last_sent_at)
+                {
+                    Some(sent_at) => failed_at >= sent_at,
+                    None => true,
+                }
+            });
+        if recent_failure {
+            magic_link_notes.push("delivery_failed_recently");
+        }
     }
     if magic_link_dev_echo_enabled {
         magic_link_notes.push("dev_echo_enabled");
@@ -5052,6 +5102,7 @@ fn local_auth_status_rows_from_config(
             credential_storage: "zeroth_local_credentials",
             delivery: "none",
             notes: password_notes,
+            delivery_status: None,
         },
         LocalAuthStatus {
             id: "passkey",
@@ -5060,6 +5111,7 @@ fn local_auth_status_rows_from_config(
             credential_storage: "zeroth_passkey_credentials",
             delivery: "browser_webauthn",
             notes: vec!["requires_webauthn_browser"],
+            delivery_status: None,
         },
         LocalAuthStatus {
             id: "magic_link",
@@ -5068,6 +5120,7 @@ fn local_auth_status_rows_from_config(
             credential_storage: "zeroth_magic_links",
             delivery: "cloudflare_email",
             notes: magic_link_notes,
+            delivery_status: magic_link_delivery,
         },
     ]
 }
@@ -5123,7 +5176,7 @@ fn provider_admin_ui_rows(env: &Env, config: &ZerothServerConfig) -> Vec<Provide
 
 #[cfg(target_arch = "wasm32")]
 fn local_auth_admin_ui_rows(env: &Env) -> Vec<LocalAuthAdminUi> {
-    local_auth_status_rows(env)
+    local_auth_status_rows(env, None)
         .into_iter()
         .map(|status| LocalAuthAdminUi {
             id: status.id.to_owned(),
@@ -6709,6 +6762,112 @@ async fn list_audit_event_rows(
         .all()
         .await?
         .results::<AuditEventRow>()
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn magic_link_delivery_status(
+    db: &worker::d1::D1Database,
+) -> worker::Result<Option<LocalAuthDeliveryStatus>> {
+    let rows = db
+        .prepare(
+            "SELECT event_type, created_at, details_json
+               FROM zeroth_audit_events
+              WHERE event_type IN ('magic_link.issue', 'magic_link.email.failed')
+              ORDER BY created_at DESC, id DESC
+              LIMIT 20",
+        )
+        .all()
+        .await?
+        .results::<MagicLinkDeliveryEventRow>()?;
+    Ok(magic_link_delivery_status_from_events(&rows))
+}
+
+fn magic_link_delivery_status_from_events(
+    rows: &[MagicLinkDeliveryEventRow],
+) -> Option<LocalAuthDeliveryStatus> {
+    if rows.is_empty() {
+        return None;
+    }
+
+    let mut status = LocalAuthDeliveryStatus::default();
+    for row in rows {
+        match row.event_type.as_str() {
+            "magic_link.issue" => {
+                status.last_issue_at.get_or_insert(row.created_at);
+                if magic_link_issue_sent(&row.details_json) {
+                    status.last_sent_at.get_or_insert(row.created_at);
+                }
+            }
+            "magic_link.email.failed" => {
+                status.last_failed_at.get_or_insert(row.created_at);
+                if status.last_error.is_none() {
+                    status.last_error = Some(magic_link_email_error_class(&row.details_json));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Some(status)
+}
+
+fn magic_link_issue_sent(details_json: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(details_json)
+        .ok()
+        .and_then(|details| details.get("sent").and_then(serde_json::Value::as_bool))
+        .unwrap_or(false)
+}
+
+fn magic_link_email_error_class(details_json: &str) -> String {
+    let error = serde_json::from_str::<serde_json::Value>(details_json)
+        .ok()
+        .and_then(|details| {
+            details
+                .get("errorClass")
+                .or_else(|| details.get("error"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_default();
+    classify_magic_link_email_error(&error).to_owned()
+}
+
+fn classify_magic_link_email_error(error: &str) -> &'static str {
+    let lower = error.trim().to_ascii_lowercase();
+    match lower.as_str() {
+        "email_unauthorized"
+        | "email_sender_rejected"
+        | "email_validation_error"
+        | "email_internal_server_error"
+        | "email_send_failed" => return matching_magic_link_email_error_class(&lower),
+        _ => {}
+    }
+    if lower.is_empty() {
+        return "email_send_failed";
+    }
+    if lower.contains("unauthorized") || lower.contains("forbidden") {
+        return "email_unauthorized";
+    }
+    if lower.contains("sender") || lower.contains("from") || lower.contains("address") {
+        return "email_sender_rejected";
+    }
+    if lower.contains("validation") || lower.contains("invalid") || lower.contains("field") {
+        return "email_validation_error";
+    }
+    if lower.contains("internal server error") {
+        return "email_internal_server_error";
+    }
+    "email_send_failed"
+}
+
+fn matching_magic_link_email_error_class(error: &str) -> &'static str {
+    match error {
+        "email_unauthorized" => "email_unauthorized",
+        "email_sender_rejected" => "email_sender_rejected",
+        "email_validation_error" => "email_validation_error",
+        "email_internal_server_error" => "email_internal_server_error",
+        _ => "email_send_failed",
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -10483,15 +10642,23 @@ async fn send_magic_link_email(env: &Env, email: &str, link: &str) -> Result<boo
     let Ok(sender) = env.send_email("EMAIL") else {
         return Ok(false);
     };
-    let text = format!("Sign in to Zeroth:\n\n{link}\n\nThis link expires in 10 minutes.");
+    let product_name = env_string(env, "PRODUCT_NAME").unwrap_or_else(|| "Zeroth".to_owned());
+    let text = format!("Sign in to {product_name}:\n\n{link}\n\nThis link expires in 10 minutes.");
     let html_link = html_escape_text(link);
+    let html_product_name = html_escape_text(&product_name);
     let html = format!(
-        r#"<p>Sign in to Zeroth:</p><p><a href="{html_link}">{html_link}</a></p><p>This link expires in 10 minutes.</p>"#
+        r#"<p>Sign in to {html_product_name}:</p><p><a href="{html_link}">{html_link}</a></p><p>This link expires in 10 minutes.</p>"#
     );
-    let builder = worker::email::SendEmailBuilder::builder(&from, email, "Sign in to Zeroth")
-        .text(&text)
-        .html(&html)
-        .build();
+    let from_address = worker::email::EmailAddress::new(&product_name, &from);
+    let subject = format!("Sign in to {product_name}");
+    let builder = worker::email::SendEmailBuilder::builder_with_email_address_and_str(
+        &from_address,
+        email,
+        &subject,
+    )
+    .text(&text)
+    .html(&html)
+    .build();
     sender
         .send_with_builder(&builder)
         .await
@@ -13668,7 +13835,7 @@ mod tests {
 
     #[test]
     fn local_auth_status_reports_magic_link_delivery_dependencies() {
-        let methods = local_auth_status_rows_from_config(true, None, true, false);
+        let methods = local_auth_status_rows_from_config(true, None, true, false, None);
         let password = methods
             .iter()
             .find(|method| method.id == "password")
@@ -13688,8 +13855,13 @@ mod tests {
             .contains(&"cloudflare_email_sending_must_be_enabled"));
         assert!(magic_link.notes.contains(&"delivery_not_proven"));
 
-        let missing =
-            local_auth_status_rows_from_config(true, Some("missing_magic_link_from"), false, false);
+        let missing = local_auth_status_rows_from_config(
+            true,
+            Some("missing_magic_link_from"),
+            false,
+            false,
+            None,
+        );
         let missing_magic_link = missing
             .iter()
             .find(|method| method.id == "magic_link")
@@ -13699,6 +13871,76 @@ mod tests {
             .notes
             .contains(&"missing_magic_link_from"));
         assert!(missing_magic_link.notes.contains(&"missing_email_binding"));
+    }
+
+    #[test]
+    fn local_auth_status_uses_magic_link_delivery_evidence() {
+        let delivery = LocalAuthDeliveryStatus {
+            last_issue_at: Some(20),
+            last_sent_at: Some(18),
+            last_failed_at: Some(20),
+            last_error: Some("email_internal_server_error".to_owned()),
+        };
+        let methods = local_auth_status_rows_from_config(true, None, true, false, Some(delivery));
+        let magic_link = methods
+            .iter()
+            .find(|method| method.id == "magic_link")
+            .unwrap();
+
+        assert!(!magic_link.notes.contains(&"delivery_not_proven"));
+        assert!(magic_link.notes.contains(&"delivery_failed_recently"));
+        assert_eq!(
+            magic_link.delivery_status.as_ref().unwrap().last_error,
+            Some("email_internal_server_error".to_owned())
+        );
+    }
+
+    #[test]
+    fn magic_link_delivery_status_summarizes_recent_audit_events() {
+        let rows = vec![
+            MagicLinkDeliveryEventRow {
+                event_type: "magic_link.email.failed".to_owned(),
+                created_at: 30,
+                details_json: r#"{"errorClass":"email_internal_server_error"}"#.to_owned(),
+            },
+            MagicLinkDeliveryEventRow {
+                event_type: "magic_link.issue".to_owned(),
+                created_at: 30,
+                details_json: r#"{"sent":false}"#.to_owned(),
+            },
+            MagicLinkDeliveryEventRow {
+                event_type: "magic_link.issue".to_owned(),
+                created_at: 20,
+                details_json: r#"{"sent":true}"#.to_owned(),
+            },
+        ];
+
+        let status = magic_link_delivery_status_from_events(&rows).unwrap();
+
+        assert_eq!(status.last_issue_at, Some(30));
+        assert_eq!(status.last_sent_at, Some(20));
+        assert_eq!(status.last_failed_at, Some(30));
+        assert_eq!(
+            status.last_error,
+            Some("email_internal_server_error".to_owned())
+        );
+    }
+
+    #[test]
+    fn magic_link_email_error_classification_is_safe() {
+        assert_eq!(
+            classify_magic_link_email_error("Unauthorized"),
+            "email_unauthorized"
+        );
+        assert_eq!(
+            classify_magic_link_email_error("invalid from address"),
+            "email_sender_rejected"
+        );
+        assert_eq!(
+            classify_magic_link_email_error("internal server error"),
+            "email_internal_server_error"
+        );
+        assert_eq!(classify_magic_link_email_error(""), "email_send_failed");
     }
 
     #[test]
