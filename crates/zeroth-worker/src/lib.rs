@@ -106,6 +106,7 @@ const DEFAULT_NATIVE_TOKEN_SCOPE: &str = "openid profile email";
 const CORS_ALLOW_METHODS: &str = "GET, POST, PATCH, DELETE, OPTIONS";
 const CORS_ALLOW_HEADERS: &str = "Authorization, Content-Type";
 const CORS_MAX_AGE_SECONDS: &str = "600";
+const ZEROTH_FAVICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="12" fill="#111827"/><path d="M17 16h30L25 48h25" fill="none" stroke="#f9fafb" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/></svg>"##;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1644,13 +1645,20 @@ async fn handle_request(request: Request, env: Env) -> worker::Result<Response> 
         }
         (Method::Get, "/.well-known/jwks.json") => jwks(env),
         (Method::Get, "/.well-known/apple-app-site-association") => apple_app_site_association(env),
+        (Method::Get, "/favicon.ico" | "/favicon.svg") => favicon(),
         (Method::Get, "/login") => hosted_login(request, env).await,
         (Method::Get, "/account") => hosted_account(request, env).await,
         (Method::Get, "/admin") => hosted_clients_admin(request, env).await,
         (Method::Get, "/admin/clients") => hosted_clients_admin(request, env).await,
+        (Method::Get, path) if provider_authorize_alias_path(path) => {
+            redirect_to_provider_authorize_alias(&url)
+        }
         (Method::Get, "/authorize") => authorize(request, env).await,
         (Method::Get, "/__zeroth/db/status") => d1_schema_status(request, env).await,
         (Method::Post, "/__zeroth/db/ensure") => ensure_d1_schema(request, env).await,
+        (Method::Get | Method::Post, path) if provider_callback_alias_path(path) => {
+            provider_callback(request, env).await
+        }
         (Method::Get | Method::Post, "/oauth2/callback") => provider_callback(request, env).await,
         (Method::Post, "/oauth/token") => oauth_token(request, env).await,
         (Method::Post, "/oauth/revoke") => oauth_revoke(request, env).await,
@@ -1661,16 +1669,24 @@ async fn handle_request(request: Request, env: Env) -> worker::Result<Response> 
         (Method::Get | Method::Patch, "/profile") => profile(request, env).await,
         (Method::Get, "/identities/link") => identity_link(request, env).await,
         (Method::Get | Method::Delete, "/identities") => identities(request, env).await,
-        (Method::Post, "/passkeys/register/options") => {
+        (Method::Post, "/passkeys/register/options" | "/passkeys/registration/options") => {
             passkey_register_options(request, env).await
         }
-        (Method::Post, "/passkeys/register/verify") => passkey_register_verify(request, env).await,
-        (Method::Post, "/passkeys/authenticate/options") => {
+        (
+            Method::Post,
+            "/passkeys/register/verify"
+            | "/passkeys/register/finish"
+            | "/passkeys/registration/finish",
+        ) => passkey_register_verify(request, env).await,
+        (Method::Post, "/passkeys/authenticate/options" | "/passkeys/authentication/options") => {
             passkey_authenticate_options(request, env).await
         }
-        (Method::Post, "/passkeys/authenticate/verify") => {
-            passkey_authenticate_verify(request, env).await
-        }
+        (
+            Method::Post,
+            "/passkeys/authenticate/verify"
+            | "/passkeys/authenticate/finish"
+            | "/passkeys/authentication/finish",
+        ) => passkey_authenticate_verify(request, env).await,
         (Method::Get, "/password/register" | "/password/login" | "/magic-links") => {
             redirect_local_auth_get_to_login(request, env)
         }
@@ -2306,7 +2322,7 @@ async fn provider_status(request: Request, env: Env) -> worker::Result<Response>
     }
 
     json(&ProviderStatusResponse {
-        providers: provider_status_rows(&env, &config),
+        providers: provider_status_rows(&env, &config, true),
     })
 }
 
@@ -4064,6 +4080,18 @@ fn apple_app_site_association(env: Env) -> worker::Result<Response> {
 }
 
 #[cfg(target_arch = "wasm32")]
+fn favicon() -> worker::Result<Response> {
+    let response = Response::ok(ZEROTH_FAVICON_SVG)?;
+    response
+        .headers()
+        .set("Content-Type", "image/svg+xml; charset=utf-8")?;
+    response
+        .headers()
+        .set("Cache-Control", "public, max-age=86400")?;
+    Ok(response)
+}
+
+#[cfg(target_arch = "wasm32")]
 async fn hosted_login(request: Request, env: Env) -> worker::Result<Response> {
     let url = request.url()?;
     if !authorization_login_request_present(&url) {
@@ -4626,10 +4654,14 @@ fn provider_configured_for_login(env: &Env, provider_id: &str) -> bool {
 }
 
 #[cfg(target_arch = "wasm32")]
-fn provider_status_rows(env: &Env, config: &ZerothServerConfig) -> Vec<ProviderStatus> {
+fn provider_status_rows(
+    env: &Env,
+    config: &ZerothServerConfig,
+    include_disabled: bool,
+) -> Vec<ProviderStatus> {
     [well_known::APPLE, well_known::GOOGLE, well_known::SPOTIFY]
         .into_iter()
-        .filter(|provider_id| !provider_disabled(env, provider_id))
+        .filter(|provider_id| include_disabled || !provider_disabled(env, provider_id))
         .filter_map(|provider_id| provider_status_row(env, config, provider_id))
         .collect()
 }
@@ -4726,7 +4758,7 @@ fn signing_readiness(env: &Env) -> ReadinessCheck {
 
 #[cfg(target_arch = "wasm32")]
 fn provider_readiness_rows(env: &Env, config: &ZerothServerConfig) -> Vec<ProviderReadiness> {
-    provider_status_rows(env, config)
+    provider_status_rows(env, config, false)
         .into_iter()
         .map(|status| ProviderReadiness {
             id: status.id,
@@ -4812,7 +4844,11 @@ fn provider_status_row(
     let client_id_value = binding_value_from_env(env, client_id_binding);
     let client_id_configured = config_value_configured(client_id_value.as_deref());
     let client_secret_configured = provider_client_secret_configured(env, provider_id);
+    let disabled = provider_disabled(env, provider_id);
     let mut notes = Vec::new();
+    if disabled {
+        notes.push("disabled_by_deployment");
+    }
     if let Some(note) = config_value_note(
         client_id_value.as_deref(),
         "missing_client_id",
@@ -4828,7 +4864,7 @@ fn provider_status_row(
         id,
         label,
         kind,
-        enabled: client_id_configured && client_secret_configured,
+        enabled: provider_status_enabled(client_id_configured, client_secret_configured, disabled),
         client_id_configured,
         client_secret_configured,
         client_id_binding,
@@ -4837,6 +4873,14 @@ fn provider_status_row(
         web_domain: provider_web_domain(provider_id, config),
         notes,
     })
+}
+
+fn provider_status_enabled(
+    client_id_configured: bool,
+    client_secret_configured: bool,
+    disabled: bool,
+) -> bool {
+    !disabled && client_id_configured && client_secret_configured
 }
 
 fn provider_secret_binding_sets(provider_id: &str) -> Vec<Vec<&'static str>> {
@@ -4960,7 +5004,7 @@ fn provider_secret_binding_configured(env: &Env, name: &str) -> bool {
 
 #[cfg(target_arch = "wasm32")]
 fn provider_admin_ui_rows(env: &Env, config: &ZerothServerConfig) -> Vec<ProviderAdminUi> {
-    provider_status_rows(env, config)
+    provider_status_rows(env, config, true)
         .into_iter()
         .map(|status| ProviderAdminUi {
             id: status.id.to_owned(),
@@ -5065,6 +5109,52 @@ fn client_admin_ui_from_row(row: ClientRow) -> Result<ClientAdminUi, String> {
     })
 }
 
+fn provider_authorize_alias_path(path: &str) -> bool {
+    provider_segment_alias(path, "/providers/", "/authorize").is_some()
+}
+
+fn provider_callback_alias_path(path: &str) -> bool {
+    provider_segment_alias(path, "/oauth/callback/", "").is_some()
+        || provider_segment_alias(path, "/oauth2/callback/", "").is_some()
+}
+
+fn provider_authorize_alias_url(request_url: &url::Url) -> Option<url::Url> {
+    let provider_id = provider_segment_alias(request_url.path(), "/providers/", "/authorize")?;
+    let query_pairs = request_url
+        .query_pairs()
+        .filter(|(key, _)| key != "provider")
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect::<Vec<_>>();
+    let mut target = request_url.clone();
+    target.set_path("/authorize");
+    target.set_query(None);
+    target.set_fragment(None);
+    {
+        let mut pairs = target.query_pairs_mut();
+        for (key, value) in query_pairs {
+            pairs.append_pair(&key, &value);
+        }
+        pairs.append_pair("provider", provider_id);
+    }
+    Some(target)
+}
+
+fn provider_segment_alias<'a>(path: &'a str, prefix: &str, suffix: &str) -> Option<&'a str> {
+    let provider_id = path.strip_prefix(prefix)?.strip_suffix(suffix)?;
+    if provider_alias_id_valid(provider_id) {
+        Some(provider_id)
+    } else {
+        None
+    }
+}
+
+fn provider_alias_id_valid(provider_id: &str) -> bool {
+    !provider_id.is_empty()
+        && provider_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
 #[cfg(target_arch = "wasm32")]
 fn product_name_from_env(env: &Env) -> String {
     env_string(env, "PRODUCT_NAME").unwrap_or_else(|| "Zeroth".to_owned())
@@ -5083,6 +5173,13 @@ fn redirect_to_path(request_url: &url::Url, path: &str) -> worker::Result<Respon
     target.set_path(path);
     target.set_query(None);
     target.set_fragment(None);
+    Response::redirect(target)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn redirect_to_provider_authorize_alias(request_url: &url::Url) -> worker::Result<Response> {
+    let target = provider_authorize_alias_url(request_url)
+        .ok_or_else(|| worker::Error::RustError("invalid provider authorize alias".to_owned()))?;
     Response::redirect(target)
 }
 
@@ -11132,11 +11229,11 @@ fn clear_session_cookie(name: &str, domain: Option<&str>) -> String {
 }
 
 fn transaction_cookie(name: &str, value: &str, max_age_seconds: i32) -> String {
-    format!("{name}={value}; Path=/oauth2/callback; Max-Age={max_age_seconds}; HttpOnly; Secure; SameSite=None")
+    format!("{name}={value}; Path=/; Max-Age={max_age_seconds}; HttpOnly; Secure; SameSite=None")
 }
 
 fn clear_transaction_cookie(name: &str) -> String {
-    format!("{name}=; Path=/oauth2/callback; Max-Age=0; HttpOnly; Secure; SameSite=None")
+    format!("{name}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=None")
 }
 
 fn cookie_domain_attribute(domain: Option<&str>) -> String {
@@ -13398,6 +13495,14 @@ mod tests {
             notes: vec!["missing_jwt_es256_private_key"],
         };
         assert!(!readiness_is_ready(&issuer, &missing_signing, &providers));
+    }
+
+    #[test]
+    fn provider_status_enabled_requires_not_disabled() {
+        assert!(provider_status_enabled(true, true, false));
+        assert!(!provider_status_enabled(true, true, true));
+        assert!(!provider_status_enabled(true, false, false));
+        assert!(!provider_status_enabled(false, true, false));
     }
 
     #[test]
@@ -16071,11 +16176,11 @@ mod tests {
     }
 
     #[test]
-    fn transaction_cookie_is_callback_scoped_and_cross_site_post_safe() {
+    fn transaction_cookie_is_host_scoped_and_cross_site_post_safe() {
         let cookie =
             transaction_cookie("zeroth_tx", "provider-state", AUTH_TRANSACTION_TTL_SECONDS);
 
-        assert!(cookie.starts_with("zeroth_tx=provider-state; Path=/oauth2/callback;"));
+        assert!(cookie.starts_with("zeroth_tx=provider-state; Path=/;"));
         assert!(cookie.contains("Max-Age=600"));
         assert!(cookie.contains("HttpOnly"));
         assert!(cookie.contains("Secure"));
@@ -16083,13 +16188,39 @@ mod tests {
     }
 
     #[test]
-    fn clear_transaction_cookie_expires_callback_cookie() {
+    fn clear_transaction_cookie_expires_host_scoped_cookie() {
         let cookie = clear_transaction_cookie("zeroth_tx");
 
         assert_eq!(
             cookie,
-            "zeroth_tx=; Path=/oauth2/callback; Max-Age=0; HttpOnly; Secure; SameSite=None"
+            "zeroth_tx=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=None"
         );
+    }
+
+    #[test]
+    fn provider_authorize_alias_rewrites_to_canonical_authorize_url() {
+        let url = url::Url::parse(
+            "https://id.example.com/providers/apple/authorize?client_id=browser&provider=google&state=one#frag",
+        )
+        .unwrap();
+
+        let alias = provider_authorize_alias_url(&url).unwrap();
+
+        assert_eq!(
+            alias.as_str(),
+            "https://id.example.com/authorize?client_id=browser&state=one&provider=apple"
+        );
+    }
+
+    #[test]
+    fn provider_alias_paths_reject_nested_provider_segments() {
+        assert!(provider_authorize_alias_path("/providers/google/authorize"));
+        assert!(provider_callback_alias_path("/oauth/callback/apple"));
+        assert!(provider_callback_alias_path("/oauth2/callback/apple"));
+        assert!(!provider_authorize_alias_path(
+            "/providers/google/extra/authorize"
+        ));
+        assert!(!provider_callback_alias_path("/oauth/callback/apple/extra"));
     }
 
     #[test]

@@ -7,6 +7,9 @@ use leptos::prelude::*;
 use url::{form_urlencoded, Url};
 use zeroth_providers::well_known;
 
+const TRANSPARENT_PIXEL_DATA_URI: &str =
+    "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==";
+
 /// Stylesheet for the default Zeroth account UI.
 pub const ZEROTH_UI_CSS: &str = r#"
 :root {
@@ -1011,6 +1014,7 @@ pub fn render_account_document(state: ZerothUiState) -> String {
         concat!(
             "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">",
             "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">",
+            "<link rel=\"icon\" href=\"/favicon.svg\" type=\"image/svg+xml\">",
             "<title>{}</title><style>{}</style></head><body>{}<script>{}</script></body></html>"
         ),
         escape_text(&state.product_name),
@@ -1031,6 +1035,7 @@ pub fn render_clients_admin_document(state: ClientsAdminUiState) -> String {
         concat!(
             "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">",
             "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">",
+            "<link rel=\"icon\" href=\"/favicon.svg\" type=\"image/svg+xml\">",
             "<title>{} Clients</title><style>{}</style></head><body>{}<script>{}</script></body></html>"
         ),
         escape_text(&state.product_name),
@@ -1099,6 +1104,11 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
         "zeroth-avatar-hidden"
     } else {
         ""
+    };
+    let avatar_src = if profile_picture.is_empty() {
+        TRANSPARENT_PIXEL_DATA_URI.to_owned()
+    } else {
+        profile_picture.clone()
     };
     let avatar_text_class = if profile_picture.is_empty() {
         ""
@@ -1282,7 +1292,7 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
                             <div class="zeroth-panel-body zeroth-stack">
                                 <div class="zeroth-profile">
                                     <div class="zeroth-avatar">
-                                        <img class=avatar_image_class src=profile_picture.clone() alt="" />
+                                        <img class=avatar_image_class src=avatar_src alt="" />
                                         <span class=avatar_text_class>{avatar_initial}</span>
                                     </div>
                                     <div>
@@ -1773,7 +1783,13 @@ fn application_row(application: ApplicationUi) -> impl IntoView {
 }
 
 fn provider_admin_row(provider: ProviderAdminUi) -> impl IntoView {
-    let status = if provider.enabled {
+    let disabled = provider
+        .notes
+        .iter()
+        .any(|note| note == "disabled_by_deployment");
+    let status = if disabled {
+        "Disabled"
+    } else if provider.enabled {
         "Ready"
     } else {
         "Missing config"
@@ -2707,8 +2723,9 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
 
       const state = document.createElement("td");
       const statePill = document.createElement("span");
+      const disabled = (provider.notes || []).includes("disabled_by_deployment");
       statePill.className = provider.enabled ? "zeroth-status zeroth-status-ok" : "zeroth-status zeroth-status-warn";
-      statePill.textContent = provider.enabled ? "Ready" : "Missing config";
+      statePill.textContent = disabled ? "Disabled" : provider.enabled ? "Ready" : "Missing config";
       state.appendChild(statePill);
 
       const clientId = document.createElement("td");
@@ -3375,6 +3392,8 @@ mod tests {
             "https://app.example.com/callback",
         )));
 
+        assert!(document.contains("/favicon.svg"));
+        assert!(!document.contains("src=\"\""));
         assert!(document.contains("const payload = {};"));
         assert!(document.contains("if (displayName) payload.displayName = displayName;"));
         assert!(document.contains("payload.pictureUrl = null;"));
@@ -3463,6 +3482,19 @@ mod tests {
             web_domain: Some("id.example.com".to_owned()),
             notes: Vec::new(),
         });
+        state.providers.push(ProviderAdminUi {
+            id: well_known::SPOTIFY.to_owned(),
+            label: "Spotify".to_owned(),
+            kind: "oauth2".to_owned(),
+            enabled: false,
+            client_id_configured: true,
+            client_secret_configured: true,
+            client_id_binding: "SPOTIFY_CLIENT_ID".to_owned(),
+            secret_binding_sets: vec![vec!["SPOTIFY_CLIENT_SECRET".to_owned()]],
+            callback_url: "https://id.example.com/oauth2/callback".to_owned(),
+            web_domain: None,
+            notes: vec!["disabled_by_deployment".to_owned()],
+        });
         state.local_auth.push(LocalAuthAdminUi {
             id: "magic_link".to_owned(),
             label: "Magic link".to_owned(),
@@ -3512,6 +3544,9 @@ mod tests {
         assert!(html.contains("Registered clients"));
         assert!(html.contains("Client editor"));
         assert!(html.contains("Apple"));
+        assert!(html.contains("Spotify"));
+        assert!(html.contains("Disabled"));
+        assert!(html.contains("disabled_by_deployment"));
         assert!(html.contains("Magic link"));
         assert!(html.contains("zeroth_magic_links"));
         assert!(html.contains("usr_123"));
@@ -3528,6 +3563,7 @@ mod tests {
         );
 
         assert!(document.contains("zeroth.adminToken"));
+        assert!(document.contains("/favicon.svg"));
         assert!(document.contains("fetch(path"));
         assert!(document.contains("loadAdmin().catch"));
         assert!(document.contains("/__zeroth/db/status"));

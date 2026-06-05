@@ -83,7 +83,19 @@ pub const ROUTES: &[Route] = &[
     },
     Route {
         method: "GET",
+        path: "/favicon.ico",
+    },
+    Route {
+        method: "GET",
+        path: "/favicon.svg",
+    },
+    Route {
+        method: "GET",
         path: "/authorize",
+    },
+    Route {
+        method: "GET",
+        path: "/providers/{provider}/authorize",
     },
     Route {
         method: "POST",
@@ -143,6 +155,22 @@ pub const ROUTES: &[Route] = &[
     },
     Route {
         method: "GET",
+        path: "/oauth/callback/{provider}",
+    },
+    Route {
+        method: "POST",
+        path: "/oauth/callback/{provider}",
+    },
+    Route {
+        method: "GET",
+        path: "/oauth2/callback/{provider}",
+    },
+    Route {
+        method: "POST",
+        path: "/oauth2/callback/{provider}",
+    },
+    Route {
+        method: "GET",
         path: "/session",
     },
     Route {
@@ -199,7 +227,19 @@ pub const ROUTES: &[Route] = &[
     },
     Route {
         method: "POST",
+        path: "/passkeys/registration/options",
+    },
+    Route {
+        method: "POST",
         path: "/passkeys/register/verify",
+    },
+    Route {
+        method: "POST",
+        path: "/passkeys/register/finish",
+    },
+    Route {
+        method: "POST",
+        path: "/passkeys/registration/finish",
     },
     Route {
         method: "POST",
@@ -207,7 +247,19 @@ pub const ROUTES: &[Route] = &[
     },
     Route {
         method: "POST",
+        path: "/passkeys/authentication/options",
+    },
+    Route {
+        method: "POST",
         path: "/passkeys/authenticate/verify",
+    },
+    Route {
+        method: "POST",
+        path: "/passkeys/authenticate/finish",
+    },
+    Route {
+        method: "POST",
+        path: "/passkeys/authentication/finish",
     },
     Route {
         method: "POST",
@@ -316,6 +368,15 @@ mod tests {
     }
 
     #[test]
+    fn routes_include_favicon_assets() {
+        for path in ["/favicon.ico", "/favicon.svg"] {
+            assert!(ROUTES
+                .iter()
+                .any(|route| route.method == "GET" && route.path == path));
+        }
+    }
+
+    #[test]
     fn routes_include_first_party_auth_endpoints() {
         for (method, path) in [
             ("GET", "/local-auth/status"),
@@ -327,6 +388,23 @@ mod tests {
             ("POST", "/magic-links"),
             ("GET", "/magic-links/consume"),
             ("POST", "/magic-links/consume"),
+        ] {
+            assert!(ROUTES
+                .iter()
+                .any(|route| route.method == method && route.path == path));
+        }
+    }
+
+    #[test]
+    fn routes_include_compatibility_aliases() {
+        for (method, path) in [
+            ("GET", "/providers/{provider}/authorize"),
+            ("GET", "/oauth/callback/{provider}"),
+            ("POST", "/oauth/callback/{provider}"),
+            ("POST", "/passkeys/registration/options"),
+            ("POST", "/passkeys/registration/finish"),
+            ("POST", "/passkeys/authentication/options"),
+            ("POST", "/passkeys/authentication/finish"),
         ] {
             assert!(ROUTES
                 .iter()
