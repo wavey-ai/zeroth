@@ -1604,20 +1604,7 @@ async fn handle_request(request: Request, env: Env) -> worker::Result<Response> 
             service: "zeroth",
         }),
         (Method::Get, "/ready") => ready(request, env),
-        (Method::Get, "/providers") => json(&vec![
-            ProviderResponse {
-                id: well_known::APPLE,
-                kind: "oidc",
-            },
-            ProviderResponse {
-                id: well_known::GOOGLE,
-                kind: "oidc",
-            },
-            ProviderResponse {
-                id: well_known::SPOTIFY,
-                kind: "oauth2",
-            },
-        ]),
+        (Method::Get, "/providers") => json(&provider_responses(&env)),
         (Method::Get, "/providers/status") => provider_status(request, env).await,
         (Method::Get | Method::Post | Method::Delete, "/clients") => clients(request, env).await,
         (Method::Get | Method::Patch, "/users") => users(request, env).await,
@@ -1665,6 +1652,9 @@ async fn handle_request(request: Request, env: Env) -> worker::Result<Response> 
         }
         (Method::Post, "/passkeys/authenticate/verify") => {
             passkey_authenticate_verify(request, env).await
+        }
+        (Method::Get, "/password/register" | "/password/login" | "/magic-links") => {
+            redirect_local_auth_get_to_login(request, env)
         }
         (Method::Post, "/password/register") => password_register(request, env).await,
         (Method::Post, "/password/login") => password_login(request, env).await,
@@ -3409,7 +3399,7 @@ async fn password_register(mut request: Request, env: Env) -> worker::Result<Res
     let config = server_config(&env, &url);
     let db = env.d1(D1_BINDING)?;
     let now = unix_timestamp_seconds();
-    let body = match local_auth_json_from_request::<PasswordRegisterRequest>(&mut request).await {
+    let body = match local_auth_body_from_request::<PasswordRegisterRequest>(&mut request).await {
         Ok(body) => body,
         Err(error) => return oauth_error_json("invalid_request", error, 400),
     };
@@ -3510,7 +3500,7 @@ async fn password_login(mut request: Request, env: Env) -> worker::Result<Respon
     let config = server_config(&env, &url);
     let db = env.d1(D1_BINDING)?;
     let now = unix_timestamp_seconds();
-    let body = match local_auth_json_from_request::<PasswordLoginRequest>(&mut request).await {
+    let body = match local_auth_body_from_request::<PasswordLoginRequest>(&mut request).await {
         Ok(body) => body,
         Err(error) => return oauth_error_json("invalid_request", error, 400),
     };
@@ -3573,7 +3563,7 @@ async fn magic_link_request(mut request: Request, env: Env) -> worker::Result<Re
     let config = server_config(&env, &url);
     let db = env.d1(D1_BINDING)?;
     let now = unix_timestamp_seconds();
-    let body = match local_auth_json_from_request::<MagicLinkRequest>(&mut request).await {
+    let body = match local_auth_body_from_request::<MagicLinkRequest>(&mut request).await {
         Ok(body) => body,
         Err(error) => return oauth_error_json("invalid_request", error, 400),
     };
@@ -3669,7 +3659,7 @@ async fn magic_link_consume(mut request: Request, env: Env) -> worker::Result<Re
     let token = match request.method() {
         Method::Get => query_param(&url, "token"),
         Method::Post => {
-            match local_auth_json_from_request::<MagicLinkConsumeRequest>(&mut request).await {
+            match local_auth_body_from_request::<MagicLinkConsumeRequest>(&mut request).await {
                 Ok(body) => Some(body.token),
                 Err(error) => return oauth_error_json("invalid_request", error, 400),
             }
@@ -4520,10 +4510,32 @@ fn provider_ui_rows(
             identities,
         ),
     ];
+    providers.retain(|provider| !provider_disabled(env, &provider.id));
     for provider in &mut providers {
         provider.enabled = actions_enabled && provider_configured_for_login(env, &provider.id);
     }
     providers
+}
+
+#[cfg(target_arch = "wasm32")]
+fn provider_responses(env: &Env) -> Vec<ProviderResponse> {
+    [
+        ProviderResponse {
+            id: well_known::APPLE,
+            kind: "oidc",
+        },
+        ProviderResponse {
+            id: well_known::GOOGLE,
+            kind: "oidc",
+        },
+        ProviderResponse {
+            id: well_known::SPOTIFY,
+            kind: "oauth2",
+        },
+    ]
+    .into_iter()
+    .filter(|provider| !provider_disabled(env, provider.id))
+    .collect()
 }
 
 fn provider_ui(
@@ -4559,7 +4571,8 @@ fn provider_client_id_binding(provider_id: &str) -> Option<&'static str> {
 
 #[cfg(target_arch = "wasm32")]
 fn provider_configured_for_login(env: &Env, provider_id: &str) -> bool {
-    provider_client_id_configured(env, provider_id)
+    !provider_disabled(env, provider_id)
+        && provider_client_id_configured(env, provider_id)
         && provider_client_secret_configured(env, provider_id)
 }
 
@@ -4567,8 +4580,15 @@ fn provider_configured_for_login(env: &Env, provider_id: &str) -> bool {
 fn provider_status_rows(env: &Env, config: &ZerothServerConfig) -> Vec<ProviderStatus> {
     [well_known::APPLE, well_known::GOOGLE, well_known::SPOTIFY]
         .into_iter()
+        .filter(|provider_id| !provider_disabled(env, provider_id))
         .filter_map(|provider_id| provider_status_row(env, config, provider_id))
         .collect()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn provider_disabled(env: &Env, provider_id: &str) -> bool {
+    binding_value_from_env(env, "DISABLED_PROVIDERS")
+        .is_some_and(|values| token_list_contains(Some(&values), provider_id, true))
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -7761,12 +7781,35 @@ fn hosted_admin_login_url(issuer_base_url: &str, return_to_path: &str) -> Result
     let mut login_url = url::Url::parse(&format!("{base}/login"))
         .map_err(|error| format!("invalid issuer URL: {error}"))?;
     let return_to = format!("{base}{return_to_path}");
+    login_url
+        .query_pairs_mut()
+        .append_pair("return_to", &return_to);
+    Ok(login_url)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn redirect_local_auth_get_to_login(request: Request, env: Env) -> worker::Result<Response> {
+    let request_url = request.url()?;
+    let config = server_config(&env, &request_url);
+    let mut login_url = url::Url::parse(&format!(
+        "{}/login",
+        config.public_base_url.trim_end_matches('/')
+    ))
+    .map_err(|error| worker_error(format!("invalid issuer URL: {error}")))?;
     {
         let mut pairs = login_url.query_pairs_mut();
-        pairs.append_pair("provider", well_known::APPLE);
-        pairs.append_pair("return_to", &return_to);
+        if let Some(client_id) =
+            query_param(&request_url, "client_id").or_else(|| query_param(&request_url, "clientId"))
+        {
+            pairs.append_pair("client_id", &client_id);
+        }
+        if let Some(return_to) =
+            query_param(&request_url, "return_to").or_else(|| query_param(&request_url, "returnTo"))
+        {
+            pairs.append_pair("return_to", &return_to);
+        }
     }
-    Ok(login_url)
+    Response::redirect(login_url)
 }
 
 fn client_return_to_from_url(
@@ -9645,6 +9688,13 @@ fn content_type_is_json(content_type: Option<&str>) -> bool {
         .is_some_and(|value| value.eq_ignore_ascii_case("application/json"))
 }
 
+fn content_type_is_form_urlencoded(content_type: Option<&str>) -> bool {
+    content_type
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .is_some_and(|value| value.eq_ignore_ascii_case("application/x-www-form-urlencoded"))
+}
+
 fn userinfo_response(user: &UserRow, scope: Option<&str>) -> UserInfoResponse {
     let has_email = scope_contains(scope, "email");
     let has_profile = scope_contains(scope, "profile");
@@ -9726,22 +9776,30 @@ async fn passkey_json_from_request<T: serde::de::DeserializeOwned>(
 }
 
 #[cfg(target_arch = "wasm32")]
-async fn local_auth_json_from_request<T: serde::de::DeserializeOwned>(
+async fn local_auth_body_from_request<T: serde::de::DeserializeOwned>(
     request: &mut Request,
 ) -> Result<T, String> {
     let content_type = request_header(request, "Content-Type")
         .map_err(|error| format!("could not read Content-Type header: {error}"))?;
-    if !content_type_is_json(content_type.as_deref()) {
-        return Err("Content-Type must be application/json".to_owned());
-    }
     let body = request
         .bytes()
         .await
         .map_err(|error| format!("could not read local auth body: {error}"))?;
-    if body.len() > LOCAL_AUTH_BODY_LIMIT {
-        return Err("local auth JSON body is too large".to_owned());
+    if content_type_is_json(content_type.as_deref()) {
+        if body.len() > LOCAL_AUTH_BODY_LIMIT {
+            return Err("local auth JSON body is too large".to_owned());
+        }
+        return serde_json::from_slice::<T>(&body)
+            .map_err(|error| format!("invalid local auth JSON: {error}"));
     }
-    serde_json::from_slice::<T>(&body).map_err(|error| format!("invalid local auth JSON: {error}"))
+    if content_type_is_form_urlencoded(content_type.as_deref()) {
+        if body.len() > LOCAL_AUTH_BODY_LIMIT {
+            return Err("local auth form body is too large".to_owned());
+        }
+        return serde_urlencoded::from_bytes::<T>(&body)
+            .map_err(|error| format!("invalid local auth form: {error}"));
+    }
+    Err("Content-Type must be application/json or application/x-www-form-urlencoded".to_owned())
 }
 
 fn validate_local_auth_email(value: &str) -> Result<String, String> {
@@ -14473,7 +14531,7 @@ mod tests {
     }
 
     #[test]
-    fn hosted_admin_login_url_targets_apple_session_login() {
+    fn hosted_admin_login_url_targets_hosted_login_chooser() {
         let url = hosted_admin_login_url("https://id.example.com", "/admin").unwrap();
         let query_pairs = url
             .query_pairs()
@@ -14482,9 +14540,9 @@ mod tests {
 
         assert_eq!(
             url.as_str(),
-            "https://id.example.com/login?provider=apple&return_to=https%3A%2F%2Fid.example.com%2Fadmin"
+            "https://id.example.com/login?return_to=https%3A%2F%2Fid.example.com%2Fadmin"
         );
-        assert!(query_pairs.contains(&("provider".to_owned(), well_known::APPLE.to_owned())));
+        assert!(!query_pairs.iter().any(|(key, _)| key == "provider"));
         assert!(query_pairs.contains(&(
             "return_to".to_owned(),
             "https://id.example.com/admin".to_owned()
@@ -14494,7 +14552,7 @@ mod tests {
             hosted_admin_login_url("https://id.example.com/", "/admin/clients").unwrap();
         assert_eq!(
             clients_url.as_str(),
-            "https://id.example.com/login?provider=apple&return_to=https%3A%2F%2Fid.example.com%2Fadmin%2Fclients"
+            "https://id.example.com/login?return_to=https%3A%2F%2Fid.example.com%2Fadmin%2Fclients"
         );
     }
 

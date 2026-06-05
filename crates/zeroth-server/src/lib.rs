@@ -210,6 +210,10 @@ pub const ROUTES: &[Route] = &[
         path: "/password/register",
     },
     Route {
+        method: "GET",
+        path: "/password/register",
+    },
+    Route {
         method: "OPTIONS",
         path: "/password/register",
     },
@@ -218,11 +222,19 @@ pub const ROUTES: &[Route] = &[
         path: "/password/login",
     },
     Route {
+        method: "GET",
+        path: "/password/login",
+    },
+    Route {
         method: "OPTIONS",
         path: "/password/login",
     },
     Route {
         method: "POST",
+        path: "/magic-links",
+    },
+    Route {
+        method: "GET",
         path: "/magic-links",
     },
     Route {
@@ -302,8 +314,11 @@ mod tests {
     #[test]
     fn routes_include_first_party_auth_endpoints() {
         for (method, path) in [
+            ("GET", "/password/register"),
             ("POST", "/password/register"),
+            ("GET", "/password/login"),
             ("POST", "/password/login"),
+            ("GET", "/magic-links"),
             ("POST", "/magic-links"),
             ("GET", "/magic-links/consume"),
             ("POST", "/magic-links/consume"),
