@@ -1665,7 +1665,8 @@ pub async fn main(request: Request, env: Env, _ctx: worker::Context) -> worker::
 #[cfg(target_arch = "wasm32")]
 async fn handle_request(request: Request, env: Env) -> worker::Result<Response> {
     let url = request.url()?;
-    let route_path = canonical_route_path(url.path());
+    let canonical_path = canonical_route_path(url.path());
+    let route_path = compatibility_route_path(canonical_path.as_ref());
 
     match (request.method(), route_path.as_ref()) {
         (Method::Options, path) if cors_path(path) => cors_preflight(request, env).await,
@@ -1677,10 +1678,17 @@ async fn handle_request(request: Request, env: Env) -> worker::Result<Response> 
         (Method::Get, "/ready") => ready(request, env),
         (Method::Get, "/providers") => json(&provider_responses(&env)),
         (Method::Get, "/providers/status") => provider_status(request, env).await,
+        (Method::Get, "/api/providers/status") => provider_status(request, env).await,
         (Method::Get, "/local-auth/status") => local_auth_status(request, env).await,
+        (Method::Get, "/api/local-auth/status") => local_auth_status(request, env).await,
         (Method::Get | Method::Post | Method::Delete, "/clients") => clients(request, env).await,
+        (Method::Get | Method::Post | Method::Delete, "/api/clients") => {
+            clients(request, env).await
+        }
         (Method::Get | Method::Patch, "/users") => users(request, env).await,
+        (Method::Get | Method::Patch, "/api/users") => users(request, env).await,
         (Method::Get, "/events") => events(request, env).await,
+        (Method::Get, "/api/events") => events(request, env).await,
         (Method::Get, "/routes") => json(&RoutesResponse {
             routes: ROUTES
                 .iter()
@@ -1707,11 +1715,15 @@ async fn handle_request(request: Request, env: Env) -> worker::Result<Response> 
         (Method::Get, "/account") => hosted_account(request, env).await,
         (Method::Get, "/admin") => hosted_clients_admin(request, env).await,
         (Method::Get, "/admin/clients") => hosted_clients_admin(request, env).await,
+        (Method::Get, path) if admin_console_alias_path(path) => {
+            hosted_clients_admin(request, env).await
+        }
         (Method::Get, path) if provider_authorize_alias_path(path) => {
             redirect_to_provider_authorize_alias(&url)
         }
         (Method::Get, "/authorize") => authorize(request, env).await,
         (Method::Get, "/__zeroth/db/status") => d1_schema_status(request, env).await,
+        (Method::Get, "/api/__zeroth/db/status") => d1_schema_status(request, env).await,
         (Method::Post, "/__zeroth/db/ensure") => ensure_d1_schema(request, env).await,
         (Method::Get | Method::Post, path) if provider_callback_alias_path(path) => {
             provider_callback(request, env).await
@@ -1738,21 +1750,32 @@ async fn handle_request(request: Request, env: Env) -> worker::Result<Response> 
         (Method::Post, "/passkeys/authenticate/options" | "/passkeys/authentication/options") => {
             passkey_authenticate_options(request, env).await
         }
+        (Method::Post, "/passkeys/login/options") => {
+            passkey_authenticate_options(request, env).await
+        }
         (
             Method::Post,
             "/passkeys/authenticate/verify"
             | "/passkeys/authenticate/finish"
             | "/passkeys/authentication/finish",
         ) => passkey_authenticate_verify(request, env).await,
-        (Method::Get, "/password/register" | "/password/login" | "/magic-links") => {
-            redirect_local_auth_get_to_login(request, env)
+        (Method::Post, "/passkeys/login/verify" | "/passkeys/login/finish") => {
+            passkey_authenticate_verify(request, env).await
         }
+        (
+            Method::Get,
+            "/password/register" | "/password/login" | "/magic-links" | "/magic-link"
+                | "/magic_link",
+        ) => redirect_local_auth_get_to_login(request, env),
         (Method::Post, "/password/register") => password_register(request, env).await,
         (Method::Post, "/password/login") => password_login(request, env).await,
-        (Method::Post, "/magic-links") => magic_link_request(request, env).await,
-        (Method::Get | Method::Post, "/magic-links/consume") => {
-            magic_link_consume(request, env).await
+        (Method::Post, "/magic-links" | "/magic-link" | "/magic_link" | "/magic-links/request") => {
+            magic_link_request(request, env).await
         }
+        (
+            Method::Get | Method::Post,
+            "/magic-links/consume" | "/magic-link/consume" | "/magic_link/consume",
+        ) => magic_link_consume(request, env).await,
         (Method::Get, "/validate") => validate(request, env).await,
         (Method::Get | Method::Post, "/logout") => logout(request, env).await,
         _ => json_status(&serde_json::json!({ "error": "not_found" }), 404),
@@ -4096,7 +4119,8 @@ async fn cors_preflight(request: Request, env: Env) -> worker::Result<Response> 
     let requested_method = request_header(&request, "Access-Control-Request-Method")?
         .unwrap_or_default()
         .to_ascii_uppercase();
-    let route_path = canonical_route_path(url.path());
+    let canonical_path = canonical_route_path(url.path());
+    let route_path = compatibility_route_path(canonical_path.as_ref());
     if !cors_method_allowed(route_path.as_ref(), &requested_method) {
         return Response::empty().map(|response| response.with_status(405));
     }
@@ -4228,6 +4252,53 @@ fn canonical_route_path(path: &str) -> Cow<'_, str> {
         Cow::Borrowed("/")
     } else {
         Cow::Owned(trimmed.to_owned())
+    }
+}
+
+fn compatibility_route_path(path: &str) -> Cow<'_, str> {
+    match path {
+        "/api/providers/status" => Cow::Borrowed("/providers/status"),
+        "/api/local-auth/status" => Cow::Borrowed("/local-auth/status"),
+        "/api/clients" => Cow::Borrowed("/clients"),
+        "/api/users" => Cow::Borrowed("/users"),
+        "/api/events" => Cow::Borrowed("/events"),
+        "/api/__zeroth/db/status" => Cow::Borrowed("/__zeroth/db/status"),
+        "/api/password/register" | "/local-auth/password/register" => {
+            Cow::Borrowed("/password/register")
+        }
+        "/api/password/login" | "/local-auth/password/login" => Cow::Borrowed("/password/login"),
+        "/magic-link"
+        | "/magic_link"
+        | "/magic-links/request"
+        | "/api/magic-links"
+        | "/api/magic-link"
+        | "/api/magic-links/request"
+        | "/local-auth/magic-links"
+        | "/local-auth/magic-link"
+        | "/local-auth/magic-links/request" => Cow::Borrowed("/magic-links"),
+        "/magic-link/consume"
+        | "/magic_link/consume"
+        | "/api/magic-links/consume"
+        | "/api/magic-link/consume"
+        | "/local-auth/magic-links/consume"
+        | "/local-auth/magic-link/consume" => Cow::Borrowed("/magic-links/consume"),
+        "/api/passkeys/register/options" => Cow::Borrowed("/passkeys/register/options"),
+        "/api/passkeys/register/verify" => Cow::Borrowed("/passkeys/register/verify"),
+        "/api/passkeys/register/finish" => Cow::Borrowed("/passkeys/register/finish"),
+        "/api/passkeys/authenticate/options" => Cow::Borrowed("/passkeys/authenticate/options"),
+        "/api/passkeys/authenticate/verify" => Cow::Borrowed("/passkeys/authenticate/verify"),
+        "/api/passkeys/authenticate/finish" => Cow::Borrowed("/passkeys/authenticate/finish"),
+        "/api/passkeys/login/options" | "/passkeys/login/options" => {
+            Cow::Borrowed("/passkeys/authenticate/options")
+        }
+        "/api/passkeys/login/verify" | "/passkeys/login/verify" => {
+            Cow::Borrowed("/passkeys/authenticate/verify")
+        }
+        "/api/passkeys/login/finish" | "/passkeys/login/finish" => {
+            Cow::Borrowed("/passkeys/authenticate/finish")
+        }
+        _ if admin_console_alias_path(path) => Cow::Borrowed("/admin"),
+        _ => Cow::Borrowed(path),
     }
 }
 
@@ -5355,6 +5426,14 @@ fn client_admin_ui_from_row(row: ClientRow) -> Result<ClientAdminUi, String> {
 
 fn provider_authorize_alias_path(path: &str) -> bool {
     provider_segment_alias(path, "/providers/", "/authorize").is_some()
+}
+
+fn admin_console_alias_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/admin/users" | "/admin/events" | "/admin/providers" | "/admin/local-auth"
+            | "/admin/database"
+    )
 }
 
 fn provider_callback_alias_path(path: &str) -> bool {
@@ -11602,7 +11681,12 @@ fn cors_path(path: &str) -> bool {
             | "/password/register"
             | "/password/login"
             | "/magic-links"
+            | "/magic-link"
+            | "/magic_link"
+            | "/magic-links/request"
             | "/magic-links/consume"
+            | "/magic-link/consume"
+            | "/magic_link/consume"
             | "/validate"
             | "/logout"
     )
@@ -11617,8 +11701,12 @@ fn cors_method_allowed(path: &str, method: &str) -> bool {
         "/identities" => method == "GET" || method == "DELETE",
         "/password/register" => method == "POST",
         "/password/login" => method == "POST",
-        "/magic-links" => method == "POST",
-        "/magic-links/consume" => method == "GET" || method == "POST",
+        "/magic-links" | "/magic-link" | "/magic_link" | "/magic-links/request" => {
+            method == "POST"
+        }
+        "/magic-links/consume" | "/magic-link/consume" | "/magic_link/consume" => {
+            method == "GET" || method == "POST"
+        }
         "/sessions" => method == "GET" || method == "DELETE",
         "/logout" => method == "GET" || method == "POST",
         _ => false,
@@ -16864,6 +16952,57 @@ mod tests {
     }
 
     #[test]
+    fn admin_console_alias_paths_are_bounded() {
+        assert!(admin_console_alias_path("/admin/users"));
+        assert!(admin_console_alias_path("/admin/events"));
+        assert!(admin_console_alias_path("/admin/providers"));
+        assert!(admin_console_alias_path("/admin/local-auth"));
+        assert!(admin_console_alias_path("/admin/database"));
+        assert!(!admin_console_alias_path("/admin"));
+        assert!(!admin_console_alias_path("/admin/users/export"));
+    }
+
+    #[test]
+    fn compatibility_route_path_maps_bounded_aliases_to_canonical_routes() {
+        assert_eq!(
+            compatibility_route_path("/admin/users").as_ref(),
+            "/admin"
+        );
+        assert_eq!(
+            compatibility_route_path("/api/clients").as_ref(),
+            "/clients"
+        );
+        assert_eq!(
+            compatibility_route_path("/api/local-auth/status").as_ref(),
+            "/local-auth/status"
+        );
+        assert_eq!(
+            compatibility_route_path("/local-auth/magic-links").as_ref(),
+            "/magic-links"
+        );
+        assert_eq!(
+            compatibility_route_path("/api/magic-links/request").as_ref(),
+            "/magic-links"
+        );
+        assert_eq!(
+            compatibility_route_path("/local-auth/magic-links/consume").as_ref(),
+            "/magic-links/consume"
+        );
+        assert_eq!(
+            compatibility_route_path("/api/password/login").as_ref(),
+            "/password/login"
+        );
+        assert_eq!(
+            compatibility_route_path("/api/passkeys/login/options").as_ref(),
+            "/passkeys/authenticate/options"
+        );
+        assert_eq!(
+            compatibility_route_path("/admin/users/export").as_ref(),
+            "/admin/users/export"
+        );
+    }
+
+    #[test]
     fn cookie_value_extracts_named_cookie() {
         let cookie = cookie_value(
             Some("theme=dark; zeroth_session=sess_123; other=value"),
@@ -17148,7 +17287,12 @@ mod tests {
         assert!(cors_path("/password/register"));
         assert!(cors_path("/password/login"));
         assert!(cors_path("/magic-links"));
+        assert!(cors_path("/magic-link"));
+        assert!(cors_path("/magic_link"));
+        assert!(cors_path("/magic-links/request"));
         assert!(cors_path("/magic-links/consume"));
+        assert!(cors_path("/magic-link/consume"));
+        assert!(cors_path("/magic_link/consume"));
         assert!(cors_path("/validate"));
         assert!(cors_path("/logout"));
         assert!(!cors_path("/authorize"));
@@ -17174,6 +17318,9 @@ mod tests {
         assert!(cors_method_allowed("/password/login", "POST"));
         assert!(!cors_method_allowed("/password/login", "GET"));
         assert!(cors_method_allowed("/magic-links", "POST"));
+        assert!(cors_method_allowed("/magic-link", "POST"));
+        assert!(cors_method_allowed("/magic_link", "POST"));
+        assert!(cors_method_allowed("/magic-links/request", "POST"));
         assert!(!cors_method_allowed("/magic-links", "GET"));
         let magic_links_trailing_slash = canonical_route_path("/magic-links/");
         assert!(cors_path(magic_links_trailing_slash.as_ref()));
@@ -17184,10 +17331,21 @@ mod tests {
         assert!(cors_method_allowed("/magic-links/consume", "GET"));
         assert!(cors_method_allowed("/magic-links/consume", "POST"));
         assert!(!cors_method_allowed("/magic-links/consume", "DELETE"));
+        assert!(cors_method_allowed("/magic-link/consume", "GET"));
+        assert!(cors_method_allowed("/magic-link/consume", "POST"));
+        assert!(cors_method_allowed("/magic_link/consume", "GET"));
+        assert!(cors_method_allowed("/magic_link/consume", "POST"));
         assert!(cors_method_allowed("/validate", "GET"));
         assert!(cors_method_allowed("/logout", "GET"));
         assert!(cors_method_allowed("/logout", "POST"));
         assert!(!cors_method_allowed("/logout", "PUT"));
+
+        let local_auth_magic_links = compatibility_route_path("/local-auth/magic-links");
+        assert!(cors_path(local_auth_magic_links.as_ref()));
+        assert!(cors_method_allowed(
+            local_auth_magic_links.as_ref(),
+            "POST"
+        ));
     }
 
     #[test]
