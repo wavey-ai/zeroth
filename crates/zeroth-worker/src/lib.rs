@@ -19156,6 +19156,10 @@ mod tests {
             "jamie+zeroth@wavey.ai"
         );
         assert_eq!(
+            validate_local_auth_email("jame1612+test123@gmail.com").unwrap(),
+            "jame1612+test123@gmail.com"
+        );
+        assert_eq!(
             validate_passkey_email("person+product@example.com").unwrap(),
             "person+product@example.com"
         );

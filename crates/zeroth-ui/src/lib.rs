@@ -1393,8 +1393,6 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
         .unwrap_or(config.redirect_uri.clone());
     let password_login_action = endpoint_url(&config, "/password/login");
     let password_register_action = endpoint_url(&config, "/password/register");
-    let magic_link_action = endpoint_url(&config, "/magic-links");
-
     let provider_rows = providers
         .into_iter()
         .map(|provider| provider_row(&config, provider, signed_in))
@@ -1495,18 +1493,6 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
                                         </div>
                                     </form>
 
-                                    <div class="zeroth-divider">"Magic link"</div>
-                                    <form class="zeroth-form zeroth-login-form" method="post" action=magic_link_action data-zeroth-local-auth="magic-link">
-                                        <input type="hidden" name="clientId" value=config.client_id.clone() />
-                                        <input type="hidden" name="returnTo" value=login_return_to.clone() />
-                                        <div class="zeroth-login-actions">
-                                            <div class="zeroth-field">
-                                                <label for="zeroth-magic-email">"Email"</label>
-                                                <input id="zeroth-magic-email" name="email" type="email" autocomplete="email" />
-                                            </div>
-                                            <button class="zeroth-action" type="submit">"Send link"</button>
-                                        </div>
-                                    </form>
                                 </div>
 
                                 <div class="zeroth-divider">"Passkey"</div>
@@ -2874,11 +2860,7 @@ document.addEventListener("submit", async (event) => {
       window.location.assign(body.returnTo);
       return;
     }
-    if (response.ok) {
-      window.alert(body.sent ? "Magic link sent" : "Magic link email could not be sent");
-      if (body.devLink) window.location.assign(body.devLink);
-      return;
-    }
+    if (response.ok) return;
     window.alert(zerothErrorMessage(body, "Sign in failed"));
     return;
   }
@@ -3989,7 +3971,8 @@ mod tests {
         assert!(html.contains("zeroth-status zeroth-hidden"));
         assert!(html.contains("/password/login"));
         assert!(html.contains("/password/register"));
-        assert!(html.contains("/magic-links"));
+        assert!(!html.contains("/magic-links"));
+        assert!(!html.contains("Magic link"));
         assert!(html.contains("zeroth-account-passkey-login"));
         assert!(html.contains("Use passkey"));
         assert!(html.contains("zeroth-login-card"));
@@ -4106,7 +4089,7 @@ mod tests {
 
         assert!(document.contains("function zerothErrorMessage(body, fallback)"));
         assert!(document.contains("body.errorDescription || body.error_description"));
-        assert!(document.contains("Magic link email could not be sent"));
+        assert!(!document.contains("Magic link email could not be sent"));
     }
 
     #[test]
