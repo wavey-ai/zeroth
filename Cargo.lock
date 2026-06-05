@@ -2594,6 +2594,10 @@ version = "0.1.0"
 name = "zeroth-oidc"
 version = "0.1.0"
 dependencies = [
+ "base64",
+ "serde",
+ "serde_json",
+ "sha2",
  "url",
  "zeroth-core",
 ]

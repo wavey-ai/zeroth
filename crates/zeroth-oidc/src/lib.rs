@@ -1,7 +1,13 @@
 //! OIDC protocol surface for Zeroth.
 
-use url::Url;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use url::{form_urlencoded, Url};
 use zeroth_core::{Client, ClientId, ScopeSet, UserId};
+
+pub const PKCE_CODE_VERIFIER_MIN_LEN: usize = 43;
+pub const PKCE_CODE_VERIFIER_MAX_LEN: usize = 128;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OidcIssuer {
@@ -26,9 +32,54 @@ pub struct AuthorizationRequest {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RelyingPartyAuthorizationRequest {
+    pub client_id: ClientId,
+    pub redirect_uri: String,
+    pub scope: ScopeSet,
+    pub state: Option<String>,
+    pub nonce: Option<String>,
+    pub prompt: AuthorizationPrompt,
+    pub max_age: Option<i32>,
+    pub code_challenge: String,
+    pub provider: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuthorizationRequestError {
     pub code: &'static str,
     pub description: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthorizationResponseError {
+    pub code: &'static str,
+    pub description: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AuthorizationResponse {
+    Code(AuthorizationCodeResponse),
+    Error(AuthorizationErrorResponse),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthorizationCodeResponse {
+    pub code: String,
+    pub state: Option<String>,
+    pub issuer: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthorizationErrorResponse {
+    pub error: String,
+    pub error_description: Option<String>,
+    pub state: Option<String>,
+    pub issuer: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PkceVerifierError {
+    pub description: &'static str,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -63,12 +114,16 @@ pub enum GrantType {
     RefreshToken,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TokenResponse {
+    #[serde(rename = "access_token")]
     pub access_token: String,
+    #[serde(rename = "id_token")]
     pub id_token: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub refresh_token: Option<String>,
     pub expires_in: u64,
+    #[serde(rename = "token_type")]
     pub token_type: String,
 }
 
@@ -97,6 +152,226 @@ impl OidcIssuer {
     pub fn provider_callback_endpoint(&self) -> String {
         format!("{}/oauth2/callback", self.issuer)
     }
+}
+
+impl RelyingPartyAuthorizationRequest {
+    pub fn new(
+        client_id: impl Into<String>,
+        redirect_uri: impl Into<String>,
+        code_challenge: impl Into<String>,
+    ) -> Self {
+        Self {
+            client_id: ClientId(client_id.into()),
+            redirect_uri: redirect_uri.into(),
+            scope: ScopeSet::new(["openid", "profile", "email"]),
+            state: None,
+            nonce: None,
+            prompt: AuthorizationPrompt::Default,
+            max_age: None,
+            code_challenge: code_challenge.into(),
+            provider: None,
+        }
+    }
+
+    pub fn with_scope(mut self, scope: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.scope = ScopeSet::new(scope);
+        self
+    }
+
+    pub fn with_state(mut self, state: impl Into<String>) -> Self {
+        self.state = Some(state.into());
+        self
+    }
+
+    pub fn with_nonce(mut self, nonce: impl Into<String>) -> Self {
+        self.nonce = Some(nonce.into());
+        self
+    }
+
+    pub fn with_provider(mut self, provider: impl Into<String>) -> Self {
+        self.provider = Some(provider.into());
+        self
+    }
+
+    pub fn with_prompt(mut self, prompt: AuthorizationPrompt) -> Self {
+        self.prompt = prompt;
+        self
+    }
+
+    pub fn with_max_age(mut self, max_age: i32) -> Self {
+        self.max_age = Some(max_age);
+        self
+    }
+}
+
+impl TokenRequest {
+    pub fn authorization_code(
+        client_id: impl Into<String>,
+        redirect_uri: impl Into<String>,
+        code: impl Into<String>,
+        code_verifier: impl Into<String>,
+    ) -> Self {
+        Self {
+            grant_type: GrantType::AuthorizationCode,
+            client_id: ClientId(client_id.into()),
+            redirect_uri: Some(redirect_uri.into()),
+            code: Some(code.into()),
+            code_verifier: Some(code_verifier.into()),
+            refresh_token: None,
+        }
+    }
+
+    pub fn refresh_token(client_id: impl Into<String>, refresh_token: impl Into<String>) -> Self {
+        Self {
+            grant_type: GrantType::RefreshToken,
+            client_id: ClientId(client_id.into()),
+            redirect_uri: None,
+            code: None,
+            code_verifier: None,
+            refresh_token: Some(refresh_token.into()),
+        }
+    }
+
+    pub fn to_form_urlencoded(&self) -> String {
+        token_request_form(self)
+    }
+}
+
+impl GrantType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::AuthorizationCode => "authorization_code",
+            Self::RefreshToken => "refresh_token",
+        }
+    }
+}
+
+pub fn relying_party_authorization_url(
+    issuer: &OidcIssuer,
+    request: &RelyingPartyAuthorizationRequest,
+) -> Result<Url, AuthorizationRequestError> {
+    validate_pkce_code_challenge(&request.code_challenge)?;
+    if let Some(max_age) = request.max_age {
+        if max_age < 0 {
+            return Err(AuthorizationRequestError::invalid_request(
+                "max_age must be a non-negative integer",
+            ));
+        }
+    }
+
+    let mut url = Url::parse(&issuer.authorization_endpoint).map_err(|error| {
+        AuthorizationRequestError::invalid_request(format!(
+            "invalid authorization endpoint: {error}"
+        ))
+    })?;
+    {
+        let mut pairs = url.query_pairs_mut();
+        pairs.append_pair("response_type", "code");
+        pairs.append_pair("client_id", &request.client_id.0);
+        pairs.append_pair("redirect_uri", &request.redirect_uri);
+        pairs.append_pair("scope", &request.scope.as_slice().join(" "));
+        pairs.append_pair("code_challenge", &request.code_challenge);
+        pairs.append_pair("code_challenge_method", PkceChallengeMethod::S256.as_str());
+        if let Some(state) = &request.state {
+            pairs.append_pair("state", state);
+        }
+        if let Some(nonce) = &request.nonce {
+            pairs.append_pair("nonce", nonce);
+        }
+        if let Some(provider) = &request.provider {
+            pairs.append_pair("provider", provider);
+        }
+        if !matches!(request.prompt, AuthorizationPrompt::Default) {
+            pairs.append_pair("prompt", request.prompt.as_str());
+        }
+        if let Some(max_age) = request.max_age {
+            pairs.append_pair("max_age", &max_age.to_string());
+        }
+    }
+    Ok(url)
+}
+
+pub fn parse_authorization_response(
+    url: &Url,
+    expected_issuer: Option<&str>,
+    expected_state: Option<&str>,
+) -> Result<AuthorizationResponse, AuthorizationResponseError> {
+    let state = query_param(url, "state");
+    validate_authorization_response_state(state.as_deref(), expected_state)?;
+    let issuer = query_param(url, "iss");
+    validate_authorization_response_issuer(issuer.as_deref(), expected_issuer)?;
+
+    if let Some(error) = query_param(url, "error") {
+        if error.is_empty() {
+            return Err(AuthorizationResponseError::invalid_response(
+                "authorization error code must not be empty",
+            ));
+        }
+        return Ok(AuthorizationResponse::Error(AuthorizationErrorResponse {
+            error,
+            error_description: query_param(url, "error_description"),
+            state,
+            issuer,
+        }));
+    }
+
+    let code = query_param(url, "code").ok_or_else(|| {
+        AuthorizationResponseError::invalid_response(
+            "authorization response must include code or error",
+        )
+    })?;
+    if code.is_empty() {
+        return Err(AuthorizationResponseError::invalid_response(
+            "authorization code must not be empty",
+        ));
+    }
+    Ok(AuthorizationResponse::Code(AuthorizationCodeResponse {
+        code,
+        state,
+        issuer,
+    }))
+}
+
+pub fn token_request_form(request: &TokenRequest) -> String {
+    let mut serializer = form_urlencoded::Serializer::new(String::new());
+    serializer.append_pair("grant_type", request.grant_type.as_str());
+    serializer.append_pair("client_id", &request.client_id.0);
+    if let Some(redirect_uri) = &request.redirect_uri {
+        serializer.append_pair("redirect_uri", redirect_uri);
+    }
+    if let Some(code) = &request.code {
+        serializer.append_pair("code", code);
+    }
+    if let Some(code_verifier) = &request.code_verifier {
+        serializer.append_pair("code_verifier", code_verifier);
+    }
+    if let Some(refresh_token) = &request.refresh_token {
+        serializer.append_pair("refresh_token", refresh_token);
+    }
+    serializer.finish()
+}
+
+pub fn validate_pkce_code_verifier(code_verifier: &str) -> Result<(), PkceVerifierError> {
+    let len = code_verifier.len();
+    if !(PKCE_CODE_VERIFIER_MIN_LEN..=PKCE_CODE_VERIFIER_MAX_LEN).contains(&len) {
+        return Err(PkceVerifierError {
+            description: "code_verifier must be 43 to 128 characters",
+        });
+    }
+    if !code_verifier
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~'))
+    {
+        return Err(PkceVerifierError {
+            description: "code_verifier contains unsupported characters",
+        });
+    }
+    Ok(())
+}
+
+pub fn pkce_s256_challenge(code_verifier: &str) -> Result<String, PkceVerifierError> {
+    validate_pkce_code_verifier(code_verifier)?;
+    Ok(URL_SAFE_NO_PAD.encode(Sha256::digest(code_verifier.as_bytes())))
 }
 
 pub fn parse_authorization_request(
@@ -254,6 +529,29 @@ impl AuthorizationRequestError {
     }
 }
 
+impl AuthorizationResponseError {
+    pub fn invalid_response(description: impl Into<String>) -> Self {
+        Self {
+            code: "invalid_response",
+            description: description.into(),
+        }
+    }
+
+    pub fn invalid_state(description: impl Into<String>) -> Self {
+        Self {
+            code: "invalid_state",
+            description: description.into(),
+        }
+    }
+
+    pub fn invalid_issuer(description: impl Into<String>) -> Self {
+        Self {
+            code: "invalid_issuer",
+            description: description.into(),
+        }
+    }
+}
+
 impl PkceChallengeMethod {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -264,9 +562,72 @@ impl PkceChallengeMethod {
 }
 
 impl AuthorizationPrompt {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Default => "",
+            Self::None => "none",
+            Self::Login => "login",
+            Self::Consent => "consent",
+            Self::SelectAccount => "select_account",
+        }
+    }
+
     pub fn allows_session_reuse(&self) -> bool {
         !matches!(self, Self::Login | Self::SelectAccount)
     }
+}
+
+fn validate_pkce_code_challenge(code_challenge: &str) -> Result<(), AuthorizationRequestError> {
+    let len = code_challenge.len();
+    if !(PKCE_CODE_VERIFIER_MIN_LEN..=PKCE_CODE_VERIFIER_MAX_LEN).contains(&len) {
+        return Err(AuthorizationRequestError::invalid_request(
+            "code_challenge must be 43 to 128 characters",
+        ));
+    }
+    if !code_challenge
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~'))
+    {
+        return Err(AuthorizationRequestError::invalid_request(
+            "code_challenge contains unsupported characters",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_authorization_response_state(
+    actual: Option<&str>,
+    expected: Option<&str>,
+) -> Result<(), AuthorizationResponseError> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    if actual == Some(expected) {
+        return Ok(());
+    }
+    Err(AuthorizationResponseError::invalid_state(
+        "authorization response state did not match",
+    ))
+}
+
+fn validate_authorization_response_issuer(
+    actual: Option<&str>,
+    expected: Option<&str>,
+) -> Result<(), AuthorizationResponseError> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let Some(actual) = actual else {
+        return Err(AuthorizationResponseError::invalid_issuer(
+            "authorization response issuer is missing",
+        ));
+    };
+    if actual == expected {
+        return Ok(());
+    }
+    Err(AuthorizationResponseError::invalid_issuer(
+        "authorization response issuer did not match",
+    ))
 }
 
 fn parse_prompt(raw: &str) -> Result<AuthorizationPrompt, AuthorizationRequestError> {
@@ -339,6 +700,198 @@ fn query_param(url: &Url, name: &str) -> Option<String> {
 mod tests {
     use super::*;
     use zeroth_core::ClientId;
+
+    #[test]
+    fn pkce_s256_challenge_matches_rfc7636_example() {
+        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+
+        let challenge = pkce_s256_challenge(verifier).unwrap();
+
+        assert_eq!(challenge, "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM");
+    }
+
+    #[test]
+    fn pkce_verifier_validation_is_bounded_and_unreserved() {
+        let short = "short";
+        let invalid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa!";
+
+        assert_eq!(
+            pkce_s256_challenge(short).unwrap_err().description,
+            "code_verifier must be 43 to 128 characters"
+        );
+        assert_eq!(
+            pkce_s256_challenge(invalid).unwrap_err().description,
+            "code_verifier contains unsupported characters"
+        );
+    }
+
+    #[test]
+    fn relying_party_authorization_url_builds_public_pkce_request() {
+        let issuer = OidcIssuer::from_base_url("https://id.example.com/");
+        let request = RelyingPartyAuthorizationRequest::new(
+            "wavey-browser",
+            "https://wavey.ai/auth/callback",
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+        )
+        .with_state("state-1")
+        .with_nonce("nonce-1")
+        .with_provider("google")
+        .with_prompt(AuthorizationPrompt::Login)
+        .with_max_age(0);
+
+        let url = relying_party_authorization_url(&issuer, &request).unwrap();
+
+        assert_eq!(
+            url.as_str().split('?').next(),
+            Some("https://id.example.com/authorize")
+        );
+        assert_eq!(query_param(&url, "response_type"), Some("code".to_owned()));
+        assert_eq!(
+            query_param(&url, "client_id"),
+            Some("wavey-browser".to_owned())
+        );
+        assert_eq!(
+            query_param(&url, "redirect_uri"),
+            Some("https://wavey.ai/auth/callback".to_owned())
+        );
+        assert_eq!(
+            query_param(&url, "scope"),
+            Some("openid profile email".to_owned())
+        );
+        assert_eq!(
+            query_param(&url, "code_challenge"),
+            Some("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".to_owned())
+        );
+        assert_eq!(
+            query_param(&url, "code_challenge_method"),
+            Some("S256".to_owned())
+        );
+        assert_eq!(query_param(&url, "state"), Some("state-1".to_owned()));
+        assert_eq!(query_param(&url, "nonce"), Some("nonce-1".to_owned()));
+        assert_eq!(query_param(&url, "provider"), Some("google".to_owned()));
+        assert_eq!(query_param(&url, "prompt"), Some("login".to_owned()));
+        assert_eq!(query_param(&url, "max_age"), Some("0".to_owned()));
+    }
+
+    #[test]
+    fn authorization_response_validates_state_and_issuer() {
+        let url = Url::parse(
+            "https://wavey.ai/auth/callback?code=code-1&state=state-1&iss=https%3A%2F%2Fid.example.com",
+        )
+        .unwrap();
+
+        let response =
+            parse_authorization_response(&url, Some("https://id.example.com"), Some("state-1"))
+                .unwrap();
+
+        assert_eq!(
+            response,
+            AuthorizationResponse::Code(AuthorizationCodeResponse {
+                code: "code-1".to_owned(),
+                state: Some("state-1".to_owned()),
+                issuer: Some("https://id.example.com".to_owned())
+            })
+        );
+    }
+
+    #[test]
+    fn authorization_response_preserves_error_response() {
+        let url = Url::parse(
+            "https://wavey.ai/auth/callback?error=login_required&error_description=No%20session&state=state-1&iss=https%3A%2F%2Fid.example.com",
+        )
+        .unwrap();
+
+        let response =
+            parse_authorization_response(&url, Some("https://id.example.com"), Some("state-1"))
+                .unwrap();
+
+        assert_eq!(
+            response,
+            AuthorizationResponse::Error(AuthorizationErrorResponse {
+                error: "login_required".to_owned(),
+                error_description: Some("No session".to_owned()),
+                state: Some("state-1".to_owned()),
+                issuer: Some("https://id.example.com".to_owned())
+            })
+        );
+    }
+
+    #[test]
+    fn authorization_response_rejects_state_or_issuer_mismatch() {
+        let url = Url::parse(
+            "https://wavey.ai/auth/callback?code=code-1&state=state-1&iss=https%3A%2F%2Fid.example.com",
+        )
+        .unwrap();
+
+        let state_error =
+            parse_authorization_response(&url, Some("https://id.example.com"), Some("other"))
+                .unwrap_err();
+        let issuer_error =
+            parse_authorization_response(&url, Some("https://id.other"), Some("state-1"))
+                .unwrap_err();
+
+        assert_eq!(state_error.code, "invalid_state");
+        assert_eq!(
+            state_error.description,
+            "authorization response state did not match"
+        );
+        assert_eq!(issuer_error.code, "invalid_issuer");
+        assert_eq!(
+            issuer_error.description,
+            "authorization response issuer did not match"
+        );
+    }
+
+    #[test]
+    fn token_request_form_encodes_code_and_refresh_grants() {
+        let code = TokenRequest::authorization_code(
+            "wavey-browser",
+            "https://wavey.ai/auth/callback",
+            "code-1",
+            "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk",
+        )
+        .to_form_urlencoded();
+        let refresh =
+            TokenRequest::refresh_token("wavey-browser", "refresh-1").to_form_urlencoded();
+
+        let code_pairs = form_urlencoded::parse(code.as_bytes()).collect::<Vec<_>>();
+        let refresh_pairs = form_urlencoded::parse(refresh.as_bytes()).collect::<Vec<_>>();
+
+        assert!(code_pairs.contains(&("grant_type".into(), "authorization_code".into())));
+        assert!(code_pairs.contains(&("client_id".into(), "wavey-browser".into())));
+        assert!(code_pairs.contains(&(
+            "redirect_uri".into(),
+            "https://wavey.ai/auth/callback".into()
+        )));
+        assert!(code_pairs.contains(&("code".into(), "code-1".into())));
+        assert!(code_pairs.contains(&(
+            "code_verifier".into(),
+            "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk".into()
+        )));
+        assert!(refresh_pairs.contains(&("grant_type".into(), "refresh_token".into())));
+        assert!(refresh_pairs.contains(&("client_id".into(), "wavey-browser".into())));
+        assert!(refresh_pairs.contains(&("refresh_token".into(), "refresh-1".into())));
+    }
+
+    #[test]
+    fn token_response_deserializes_oidc_json() {
+        let response: TokenResponse = serde_json::from_str(
+            r#"{
+              "access_token": "access-1",
+              "id_token": "id-1",
+              "refresh_token": "refresh-1",
+              "expires_in": 3600,
+              "token_type": "Bearer"
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(response.access_token, "access-1");
+        assert_eq!(response.id_token, "id-1");
+        assert_eq!(response.refresh_token, Some("refresh-1".to_owned()));
+        assert_eq!(response.expires_in, 3600);
+        assert_eq!(response.token_type, "Bearer");
+    }
 
     #[test]
     fn parses_authorization_code_request_with_pkce() {
