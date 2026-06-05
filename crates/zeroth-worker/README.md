@@ -253,11 +253,14 @@ wrangler secret put ADMIN_TOKEN # or ADMIN_TOKEN_SHA256
 wrangler secret put ADMIN_USER_IDS # optional first-party admin session allowlist
 wrangler secret put ADMIN_EMAILS # optional verified primary-email allowlist
 wrangler secret put APPLE_APP_SITE_ASSOCIATION_JSON # optional public AASA payload
+wrangler secret put MAGIC_LINK_WEBHOOK_BEARER # optional webhook auth
 ```
 
 Non-secret deployment vars include `PUBLIC_BASE_URL`, `SESSION_COOKIE_NAME`,
 `TX_COOKIE_NAME`, `APPLE_NATIVE_CLIENT_IDS`, `GOOGLE_NATIVE_CLIENT_IDS`,
-`SPOTIFY_NATIVE_CLIENT_IDS`, and optional `SESSION_COOKIE_DOMAIN`. Leave
+`SPOTIFY_NATIVE_CLIENT_IDS`, `MAGIC_LINK_FROM`, optional
+`MAGIC_LINK_DELIVERY`, optional `MAGIC_LINK_WEBHOOK_URL`, and optional
+`SESSION_COOKIE_DOMAIN`. Leave
 `SESSION_COOKIE_DOMAIN` unset for a host-only Zeroth session cookie, or set it
 to a parent domain such as `.example.com` when one first-party registrable
 domain owns multiple subdomain apps. This is the Zeroth-native equivalent of
@@ -273,6 +276,16 @@ calling Spotify's profile endpoint because Spotify does not expose an OIDC ID
 token for that mobile SDK path. When Spotify returns `account_id`, Zeroth uses
 that immutable profile value for account linking and falls back to legacy `id`
 only for older responses.
+
+Magic-link local auth defaults to `MAGIC_LINK_DELIVERY=cloudflare_email`. That
+requires `MAGIC_LINK_FROM` and a Worker `send_email` binding named `EMAIL`.
+Set `MAGIC_LINK_DELIVERY=webhook` to use a generic HTTPS email sender instead;
+Zeroth will POST JSON containing `kind`, `to`, `from`, `fromName`, `subject`,
+`text`, `html`, `link`, and `productName` to `MAGIC_LINK_WEBHOOK_URL`. If
+`MAGIC_LINK_WEBHOOK_BEARER` or `MAGIC_LINK_WEBHOOK_TOKEN` is configured as a
+secret, Zeroth sends it as `Authorization: Bearer ...`. Webhook delivery treats
+any 2xx response as sent and records only bounded transport error classes in
+audit events.
 
 Apple can be configured in either of two ways:
 

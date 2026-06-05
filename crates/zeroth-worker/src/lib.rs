@@ -99,6 +99,9 @@ const PASSWORD_PBKDF2_MAX_ITERATIONS: u32 = 100_000;
 const MAGIC_LINK_TTL_SECONDS: i32 = 10 * 60;
 const MAGIC_LINK_CLEANUP_LIMIT: i32 = 64;
 const MAGIC_LINK_EMAIL_ERROR_DETAIL_MAX_CHARS: usize = 160;
+const MAGIC_LINK_DELIVERY_CLOUDFLARE_EMAIL: &str = "cloudflare_email";
+const MAGIC_LINK_DELIVERY_WEBHOOK: &str = "webhook";
+const MAGIC_LINK_DELIVERY_UNSUPPORTED: &str = "unsupported";
 const PROFILE_PATCH_BODY_LIMIT: usize = 4 * 1024;
 const PROFILE_NAME_MAX_CHARS: usize = 128;
 const PROFILE_PICTURE_MAX_BYTES: usize = 2048;
@@ -436,6 +439,19 @@ struct LocalAuthDeliveryStatus {
     last_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     last_error_detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct MagicLinkDeliveryConfig {
+    transport: &'static str,
+    enabled: bool,
+    notes: Vec<&'static str>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum MagicLinkDeliveryTransport {
+    CloudflareEmail,
+    Webhook,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -5344,26 +5360,38 @@ fn local_auth_status_rows(
     magic_link_delivery: Option<LocalAuthDeliveryStatus>,
 ) -> Vec<LocalAuthStatus> {
     let password_ready = password_iterations_from_env(env).is_ok();
-    let magic_link_from_note = config_value_note(
-        binding_value_from_env(env, "MAGIC_LINK_FROM").as_deref(),
-        "missing_magic_link_from",
-        "placeholder_magic_link_from",
-    );
-    let email_binding_configured = env.send_email("EMAIL").is_ok();
+    let magic_link_delivery_config = magic_link_delivery_config_from_env(env);
 
     local_auth_status_rows_from_config(
         password_ready,
-        magic_link_from_note,
-        email_binding_configured,
+        magic_link_delivery_config,
         magic_link_dev_echo_enabled(env),
         magic_link_delivery,
     )
 }
 
+#[cfg(target_arch = "wasm32")]
+fn magic_link_delivery_config_from_env(env: &Env) -> MagicLinkDeliveryConfig {
+    let magic_link_from_note = config_value_note(
+        binding_value_from_env(env, "MAGIC_LINK_FROM").as_deref(),
+        "missing_magic_link_from",
+        "placeholder_magic_link_from",
+    );
+    let webhook_url_note = magic_link_webhook_url_note(
+        binding_value_from_env(env, "MAGIC_LINK_WEBHOOK_URL").as_deref(),
+    );
+
+    magic_link_delivery_config_from_values(
+        binding_value_from_env(env, "MAGIC_LINK_DELIVERY").as_deref(),
+        magic_link_from_note,
+        env.send_email("EMAIL").is_ok(),
+        webhook_url_note,
+    )
+}
+
 fn local_auth_status_rows_from_config(
     password_ready: bool,
-    magic_link_from_note: Option<&'static str>,
-    email_binding_configured: bool,
+    magic_link_delivery_config: MagicLinkDeliveryConfig,
     magic_link_dev_echo_enabled: bool,
     magic_link_delivery: Option<LocalAuthDeliveryStatus>,
 ) -> Vec<LocalAuthStatus> {
@@ -5372,15 +5400,8 @@ fn local_auth_status_rows_from_config(
         password_notes.push("invalid_password_iterations");
     }
 
-    let mut magic_link_notes = Vec::new();
-    if let Some(note) = magic_link_from_note {
-        magic_link_notes.push(note);
-    }
-    if !email_binding_configured {
-        magic_link_notes.push("missing_email_binding");
-    }
-    if email_binding_configured && magic_link_from_note.is_none() {
-        magic_link_notes.push("cloudflare_email_sending_must_be_enabled");
+    let mut magic_link_notes = magic_link_delivery_config.notes.clone();
+    if magic_link_delivery_config.enabled {
         let delivery_proven = magic_link_delivery
             .as_ref()
             .and_then(|status| status.last_sent_at)
@@ -5430,13 +5451,97 @@ fn local_auth_status_rows_from_config(
         LocalAuthStatus {
             id: "magic_link",
             label: "Magic link",
-            enabled: magic_link_from_note.is_none() && email_binding_configured,
+            enabled: magic_link_delivery_config.enabled,
             credential_storage: "zeroth_magic_links",
-            delivery: "cloudflare_email",
+            delivery: magic_link_delivery_config.transport,
             notes: magic_link_notes,
             delivery_status: magic_link_delivery,
         },
     ]
+}
+
+fn magic_link_delivery_config_from_values(
+    transport_value: Option<&str>,
+    magic_link_from_note: Option<&'static str>,
+    email_binding_configured: bool,
+    webhook_url_note: Option<&'static str>,
+) -> MagicLinkDeliveryConfig {
+    match magic_link_delivery_transport_from_value(transport_value) {
+        Ok(MagicLinkDeliveryTransport::CloudflareEmail) => {
+            let mut notes = Vec::new();
+            if let Some(note) = magic_link_from_note {
+                notes.push(note);
+            }
+            if !email_binding_configured {
+                notes.push("missing_email_binding");
+            }
+            let enabled = magic_link_from_note.is_none() && email_binding_configured;
+            if enabled {
+                notes.push("cloudflare_email_sending_must_be_enabled");
+            }
+            MagicLinkDeliveryConfig {
+                transport: MAGIC_LINK_DELIVERY_CLOUDFLARE_EMAIL,
+                enabled,
+                notes,
+            }
+        }
+        Ok(MagicLinkDeliveryTransport::Webhook) => {
+            let mut notes = Vec::new();
+            if let Some(note) = magic_link_from_note {
+                notes.push(note);
+            }
+            if let Some(note) = webhook_url_note {
+                notes.push(note);
+            }
+            let enabled = magic_link_from_note.is_none() && webhook_url_note.is_none();
+            if enabled {
+                notes.push("magic_link_webhook_must_send_email");
+            }
+            MagicLinkDeliveryConfig {
+                transport: MAGIC_LINK_DELIVERY_WEBHOOK,
+                enabled,
+                notes,
+            }
+        }
+        Err(note) => MagicLinkDeliveryConfig {
+            transport: MAGIC_LINK_DELIVERY_UNSUPPORTED,
+            enabled: false,
+            notes: vec![note],
+        },
+    }
+}
+
+fn magic_link_delivery_transport_from_value(
+    value: Option<&str>,
+) -> Result<MagicLinkDeliveryTransport, &'static str> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(MagicLinkDeliveryTransport::CloudflareEmail);
+    };
+    match value.to_ascii_lowercase().as_str() {
+        "cloudflare" | "cloudflare_email" => Ok(MagicLinkDeliveryTransport::CloudflareEmail),
+        "webhook" => Ok(MagicLinkDeliveryTransport::Webhook),
+        _ => Err("unsupported_magic_link_delivery"),
+    }
+}
+
+fn magic_link_webhook_url_note(value: Option<&str>) -> Option<&'static str> {
+    config_value_note(
+        value,
+        "missing_magic_link_webhook_url",
+        "placeholder_magic_link_webhook_url",
+    )
+    .or_else(|| {
+        value.and_then(|value| {
+            (!magic_link_webhook_url_valid(value)).then_some("invalid_magic_link_webhook_url")
+        })
+    })
+}
+
+fn magic_link_webhook_url_valid(value: &str) -> bool {
+    let Ok(url) = url::Url::parse(value.trim()) else {
+        return false;
+    };
+    url.scheme() == "https" && url.host_str().is_some()
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -7369,6 +7474,7 @@ fn classify_magic_link_email_error(error: &str) -> &'static str {
         | "email_sender_rejected"
         | "email_validation_error"
         | "email_internal_server_error"
+        | "email_webhook_failed"
         | "email_send_failed" => return matching_magic_link_email_error_class(&lower),
         _ => {}
     }
@@ -7387,6 +7493,9 @@ fn classify_magic_link_email_error(error: &str) -> &'static str {
     if lower.contains("internal server error") {
         return "email_internal_server_error";
     }
+    if lower.contains("email_webhook_failed") {
+        return "email_webhook_failed";
+    }
     "email_send_failed"
 }
 
@@ -7396,6 +7505,7 @@ fn matching_magic_link_email_error_class(error: &str) -> &'static str {
         "email_sender_rejected" => "email_sender_rejected",
         "email_validation_error" => "email_validation_error",
         "email_internal_server_error" => "email_internal_server_error",
+        "email_webhook_failed" => "email_webhook_failed",
         _ => "email_send_failed",
     }
 }
@@ -11163,37 +11273,171 @@ fn magic_link_url(config: &ZerothServerConfig, token: &str) -> worker::Result<St
 
 #[cfg(target_arch = "wasm32")]
 async fn send_magic_link_email(env: &Env, email: &str, link: &str) -> Result<bool, String> {
-    let Some(from) = binding_value_from_env(env, "MAGIC_LINK_FROM")
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty())
-    else {
+    let transport = match magic_link_delivery_transport_from_value(
+        binding_value_from_env(env, "MAGIC_LINK_DELIVERY").as_deref(),
+    ) {
+        Ok(transport) => transport,
+        Err(_) => return Ok(false),
+    };
+    let Some(from) = magic_link_from_env(env) else {
         return Ok(false);
     };
+    let content = magic_link_email_content(env, &from, link);
+    match transport {
+        MagicLinkDeliveryTransport::CloudflareEmail => {
+            send_magic_link_cloudflare_email(env, email, &content).await
+        }
+        MagicLinkDeliveryTransport::Webhook => {
+            send_magic_link_webhook_email(env, email, link, &content).await
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+struct MagicLinkEmailContent {
+    from: String,
+    product_name: String,
+    subject: String,
+    text: String,
+    html: String,
+}
+
+#[cfg(target_arch = "wasm32")]
+fn magic_link_from_env(env: &Env) -> Option<String> {
+    binding_value_from_env(env, "MAGIC_LINK_FROM")
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn magic_link_email_content(env: &Env, from: &str, link: &str) -> MagicLinkEmailContent {
+    let product_name = env_string(env, "PRODUCT_NAME").unwrap_or_else(|| "Zeroth".to_owned());
+    let subject = format!("Sign in to {product_name}");
+    let text = format!("Sign in to {product_name}:\n\n{link}\n\nThis link expires in 10 minutes.");
+    let html = format!(
+        r#"<p>Sign in to {}:</p><p><a href="{}">{}</a></p><p>This link expires in 10 minutes.</p>"#,
+        html_escape_text(&product_name),
+        html_escape_text(link),
+        html_escape_text(link)
+    );
+    MagicLinkEmailContent {
+        from: from.to_owned(),
+        product_name,
+        subject,
+        text,
+        html,
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn send_magic_link_cloudflare_email(
+    env: &Env,
+    email: &str,
+    content: &MagicLinkEmailContent,
+) -> Result<bool, String> {
     let Ok(sender) = env.send_email("EMAIL") else {
         return Ok(false);
     };
-    let product_name = env_string(env, "PRODUCT_NAME").unwrap_or_else(|| "Zeroth".to_owned());
-    let text = format!("Sign in to {product_name}:\n\n{link}\n\nThis link expires in 10 minutes.");
-    let html_link = html_escape_text(link);
-    let html_product_name = html_escape_text(&product_name);
-    let html = format!(
-        r#"<p>Sign in to {html_product_name}:</p><p><a href="{html_link}">{html_link}</a></p><p>This link expires in 10 minutes.</p>"#
-    );
-    let from_address = worker::email::EmailAddress::new(&product_name, &from);
-    let subject = format!("Sign in to {product_name}");
+    let from_address = worker::email::EmailAddress::new(&content.product_name, &content.from);
     let builder = worker::email::SendEmailBuilder::builder_with_email_address_and_str(
         &from_address,
         email,
-        &subject,
+        &content.subject,
     )
-    .text(&text)
-    .html(&html)
+    .text(&content.text)
+    .html(&content.html)
     .build();
     sender
         .send_with_builder(&builder)
         .await
         .map(|_| true)
         .map_err(|error| String::from(error.message()))
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MagicLinkWebhookPayload<'a> {
+    kind: &'static str,
+    to: &'a str,
+    from: &'a str,
+    from_name: &'a str,
+    subject: &'a str,
+    text: &'a str,
+    html: &'a str,
+    link: &'a str,
+    product_name: &'a str,
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn send_magic_link_webhook_email(
+    env: &Env,
+    email: &str,
+    link: &str,
+    content: &MagicLinkEmailContent,
+) -> Result<bool, String> {
+    let Some(endpoint) = magic_link_webhook_url_from_env(env) else {
+        return Ok(false);
+    };
+    let payload = MagicLinkWebhookPayload {
+        kind: "magic_link",
+        to: email,
+        from: &content.from,
+        from_name: &content.product_name,
+        subject: &content.subject,
+        text: &content.text,
+        html: &content.html,
+        link,
+        product_name: &content.product_name,
+    };
+    let body = serde_json::to_string(&payload)
+        .map_err(|error| format!("email_webhook_failed JSON serialization: {error}"))?;
+    let headers = Headers::new();
+    headers
+        .set("Content-Type", "application/json")
+        .map_err(|error| format!("email_webhook_failed header: {error}"))?;
+    headers
+        .set("Accept", "application/json")
+        .map_err(|error| format!("email_webhook_failed header: {error}"))?;
+    if let Some(bearer) = magic_link_webhook_bearer_from_env(env) {
+        headers
+            .set("Authorization", &format!("Bearer {bearer}"))
+            .map_err(|error| format!("email_webhook_failed header: {error}"))?;
+    }
+
+    let mut init = RequestInit::new();
+    init.with_method(Method::Post)
+        .with_headers(headers)
+        .with_body(Some(worker::wasm_bindgen::JsValue::from_str(&body)));
+    let outbound = Request::new_with_init(&endpoint, &init)
+        .map_err(|error| format!("email_webhook_failed request: {error}"))?;
+    let response = Fetch::Request(outbound)
+        .send()
+        .await
+        .map_err(|error| format!("email_webhook_failed fetch: {error}"))?;
+    let status = response.status_code();
+    if !(200..300).contains(&status) {
+        return Err(format!("email_webhook_failed HTTP {status}"));
+    }
+    Ok(true)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn magic_link_webhook_url_from_env(env: &Env) -> Option<String> {
+    binding_value_from_env(env, "MAGIC_LINK_WEBHOOK_URL")
+        .map(|value| value.trim().to_owned())
+        .filter(|value| magic_link_webhook_url_valid(value))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn magic_link_webhook_bearer_from_env(env: &Env) -> Option<String> {
+    ["MAGIC_LINK_WEBHOOK_BEARER", "MAGIC_LINK_WEBHOOK_TOKEN"]
+        .into_iter()
+        .find_map(|name| {
+            binding_value_from_env(env, name)
+                .map(|value| value.trim().to_owned())
+                .filter(|value| config_value_configured(Some(value)))
+        })
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -14520,7 +14764,12 @@ mod tests {
 
     #[test]
     fn local_auth_status_reports_magic_link_delivery_dependencies() {
-        let methods = local_auth_status_rows_from_config(true, None, true, false, None);
+        let methods = local_auth_status_rows_from_config(
+            true,
+            magic_link_delivery_config_from_values(None, None, true, None),
+            false,
+            None,
+        );
         let password = methods
             .iter()
             .find(|method| method.id == "password")
@@ -14542,8 +14791,12 @@ mod tests {
 
         let missing = local_auth_status_rows_from_config(
             true,
-            Some("missing_magic_link_from"),
-            false,
+            magic_link_delivery_config_from_values(
+                None,
+                Some("missing_magic_link_from"),
+                false,
+                None,
+            ),
             false,
             None,
         );
@@ -14559,6 +14812,71 @@ mod tests {
     }
 
     #[test]
+    fn local_auth_status_reports_magic_link_webhook_delivery_dependencies() {
+        let methods = local_auth_status_rows_from_config(
+            true,
+            magic_link_delivery_config_from_values(
+                Some("webhook"),
+                None,
+                false,
+                magic_link_webhook_url_note(Some("https://mail.example.com/zeroth")),
+            ),
+            false,
+            None,
+        );
+        let magic_link = methods
+            .iter()
+            .find(|method| method.id == "magic_link")
+            .unwrap();
+        assert!(magic_link.enabled);
+        assert_eq!(magic_link.delivery, "webhook");
+        assert!(magic_link
+            .notes
+            .contains(&"magic_link_webhook_must_send_email"));
+        assert!(magic_link.notes.contains(&"delivery_not_proven"));
+        assert!(!magic_link.notes.contains(&"missing_email_binding"));
+
+        let missing_url = local_auth_status_rows_from_config(
+            true,
+            magic_link_delivery_config_from_values(
+                Some("webhook"),
+                None,
+                true,
+                magic_link_webhook_url_note(None),
+            ),
+            false,
+            None,
+        );
+        let missing_magic_link = missing_url
+            .iter()
+            .find(|method| method.id == "magic_link")
+            .unwrap();
+        assert!(!missing_magic_link.enabled);
+        assert!(missing_magic_link
+            .notes
+            .contains(&"missing_magic_link_webhook_url"));
+
+        let invalid_url = magic_link_delivery_config_from_values(
+            Some("webhook"),
+            None,
+            true,
+            magic_link_webhook_url_note(Some("http://mail.example.com/zeroth")),
+        );
+        assert!(!invalid_url.enabled);
+        assert!(invalid_url
+            .notes
+            .contains(&"invalid_magic_link_webhook_url"));
+
+        let unsupported =
+            magic_link_delivery_config_from_values(Some("postmark"), None, true, None);
+        assert!(!unsupported.enabled);
+        assert_eq!(unsupported.transport, "unsupported");
+        assert!(unsupported
+            .notes
+            .contains(&"unsupported_magic_link_delivery"));
+    }
+
+    #[test]
     fn local_auth_status_uses_magic_link_delivery_evidence() {
         let delivery = LocalAuthDeliveryStatus {
             last_issue_at: Some(20),
@@ -14567,7 +14885,12 @@ mod tests {
             last_error: Some("email_internal_server_error".to_owned()),
             last_error_detail: Some("email.sending.error.internal_server [code: 10002]".to_owned()),
         };
-        let methods = local_auth_status_rows_from_config(true, None, true, false, Some(delivery));
+        let methods = local_auth_status_rows_from_config(
+            true,
+            magic_link_delivery_config_from_values(None, None, true, None),
+            false,
+            Some(delivery),
+        );
         let magic_link = methods
             .iter()
             .find(|method| method.id == "magic_link")
@@ -14637,6 +14960,10 @@ mod tests {
         assert_eq!(
             classify_magic_link_email_error("internal server error"),
             "email_internal_server_error"
+        );
+        assert_eq!(
+            classify_magic_link_email_error("email_webhook_failed HTTP 500"),
+            "email_webhook_failed"
         );
         assert_eq!(classify_magic_link_email_error(""), "email_send_failed");
     }
