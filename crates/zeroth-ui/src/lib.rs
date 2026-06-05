@@ -1283,7 +1283,7 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
                             <div class="zeroth-panel-body zeroth-local-auth">
                                 <div class="zeroth-provider-list">{provider_rows}</div>
 
-                                <div class="zeroth-divider">"Email"</div>
+                                <div class="zeroth-divider">"Email and password"</div>
                                 <form class="zeroth-form zeroth-login-form" method="post" action=password_login_action data-zeroth-local-auth="password-login">
                                     <input type="hidden" name="clientId" value=config.client_id.clone() />
                                     <input type="hidden" name="returnTo" value=login_return_to.clone() />
@@ -1299,7 +1299,7 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
                                         <button class="zeroth-action zeroth-primary" type="submit">"Sign in"</button>
                                     </div>
                                     <div class="zeroth-form-actions">
-                                        <button class="zeroth-action" type="submit" formaction=password_register_action data-zeroth-local-mode="password-register">"Create password"</button>
+                                        <button class="zeroth-action" type="submit" formaction=password_register_action data-zeroth-local-mode="password-register">"Create account"</button>
                                     </div>
                                 </form>
 
@@ -1309,7 +1309,7 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
                                     <input type="hidden" name="returnTo" value=login_return_to.clone() />
                                     <div class="zeroth-login-actions">
                                         <div class="zeroth-field">
-                                            <label for="zeroth-magic-email">"Magic link"</label>
+                                            <label for="zeroth-magic-email">"Email"</label>
                                             <input id="zeroth-magic-email" name="email" type="email" autocomplete="email" />
                                         </div>
                                         <button class="zeroth-action" type="submit">"Send link"</button>
@@ -3633,6 +3633,9 @@ mod tests {
         assert!(provider_index < password_index);
         assert!(html.contains("Continue with Apple"));
         assert!(html.contains("Continue with Google"));
+        assert!(html.contains("Email and password"));
+        assert!(html.contains("Create account"));
+        assert!(!html.contains("Create password"));
         assert!(html.contains("zeroth-status zeroth-hidden"));
         assert!(html.contains("/password/login"));
         assert!(html.contains("/password/register"));

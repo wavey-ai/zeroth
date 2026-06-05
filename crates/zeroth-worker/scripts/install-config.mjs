@@ -64,7 +64,8 @@ options:
   --spotify-native-client-ids CLIENT_ID[,CLIENT_ID]
   --magic-link-from EMAIL
   --magic-link-delivery cloudflare_email|webhook|resend|mailchannels
-  --magic-link-webhook-url URL`;
+  --magic-link-webhook-url URL
+  --email-binding NAME`;
 }
 
 function option(options, name, envNames = []) {
@@ -170,6 +171,11 @@ function setVar(vars, name, value) {
   }
 }
 
+function magicLinkDeliveryIsCloudflareEmail(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  return !normalized || normalized === "cloudflare" || normalized === "cloudflare_email";
+}
+
 function main() {
   const options = parseArgs(process.argv.slice(2));
   if (options.has("help")) {
@@ -243,11 +249,15 @@ function main() {
       "SPOTIFY_NATIVE_CLIENT_IDS",
     ]).join(","),
   );
-  setVar(vars, "MAGIC_LINK_FROM", option(options, "magic-link-from", ["MAGIC_LINK_FROM"]));
+  const magicLinkFrom = option(options, "magic-link-from", ["MAGIC_LINK_FROM"]);
+  const magicLinkDelivery = option(options, "magic-link-delivery", ["MAGIC_LINK_DELIVERY"]);
+  const effectiveMagicLinkDelivery =
+    magicLinkDelivery ?? (magicLinkFrom ? "cloudflare_email" : undefined);
+  setVar(vars, "MAGIC_LINK_FROM", magicLinkFrom);
   setVar(
     vars,
     "MAGIC_LINK_DELIVERY",
-    option(options, "magic-link-delivery", ["MAGIC_LINK_DELIVERY"]),
+    effectiveMagicLinkDelivery,
   );
   setVar(
     vars,
@@ -278,6 +288,15 @@ function main() {
       command: "cargo install -q worker-build && worker-build --release",
     },
   };
+
+  if (magicLinkFrom && magicLinkDeliveryIsCloudflareEmail(effectiveMagicLinkDelivery)) {
+    config.send_email = [
+      {
+        name: option(options, "email-binding", ["ZEROTH_EMAIL_BINDING"]) ?? "EMAIL",
+        allowed_sender_addresses: [magicLinkFrom.trim()],
+      },
+    ];
+  }
 
   if (route !== undefined && route.trim() !== "") {
     config.routes = [

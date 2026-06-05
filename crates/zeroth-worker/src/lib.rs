@@ -11494,7 +11494,7 @@ fn local_auth_registration_user_id(
     }
 
     if existing_user.is_some() {
-        return Err("sign in before adding a password to an existing user".to_owned());
+        return Err("account already exists; sign in instead".to_owned());
     }
     Ok(None)
 }
@@ -18808,6 +18808,20 @@ mod tests {
 
         assert_eq!(login.client_id.as_deref(), Some("ios"));
         assert_eq!(login.return_to.as_deref(), Some("wavey://auth/callback"));
+    }
+
+    #[test]
+    fn local_auth_registration_existing_user_requires_login() {
+        let existing_user = valid_user_row();
+
+        let error = local_auth_registration_user_id(None, Some(&existing_user), "user@example.com")
+            .unwrap_err();
+
+        assert_eq!(error, "account already exists; sign in instead");
+        assert_eq!(
+            local_auth_registration_user_id(None, None, "new@example.com").unwrap(),
+            None
+        );
     }
 
     #[test]
