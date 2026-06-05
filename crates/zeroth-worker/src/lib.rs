@@ -421,6 +421,11 @@ struct ProviderStatus {
     enabled: bool,
     client_id_configured: bool,
     client_secret_configured: bool,
+    client_id_binding: &'static str,
+    secret_binding_sets: Vec<Vec<&'static str>>,
+    callback_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    web_domain: Option<String>,
     notes: Vec<&'static str>,
 }
 
@@ -2141,7 +2146,7 @@ async fn provider_status(request: Request, env: Env) -> worker::Result<Response>
     }
 
     json(&ProviderStatusResponse {
-        providers: provider_status_rows(&env),
+        providers: provider_status_rows(&env, &config),
     })
 }
 
@@ -3561,7 +3566,7 @@ async fn hosted_clients_admin(request: Request, env: Env) -> worker::Result<Resp
     let config = server_config(&env, &url);
     let mut state = ClientsAdminUiState::new(config.issuer().issuer)
         .with_product_name(product_name_from_env(&env));
-    state.providers = provider_admin_ui_rows(&env);
+    state.providers = provider_admin_ui_rows(&env, &config);
     let db = env.d1(D1_BINDING)?;
 
     if validate_admin_request(&request, &env, &db, &config, unix_timestamp_seconds())
@@ -3903,16 +3908,15 @@ fn provider_client_id_binding(provider_id: &str) -> Option<&'static str> {
 
 #[cfg(target_arch = "wasm32")]
 fn provider_configured_for_login(env: &Env, provider_id: &str) -> bool {
-    provider_status_row(env, provider_id)
-        .map(|status| status.enabled)
-        .unwrap_or(false)
+    provider_client_id_configured(env, provider_id)
+        && provider_client_secret_configured(env, provider_id)
 }
 
 #[cfg(target_arch = "wasm32")]
-fn provider_status_rows(env: &Env) -> Vec<ProviderStatus> {
+fn provider_status_rows(env: &Env, config: &ZerothServerConfig) -> Vec<ProviderStatus> {
     [well_known::APPLE, well_known::GOOGLE, well_known::SPOTIFY]
         .into_iter()
-        .filter_map(|provider_id| provider_status_row(env, provider_id))
+        .filter_map(|provider_id| provider_status_row(env, config, provider_id))
         .collect()
 }
 
@@ -3920,7 +3924,7 @@ fn provider_status_rows(env: &Env) -> Vec<ProviderStatus> {
 fn readiness_response(env: &Env, config: &ZerothServerConfig) -> ReadinessResponse {
     let issuer_check = issuer_readiness(config);
     let signing = signing_readiness(env);
-    let providers = provider_readiness_rows(env);
+    let providers = provider_readiness_rows(env, config);
     let apple_app_site_association = apple_app_site_association_readiness(env);
     let ready = readiness_is_ready(&issuer_check, &signing, &providers);
     let mut notes = Vec::new();
@@ -4001,8 +4005,8 @@ fn signing_readiness(env: &Env) -> ReadinessCheck {
 }
 
 #[cfg(target_arch = "wasm32")]
-fn provider_readiness_rows(env: &Env) -> Vec<ProviderReadiness> {
-    provider_status_rows(env)
+fn provider_readiness_rows(env: &Env, config: &ZerothServerConfig) -> Vec<ProviderReadiness> {
+    provider_status_rows(env, config)
         .into_iter()
         .map(|status| ProviderReadiness {
             id: status.id,
@@ -4073,15 +4077,19 @@ fn config_value_is_placeholder(value: &str) -> bool {
 }
 
 #[cfg(target_arch = "wasm32")]
-fn provider_status_row(env: &Env, provider_id: &str) -> Option<ProviderStatus> {
+fn provider_status_row(
+    env: &Env,
+    config: &ZerothServerConfig,
+    provider_id: &str,
+) -> Option<ProviderStatus> {
     let (id, label, kind) = match provider_id {
         well_known::APPLE => (well_known::APPLE, "Apple", "oidc"),
         well_known::GOOGLE => (well_known::GOOGLE, "Google", "oidc"),
         well_known::SPOTIFY => (well_known::SPOTIFY, "Spotify", "oauth2"),
         _ => return None,
     };
-    let client_id_value =
-        provider_client_id_binding(provider_id).and_then(|name| binding_value_from_env(env, name));
+    let client_id_binding = provider_client_id_binding(provider_id)?;
+    let client_id_value = binding_value_from_env(env, client_id_binding);
     let client_id_configured = config_value_configured(client_id_value.as_deref());
     let client_secret_configured = provider_client_secret_configured(env, provider_id);
     let mut notes = Vec::new();
@@ -4103,8 +4111,34 @@ fn provider_status_row(env: &Env, provider_id: &str) -> Option<ProviderStatus> {
         enabled: client_id_configured && client_secret_configured,
         client_id_configured,
         client_secret_configured,
+        client_id_binding,
+        secret_binding_sets: provider_secret_binding_sets(provider_id),
+        callback_url: config.issuer().provider_callback_endpoint(),
+        web_domain: provider_web_domain(provider_id, config),
         notes,
     })
+}
+
+fn provider_secret_binding_sets(provider_id: &str) -> Vec<Vec<&'static str>> {
+    match provider_id {
+        well_known::APPLE => vec![
+            vec!["APPLE_CLIENT_SECRET"],
+            vec!["APPLE_TEAM_ID", "APPLE_KEY_ID", "APPLE_PRIVATE_KEY"],
+            vec!["APPLE_TEAM_ID", "APPLE_KEY_ID", "APPLE_PRIVATE_KEY_PEM"],
+        ],
+        well_known::GOOGLE => vec![vec!["GOOGLE_CLIENT_SECRET"]],
+        well_known::SPOTIFY => vec![vec!["SPOTIFY_CLIENT_SECRET"]],
+        _ => Vec::new(),
+    }
+}
+
+fn provider_web_domain(provider_id: &str, config: &ZerothServerConfig) -> Option<String> {
+    if provider_id != well_known::APPLE {
+        return None;
+    }
+    url::Url::parse(&config.issuer().issuer)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -4133,8 +4167,8 @@ fn provider_secret_binding_configured(env: &Env, name: &str) -> bool {
 }
 
 #[cfg(target_arch = "wasm32")]
-fn provider_admin_ui_rows(env: &Env) -> Vec<ProviderAdminUi> {
-    provider_status_rows(env)
+fn provider_admin_ui_rows(env: &Env, config: &ZerothServerConfig) -> Vec<ProviderAdminUi> {
+    provider_status_rows(env, config)
         .into_iter()
         .map(|status| ProviderAdminUi {
             id: status.id.to_owned(),
@@ -4143,6 +4177,14 @@ fn provider_admin_ui_rows(env: &Env) -> Vec<ProviderAdminUi> {
             enabled: status.enabled,
             client_id_configured: status.client_id_configured,
             client_secret_configured: status.client_secret_configured,
+            client_id_binding: status.client_id_binding.to_owned(),
+            secret_binding_sets: status
+                .secret_binding_sets
+                .iter()
+                .map(|set| set.iter().map(|name| (*name).to_owned()).collect())
+                .collect(),
+            callback_url: status.callback_url,
+            web_domain: status.web_domain,
             notes: status.notes.iter().map(|note| (*note).to_owned()).collect(),
         })
         .collect()

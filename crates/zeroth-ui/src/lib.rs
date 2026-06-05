@@ -694,6 +694,10 @@ pub struct ProviderAdminUi {
     pub enabled: bool,
     pub client_id_configured: bool,
     pub client_secret_configured: bool,
+    pub client_id_binding: String,
+    pub secret_binding_sets: Vec<Vec<String>>,
+    pub callback_url: String,
+    pub web_domain: Option<String>,
     pub notes: Vec<String>,
 }
 
@@ -1181,6 +1185,7 @@ pub fn ClientsAdminApp(state: ClientsAdminUiState) -> impl IntoView {
                                         <th>"Status"</th>
                                         <th>"Client ID"</th>
                                         <th>"Client secret"</th>
+                                        <th>"Setup"</th>
                                         <th>"Notes"</th>
                                     </tr>
                                 </thead>
@@ -1472,6 +1477,12 @@ fn provider_admin_row(provider: ProviderAdminUi) -> impl IntoView {
     };
     let notes = join_or_dash(provider.notes);
     let initial = provider_initial_by_id(&provider.id);
+    let setup = provider_setup_text(
+        provider.web_domain.as_deref(),
+        &provider.callback_url,
+        &provider.client_id_binding,
+        &provider.secret_binding_sets,
+    );
 
     view! {
         <tr>
@@ -1482,6 +1493,7 @@ fn provider_admin_row(provider: ProviderAdminUi) -> impl IntoView {
             <td><span class=status_class>{status}</span></td>
             <td>{client_id}</td>
             <td>{client_secret}</td>
+            <td class="zeroth-code">{setup}</td>
             <td>
                 <span class="zeroth-provider-badge">{initial}</span>
                 " "
@@ -1489,6 +1501,33 @@ fn provider_admin_row(provider: ProviderAdminUi) -> impl IntoView {
             </td>
         </tr>
     }
+}
+
+fn provider_setup_text(
+    web_domain: Option<&str>,
+    callback_url: &str,
+    client_id_binding: &str,
+    secret_binding_sets: &[Vec<String>],
+) -> String {
+    let mut parts = Vec::new();
+    if let Some(web_domain) = web_domain.filter(|value| !value.trim().is_empty()) {
+        parts.push(format!("Domain {web_domain}"));
+    }
+    if !callback_url.trim().is_empty() {
+        parts.push(format!("Callback {callback_url}"));
+    }
+    if !client_id_binding.trim().is_empty() {
+        parts.push(format!("Client ID {client_id_binding}"));
+    }
+    let secret_sets = secret_binding_sets
+        .iter()
+        .filter(|set| !set.is_empty())
+        .map(|set| set.join(" + "))
+        .collect::<Vec<_>>();
+    if !secret_sets.is_empty() {
+        parts.push(format!("Secrets {}", secret_sets.join(" or ")));
+    }
+    join_or_dash(parts)
 }
 
 fn user_admin_row(user: UserAdminUi) -> impl IntoView {
@@ -2080,7 +2119,7 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
   function renderProviderRows(providers) {
     providerRows.replaceChildren();
     if (providers.length === 0) {
-      renderEmptyRows(providerRows, 5);
+      renderEmptyRows(providerRows, 6);
       return;
     }
 
@@ -2102,12 +2141,28 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
       const secret = document.createElement("td");
       secret.textContent = provider.clientSecretConfigured ? "Configured" : "Missing";
 
+      const setup = document.createElement("td");
+      setup.className = "zeroth-code";
+      setup.textContent = providerSetupText(provider);
+
       const notes = document.createElement("td");
       notes.textContent = (provider.notes || []).join(", ") || "-";
 
-      row.append(name, state, clientId, secret, notes);
+      row.append(name, state, clientId, secret, setup, notes);
       providerRows.appendChild(row);
     }
+  }
+
+  function providerSetupText(provider) {
+    const parts = [];
+    if (provider.webDomain) parts.push(`Domain ${provider.webDomain}`);
+    if (provider.callbackUrl) parts.push(`Callback ${provider.callbackUrl}`);
+    if (provider.clientIdBinding) parts.push(`Client ID ${provider.clientIdBinding}`);
+    const secretSets = (provider.secretBindingSets || [])
+      .filter((set) => Array.isArray(set) && set.length > 0)
+      .map((set) => set.join(" + "));
+    if (secretSets.length > 0) parts.push(`Secrets ${secretSets.join(" or ")}`);
+    return parts.join("; ") || "-";
   }
 
   function renderDbStatus(body) {
@@ -2735,6 +2790,14 @@ mod tests {
             enabled: true,
             client_id_configured: true,
             client_secret_configured: true,
+            client_id_binding: "APPLE_CLIENT_ID".to_owned(),
+            secret_binding_sets: vec![vec![
+                "APPLE_TEAM_ID".to_owned(),
+                "APPLE_KEY_ID".to_owned(),
+                "APPLE_PRIVATE_KEY".to_owned(),
+            ]],
+            callback_url: "https://id.example.com/oauth2/callback".to_owned(),
+            web_domain: Some("id.example.com".to_owned()),
             notes: Vec::new(),
         });
         state.users.push(UserAdminUi {
