@@ -483,6 +483,8 @@ struct ProviderStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     web_domain: Option<String>,
     notes: Vec<&'static str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    activation_requirements: Vec<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     last_failure: Option<ProviderFailureStatus>,
 }
@@ -5097,6 +5099,7 @@ fn provider_status_row(
     let mut notes = Vec::new();
     if disabled {
         notes.push("disabled_by_deployment");
+        notes.extend(provider_disabled_notes(provider_id));
     }
     if let Some(note) = config_value_note(
         client_id_value.as_deref(),
@@ -5121,8 +5124,33 @@ fn provider_status_row(
         callback_url: config.issuer().provider_callback_endpoint(),
         web_domain: provider_web_domain(provider_id, config),
         notes,
+        activation_requirements: provider_activation_requirements(provider_id, disabled),
         last_failure: provider_failure_for_provider(provider_id, provider_failures),
     })
+}
+
+fn provider_disabled_notes(provider_id: &str) -> Vec<&'static str> {
+    match provider_id {
+        well_known::SPOTIFY => vec![
+            "spotify_development_mode_owner_premium_required",
+            "spotify_development_mode_users_must_be_allowlisted",
+        ],
+        _ => Vec::new(),
+    }
+}
+
+fn provider_activation_requirements(provider_id: &str, disabled: bool) -> Vec<&'static str> {
+    if !disabled {
+        return Vec::new();
+    }
+    match provider_id {
+        well_known::SPOTIFY => vec![
+            "Spotify app owner account has Premium while the app is in development mode",
+            "Spotify test login user is allowlisted in the Spotify app Users Management tab",
+            "Spotify current-user profile endpoint /v1/me returns HTTP 200 for an authorized user",
+        ],
+        _ => Vec::new(),
+    }
 }
 
 fn provider_failure_for_provider(
@@ -5315,6 +5343,11 @@ fn provider_admin_ui_rows(
             callback_url: status.callback_url,
             web_domain: status.web_domain,
             notes: status.notes.iter().map(|note| (*note).to_owned()).collect(),
+            activation_requirements: status
+                .activation_requirements
+                .iter()
+                .map(|requirement| (*requirement).to_owned())
+                .collect(),
             last_failure: status.last_failure.map(provider_failure_admin_ui),
         })
         .collect()
@@ -14160,6 +14193,27 @@ mod tests {
         assert!(!provider_status_enabled(true, true, true));
         assert!(!provider_status_enabled(true, false, false));
         assert!(!provider_status_enabled(false, true, false));
+    }
+
+    #[test]
+    fn spotify_disabled_status_includes_activation_requirements() {
+        assert_eq!(
+            provider_disabled_notes(well_known::SPOTIFY),
+            vec![
+                "spotify_development_mode_owner_premium_required",
+                "spotify_development_mode_users_must_be_allowlisted",
+            ]
+        );
+        assert_eq!(
+            provider_activation_requirements(well_known::SPOTIFY, true),
+            vec![
+                "Spotify app owner account has Premium while the app is in development mode",
+                "Spotify test login user is allowlisted in the Spotify app Users Management tab",
+                "Spotify current-user profile endpoint /v1/me returns HTTP 200 for an authorized user",
+            ]
+        );
+        assert!(provider_activation_requirements(well_known::SPOTIFY, false).is_empty());
+        assert!(provider_activation_requirements(well_known::GOOGLE, true).is_empty());
     }
 
     #[test]

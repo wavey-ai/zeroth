@@ -879,6 +879,7 @@ pub struct ProviderAdminUi {
     pub callback_url: String,
     pub web_domain: Option<String>,
     pub notes: Vec<String>,
+    pub activation_requirements: Vec<String>,
     pub last_failure: Option<ProviderFailureAdminUi>,
 }
 
@@ -1832,7 +1833,7 @@ fn provider_admin_row(provider: ProviderAdminUi) -> impl IntoView {
     } else {
         "Missing"
     };
-    let notes = join_or_dash(provider.notes);
+    let notes = provider_notes_text(&provider.notes, &provider.activation_requirements);
     let last_failure = provider_failure_text(provider.last_failure.as_ref());
     let initial = provider_initial_by_id(&provider.id);
     let setup = provider_setup_text(
@@ -1860,6 +1861,17 @@ fn provider_admin_row(provider: ProviderAdminUi) -> impl IntoView {
             </td>
         </tr>
     }
+}
+
+fn provider_notes_text(notes: &[String], activation_requirements: &[String]) -> String {
+    let mut parts = notes.to_vec();
+    parts.extend(
+        activation_requirements
+            .iter()
+            .filter(|requirement| !requirement.is_empty())
+            .map(|requirement| format!("requires: {requirement}")),
+    );
+    join_or_dash(parts)
 }
 
 fn provider_failure_text(failure: Option<&ProviderFailureAdminUi>) -> String {
@@ -2834,11 +2846,19 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
       lastFailure.textContent = providerFailureText(provider);
 
       const notes = document.createElement("td");
-      notes.textContent = (provider.notes || []).join(", ") || "-";
+      notes.textContent = providerNotesText(provider);
 
       row.append(name, state, clientId, secret, setup, lastFailure, notes);
       providerRows.appendChild(row);
     }
+  }
+
+  function providerNotesText(provider) {
+    const parts = [...(provider.notes || [])];
+    for (const requirement of provider.activationRequirements || provider.activation_requirements || []) {
+      if (requirement) parts.push(`requires: ${requirement}`);
+    }
+    return parts.join(", ") || "-";
   }
 
   function providerFailureText(provider) {
@@ -3611,6 +3631,7 @@ mod tests {
             callback_url: "https://id.example.com/oauth2/callback".to_owned(),
             web_domain: Some("id.example.com".to_owned()),
             notes: Vec::new(),
+            activation_requirements: Vec::new(),
             last_failure: None,
         });
         state.providers.push(ProviderAdminUi {
@@ -3624,7 +3645,19 @@ mod tests {
             secret_binding_sets: vec![vec!["SPOTIFY_CLIENT_SECRET".to_owned()]],
             callback_url: "https://id.example.com/oauth2/callback".to_owned(),
             web_domain: None,
-            notes: vec!["disabled_by_deployment".to_owned()],
+            notes: vec![
+                "disabled_by_deployment".to_owned(),
+                "spotify_development_mode_owner_premium_required".to_owned(),
+                "spotify_development_mode_users_must_be_allowlisted".to_owned(),
+            ],
+            activation_requirements: vec![
+                "Spotify app owner account has Premium while the app is in development mode"
+                    .to_owned(),
+                "Spotify test login user is allowlisted in the Spotify app Users Management tab"
+                    .to_owned(),
+                "Spotify current-user profile endpoint /v1/me returns HTTP 200 for an authorized user"
+                    .to_owned(),
+            ],
             last_failure: Some(ProviderFailureAdminUi {
                 event_type: "provider.profile.failed".to_owned(),
                 created_at: "1780000400".to_owned(),
@@ -3693,6 +3726,8 @@ mod tests {
         assert!(html.contains("Spotify"));
         assert!(html.contains("Disabled"));
         assert!(html.contains("disabled_by_deployment"));
+        assert!(html.contains("spotify_development_mode_owner_premium_required"));
+        assert!(html.contains("Spotify current-user profile endpoint /v1/me returns HTTP 200"));
         assert!(html.contains("provider.profile.failed"));
         assert!(html.contains("Spotify profile endpoint returned HTTP 403"));
         assert!(html.contains("Magic link"));
