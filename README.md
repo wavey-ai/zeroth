@@ -96,6 +96,9 @@ Implemented so far:
   for registered-client create/update/list/disable, protected by either a
   deployment admin bearer token or an allowlisted Zeroth browser session, and
   backed by D1
+- Worker `/tokens` and `/api/tokens` short-lived ES256 bearer-token minting for
+  client-configured downstream issuers such as `yl-record-issuer`, with the
+  audience and TTL editable through the client admin UI
 - Worker `POST /__zeroth/db/ensure` schema bootstrap endpoint protected by the
   same admin gate, applying unrecorded generic migrations, persisting migration
   history in D1, and repairing D1 compatibility columns exported by

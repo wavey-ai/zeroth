@@ -24,4 +24,4 @@ name = "EMAIL"
 allowed_sender_addresses = ["login@example.com"]
 
 [build]
-command = "cargo install -q worker-build && worker-build --release"
+command = "cargo install -q worker-build && worker-build --release --no-panic-recovery"

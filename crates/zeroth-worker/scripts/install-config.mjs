@@ -285,7 +285,7 @@ function main() {
       },
     ],
     build: {
-      command: "cargo install -q worker-build && worker-build --release",
+      command: "cargo install -q worker-build && worker-build --release --no-panic-recovery",
     },
   };
 

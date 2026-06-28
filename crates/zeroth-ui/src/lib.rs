@@ -767,7 +767,7 @@ a:hover {
   color: var(--z-muted);
 }
 
-@media (max-width: 880px) {
+@media (max-width: 1120px) {
   .zeroth-shell {
     grid-template-columns: 1fr;
   }
@@ -777,6 +777,10 @@ a:hover {
     height: auto;
     border-right: 0;
     border-bottom: 1px solid var(--z-sidebar-line);
+  }
+
+  .zeroth-main {
+    padding: 16px 14px 24px;
   }
 
   .zeroth-nav {
@@ -1026,6 +1030,8 @@ pub struct ClientAdminUi {
     pub redirect_uris: Vec<String>,
     pub allowed_origins: Vec<String>,
     pub allowed_email_domains: Vec<String>,
+    pub issuer_token_audience: Option<String>,
+    pub issuer_token_ttl_seconds: Option<i32>,
     pub account_sharing_mode: String,
     pub account_tenant_id: String,
     pub account_namespace: String,
@@ -1965,7 +1971,10 @@ pub fn ClientsAdminApp(state: ClientsAdminUiState) -> impl IntoView {
                         <section id="clients" class="zeroth-panel">
                             <div class="zeroth-panel-header">
                                 <h2 class="zeroth-panel-title">"Applications"</h2>
-                                <button class="zeroth-action" id="zeroth-clients-refresh" type="button">"Refresh"</button>
+                                <div class="zeroth-actions">
+                                    <button class="zeroth-action zeroth-primary" id="zeroth-client-new" type="button">"New application"</button>
+                                    <button class="zeroth-action" id="zeroth-clients-refresh" type="button">"Refresh"</button>
+                                </div>
                             </div>
                             <table class="zeroth-table">
                                 <thead>
@@ -1978,6 +1987,7 @@ pub fn ClientsAdminApp(state: ClientsAdminUiState) -> impl IntoView {
                                         <th>"Email domains"</th>
                                         <th>"Account"</th>
                                         <th>"Login"</th>
+                                        <th>"Issuer token"</th>
                                         <th>"Actions"</th>
                                     </tr>
                                 </thead>
@@ -2043,6 +2053,14 @@ pub fn ClientsAdminApp(state: ClientsAdminUiState) -> impl IntoView {
                                             <input id="zeroth-client-show-magic-link" name="visibleLoginMethods" value="magic_link" type="checkbox" />
                                             <label for="zeroth-client-show-magic-link">"Magic link"</label>
                                         </div>
+                                    </div>
+                                    <div class="zeroth-field">
+                                        <label for="zeroth-client-issuer-token-audience">"Issuer token audience"</label>
+                                        <input id="zeroth-client-issuer-token-audience" name="issuerTokenAudience" autocomplete="off" />
+                                    </div>
+                                    <div class="zeroth-field">
+                                        <label for="zeroth-client-issuer-token-ttl">"Issuer token TTL (seconds)"</label>
+                                        <input id="zeroth-client-issuer-token-ttl" name="issuerTokenTtlSeconds" inputmode="numeric" autocomplete="off" />
                                     </div>
                                     <div class="zeroth-field">
                                         <label for="zeroth-client-secret">"Client secret"</label>
@@ -2495,10 +2513,23 @@ fn client_admin_row(client: ClientAdminUi) -> impl IntoView {
         client.account_sharing_mode, client.account_namespace
     );
     let visible_login_methods = join_or_dash(client.visible_login_methods.clone());
+    let issuer_token = client
+        .issuer_token_audience
+        .as_ref()
+        .map(|audience| {
+            let ttl_seconds = client.issuer_token_ttl_seconds.unwrap_or(300);
+            format!("{audience} / {ttl_seconds}s")
+        })
+        .unwrap_or_else(|| "-".to_owned());
     let redirect_lines = client.redirect_uris.join("\n");
     let origin_lines = client.allowed_origins.join("\n");
     let email_domain_lines = client.allowed_email_domains.join("\n");
     let visible_login_method_lines = client.visible_login_methods.join("\n");
+    let issuer_token_audience = client.issuer_token_audience.clone().unwrap_or_default();
+    let issuer_token_ttl_seconds = client
+        .issuer_token_ttl_seconds
+        .map(|seconds| seconds.to_string())
+        .unwrap_or_default();
     let account_sharing_mode = client.account_sharing_mode.clone();
     let account_tenant_id = client.account_tenant_id.clone();
     let account_namespace = client.account_namespace.clone();
@@ -2522,6 +2553,8 @@ fn client_admin_row(client: ClientAdminUi) -> impl IntoView {
             data-client-account-tenant-id=account_tenant_id
             data-client-account-namespace=account_namespace
             data-client-visible-login-methods=visible_login_method_lines
+            data-client-issuer-token-audience=issuer_token_audience
+            data-client-issuer-token-ttl-seconds=issuer_token_ttl_seconds
         >
             <td>
                 <div class="zeroth-row-title">{client_name}</div>
@@ -2537,8 +2570,11 @@ fn client_admin_row(client: ClientAdminUi) -> impl IntoView {
             <td>{email_domains}</td>
             <td>{account}</td>
             <td>{visible_login_methods}</td>
+            <td>{issuer_token}</td>
             <td>
                 <button class="zeroth-action" type="button" data-zeroth-edit-client="true">"Edit"</button>
+                " "
+                <button class="zeroth-action" type="button" data-zeroth-clone-client="true">"Clone with env"</button>
             </td>
         </tr>
     }
@@ -3314,7 +3350,9 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
       accountSharingMode: row.dataset.clientAccountSharingMode || "global",
       accountTenantId: row.dataset.clientAccountTenantId || "global",
       accountNamespace: row.dataset.clientAccountNamespace || "global",
-      visibleLoginMethods: splitLines(row.dataset.clientVisibleLoginMethods || "")
+      visibleLoginMethods: splitLines(row.dataset.clientVisibleLoginMethods || ""),
+      issuerTokenAudience: row.dataset.clientIssuerTokenAudience || "",
+      issuerTokenTtlSeconds: row.dataset.clientIssuerTokenTtlSeconds || ""
     };
   }
 
@@ -3327,7 +3365,63 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
     return methods.length > 0 ? methods.join(", ") : "-";
   }
 
-  function fillForm(client) {
+  function hostWithSubdomain(hostname, subdomain) {
+    const clean = String(subdomain || "").trim().toLowerCase().replace(/[^a-z0-9-]/g, "");
+    if (!clean) return hostname;
+    if (!hostname || hostname === "localhost" || /^[\d.]+$/.test(hostname)) return hostname;
+    const labels = hostname.split(".");
+    if (labels.length < 3) return `${clean}.${hostname}`;
+    labels[0] = clean;
+    return labels.join(".");
+  }
+
+  function rewriteUrlSubdomain(value, subdomain) {
+    try {
+      const url = new URL(value);
+      url.hostname = hostWithSubdomain(url.hostname, subdomain);
+      return url.toString();
+    } catch (_) {
+      return value;
+    }
+  }
+
+  function cloneClient(client, subdomain) {
+    const suffix = String(subdomain || "").trim().toLowerCase().replace(/[^a-z0-9-]/g, "");
+    if (!suffix) return null;
+    const id = String(client.id || "").trim();
+    const name = String(client.name || "").trim();
+    return {
+      id: id ? `${id}-${suffix}` : suffix,
+      name: name ? `${name} ${suffix}` : suffix,
+      confidential: Boolean(client.confidential),
+      disabled: false,
+      redirectUris: (client.redirectUris || client.redirect_uris || []).map((value) => rewriteUrlSubdomain(value, suffix)),
+      allowedOrigins: (client.allowedOrigins || client.allowed_origins || []).map((value) => rewriteUrlSubdomain(value, suffix)),
+      allowedEmailDomains: client.allowedEmailDomains || client.allowed_email_domains || [],
+      accountSharingMode: client.accountSharingMode || client.account_sharing_mode || "global",
+      accountTenantId: client.accountTenantId || client.account_tenant_id || "",
+      visibleLoginMethods: visibleLoginMethodsForClient(client),
+      issuerTokenAudience: client.issuerTokenAudience || client.issuer_token_audience || "",
+      issuerTokenTtlSeconds: client.issuerTokenTtlSeconds || client.issuer_token_ttl_seconds || ""
+    };
+  }
+
+  function cloneClientFromRow(row) {
+    const source = clientFromRow(row);
+    const requested = window.prompt("Clone application with env subdomain", "dev");
+    if (requested === null) return;
+    const client = cloneClient(source, requested);
+    if (!client) {
+      setMessage("Clone needs a subdomain", true);
+      return;
+    }
+    fillForm(client, true);
+    form.elements.id.disabled = false;
+    editorMode.textContent = "Clone";
+    setMessage("Review cloned env application, then save");
+  }
+
+  function fillForm(client, focus = false) {
     form.elements.id.value = client.id || "";
     form.elements.name.value = client.name || "";
     form.elements.type.value = client.confidential ? "confidential" : "public";
@@ -3340,17 +3434,34 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
     for (const checkbox of form.querySelectorAll("input[name='visibleLoginMethods']")) {
       checkbox.checked = visibleMethods.has(checkbox.value);
     }
+    form.elements.issuerTokenAudience.value = client.issuerTokenAudience || client.issuer_token_audience || "";
+    form.elements.issuerTokenTtlSeconds.value = client.issuerTokenTtlSeconds || client.issuer_token_ttl_seconds || "";
     form.elements.clientSecret.value = "";
     form.elements.disabled.checked = Boolean(client.disabled);
     editorMode.textContent = client.id ? "Edit" : "New";
     form.elements.id.disabled = Boolean(client.id);
+    if (focus) {
+      form.scrollIntoView({ block: "start", behavior: "smooth" });
+      form.elements.name.focus({ preventScroll: true });
+    }
+  }
+
+  function resetClientForm(focus = false) {
+    form.reset();
+    form.elements.id.disabled = false;
+    editorMode.textContent = "New";
+    setMessage("");
+    if (focus) {
+      form.scrollIntoView({ block: "start", behavior: "smooth" });
+      form.elements.id.focus({ preventScroll: true });
+    }
   }
 
   function renderRows(clients) {
     rows.replaceChildren();
     setCountLabel(count, clients.length, "clients");
     if (clients.length === 0) {
-      renderEmptyRows(rows, 9);
+      renderEmptyRows(rows, 10);
       return;
     }
 
@@ -3367,6 +3478,8 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
       row.dataset.clientAccountTenantId = client.accountTenantId || client.account_tenant_id || "global";
       row.dataset.clientAccountNamespace = client.accountNamespace || client.account_namespace || "global";
       row.dataset.clientVisibleLoginMethods = visibleLoginMethodsForClient(client).join("\n");
+      row.dataset.clientIssuerTokenAudience = client.issuerTokenAudience || client.issuer_token_audience || "";
+      row.dataset.clientIssuerTokenTtlSeconds = client.issuerTokenTtlSeconds || client.issuer_token_ttl_seconds || "";
 
       const name = document.createElement("td");
       setText(name, client.name, "zeroth-row-title");
@@ -3398,6 +3511,11 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
       const login = document.createElement("td");
       login.textContent = visibleLoginMethodLabel(client);
 
+      const issuerToken = document.createElement("td");
+      const audience = client.issuerTokenAudience || client.issuer_token_audience || "";
+      const ttlSeconds = client.issuerTokenTtlSeconds || client.issuer_token_ttl_seconds || "";
+      issuerToken.textContent = audience ? `${audience} / ${ttlSeconds || 300}s` : "-";
+
       const actions = document.createElement("td");
       const edit = document.createElement("button");
       edit.className = "zeroth-action";
@@ -3405,6 +3523,13 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
       edit.dataset.zerothEditClient = "true";
       edit.textContent = "Edit";
       actions.appendChild(edit);
+      const clone = document.createElement("button");
+      clone.className = "zeroth-action";
+      clone.type = "button";
+      clone.dataset.zerothCloneClient = "true";
+      clone.textContent = "Clone with env";
+      actions.appendChild(document.createTextNode(" "));
+      actions.appendChild(clone);
       if (!client.disabled) {
         const disable = document.createElement("button");
         disable.className = "zeroth-action zeroth-danger";
@@ -3415,7 +3540,7 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
         actions.appendChild(disable);
       }
 
-      row.append(name, type, state, redirects, origins, emailDomains, account, login, actions);
+      row.append(name, type, state, redirects, origins, emailDomains, account, login, issuerToken, actions);
       rows.appendChild(row);
     }
   }
@@ -3777,6 +3902,13 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
       accountSharingMode: String(data.get("accountSharingMode") || "global"),
       accountTenantId: String(data.get("accountTenantId") || "").trim() || undefined,
       visibleLoginMethods: data.getAll("visibleLoginMethods").map((value) => String(value)),
+      issuerTokenAudience: String(data.get("issuerTokenAudience") || "").trim() || undefined,
+      issuerTokenTtlSeconds: (() => {
+        const raw = String(data.get("issuerTokenTtlSeconds") || "").trim();
+        if (!raw) return undefined;
+        const value = Number.parseInt(raw, 10);
+        return Number.isInteger(value) ? value : undefined;
+      })(),
       confidential: data.get("type") === "confidential",
       disabled: form.elements.disabled.checked
     };
@@ -3907,12 +4039,15 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
     });
   }
 
-  $("zeroth-passkey-login").addEventListener("click", () => {
-    signInWithPasskey().catch((error) => {
-      setPasskeyStatus("Failed", true);
-      setMessage(error.message, true);
+  const passkeyLogin = $("zeroth-passkey-login");
+  if (passkeyLogin) {
+    passkeyLogin.addEventListener("click", () => {
+      signInWithPasskey().catch((error) => {
+        setPasskeyStatus("Failed", true);
+        setMessage(error.message, true);
+      });
     });
-  });
+  }
 
   $("zeroth-admin-token-form").addEventListener("submit", (event) => {
     event.preventDefault();
@@ -3977,6 +4112,10 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
     loadClients().catch((error) => setMessage(error.message, true));
   });
 
+  $("zeroth-client-new").addEventListener("click", () => {
+    resetClientForm(true);
+  });
+
   userRows.addEventListener("click", (event) => {
     const target = event.target instanceof Element ? event.target : event.target.parentElement;
     const button = target && target.closest("button");
@@ -3997,7 +4136,9 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
     const row = button.closest("tr");
     if (!row) return;
     if (button.dataset.zerothEditClient) {
-      fillForm(clientFromRow(row));
+      fillForm(clientFromRow(row), true);
+    } else if (button.dataset.zerothCloneClient) {
+      cloneClientFromRow(row);
     } else if (button.dataset.zerothDisableClient) {
       disableClient(row).catch((error) => setMessage(error.message, true));
     }
@@ -4008,10 +4149,7 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
   });
 
   $("zeroth-client-reset").addEventListener("click", () => {
-    form.reset();
-    form.elements.id.disabled = false;
-    editorMode.textContent = "New";
-    setMessage("");
+    resetClientForm();
   });
 })();
 "#;
@@ -4369,6 +4507,8 @@ mod tests {
             redirect_uris: vec!["wavey://auth/callback".to_owned()],
             allowed_origins: Vec::new(),
             allowed_email_domains: Vec::new(),
+            issuer_token_audience: Some("yl-record-issuer".to_owned()),
+            issuer_token_ttl_seconds: Some(300),
             account_sharing_mode: "global".to_owned(),
             account_tenant_id: "global".to_owned(),
             account_namespace: "global".to_owned(),
@@ -4496,6 +4636,8 @@ mod tests {
         assert!(html.contains("Applications"));
         assert!(html.contains("Client editor"));
         assert!(html.contains("Visible login methods"));
+        assert!(html.contains("Issuer token audience"));
+        assert!(html.contains("Issuer token TTL (seconds)"));
         assert!(html.contains("zeroth-client-show-passkey"));
         assert!(html.contains("zeroth-client-show-magic-link"));
         assert!(html.contains("Apple"));

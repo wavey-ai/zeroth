@@ -199,6 +199,16 @@ pub mod compatibility {
         name: "allowed_email_domains_json",
         definition: "TEXT NOT NULL DEFAULT '[]'",
     };
+    pub const CLIENT_ISSUER_TOKEN_AUDIENCE: CompatibilityColumn = CompatibilityColumn {
+        table: "zeroth_clients",
+        name: "issuer_token_audience",
+        definition: "TEXT",
+    };
+    pub const CLIENT_ISSUER_TOKEN_TTL_SECONDS: CompatibilityColumn = CompatibilityColumn {
+        table: "zeroth_clients",
+        name: "issuer_token_ttl_seconds",
+        definition: "INTEGER",
+    };
     pub const CLIENT_ACCOUNT_SHARING_MODE: CompatibilityColumn = CompatibilityColumn {
         table: "zeroth_clients",
         name: "account_sharing_mode",
@@ -224,6 +234,8 @@ pub mod compatibility {
 
     pub const ALL: &[CompatibilityColumn] = &[
         CLIENT_ALLOWED_EMAIL_DOMAINS,
+        CLIENT_ISSUER_TOKEN_AUDIENCE,
+        CLIENT_ISSUER_TOKEN_TTL_SECONDS,
         CLIENT_ACCOUNT_SHARING_MODE,
         CLIENT_ACCOUNT_TENANT_ID,
         CLIENT_VISIBLE_LOGIN_METHODS,

@@ -7,7 +7,7 @@ use base64::{
 use p256::ecdsa::{
     signature::Verifier as _, Signature as Es256Signature, VerifyingKey as Es256VerifyingKey,
 };
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use url::{form_urlencoded, Url};
 use zeroth_core::{Client, ClientId, ScopeSet, UserId};
@@ -180,6 +180,17 @@ pub struct ZerothJwtClaims {
     pub picture: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub roles: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ZerothIssuedAccessTokenClaims {
+    pub iss: String,
+    pub sub: String,
+    pub aud: String,
+    pub iat: i64,
+    pub exp: i64,
+    pub jti: String,
+    pub client_id: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -675,11 +686,14 @@ pub fn verify_zeroth_access_token(
     audience: &str,
     now: i64,
 ) -> Result<ZerothJwtClaims, ZerothTokenError> {
-    verify_zeroth_token(
+    let validation = ZerothTokenValidation::access_token(issuer, audience, now);
+    let claims = verify_zeroth_signed_token(
         token,
         jwks,
-        &ZerothTokenValidation::access_token(issuer, audience, now),
-    )
+        &validation,
+    )?;
+    validate_zeroth_claims(&claims, &validation)?;
+    Ok(claims)
 }
 
 pub fn verify_zeroth_id_token(
@@ -692,7 +706,25 @@ pub fn verify_zeroth_id_token(
 ) -> Result<ZerothJwtClaims, ZerothTokenError> {
     let mut validation = ZerothTokenValidation::id_token_without_nonce(issuer, audience, now);
     validation.nonce = expected_nonce.map(ToOwned::to_owned);
-    verify_zeroth_token(token, jwks, &validation)
+    let claims = verify_zeroth_signed_token(token, jwks, &validation)?;
+    validate_zeroth_claims(&claims, &validation)?;
+    Ok(claims)
+}
+
+pub fn verify_zeroth_issued_access_token(
+    token: &str,
+    jwks: &ZerothJwks,
+    issuer: &str,
+    audience: &str,
+    now: i64,
+) -> Result<ZerothIssuedAccessTokenClaims, ZerothTokenError> {
+    let claims = verify_zeroth_signed_token(
+        token,
+        jwks,
+        &ZerothTokenValidation::access_token(issuer, audience, now),
+    )?;
+    validate_zeroth_issued_access_token_claims(&claims, issuer, audience, now)?;
+    Ok(claims)
 }
 
 pub fn verify_zeroth_token(
@@ -700,6 +732,16 @@ pub fn verify_zeroth_token(
     jwks: &ZerothJwks,
     validation: &ZerothTokenValidation,
 ) -> Result<ZerothJwtClaims, ZerothTokenError> {
+    let claims = verify_zeroth_signed_token(token, jwks, validation)?;
+    validate_zeroth_claims(&claims, validation)?;
+    Ok(claims)
+}
+
+fn verify_zeroth_signed_token<T: DeserializeOwned>(
+    token: &str,
+    jwks: &ZerothJwks,
+    _validation: &ZerothTokenValidation,
+) -> Result<T, ZerothTokenError> {
     let segments = token.split('.').collect::<Vec<_>>();
     if segments.len() != 3 || segments.iter().any(|segment| segment.is_empty()) {
         return Err(ZerothTokenError::invalid_token(
@@ -734,8 +776,7 @@ pub fn verify_zeroth_token(
         .verify(signing_input.as_bytes(), &signature)
         .map_err(|_| ZerothTokenError::invalid_token("JWT signature did not verify"))?;
 
-    let claims = decode_jwt_segment::<ZerothJwtClaims>(segments[1])?;
-    validate_zeroth_claims(&claims, validation)?;
+    let claims = decode_jwt_segment::<T>(segments[1])?;
     Ok(claims)
 }
 
@@ -798,6 +839,42 @@ fn validate_zeroth_claims(
                 }
             }
         }
+    }
+    Ok(())
+}
+
+fn validate_zeroth_issued_access_token_claims(
+    claims: &ZerothIssuedAccessTokenClaims,
+    issuer: &str,
+    audience: &str,
+    now: i64,
+) -> Result<(), ZerothTokenError> {
+    if claims.iss != issuer {
+        return Err(ZerothTokenError::invalid_token(
+            "JWT issuer did not match expected Zeroth issuer",
+        ));
+    }
+    if claims.aud != audience {
+        return Err(ZerothTokenError::invalid_token(
+            "JWT audience did not match expected issuer token audience",
+        ));
+    }
+    if claims.exp <= now {
+        return Err(ZerothTokenError::invalid_token("JWT has expired"));
+    }
+    if claims.exp <= claims.iat {
+        return Err(ZerothTokenError::invalid_token(
+            "JWT expiry must be after issued-at",
+        ));
+    }
+    if claims.sub.is_empty() {
+        return Err(ZerothTokenError::invalid_token("JWT subject is empty"));
+    }
+    if claims.client_id.is_empty() {
+        return Err(ZerothTokenError::invalid_token("JWT client_id is empty"));
+    }
+    if claims.jti.is_empty() {
+        return Err(ZerothTokenError::invalid_token("JWT jti is empty"));
     }
     Ok(())
 }
@@ -1472,6 +1549,30 @@ mod tests {
     }
 
     #[test]
+    fn zeroth_issued_access_token_verifier_accepts_es256_jwks() {
+        let signing_key = test_signing_key();
+        let jwks = test_jwks(&signing_key, "test-key");
+        let claims = issued_access_token_claims(1_780_000_100);
+        let token = signed_test_token(&signing_key, "test-key", &claims);
+
+        let verified = verify_zeroth_issued_access_token(
+            &token,
+            &jwks,
+            "https://id.example.com",
+            "yl-record-issuer",
+            1_780_000_200,
+        )
+        .unwrap();
+
+        assert_eq!(verified.iss, "https://id.example.com");
+        assert_eq!(verified.sub, "usr_123");
+        assert_eq!(verified.aud, "yl-record-issuer");
+        assert_eq!(verified.client_id, "yl-web");
+        assert_eq!(verified.jti, "jti-123");
+        assert_eq!(verified.exp - verified.iat, 300);
+    }
+
+    #[test]
     fn zeroth_id_token_verifier_checks_nonce() {
         let signing_key = test_signing_key();
         let jwks = test_jwks(&signing_key, "test-key");
@@ -1860,7 +1961,11 @@ mod tests {
         }
     }
 
-    fn signed_test_token(signing_key: &SigningKey, kid: &str, claims: &ZerothJwtClaims) -> String {
+    fn signed_test_token<T: Serialize>(
+        signing_key: &SigningKey,
+        kid: &str,
+        claims: &T,
+    ) -> String {
         let header = serde_json::json!({
             "alg": "ES256",
             "kid": kid,
@@ -1924,6 +2029,18 @@ mod tests {
             name: Some("Example User".to_owned()),
             picture: None,
             roles: vec!["user".to_owned()],
+        }
+    }
+
+    fn issued_access_token_claims(iat: i64) -> ZerothIssuedAccessTokenClaims {
+        ZerothIssuedAccessTokenClaims {
+            iss: "https://id.example.com".to_owned(),
+            sub: "usr_123".to_owned(),
+            aud: "yl-record-issuer".to_owned(),
+            iat,
+            exp: iat + 300,
+            jti: "jti-123".to_owned(),
+            client_id: "yl-web".to_owned(),
         }
     }
 }

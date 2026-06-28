@@ -222,6 +222,22 @@ pub const ROUTES: &[Route] = &[
         path: "/userinfo",
     },
     Route {
+        method: "POST",
+        path: "/tokens",
+    },
+    Route {
+        method: "POST",
+        path: "/api/tokens",
+    },
+    Route {
+        method: "OPTIONS",
+        path: "/tokens",
+    },
+    Route {
+        method: "OPTIONS",
+        path: "/api/tokens",
+    },
+    Route {
         method: "GET",
         path: "/login",
     },

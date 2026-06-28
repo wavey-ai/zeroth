@@ -126,6 +126,14 @@ public clients that can accept any provider account, or set domains such as
 `["example.com"]` to require a verified provider email whose domain matches the
 client allowlist before Zeroth issues a session or authorization code.
 
+The client row can also configure a short-lived bearer token for a downstream
+issuer such as `yl-record-issuer`. Set `issuer_token_audience` to the fixed
+audience the client should receive, and `issuer_token_ttl_seconds` to a value
+between 60 and 600 seconds. Zeroth exposes these fields in the admin client UI
+so deployments can update them without editing SQL. The token minting endpoint
+uses the current signed-in browser session, the exact browser origin, and the
+client's configured audience; it does not accept an audience from the request.
+
 For confidential clients, `secret_hash` is the SHA-256 hex digest of the client
 secret, optionally prefixed with `sha256:`. `/oauth/token` accepts
 `client_secret_post` and `client_secret_basic`.
@@ -166,6 +174,46 @@ and scaffold placeholders such as `replace-with-*`, `changeme`, or `<...>` are
 treated as unconfigured so local templates cannot accidentally pass a live
 readiness check. It also reports Apple App Site Association JSON status without
 making that optional file block readiness.
+
+`POST /tokens` and `POST /api/tokens` mint a short-lived ES256 bearer token for
+the signed-in browser session's registered client. The request must come from an
+allowed browser origin, must include `X-Zeroth-Token-Purpose:
+yl-record-issuer`, and returns:
+
+```json
+{
+  "accessToken": "<signed JWT>",
+  "tokenType": "Bearer",
+  "expiresIn": 300
+}
+```
+
+The client must have `issuer_token_audience` configured in Zeroth. The token is
+signed with Zeroth's active ES256 key, uses the configured issuer, and is
+intended for immediate use by the downstream `yl-record-issuer` worker. The
+browser-readable `zeroth` profile cookie is not authentication and is not used
+to mint this token.
+
+Browser example:
+
+```js
+const tokenResponse = await fetch(
+  "https://id.wavey.ai/api/tokens",
+  {
+    method: "POST",
+    credentials: "include",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Zeroth-Token-Purpose": "yl-record-issuer",
+    },
+    body: "{}",
+  }
+);
+if (!tokenResponse.ok) {
+  throw new Error(`Zeroth token request failed: ${tokenResponse.status}`);
+}
+const { accessToken } = await tokenResponse.json();
+```
 
 `GET /admin` and `GET /admin/clients` serve the Leptos management UI for the
 same APIs. The page can use the current Zeroth session when the user is

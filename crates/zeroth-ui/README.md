@@ -17,6 +17,8 @@ Zeroth now:
 - linked identity display and guarded unlink forms
 - browser session display and current-session sign out
 - compact OIDC application/client inventory
+- client admin editing for issuer token audience and TTL so deployments can
+  configure downstream bearer-token minting without code changes
 - `/admin` and `/admin/clients` provider readiness, user lifecycle, filtered
   audit event inspection, and registered-client management backed by Zeroth's
   management APIs

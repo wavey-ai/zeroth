@@ -52,6 +52,8 @@ CREATE TABLE IF NOT EXISTS zeroth_clients (
     redirect_uris_json TEXT NOT NULL,
     allowed_origins_json TEXT NOT NULL DEFAULT '[]',
     allowed_email_domains_json TEXT NOT NULL DEFAULT '[]',
+    issuer_token_audience TEXT,
+    issuer_token_ttl_seconds INTEGER,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     disabled_at INTEGER

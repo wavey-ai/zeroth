@@ -33,7 +33,10 @@ use zeroth_oidc::validate_authorization_request_for_client;
 #[cfg(any(test, target_arch = "wasm32"))]
 use zeroth_oidc::AuthorizationPrompt;
 use zeroth_oidc::{AuthorizationRequest, AuthorizationRequestError};
-use zeroth_oidc::{ZerothJwk, ZerothJwks, ZerothJwtClaims, ZerothTokenUse, ZerothTokenValidation};
+use zeroth_oidc::{
+    ZerothIssuedAccessTokenClaims, ZerothJwk, ZerothJwks, ZerothJwtClaims, ZerothTokenUse,
+    ZerothTokenValidation,
+};
 use zeroth_providers::well_known;
 #[cfg(any(test, target_arch = "wasm32"))]
 use zeroth_providers::TokenAuth;
@@ -139,6 +142,10 @@ const CORS_MAX_AGE_SECONDS: &str = "600";
 const ZEROTH_FAVICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><defs><linearGradient id="g" x1="0" x2="1" y1="0" y2="1"><stop stop-color="#2d333b"/><stop offset="0.58" stop-color="#1f2328"/><stop offset="1" stop-color="#0b0f19"/></linearGradient></defs><rect width="64" height="64" rx="12" fill="url(#g)"/><path d="M17 16h30L25 48h25" fill="none" stroke="#f9fafb" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/></svg>"##;
 const ZEROTH_PROFILE_MENU_JS: &str = r###"
 (() => {
+  const ZEROTH_COOKIE_NAME = "zeroth";
+  const ZEROTH_COOKIE_MAX_AGE_SECONDS = 31536000;
+  const ZEROTH_COOKIE_ICON_MAX_CHARS = 1800;
+  const ZEROTH_LOCAL_ICON_PREFIX = "zeroth:userIcon:";
   const scriptOrigin = document.currentScript && document.currentScript.src
     ? new URL(document.currentScript.src, window.location.href).origin
     : "";
@@ -161,34 +168,207 @@ const ZEROTH_PROFILE_MENU_JS: &str = r###"
     if (!value) return fallback;
     return !["0", "false", "no", "off"].includes(value.toLowerCase());
   };
+  const boolOption = (value, fallback = false) => {
+    if (value == null) return fallback;
+    if (typeof value === "boolean") return value;
+    const normalized = String(value).trim().toLowerCase();
+    if (!normalized) return fallback;
+    return !["0", "false", "no", "off"].includes(normalized);
+  };
+  const compactMenuOption = (options, host) => {
+    if (options.compact != null) return boolOption(options.compact);
+    const variant = String(options.variant || attr(host, "variant") || attr(host, "data-variant") || "").trim().toLowerCase();
+    if (variant === "compact") return true;
+    if (host && typeof host.hasAttribute === "function") {
+      if (host.hasAttribute("compact")) return boolAttr(host, "compact", true);
+      if (host.hasAttribute("data-compact")) return boolAttr(host, "data-compact", true);
+    }
+    return false;
+  };
   const trimSlash = (value) => String(value || "").replace(/\/+$/, "");
   const endpoint = (issuer, value, fallback) => new URL(value || fallback, trimSlash(issuer) + "/").toString();
+  const clean = (value) => value == null ? "" : String(value).trim();
+  const labelInitial = (label, fallback = "Z") => {
+    const value = text(label || fallback).trim();
+    return esc((value && value[0] ? value[0] : fallback).toUpperCase());
+  };
   const initial = (user) => {
-    const label = text(first(user, ["name", "email", "sub"]) || "Z").trim();
-    return esc((label && label[0] ? label[0] : "Z").toUpperCase());
+    return labelInitial(first(user, ["name", "email", "sub"]) || "Z");
+  };
+  const decode = (value) => {
+    try { return decodeURIComponent(String(value || "").replaceAll("+", "%20")); } catch (_) { return String(value || ""); }
+  };
+  const cookieValue = (name) => {
+    const parts = String(document.cookie || "").split(";");
+    for (const part of parts) {
+      const index = part.indexOf("=");
+      const current = (index >= 0 ? part.slice(0, index) : part).trim();
+      if (current !== name) continue;
+      return decode(index >= 0 ? part.slice(index + 1) : "");
+    }
+    return "";
+  };
+  const readZerothCookie = () => {
+    const raw = cookieValue(ZEROTH_COOKIE_NAME);
+    if (!raw) return null;
+    try {
+      const value = JSON.parse(raw);
+      return value && typeof value === "object" ? value : null;
+    } catch (_) {
+      const params = new URLSearchParams(raw);
+      return Object.fromEntries(params.entries());
+    }
+  };
+  const nowSeconds = () => Math.floor(Date.now() / 1000);
+  const randomId = () => {
+    if (window.crypto && typeof crypto.randomUUID === "function") return crypto.randomUUID();
+    const bytes = new Uint8Array(16);
+    if (window.crypto && typeof crypto.getRandomValues === "function") {
+      crypto.getRandomValues(bytes);
+    } else {
+      for (let index = 0; index < bytes.length; index += 1) bytes[index] = Math.floor(Math.random() * 256);
+    }
+    return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  };
+  const stableNumber = (value, fallback) => {
+    const number = Number(value);
+    return Number.isFinite(number) && number > 0 ? Math.floor(number) : fallback;
+  };
+  const imageUrl = (value) => {
+    const raw = String(value || "").trim();
+    if (!raw) return "";
+    if (/^data:image\/(?:png|jpe?g|gif|webp|svg\+xml);/i.test(raw)) return raw;
+    try {
+      const url = new URL(raw, window.location.href);
+      return ["http:", "https:"].includes(url.protocol) ? url.toString() : "";
+    } catch (_) {
+      return "";
+    }
+  };
+  const normalizeZerothCookie = (value = {}) => {
+    const now = nowSeconds();
+    const createdAt = stableNumber(value.createdAt, now);
+    return {
+      v: 1,
+      anonId: clean(value.anonId || value.anonymousId || value.id) || randomId(),
+      clientId: clean(value.clientId),
+      name: clean(value.name || value.label || value.displayName),
+      nameSource: ["user", "brand"].includes(clean(value.nameSource)) ? clean(value.nameSource) : "",
+      icon: imageUrl(value.icon || value.iconUrl || value.picture || value.pictureUrl || ""),
+      userIcon: imageUrl(value.userIcon || value.userIconUrl || value.avatarIcon || value.avatar || ""),
+      userIconKey: clean(value.userIconKey || value.avatarIconKey || ""),
+      createdAt,
+      updatedAt: now,
+    };
+  };
+  const writeZerothCookie = (identity) => {
+    const secure = window.location.protocol === "https:" ? "; Secure" : "";
+    document.cookie = `${ZEROTH_COOKIE_NAME}=${encodeURIComponent(JSON.stringify(identity))}; Path=/; Max-Age=${ZEROTH_COOKIE_MAX_AGE_SECONDS}; SameSite=Lax${secure}`;
+  };
+  const expireZerothCookie = () => {
+    const secure = window.location.protocol === "https:" ? "; Secure" : "";
+    document.cookie = `${ZEROTH_COOKIE_NAME}=; Path=/; Max-Age=0; SameSite=Lax${secure}`;
+  };
+  const userIconStorageKey = (identity) => `${ZEROTH_LOCAL_ICON_PREFIX}${clean(identity && identity.anonId) || randomId()}`;
+  const storageGet = (key) => {
+    try { return key ? window.localStorage.getItem(key) || "" : ""; } catch (_) { return ""; }
+  };
+  const storageSet = (key, value) => {
+    try { if (key) window.localStorage.setItem(key, value); return true; } catch (_) { return false; }
+  };
+  const storageRemove = (key) => {
+    try { if (key) window.localStorage.removeItem(key); } catch (_) {}
+  };
+  const identityUserIcon = (identity) => {
+    if (!identity) return "";
+    return imageUrl(identity.userIcon || storageGet(identity.userIconKey));
+  };
+  const mergeZerothCookie = (patch = {}) => {
+    const current = normalizeZerothCookie(readZerothCookie() || {});
+    const nextPatch = { ...patch };
+    if (current.nameSource === "user" && nextPatch.name && nextPatch.nameSource !== "user") {
+      delete nextPatch.name;
+      delete nextPatch.nameSource;
+    }
+    let next = normalizeZerothCookie({ ...current, ...nextPatch });
+    if (next.userIcon && next.userIcon.length > ZEROTH_COOKIE_ICON_MAX_CHARS) {
+      const key = userIconStorageKey(next);
+      if (storageSet(key, next.userIcon)) {
+        next = normalizeZerothCookie({ ...next, userIcon: "", userIconKey: key });
+      }
+    }
+    if (current.userIconKey && current.userIconKey !== next.userIconKey) {
+      storageRemove(current.userIconKey);
+    }
+    writeZerothCookie(next);
+    window.dispatchEvent(new CustomEvent("zeroth:identity", { detail: next }));
+    return next;
+  };
+  const clearZerothCookieIdentity = () => {
+    const current = normalizeZerothCookie(readZerothCookie() || {});
+    storageRemove(current.userIconKey);
+    expireZerothCookie();
+    window.dispatchEvent(new CustomEvent("zeroth:identity-cleared", { detail: current }));
+    return current;
+  };
+  const zerothCookieIdentity = () => normalizeZerothCookie(readZerothCookie() || {});
+  const temporaryIdentity = (identity = zerothCookieIdentity()) => {
+    const name = identity.name || "";
+    const icon = identityUserIcon(identity) || identity.icon || "";
+    return { name: clean(name), icon: imageUrl(icon) };
+  };
+  const hasTemporaryIdentity = (identity) => Boolean(identity && (identity.name || identity.icon));
+  const avatarMarkup = (label, picture, fallback = "Z") => {
+    const src = imageUrl(picture);
+    if (src) return `<img src="${esc(src)}" alt="">`;
+    return labelInitial(label, fallback);
   };
 
   const style = `
-    :host, .zeroth-profile-menu { color: #24292f; font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    :host, .zeroth-profile-menu { color: #f8fafc; font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
     .zeroth-profile-menu { position: relative; display: inline-block; text-align: left; }
     .zeroth-profile-menu * { box-sizing: border-box; }
-    .zeroth-menu-button, .zeroth-menu-link, .zeroth-menu-item { min-height: 34px; border: 1px solid #d0d7de; border-radius: 8px; background: #fff; color: #24292f; font: inherit; font-weight: 700; text-decoration: none; cursor: pointer; }
-    .zeroth-menu-link { display: inline-flex; align-items: center; justify-content: center; padding: 7px 12px; white-space: nowrap; }
-    .zeroth-menu-button { display: inline-flex; align-items: center; gap: 8px; max-width: 260px; padding: 4px 9px 4px 5px; }
-    .zeroth-menu-button:hover, .zeroth-menu-link:hover, .zeroth-menu-item:hover { background: #f6f8fa; text-decoration: none; }
-    .zeroth-avatar { display: grid; place-items: center; width: 26px; height: 26px; border-radius: 6px; background: linear-gradient(145deg, #2d333b 0%, #1f2328 55%, #0b0f19 100%); color: #fff; font-weight: 800; overflow: hidden; flex: 0 0 auto; }
+    .zeroth-menu-button, .zeroth-menu-link, .zeroth-menu-item { min-height: 38px; border-radius: 14px; font: inherit; font-weight: 760; text-decoration: none; cursor: pointer; }
+    .zeroth-menu-button, .zeroth-menu-link { border: 1px solid rgba(255,255,255,0.16); background: linear-gradient(145deg, rgba(30,32,37,0.98) 0%, rgba(11,13,18,0.98) 62%, rgba(0,0,0,0.98) 100%); color: #fff; box-shadow: 0 14px 34px rgba(0,0,0,0.28), 0 2px 9px rgba(0,0,0,0.22), inset 0 1px 0 rgba(255,255,255,0.08); }
+    .zeroth-menu-link { display: inline-flex; align-items: center; justify-content: center; gap: 9px; padding: 5px 13px 5px 6px; white-space: nowrap; }
+    .zeroth-menu-button { display: inline-flex; align-items: center; gap: 9px; max-width: 260px; padding: 5px 11px 5px 6px; }
+    .zeroth-menu-button-compact { gap: 6px; max-width: none; min-width: 0; padding: 5px 7px 5px 5px; }
+    .zeroth-menu-link-compact { gap: 6px; min-width: 0; padding: 5px 7px 5px 5px; }
+    .zeroth-menu-loading { cursor: progress; opacity: 0.86; }
+    .zeroth-menu-button:hover, .zeroth-menu-link:hover { border-color: rgba(255,255,255,0.28); background: linear-gradient(145deg, rgba(40,43,49,0.98) 0%, rgba(15,17,23,0.98) 64%, rgba(0,0,0,0.98) 100%); text-decoration: none; }
+    .zeroth-anon-profile { max-width: 210px; }
+    .zeroth-anon-profile.zeroth-menu-button-compact { max-width: none; }
+    .zeroth-mark, .zeroth-avatar { display: grid; place-items: center; width: 28px; height: 28px; border-radius: 10px; background: linear-gradient(145deg, #3a3f47 0%, #1f2328 52%, #05070b 100%); color: #fff; font-weight: 850; line-height: 1; overflow: hidden; flex: 0 0 auto; box-shadow: inset 0 1px 0 rgba(255,255,255,0.12), 0 5px 14px rgba(0,0,0,0.24); }
     .zeroth-avatar img { width: 100%; height: 100%; object-fit: cover; }
     .zeroth-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .zeroth-caret { color: #57606a; font-size: 11px; }
-    .zeroth-popover { position: absolute; right: 0; top: calc(100% + 8px); width: min(320px, calc(100vw - 24px)); border: 1px solid #d0d7de; border-radius: 8px; background: #fff; box-shadow: 0 16px 40px rgba(31, 35, 40, 0.16); overflow: hidden; z-index: 2147483647; }
+    .zeroth-caret { position: relative; display: inline-grid; place-items: center; width: 18px; height: 18px; border-radius: 999px; background: rgba(255,255,255,0.08); color: rgba(255,255,255,0.78); flex: 0 0 auto; box-shadow: inset 0 1px 0 rgba(255,255,255,0.08); transition: background 140ms ease, color 140ms ease, transform 140ms ease; }
+    .zeroth-caret::before { content: ""; width: 6px; height: 6px; border-right: 1.8px solid currentColor; border-bottom: 1.8px solid currentColor; transform: translateY(-1px) rotate(45deg); }
+    .zeroth-menu-button:hover .zeroth-caret, .zeroth-menu-link:hover .zeroth-caret { background: rgba(255,255,255,0.13); color: #fff; }
+    .zeroth-menu-button[aria-expanded="true"] .zeroth-caret { transform: rotate(180deg); }
+    .zeroth-popover { position: absolute; right: 0; top: calc(100% + 10px); width: min(292px, calc(100vw - 32px)); border: 1px solid rgba(15,23,42,0.13); border-radius: 16px; background: radial-gradient(circle at 0% 0%, rgba(0,0,0,0.22) 0, rgba(0,0,0,0.08) 24%, rgba(0,0,0,0) 48%), radial-gradient(circle at 100% 100%, rgba(0,0,0,0.2) 0, rgba(0,0,0,0.06) 24%, rgba(0,0,0,0) 48%), linear-gradient(180deg, rgba(255,255,255,0.98), rgba(247,249,252,0.96)); box-shadow: 0 22px 52px rgba(0,0,0,0.28), 0 4px 14px rgba(0,0,0,0.18); overflow: hidden; z-index: 2147483647; color: #111827; }
+    .zeroth-profile-menu-portal-root { position: fixed; inset: 0; z-index: 2147483647; width: 0; height: 0; pointer-events: none; }
+    .zeroth-profile-menu-portal { position: fixed; top: 0; left: 0; z-index: 2147483647; width: 0; height: 0; pointer-events: none; }
+    .zeroth-profile-menu-portal .zeroth-popover { position: fixed; top: auto; right: auto; overflow: auto; pointer-events: auto; }
     .zeroth-popover[hidden] { display: none; }
-    .zeroth-menu-head { display: flex; align-items: center; gap: 10px; padding: 12px; border-bottom: 1px solid #d8dee4; }
-    .zeroth-menu-name { font-weight: 800; overflow-wrap: anywhere; }
-    .zeroth-menu-email { color: #57606a; font-size: 12px; overflow-wrap: anywhere; }
-    .zeroth-menu-list { display: grid; padding: 6px; gap: 4px; }
-    .zeroth-menu-item { display: flex; width: 100%; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 10px; border-color: transparent; font-weight: 700; }
-    .zeroth-menu-item-danger { color: #cf222e; }
-    .zeroth-status { color: #57606a; font-size: 12px; padding: 8px 10px; }
+    .zeroth-menu-head { display: flex; align-items: center; gap: 10px; padding: 14px 14px 12px; border-bottom: 1px solid rgba(17,24,39,0.08); }
+    .zeroth-menu-head-main { display: flex; align-items: center; gap: 10px; min-width: 0; flex: 1 1 auto; }
+    .zeroth-menu-head-copy { min-width: 0; }
+    .zeroth-menu-name { font-size: 15px; font-weight: 820; line-height: 1.18; overflow-wrap: anywhere; }
+    .zeroth-menu-email { color: #4b5563; font-size: 12px; line-height: 1.3; margin-top: 3px; overflow-wrap: anywhere; }
+    .zeroth-menu-list { display: grid; padding: 7px; gap: 5px; }
+    .zeroth-menu-item { display: flex; width: 100%; align-items: center; justify-content: space-between; gap: 10px; padding: 9px 10px; border: 1px solid transparent; background: rgba(255,255,255,0.74); color: #111827; font-weight: 760; }
+    .zeroth-menu-item:hover { background: rgba(255,255,255,0.96); border-color: rgba(17,24,39,0.08); text-decoration: none; }
+    .zeroth-menu-item-primary { background: #0b0f19; border-color: #0b0f19; color: #fff; box-shadow: 0 8px 22px rgba(0,0,0,0.18); }
+    .zeroth-menu-item-primary:hover { background: #020617; color: #fff; }
+    .zeroth-menu-item-danger { color: #b42318; }
+    .zeroth-menu-actions { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 8px; padding: 9px 10px 10px; }
+    .zeroth-menu-action { display: inline-flex; align-items: center; justify-content: center; min-width: 0; min-height: 38px; padding: 8px 9px; border: 1px solid rgba(17,24,39,0.1); border-radius: 12px; font: inherit; font-size: 12px; font-weight: 820; line-height: 1.12; text-align: center; text-decoration: none; white-space: nowrap; cursor: pointer; }
+    .zeroth-menu-action:hover { text-decoration: none; }
+    .zeroth-menu-action-primary { background: #0b0f19; border-color: #0b0f19; color: #fff; box-shadow: 0 8px 22px rgba(0,0,0,0.18); }
+    .zeroth-menu-action-primary:hover { background: #020617; color: #fff; }
+    .zeroth-menu-action-secondary { background: rgba(17,24,39,0.06); color: #111827; }
+    .zeroth-menu-action-secondary:hover { background: rgba(17,24,39,0.1); border-color: rgba(17,24,39,0.16); color: #111827; }
+    .zeroth-status { color: rgba(255,255,255,0.68); font-size: 12px; padding: 8px 10px; }
   `;
 
   async function tokenFor(options, host) {
@@ -225,10 +405,26 @@ const ZEROTH_PROFILE_MENU_JS: &str = r###"
     return { authenticated: Boolean(session.authenticated), user: session.user || null, token: "" };
   }
 
-  function avatar(user) {
+  async function loadBranding(state) {
+    if (!state.clientId) return null;
+    const url = new URL(endpoint(state.issuer, state.brandingPath, "/client-branding"));
+    url.searchParams.set("client_id", state.clientId);
+    if (state.returnTo) url.searchParams.set("return_to", state.returnTo);
+    const branding = await apiJson(url, {
+      headers: { Accept: "application/json" },
+      credentials: "omit",
+    });
+    return {
+      clientId: state.clientId,
+      name: text(branding.name || branding.displayName || "").trim(),
+      nameSource: "brand",
+      icon: imageUrl(branding.icon || branding.iconUrl || branding.picture || branding.pictureUrl || ""),
+    };
+  }
+
+  function avatar(user, fallbackIcon = "") {
     const picture = user && (user.picture || user.pictureUrl);
-    if (picture) return `<img src="${esc(picture)}" alt="">`;
-    return initial(user);
+    return avatarMarkup(first(user, ["name", "email", "sub"]) || "Z", picture || fallbackIcon);
   }
 
   function render(root, state) {
@@ -238,37 +434,123 @@ const ZEROTH_PROFILE_MENU_JS: &str = r###"
     if (state.clientId && !loginTarget.searchParams.has("client_id")) loginTarget.searchParams.set("client_id", state.clientId);
     const accountUrl = state.accountUrl || `${trimSlash(state.issuer)}/account?return_to=${encodeURIComponent(state.returnTo || window.location.href)}`;
     const adminUrl = state.adminUrl || `${trimSlash(state.issuer)}/admin`;
+    const compactClass = state.compact ? " zeroth-menu-button-compact" : "";
+    const triggerLabel = (label) => state.compact ? "" : `<span class="zeroth-label">${esc(label)}</span>`;
+    state.portalHtml = "";
 
     if (state.loading) {
+      if (state.compact) {
+        const temp = state.temporaryIdentity || {};
+        const tempName = temp.name || "Account";
+        root.innerHTML = `<style>${style}</style>
+          <span class="zeroth-profile-menu">
+            <span class="zeroth-menu-button zeroth-menu-button-compact zeroth-menu-loading" role="status" aria-label="Loading account">
+              <span class="zeroth-avatar">${avatarMarkup(tempName, temp.icon)}</span>
+              <span class="zeroth-caret" aria-hidden="true"></span>
+            </span>
+          </span>`;
+        return;
+      }
       root.innerHTML = `<style>${style}</style><span class="zeroth-profile-menu"><span class="zeroth-status">Loading account</span></span>`;
       return;
     }
     if (!state.authenticated || !state.user) {
-      root.innerHTML = `<style>${style}</style><span class="zeroth-profile-menu"><a class="zeroth-menu-link" href="${esc(loginTarget.toString())}">Sign in</a></span>`;
+      const temp = state.temporaryIdentity || {};
+      const tempName = temp.name || "Account";
+      if (hasTemporaryIdentity(temp)) {
+        if (state.open) {
+          state.portalHtml = `<div class="zeroth-popover" role="menu" data-zeroth-portal-popover>
+            <div class="zeroth-menu-head">
+              <div class="zeroth-menu-head-main">
+                <span class="zeroth-avatar">${avatarMarkup(tempName, temp.icon)}</span>
+                <div class="zeroth-menu-head-copy"><div class="zeroth-menu-name">${esc(tempName)}</div></div>
+              </div>
+            </div>
+            <div class="zeroth-menu-actions">
+              <a class="zeroth-menu-action zeroth-menu-action-primary" href="${esc(loginTarget.toString())}">Sign In</a>
+              <button class="zeroth-menu-action zeroth-menu-action-secondary" type="button" data-zeroth-menu-clear>Reset Anon</button>
+            </div>
+          </div>`;
+        }
+        root.innerHTML = `<style>${style}</style>
+          <div class="zeroth-profile-menu">
+            <button class="zeroth-menu-button zeroth-anon-profile${compactClass}" type="button" aria-haspopup="menu" aria-expanded="${state.open ? "true" : "false"}" aria-label="${esc(`Open profile menu for ${tempName}`)}" data-zeroth-menu-toggle>
+              <span class="zeroth-avatar">${avatarMarkup(tempName, temp.icon)}</span>
+              ${triggerLabel(tempName)}
+              <span class="zeroth-caret" aria-hidden="true"></span>
+            </button>
+          </div>`;
+        return;
+      }
+      const compactLinkClass = state.compact ? " zeroth-menu-link-compact" : "";
+      const compactLinkLabel = state.compact ? "" : "<span>Sign in</span>";
+      const compactLinkCaret = state.compact ? `<span class="zeroth-caret" aria-hidden="true"></span>` : "";
+      root.innerHTML = `<style>${style}</style><span class="zeroth-profile-menu"><a class="zeroth-menu-link${compactLinkClass}" href="${esc(loginTarget.toString())}" aria-label="Sign in"><span class="zeroth-mark" aria-hidden="true">${avatarMarkup("Z", "")}</span>${compactLinkLabel}${compactLinkCaret}</a></span>`;
       return;
     }
 
     const user = state.user;
     const name = first(user, ["name", "displayName", "email", "sub"]) || "Account";
     const email = first(user, ["email", "sub"]);
-    const open = state.open ? "" : " hidden";
     const adminItem = state.showAdmin ? `<a class="zeroth-menu-item" href="${esc(adminUrl)}"><span>Admin</span><span>Open</span></a>` : "";
-    root.innerHTML = `<style>${style}</style>
-      <div class="zeroth-profile-menu">
-        <button class="zeroth-menu-button" type="button" aria-haspopup="menu" aria-expanded="${state.open ? "true" : "false"}" data-zeroth-menu-toggle>
-          <span class="zeroth-avatar">${avatar(user)}</span>
-          <span class="zeroth-label">${esc(name)}</span>
-          <span class="zeroth-caret">v</span>
-        </button>
-        <div class="zeroth-popover" role="menu"${open}>
-          <div class="zeroth-menu-head"><span class="zeroth-avatar">${avatar(user)}</span><div><div class="zeroth-menu-name">${esc(name)}</div><div class="zeroth-menu-email">${esc(email)}</div></div></div>
-          <div class="zeroth-menu-list">
-            <a class="zeroth-menu-item" href="${esc(accountUrl)}"><span>Account</span><span>Manage</span></a>
-            ${adminItem}
-            <button class="zeroth-menu-item zeroth-menu-item-danger" type="button" data-zeroth-menu-logout><span>Sign out</span><span>End session</span></button>
-          </div>
+    if (state.open) {
+      state.portalHtml = `<div class="zeroth-popover" role="menu" data-zeroth-portal-popover>
+        <div class="zeroth-menu-head"><span class="zeroth-avatar">${avatar(user, identityUserIcon(state.cookieIdentity))}</span><div><div class="zeroth-menu-name">${esc(name)}</div><div class="zeroth-menu-email">${esc(email)}</div></div></div>
+        <div class="zeroth-menu-list">
+          <a class="zeroth-menu-item" href="${esc(accountUrl)}"><span>Account</span><span>Manage</span></a>
+          ${adminItem}
+          <button class="zeroth-menu-item zeroth-menu-item-danger" type="button" data-zeroth-menu-logout><span>Sign out</span><span>End session</span></button>
         </div>
       </div>`;
+    }
+    root.innerHTML = `<style>${style}</style>
+      <div class="zeroth-profile-menu">
+        <button class="zeroth-menu-button${compactClass}" type="button" aria-haspopup="menu" aria-expanded="${state.open ? "true" : "false"}" aria-label="${esc(`Open profile menu for ${name}`)}" data-zeroth-menu-toggle>
+          <span class="zeroth-avatar">${avatar(user, identityUserIcon(state.cookieIdentity))}</span>
+          ${triggerLabel(name)}
+          <span class="zeroth-caret" aria-hidden="true"></span>
+        </button>
+      </div>`;
+  }
+
+  const mountedMenus = new Set();
+
+  const refreshMountedMenus = () => {
+    for (const menu of mountedMenus) {
+      if (menu && typeof menu.refresh === "function") menu.refresh();
+    }
+  };
+
+  function setUserIcon(icon) {
+    const userIcon = imageUrl(icon);
+    if (!userIcon) throw new Error("Zeroth user icon must be an http(s) or data image URL");
+    const identity = mergeZerothCookie({ userIcon, userIconKey: "" });
+    refreshMountedMenus();
+    return identity;
+  }
+
+  function clearUserIcon() {
+    const identity = mergeZerothCookie({ userIcon: "", userIconKey: "" });
+    refreshMountedMenus();
+    return identity;
+  }
+
+  function setAnonymousName(name) {
+    const displayName = clean(name).split(/\s+/).join(" ").slice(0, 64);
+    if (!displayName) throw new Error("Zeroth anonymous name must not be empty");
+    const identity = mergeZerothCookie({ name: displayName, nameSource: "user" });
+    refreshMountedMenus();
+    return identity;
+  }
+
+  function clearAnonymousIdentity() {
+    clearZerothCookieIdentity();
+    refreshMountedMenus();
+    return anonymousIdentity();
+  }
+
+  function anonymousIdentity() {
+    return zerothCookieIdentity();
   }
 
   function mount(target, options = {}) {
@@ -285,23 +567,117 @@ const ZEROTH_PROFILE_MENU_JS: &str = r###"
       logoutUrl: options.logoutUrl || attr(host, "logout-url") || attr(host, "data-logout-url"),
       sessionPath: options.sessionPath || attr(host, "session-path") || attr(host, "data-session-path") || "/session",
       profilePath: options.profilePath || attr(host, "profile-path") || attr(host, "data-profile-path") || "/profile",
+      brandingPath: options.brandingPath || attr(host, "branding-path") || attr(host, "data-branding-path") || "/client-branding",
       showAdmin: options.showAdmin ?? boolAttr(host, "data-show-admin", boolAttr(host, "show-admin", true)),
+      compact: compactMenuOption(options, host),
+      cookieIdentity: null,
+      temporaryIdentity: null,
       loading: true,
       authenticated: false,
       user: null,
       open: false,
+      portalHtml: "",
     };
+    state.cookieIdentity = mergeZerothCookie({ clientId: state.clientId });
+    state.temporaryIdentity = temporaryIdentity(state.cookieIdentity);
+    let portal = null;
+    let portalFrame = 0;
+
+    function syncOpenState() {
+      if (state.open) host.setAttribute("data-zeroth-menu-open", "true");
+      else host.removeAttribute("data-zeroth-menu-open");
+    }
+
+    function renderState() {
+      syncOpenState();
+      render(root, state);
+      syncPopoverPortal();
+    }
+
+    function triggerButton() {
+      return root.querySelector("[data-zeroth-menu-toggle]");
+    }
+
+    function removePopoverPortal() {
+      if (portalFrame) {
+        window.cancelAnimationFrame(portalFrame);
+        portalFrame = 0;
+      }
+      if (portal) {
+        portal.remove();
+        portal = null;
+      }
+    }
+
+    function positionPopoverPortal() {
+      portalFrame = 0;
+      if (!portal) return;
+      const button = triggerButton();
+      const popover = portal.querySelector("[data-zeroth-portal-popover]");
+      if (!button || !popover) return;
+      const rect = button.getBoundingClientRect();
+      const viewportWidth = Math.max(0, document.documentElement.clientWidth || window.innerWidth || 0);
+      const viewportHeight = Math.max(0, document.documentElement.clientHeight || window.innerHeight || 0);
+      const margin = 16;
+      const gap = 10;
+      const width = Math.min(292, Math.max(180, viewportWidth - (margin * 2)));
+      popover.style.position = "fixed";
+      popover.style.zIndex = "2147483647";
+      popover.style.width = `${width}px`;
+      popover.style.maxHeight = `${Math.max(160, viewportHeight - (margin * 2))}px`;
+      const height = popover.offsetHeight || 0;
+      const maxLeft = Math.max(margin, viewportWidth - width - margin);
+      let left = Math.min(maxLeft, Math.max(margin, rect.right - width));
+      let top = rect.bottom + gap;
+      if (top + height > viewportHeight - margin && rect.top - height - gap >= margin) {
+        top = rect.top - height - gap;
+      }
+      const maxTop = Math.max(margin, viewportHeight - height - margin);
+      top = Math.min(maxTop, Math.max(margin, top));
+      popover.style.left = `${Math.round(left)}px`;
+      popover.style.top = `${Math.round(top)}px`;
+    }
+
+    function schedulePopoverPosition() {
+      if (!portal || portalFrame) return;
+      portalFrame = window.requestAnimationFrame(positionPopoverPortal);
+    }
+
+    function syncPopoverPortal() {
+      if (!state.open || !state.portalHtml) {
+        removePopoverPortal();
+        return;
+      }
+      if (!portal) {
+        portal = document.createElement("div");
+        portal.className = "zeroth-profile-menu-portal-root";
+        portal.setAttribute("data-zeroth-popover-portal", "true");
+        portal.style.cssText = "position:fixed;inset:0;z-index:2147483647;width:0;height:0;pointer-events:none;";
+        portal.addEventListener("click", handlePortalClick);
+        (document.body || document.documentElement).append(portal);
+      }
+      portal.innerHTML = `<style>${style}</style><div class="zeroth-profile-menu zeroth-profile-menu-portal">${state.portalHtml}</div>`;
+      positionPopoverPortal();
+      schedulePopoverPosition();
+    }
 
     async function refresh() {
       state.loading = true;
       state.open = false;
-      render(root, state);
+      state.cookieIdentity = mergeZerothCookie({ clientId: state.clientId });
+      state.temporaryIdentity = temporaryIdentity(state.cookieIdentity);
+      renderState();
+      const branding = await loadBranding(state).catch(() => null);
+      if (hasTemporaryIdentity(branding)) {
+        state.cookieIdentity = mergeZerothCookie(branding);
+        state.temporaryIdentity = temporaryIdentity(state.cookieIdentity);
+      }
       try {
         Object.assign(state, await loadIdentity(state, options, host), { loading: false });
       } catch (error) {
         Object.assign(state, { loading: false, authenticated: false, user: null, error });
       }
-      render(root, state);
+      renderState();
     }
 
     async function signOut() {
@@ -318,35 +694,69 @@ const ZEROTH_PROFILE_MENU_JS: &str = r###"
       state.authenticated = false;
       state.user = null;
       state.open = false;
-      render(root, state);
+      renderState();
       const signedOutUrl = options.signedOutUrl || attr(host, "signed-out-url") || attr(host, "data-signed-out-url");
       if (signedOutUrl) window.location.assign(signedOutUrl);
     }
 
-    root.addEventListener("click", (event) => {
+    function handleMenuClick(event) {
       const target = event.target;
-      if (!(target instanceof Element)) return;
+      if (!(target instanceof Element)) return false;
       if (target.closest("[data-zeroth-menu-toggle]")) {
         event.preventDefault();
         state.open = !state.open;
-        render(root, state);
-        return;
+        renderState();
+        return true;
       }
       if (target.closest("[data-zeroth-menu-logout]")) {
         event.preventDefault();
         signOut();
+        return true;
       }
+      if (target.closest("[data-zeroth-menu-clear]")) {
+        event.preventDefault();
+        state.open = false;
+        clearZerothCookieIdentity();
+        renderState();
+        window.setTimeout(refresh, 0);
+        return true;
+      }
+      return false;
+    }
+
+    function handlePortalClick(event) {
+      if (handleMenuClick(event)) {
+        event.stopPropagation();
+      }
+    }
+
+    root.addEventListener("click", (event) => {
+      handleMenuClick(event);
     });
     document.addEventListener("click", (event) => {
       if (!state.open) return;
       const path = typeof event.composedPath === "function" ? event.composedPath() : [];
-      if (path.includes(host) || path.includes(root)) return;
+      if (path.includes(host) || path.includes(root) || (portal && path.includes(portal))) return;
       state.open = false;
-      render(root, state);
+      renderState();
     });
+    window.addEventListener("resize", schedulePopoverPosition, { passive: true });
+    window.addEventListener("scroll", schedulePopoverPosition, { passive: true, capture: true });
 
+    const api = {
+      refresh,
+      signOut,
+      root,
+      state,
+      setUserIcon,
+      clearUserIcon,
+      setAnonymousName,
+      clearAnonymousIdentity,
+      anonymousIdentity,
+    };
+    mountedMenus.add(api);
     refresh();
-    return { refresh, signOut, root, state };
+    return api;
   }
 
   class ZerothProfileMenuElement extends HTMLElement {
@@ -362,9 +772,24 @@ const ZEROTH_PROFILE_MENU_JS: &str = r###"
     signOut() {
       return this.__zerothProfileMenu && this.__zerothProfileMenu.signOut();
     }
+    setUserIcon(icon) {
+      return this.__zerothProfileMenu && this.__zerothProfileMenu.setUserIcon(icon);
+    }
+    clearUserIcon() {
+      return this.__zerothProfileMenu && this.__zerothProfileMenu.clearUserIcon();
+    }
+    setAnonymousName(name) {
+      return this.__zerothProfileMenu && this.__zerothProfileMenu.setAnonymousName(name);
+    }
+    clearAnonymousIdentity() {
+      return this.__zerothProfileMenu && this.__zerothProfileMenu.clearAnonymousIdentity();
+    }
+    anonymousIdentity() {
+      return this.__zerothProfileMenu && this.__zerothProfileMenu.anonymousIdentity();
+    }
   }
 
-  window.ZerothProfileMenu = { mount };
+  window.ZerothProfileMenu = { mount, setUserIcon, clearUserIcon, setAnonymousName, clearAnonymousIdentity, anonymousIdentity };
   if (window.customElements && !customElements.get("zeroth-profile-menu")) {
     customElements.define("zeroth-profile-menu", ZerothProfileMenuElement);
   }
@@ -822,6 +1247,14 @@ struct OAuthErrorResponse {
     error_description: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IssuerAccessTokenResponse {
+    access_token: String,
+    token_type: String,
+    expires_in: i32,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct ClientRow {
     #[serde(default)]
@@ -836,6 +1269,10 @@ struct ClientRow {
     allowed_origins_json: String,
     #[serde(default)]
     allowed_email_domains_json: String,
+    #[serde(default)]
+    issuer_token_audience: Option<String>,
+    #[serde(default)]
+    issuer_token_ttl_seconds: Option<i32>,
     #[serde(default)]
     account_sharing_mode: Option<String>,
     #[serde(default)]
@@ -862,6 +1299,10 @@ struct ClientResponse {
     redirect_uris: Vec<String>,
     allowed_origins: Vec<String>,
     allowed_email_domains: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    issuer_token_audience: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    issuer_token_ttl_seconds: Option<i32>,
     account_sharing_mode: String,
     account_tenant_id: String,
     account_namespace: String,
@@ -875,6 +1316,15 @@ struct ClientResponse {
 #[serde(rename_all = "camelCase")]
 struct ClientsResponse {
     clients: Vec<ClientResponse>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClientBrandingResponse {
+    client_id: String,
+    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    icon: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -928,6 +1378,13 @@ struct MagicLinkDeliveryConfig {
 #[serde(rename_all = "camelCase")]
 struct LoginThemeOverride {
     name: Option<String>,
+    #[serde(
+        default,
+        alias = "iconUrl",
+        alias = "brandIcon",
+        alias = "brandIconUrl"
+    )]
+    icon: Option<String>,
     #[serde(default, alias = "backgroundColor")]
     header_background_from: Option<String>,
     #[serde(default, alias = "backgroundToColor")]
@@ -940,6 +1397,9 @@ impl LoginThemeOverride {
     fn merge_from(&mut self, other: &LoginThemeOverride) {
         if other.name.is_some() {
             self.name.clone_from(&other.name);
+        }
+        if other.icon.is_some() {
+            self.icon.clone_from(&other.icon);
         }
         if other.header_background_from.is_some() {
             self.header_background_from
@@ -956,6 +1416,14 @@ impl LoginThemeOverride {
 
     fn trimmed_name(&self) -> Option<String> {
         self.name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    }
+
+    fn trimmed_icon(&self) -> Option<String> {
+        self.icon
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -1070,6 +1538,10 @@ struct ClientUpsertRequest {
     account_tenant_id: Option<String>,
     #[serde(default, alias = "visible_login_methods")]
     visible_login_methods: Vec<String>,
+    #[serde(default, alias = "issuer_token_audience")]
+    issuer_token_audience: Option<String>,
+    #[serde(default, alias = "issuer_token_ttl_seconds")]
+    issuer_token_ttl_seconds: Option<i32>,
     #[serde(default)]
     confidential: bool,
     #[serde(default, alias = "client_secret")]
@@ -1087,6 +1559,8 @@ struct ValidatedClientUpsert {
     redirect_uris: Vec<String>,
     allowed_origins: Vec<String>,
     allowed_email_domains: Vec<String>,
+    issuer_token_audience: Option<String>,
+    issuer_token_ttl_seconds: Option<i32>,
     account_sharing_mode: AccountSharingMode,
     account_tenant_id: String,
     visible_login_methods: Vec<String>,
@@ -2385,6 +2859,8 @@ async fn handle_request(request: Request, env: Env) -> worker::Result<Response> 
         (Method::Get, "/providers") => json(&provider_responses(&env)),
         (Method::Get, "/providers/status") => provider_status(request, env).await,
         (Method::Get, "/api/providers/status") => provider_status(request, env).await,
+        (Method::Get, "/client-branding") => client_branding(request, env).await,
+        (Method::Get, "/api/client-branding") => client_branding(request, env).await,
         (Method::Get, "/local-auth/status") => local_auth_status(request, env).await,
         (Method::Get, "/api/local-auth/status") => local_auth_status(request, env).await,
         (Method::Get | Method::Post | Method::Delete, "/clients") => clients(request, env).await,
@@ -2441,6 +2917,7 @@ async fn handle_request(request: Request, env: Env) -> worker::Result<Response> 
         (Method::Post, "/oauth/revoke") => oauth_revoke(request, env).await,
         (Method::Post, "/oauth/introspect") => oauth_introspect(request, env).await,
         (Method::Get, "/userinfo") => userinfo(request, env).await,
+        (Method::Post, "/tokens") => client_issuer_access_token(request, env).await,
         (Method::Get, "/session") => session(request, env).await,
         (Method::Get | Method::Delete, "/sessions") => sessions(request, env).await,
         (Method::Get | Method::Patch, "/profile") => profile(request, env).await,
@@ -3135,6 +3612,41 @@ async fn provider_status(request: Request, env: Env) -> worker::Result<Response>
 }
 
 #[cfg(target_arch = "wasm32")]
+async fn client_branding(request: Request, env: Env) -> worker::Result<Response> {
+    let url = request.url()?;
+    let origin = request_origin(&request)?;
+    let Some(client_id) = query_param(&url, "client_id") else {
+        return oauth_error_json("invalid_request", "missing client_id", 400);
+    };
+    let client_id = match validate_client_id(&client_id) {
+        Ok(client_id) => client_id,
+        Err(error) => {
+            return oauth_error_json("invalid_request", error.description, error.status);
+        }
+    };
+
+    let db = env.d1(D1_BINDING)?;
+    let Some(client) = get_client(&db, &client_id).await? else {
+        return oauth_error_json("invalid_request", "client is not registered", 404);
+    };
+    if let Err(error) = validate_cors_origin(origin.as_deref(), &client.allowed_origins) {
+        return oauth_error_json("invalid_request", error, 403);
+    }
+
+    let config = server_config(&env, &url);
+    let catalog = login_theme_catalog_from_env(&env);
+    let target_url = query_param(&url, "return_to").or_else(|| origin.clone());
+    let response = json(&client_branding_for_client(
+        &product_name_from_env(&env),
+        &client,
+        &config.issuer().issuer,
+        target_url.as_deref(),
+        &catalog,
+    ))?;
+    with_cors_actual_headers(response, origin.as_deref())
+}
+
+#[cfg(target_arch = "wasm32")]
 async fn local_auth_status(request: Request, env: Env) -> worker::Result<Response> {
     let url = request.url()?;
     let db = env.d1(D1_BINDING)?;
@@ -3676,6 +4188,108 @@ async fn userinfo(request: Request, env: Env) -> worker::Result<Response> {
 
     let response = json(&userinfo_response(&user, claims.scope.as_deref()))?;
     with_cors_actual_headers(response, origin.as_deref())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn client_issuer_access_token(request: Request, env: Env) -> worker::Result<Response> {
+    let request_url = request.url()?;
+    let origin = request_origin(&request)?;
+    let config = server_config(&env, &request_url);
+    let db = env.d1(D1_BINDING)?;
+    let now = unix_timestamp_seconds();
+
+    let Some(current) = current_session_from_request(&request, &db, &config, now).await? else {
+        return token_issuer_error_json(
+            "unauthenticated",
+            "an active Zeroth session is required",
+            401,
+        );
+    };
+    let Some(origin) = origin.as_deref() else {
+        return token_issuer_error_json(
+            "origin_not_allowed",
+            "this origin is not permitted to request an issuer token",
+            403,
+        );
+    };
+    if let Err(error) = validate_session_cors_origin(&db, Some(origin), &current.session).await? {
+        return token_issuer_error_json("origin_not_allowed", error, 403);
+    }
+    let Some(client_id) = current.session.client_id.as_deref() else {
+        return token_issuer_error_json(
+            "token_signing_unavailable",
+            "issuer token minting is not configured for this session",
+            503,
+        );
+    };
+    let Some(client_row) = get_client_row_for_admin(&db, client_id).await? else {
+        return token_issuer_error_json(
+            "token_signing_unavailable",
+            "issuer token minting is not configured for this client",
+            503,
+        );
+    };
+    if client_row.disabled_at.is_some() {
+        return token_issuer_error_json(
+            "token_signing_unavailable",
+            "issuer token minting is not configured for this client",
+            503,
+        );
+    }
+    let Some(audience) = client_row
+        .issuer_token_audience
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return token_issuer_error_json(
+            "token_signing_unavailable",
+            "issuer token minting is not configured for this client",
+            503,
+        );
+    };
+    let ttl_seconds = match issuer_token_ttl_seconds(client_row.issuer_token_ttl_seconds) {
+        Ok(ttl_seconds) => ttl_seconds,
+        Err(error) => {
+            return token_issuer_error_json("token_signing_unavailable", error, 503);
+        }
+    };
+    let material = match signing_material_from_env(&env) {
+        Ok(material) => material,
+        Err(_) => {
+            return token_issuer_error_json(
+                "token_signing_unavailable",
+                "the access token could not be issued",
+                503,
+            )
+        }
+    };
+    let Some(session_client_id) = current.session.client_id.as_deref() else {
+        return token_issuer_error_json(
+            "token_signing_unavailable",
+            "issuer token minting is not configured for this session",
+            503,
+        );
+    };
+    let claims = build_issuer_access_token_claims(
+        &config.issuer().issuer,
+        &current.user.id,
+        session_client_id,
+        audience,
+        i64::from(now),
+        i64::from(ttl_seconds),
+        random_token().map_err(worker_error)?,
+    );
+    let access_token = sign_jwt(&material.signing_key, &claims).map_err(worker_error)?;
+    let response = json_status_no_store(
+        &IssuerAccessTokenResponse {
+            access_token,
+            token_type: "Bearer".to_owned(),
+            expires_in: ttl_seconds,
+        },
+        200,
+    )?;
+    with_cors_actual_headers(response, Some(origin))
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -5095,8 +5709,8 @@ fn profile_menu_script() -> worker::Result<Response> {
         .set("Content-Type", "text/javascript; charset=utf-8")?;
     response
         .headers()
-        .set("Cache-Control", "public, max-age=3600")?;
-    Ok(response)
+        .set("Cache-Control", "public, max-age=60")?;
+    with_public_cross_origin_asset_headers(response)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -5108,6 +5722,15 @@ fn profile_panel_script() -> worker::Result<Response> {
     response
         .headers()
         .set("Cache-Control", "public, max-age=3600")?;
+    with_public_cross_origin_asset_headers(response)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn with_public_cross_origin_asset_headers(response: Response) -> worker::Result<Response> {
+    response.headers().set("Access-Control-Allow-Origin", "*")?;
+    response
+        .headers()
+        .set("Cross-Origin-Resource-Policy", "cross-origin")?;
     Ok(response)
 }
 
@@ -5196,6 +5819,7 @@ fn compatibility_route_path(path: &str) -> Cow<'_, str> {
         "/status" | "/api/status" | "/api/ready" => Cow::Borrowed("/ready"),
         "/api/providers" => Cow::Borrowed("/providers"),
         "/api/providers/status" => Cow::Borrowed("/providers/status"),
+        "/api/client-branding" => Cow::Borrowed("/client-branding"),
         "/api/local-auth/status" => Cow::Borrowed("/local-auth/status"),
         "/api/clients" => Cow::Borrowed("/clients"),
         "/api/users" => Cow::Borrowed("/users"),
@@ -5207,6 +5831,7 @@ fn compatibility_route_path(path: &str) -> Cow<'_, str> {
         "/api/oauth/revoke" => Cow::Borrowed("/oauth/revoke"),
         "/api/oauth/introspect" => Cow::Borrowed("/oauth/introspect"),
         "/api/userinfo" => Cow::Borrowed("/userinfo"),
+        "/api/tokens" => Cow::Borrowed("/tokens"),
         "/api/session" => Cow::Borrowed("/session"),
         "/api/sessions" => Cow::Borrowed("/sessions"),
         "/api/profile" => Cow::Borrowed("/profile"),
@@ -5422,6 +6047,7 @@ fn known_route_path(path: &str) -> bool {
             | "/providers"
             | "/providers/status"
             | "/local-auth/status"
+            | "/client-branding"
             | "/clients"
             | "/users"
             | "/events"
@@ -5615,8 +6241,8 @@ async fn hosted_account(request: Request, env: Env) -> worker::Result<Response> 
     let url = request.url()?;
     let config = server_config(&env, &url);
     let db = env.d1(D1_BINDING)?;
-    let current =
-        current_session_from_request(&request, &db, &config, unix_timestamp_seconds()).await?;
+    let now = unix_timestamp_seconds();
+    let current = current_session_from_request(&request, &db, &config, now).await?;
 
     let mut client = None;
     if let Some(current) = &current {
@@ -5670,7 +6296,8 @@ async fn hosted_account(request: Request, env: Env) -> worker::Result<Response> 
         .map(|client| vec![application_ui_from_client(client)])
         .unwrap_or_default();
 
-    html(render_account_document(state))
+    let response = html(render_account_document(state))?;
+    with_refreshed_session_cookie(response, current.as_ref(), &config, now)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -5890,8 +6517,14 @@ async fn hosted_session_login_document(
 ) -> worker::Result<Response> {
     let client = &registered_client.client;
     let config = server_config(env, url);
-    let current =
-        current_session_from_request(request, db, &config, unix_timestamp_seconds()).await?;
+    let now = unix_timestamp_seconds();
+    let current = current_session_from_request(request, db, &config, now).await?;
+    if current.is_some() {
+        let target = url::Url::parse(&return_to)
+            .map_err(|error| worker_error(format!("invalid session login return_to: {error}")))?;
+        let response = Response::redirect(target)?;
+        return with_refreshed_session_cookie(response, current.as_ref(), &config, now);
+    }
     let identities = if let Some(current) = &current {
         list_identities_for_user(db, &current.user.id).await?
     } else {
@@ -5928,7 +6561,8 @@ async fn hosted_session_login_document(
     state.identities = identity_ui_rows(&identities);
     state.applications = vec![application_ui_from_client(client)];
 
-    html(render_account_document(state))
+    let response = html(render_account_document(state))?;
+    with_refreshed_session_cookie(response, current.as_ref(), &config, now)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -5976,7 +6610,8 @@ async fn hosted_authorization_document(
     state.identities = identity_ui_rows(&identities);
     state.applications = vec![application_ui_from_client(client)];
 
-    html(render_account_document(state))
+    let response = html(render_account_document(state))?;
+    with_refreshed_session_cookie(response, current.as_ref(), &config, now)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -6796,6 +7431,8 @@ fn client_admin_ui_from_row(row: ClientRow) -> Result<ClientAdminUi, String> {
         redirect_uris: response.redirect_uris,
         allowed_origins: response.allowed_origins,
         allowed_email_domains: response.allowed_email_domains,
+        issuer_token_audience: response.issuer_token_audience,
+        issuer_token_ttl_seconds: response.issuer_token_ttl_seconds,
         account_sharing_mode: response.account_sharing_mode,
         account_tenant_id: response.account_tenant_id,
         account_namespace: response.account_namespace,
@@ -6885,15 +7522,7 @@ fn login_theme_for_client(
     target_url: Option<&str>,
     catalog: &LoginThemeCatalog,
 ) -> (String, ZerothUiTheme) {
-    let mut merged = catalog.default.clone();
-    if let Some(theme) = catalog.clients.get(&client.id.0) {
-        merged.merge_from(theme);
-    }
-    if let Some(target_host) = target_url.and_then(url_host) {
-        if let Some(theme) = theme_domain_match(&catalog.domains, &target_host) {
-            merged.merge_from(theme);
-        }
-    }
+    let merged = merged_login_theme_for_client(client, target_url, catalog);
 
     let explicit_name = merged.trimmed_name();
     let mut display_name = product_name.to_owned();
@@ -6915,6 +7544,40 @@ fn login_theme_for_client(
             header_text_color: merged.header_text_color,
         },
     )
+}
+
+fn client_branding_for_client(
+    product_name: &str,
+    client: &Client,
+    issuer_base_url: &str,
+    target_url: Option<&str>,
+    catalog: &LoginThemeCatalog,
+) -> ClientBrandingResponse {
+    let (name, _) =
+        login_theme_for_client(product_name, client, issuer_base_url, target_url, catalog);
+    let merged = merged_login_theme_for_client(client, target_url, catalog);
+    ClientBrandingResponse {
+        client_id: client.id.0.clone(),
+        name,
+        icon: merged.trimmed_icon(),
+    }
+}
+
+fn merged_login_theme_for_client(
+    client: &Client,
+    target_url: Option<&str>,
+    catalog: &LoginThemeCatalog,
+) -> LoginThemeOverride {
+    let mut merged = catalog.default.clone();
+    if let Some(theme) = catalog.clients.get(&client.id.0) {
+        merged.merge_from(theme);
+    }
+    if let Some(target_host) = target_url.and_then(url_host) {
+        if let Some(theme) = theme_domain_match(&catalog.domains, &target_host) {
+            merged.merge_from(theme);
+        }
+    }
+    merged
 }
 
 fn target_is_external(issuer_base_url: &str, target_url: Option<&str>) -> bool {
@@ -6965,6 +7628,9 @@ fn login_theme_catalog_from_env(env: &Env) -> LoginThemeCatalog {
     let mut catalog = LoginThemeCatalog::default();
     catalog.default.merge_from(&LoginThemeOverride {
         name: env_string(env, "LOGIN_BRAND_NAME").or_else(|| env_string(env, "LOGIN_NAME")),
+        icon: env_string(env, "LOGIN_BRAND_ICON")
+            .or_else(|| env_string(env, "LOGIN_ICON"))
+            .or_else(|| env_string(env, "LOGIN_ICON_URL")),
         header_background_from: env_string(env, "LOGIN_HEADER_BACKGROUND_FROM")
             .or_else(|| env_string(env, "LOGIN_HEADER_GRADIENT_FROM"))
             .or_else(|| env_string(env, "LOGIN_BACKGROUND_COLOR")),
@@ -7123,7 +7789,8 @@ async fn get_registered_client(
     let row = db
         .prepare(
             "SELECT id, name, secret_hash, redirect_uris_json, allowed_origins_json,
-                    allowed_email_domains_json, account_sharing_mode, account_tenant_id,
+                    allowed_email_domains_json, issuer_token_audience,
+                    issuer_token_ttl_seconds, account_sharing_mode, account_tenant_id,
                     visible_login_methods_json, confidential, disabled_at
              FROM zeroth_clients
              WHERE id = ?
@@ -7147,7 +7814,8 @@ async fn get_client_row_for_admin(
     let args = [worker::d1::D1Type::Text(client_id)];
     db.prepare(
         "SELECT id, name, secret_hash, redirect_uris_json, allowed_origins_json,
-                allowed_email_domains_json, account_sharing_mode, account_tenant_id,
+                allowed_email_domains_json, issuer_token_audience,
+                issuer_token_ttl_seconds, account_sharing_mode, account_tenant_id,
                 visible_login_methods_json, confidential, disabled_at
          FROM zeroth_clients
          WHERE id = ?
@@ -7163,7 +7831,8 @@ async fn list_client_rows_for_admin(db: &worker::d1::D1Database) -> worker::Resu
     let args = [worker::d1::D1Type::Integer(CLIENT_LIST_LIMIT)];
     db.prepare(
         "SELECT id, name, secret_hash, redirect_uris_json, allowed_origins_json,
-                allowed_email_domains_json, account_sharing_mode, account_tenant_id,
+                allowed_email_domains_json, issuer_token_audience,
+                issuer_token_ttl_seconds, account_sharing_mode, account_tenant_id,
                 visible_login_methods_json, confidential, disabled_at
          FROM zeroth_clients
          ORDER BY id
@@ -7200,6 +7869,11 @@ async fn upsert_client(
             ))
         })?;
     let secret_hash = d1_optional_text(client.secret_hash.as_deref());
+    let issuer_token_audience = d1_optional_text(client.issuer_token_audience.as_deref());
+    let issuer_token_ttl_seconds = match client.issuer_token_ttl_seconds {
+        Some(value) => worker::d1::D1Type::Integer(i64::from(value)),
+        None => worker::d1::D1Type::Null,
+    };
     let disabled_at = if client.disabled {
         worker::d1::D1Type::Integer(now)
     } else {
@@ -7214,6 +7888,8 @@ async fn upsert_client(
         worker::d1::D1Type::Text(&redirect_uris_json),
         worker::d1::D1Type::Text(&allowed_origins_json),
         worker::d1::D1Type::Text(&allowed_email_domains_json),
+        issuer_token_audience,
+        issuer_token_ttl_seconds,
         worker::d1::D1Type::Text(account_sharing_mode_label(client.account_sharing_mode)),
         worker::d1::D1Type::Text(&client.account_tenant_id),
         worker::d1::D1Type::Text(&visible_login_methods_json),
@@ -7225,9 +7901,10 @@ async fn upsert_client(
     db.prepare(
         "INSERT INTO zeroth_clients (
              id, name, secret_hash, confidential, redirect_uris_json,
-             allowed_origins_json, allowed_email_domains_json, account_sharing_mode,
-             account_tenant_id, visible_login_methods_json, created_at, updated_at, disabled_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             allowed_origins_json, allowed_email_domains_json, issuer_token_audience,
+             issuer_token_ttl_seconds, account_sharing_mode, account_tenant_id,
+             visible_login_methods_json, created_at, updated_at, disabled_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
              name = excluded.name,
              secret_hash = CASE
@@ -7239,6 +7916,8 @@ async fn upsert_client(
              redirect_uris_json = excluded.redirect_uris_json,
              allowed_origins_json = excluded.allowed_origins_json,
              allowed_email_domains_json = excluded.allowed_email_domains_json,
+             issuer_token_audience = excluded.issuer_token_audience,
+             issuer_token_ttl_seconds = excluded.issuer_token_ttl_seconds,
              account_sharing_mode = excluded.account_sharing_mode,
              account_tenant_id = excluded.account_tenant_id,
              visible_login_methods_json = excluded.visible_login_methods_json,
@@ -11747,6 +12426,12 @@ fn validate_client_upsert_request(
     let allowed_origins = validate_allowed_origins(&request.allowed_origins)?;
     let allowed_email_domains = validate_allowed_email_domains(&request.allowed_email_domains)?;
     let visible_login_methods = validate_visible_login_methods(&request.visible_login_methods)?;
+    let issuer_token_audience =
+        validate_issuer_token_audience(request.issuer_token_audience.as_deref())?;
+    let issuer_token_ttl_seconds = validate_issuer_token_ttl_seconds(
+        request.issuer_token_ttl_seconds,
+        issuer_token_audience.as_deref(),
+    )?;
     let account_sharing_mode =
         validate_account_sharing_mode(request.account_sharing_mode.as_deref())?;
     let account_tenant_id = validate_account_tenant_id(
@@ -11766,6 +12451,8 @@ fn validate_client_upsert_request(
         redirect_uris,
         allowed_origins,
         allowed_email_domains,
+        issuer_token_audience,
+        issuer_token_ttl_seconds,
         account_sharing_mode,
         account_tenant_id,
         visible_login_methods,
@@ -11992,6 +12679,45 @@ fn validate_visible_login_methods(raw: &[String]) -> Result<Vec<String>, ClientM
         push_unique(&mut methods, method);
     }
     Ok(methods)
+}
+
+fn validate_issuer_token_audience(
+    raw: Option<&str>,
+) -> Result<Option<String>, ClientManagementError> {
+    let Some(value) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    if value.chars().count() > 256 {
+        return Err(ClientManagementError::invalid_request(
+            "issuerTokenAudience must be at most 256 characters",
+        ));
+    }
+    if value.chars().any(|ch| ch.is_control()) {
+        return Err(ClientManagementError::invalid_request(
+            "issuerTokenAudience contains unsupported characters",
+        ));
+    }
+    Ok(Some(value.to_owned()))
+}
+
+fn validate_issuer_token_ttl_seconds(
+    raw: Option<i32>,
+    issuer_token_audience: Option<&str>,
+) -> Result<Option<i32>, ClientManagementError> {
+    let Some(ttl_seconds) = raw else {
+        return Ok(None);
+    };
+    if issuer_token_audience.is_none() {
+        return Err(ClientManagementError::invalid_request(
+            "issuerTokenTtlSeconds requires issuerTokenAudience",
+        ));
+    }
+    if !(60..=600).contains(&ttl_seconds) {
+        return Err(ClientManagementError::invalid_request(
+            "issuerTokenTtlSeconds must be between 60 and 600",
+        ));
+    }
+    Ok(Some(ttl_seconds))
 }
 
 fn normalize_visible_login_method(raw: &str) -> Result<String, ClientManagementError> {
@@ -12474,6 +13200,8 @@ fn client_response_from_row(row: ClientRow) -> Result<ClientResponse, String> {
             &row.allowed_email_domains_json,
             "allowed_email_domains_json",
         )?,
+        issuer_token_audience: row.issuer_token_audience,
+        issuer_token_ttl_seconds: row.issuer_token_ttl_seconds,
         account_sharing_mode: account_sharing_mode_label(account_scope.sharing_mode).to_owned(),
         account_tenant_id: account_scope.tenant_id,
         account_namespace: account_scope.namespace,
@@ -14382,6 +15110,8 @@ fn cors_path(path: &str) -> bool {
         "/oauth/token"
             | "/oauth/revoke"
             | "/oauth/introspect"
+            | "/tokens"
+            | "/client-branding"
             | "/userinfo"
             | "/session"
             | "/sessions"
@@ -14423,8 +15153,8 @@ fn cors_path(path: &str) -> bool {
 
 fn cors_method_allowed(path: &str, method: &str) -> bool {
     match path {
-        "/oauth/token" | "/oauth/revoke" | "/oauth/introspect" => method == "POST",
-        "/userinfo" | "/session" | "/validate" => method == "GET",
+        "/oauth/token" | "/oauth/revoke" | "/oauth/introspect" | "/tokens" => method == "POST",
+        "/client-branding" | "/userinfo" | "/session" | "/validate" => method == "GET",
         "/profile" => method == "GET" || method == "PATCH",
         "/identities/link" => method == "GET",
         "/identities" => method == "GET" || method == "DELETE",
@@ -14497,13 +15227,13 @@ fn authorization_request_session_is_fresh(
 fn session_cookie(name: &str, value: &str, max_age_seconds: i32, domain: Option<&str>) -> String {
     let domain = cookie_domain_attribute(domain);
     format!(
-        "{name}={value}; Path=/; Max-Age={max_age_seconds};{domain} HttpOnly; Secure; SameSite=Lax"
+        "{name}={value}; Path=/; Max-Age={max_age_seconds};{domain} HttpOnly; Secure; SameSite=None"
     )
 }
 
 fn clear_session_cookie(name: &str, domain: Option<&str>) -> String {
     let domain = cookie_domain_attribute(domain);
-    format!("{name}=; Path=/; Max-Age=0;{domain} HttpOnly; Secure; SameSite=Lax")
+    format!("{name}=; Path=/; Max-Age=0;{domain} HttpOnly; Secure; SameSite=None")
 }
 
 fn transaction_cookie(name: &str, value: &str, max_age_seconds: i32) -> String {
@@ -15324,6 +16054,31 @@ fn with_set_cookie(response: Response, cookie: &str) -> worker::Result<Response>
 }
 
 #[cfg(target_arch = "wasm32")]
+fn with_refreshed_session_cookie(
+    response: Response,
+    current: Option<&CurrentSession>,
+    config: &ZerothServerConfig,
+    now: i32,
+) -> worker::Result<Response> {
+    let Some(current) = current else {
+        return Ok(response);
+    };
+    let max_age_seconds = current.session.expires_at.saturating_sub(now);
+    if max_age_seconds <= 0 {
+        return Ok(response);
+    }
+    with_set_cookie(
+        response,
+        &session_cookie(
+            &config.cookie_name,
+            &current.session.id,
+            max_age_seconds,
+            config.cookie_domain.as_deref(),
+        ),
+    )
+}
+
+#[cfg(target_arch = "wasm32")]
 fn with_cors_actual_headers(response: Response, origin: Option<&str>) -> worker::Result<Response> {
     if let Some(origin) = origin {
         set_cors_origin_headers(&response, origin)?;
@@ -15354,6 +16109,9 @@ fn set_cors_origin_headers(response: &Response, origin: &str) -> worker::Result<
     response
         .headers()
         .set("Access-Control-Allow-Credentials", "true")?;
+    response
+        .headers()
+        .set("Cross-Origin-Resource-Policy", "cross-origin")?;
     response.headers().set("Vary", "Origin")?;
     Ok(())
 }
@@ -15572,6 +16330,50 @@ fn token_exchange_error_json(error: &TokenExchangeError, status: u16) -> worker:
 #[cfg(target_arch = "wasm32")]
 fn client_management_error_json(error: &ClientManagementError) -> worker::Result<Response> {
     oauth_error_json(&error.code, &error.description, error.status)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn token_issuer_error_json(
+    error: &str,
+    message: impl Into<String>,
+    status: u16,
+) -> worker::Result<Response> {
+    json_status_no_store(
+        &serde_json::json!({
+            "error": error,
+            "message": message.into(),
+        }),
+        status,
+    )
+}
+
+#[cfg(target_arch = "wasm32")]
+fn issuer_token_ttl_seconds(value: Option<i32>) -> Result<i32, String> {
+    let ttl_seconds = value.unwrap_or(300);
+    if !(60..=600).contains(&ttl_seconds) {
+        return Err("issuer token ttl_seconds must be between 60 and 600".to_owned());
+    }
+    Ok(ttl_seconds)
+}
+
+fn build_issuer_access_token_claims(
+    issuer: &str,
+    subject: &str,
+    client_id: &str,
+    audience: &str,
+    issued_at: i64,
+    ttl_seconds: i64,
+    jti: String,
+) -> ZerothIssuedAccessTokenClaims {
+    ZerothIssuedAccessTokenClaims {
+        iss: issuer.to_owned(),
+        sub: subject.to_owned(),
+        aud: audience.to_owned(),
+        iat: issued_at,
+        exp: issued_at + ttl_seconds,
+        jti,
+        client_id: client_id.to_owned(),
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -16707,6 +17509,13 @@ fn json_status<T: Serialize>(value: &T, status: u16) -> worker::Result<Response>
     Response::from_json(value).map(|response| response.with_status(status))
 }
 
+#[cfg(target_arch = "wasm32")]
+fn json_status_no_store<T: Serialize>(value: &T, status: u16) -> worker::Result<Response> {
+    let response = json_status(value, status)?;
+    response.headers().set("Cache-Control", "no-store")?;
+    Ok(response)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -17448,6 +18257,7 @@ mod tests {
             "app-web".to_owned(),
             LoginThemeOverride {
                 name: Some("Client Name".to_owned()),
+                icon: None,
                 header_background_from: Some("#111111".to_owned()),
                 header_background_to: Some("#222222".to_owned()),
                 header_text_color: None,
@@ -17457,6 +18267,7 @@ mod tests {
             "example.com".to_owned(),
             LoginThemeOverride {
                 name: Some("Domain Name".to_owned()),
+                icon: None,
                 header_background_from: Some("#ffffff".to_owned()),
                 header_background_to: Some("#f6f8fa".to_owned()),
                 header_text_color: Some("#101820".to_owned()),
@@ -17475,6 +18286,47 @@ mod tests {
         assert_eq!(theme.header_background_from.as_deref(), Some("#ffffff"));
         assert_eq!(theme.header_background_to.as_deref(), Some("#f6f8fa"));
         assert_eq!(theme.header_text_color.as_deref(), Some("#101820"));
+    }
+
+    #[test]
+    fn client_branding_uses_domain_name_and_icon() {
+        let client = Client {
+            id: ClientId("app-web".to_owned()),
+            name: "App Web".to_owned(),
+            redirect_uris: vec!["https://app.example.com/callback".to_owned()],
+            allowed_origins: vec!["https://app.example.com".to_owned()],
+            allowed_email_domains: Vec::new(),
+            confidential: false,
+        };
+        let mut catalog = LoginThemeCatalog::default();
+        catalog.clients.insert(
+            "app-web".to_owned(),
+            LoginThemeOverride {
+                name: Some("Client Name".to_owned()),
+                icon: Some("/client-icon.png".to_owned()),
+                ..LoginThemeOverride::default()
+            },
+        );
+        catalog.domains.insert(
+            "example.com".to_owned(),
+            LoginThemeOverride {
+                name: Some("Domain Name".to_owned()),
+                icon: Some("/domain-icon.png".to_owned()),
+                ..LoginThemeOverride::default()
+            },
+        );
+
+        let branding = client_branding_for_client(
+            "Wavey ID",
+            &client,
+            "https://id.example.com",
+            Some("https://sub.example.com/home"),
+            &catalog,
+        );
+
+        assert_eq!(branding.client_id, "app-web");
+        assert_eq!(branding.name, "Domain Name");
+        assert_eq!(branding.icon.as_deref(), Some("/domain-icon.png"));
     }
 
     #[test]
@@ -17717,6 +18569,8 @@ mod tests {
             redirect_uris_json: r#"["wavey://auth/callback"]"#.to_owned(),
             allowed_origins_json: "[]".to_owned(),
             allowed_email_domains_json: "[]".to_owned(),
+            issuer_token_audience: None,
+            issuer_token_ttl_seconds: None,
             account_sharing_mode: None,
             account_tenant_id: None,
             visible_login_methods_json: None,
@@ -17740,6 +18594,8 @@ mod tests {
             redirect_uris_json: r#"["https://app.example.com/callback"]"#.to_owned(),
             allowed_origins_json: "[]".to_owned(),
             allowed_email_domains_json: "[]".to_owned(),
+            issuer_token_audience: None,
+            issuer_token_ttl_seconds: None,
             account_sharing_mode: None,
             account_tenant_id: None,
             visible_login_methods_json: None,
@@ -17850,6 +18706,43 @@ mod tests {
         );
         assert!(config.show_passkey_login);
         assert!(config.show_magic_link_login);
+    }
+
+    #[test]
+    fn client_upsert_accepts_issuer_token_config() {
+        let upsert = client_upsert_from_value(serde_json::json!({
+            "id": "yl-web",
+            "name": "YL Web",
+            "redirectUris": ["https://yl.vin/callback"],
+            "issuerTokenAudience": "yl-record-issuer",
+            "issuerTokenTtlSeconds": 300,
+            "confidential": false
+        }))
+        .unwrap();
+
+        assert_eq!(
+            upsert.issuer_token_audience,
+            Some("yl-record-issuer".to_owned())
+        );
+        assert_eq!(upsert.issuer_token_ttl_seconds, Some(300));
+    }
+
+    #[test]
+    fn client_upsert_rejects_invalid_issuer_token_ttl_seconds() {
+        let error = client_upsert_from_value(serde_json::json!({
+            "id": "yl-web",
+            "name": "YL Web",
+            "redirectUris": ["https://yl.vin/callback"],
+            "issuerTokenAudience": "yl-record-issuer",
+            "issuerTokenTtlSeconds": 30,
+            "confidential": false
+        }))
+        .unwrap_err();
+
+        assert_eq!(
+            error.description,
+            "issuerTokenTtlSeconds must be between 60 and 600"
+        );
     }
 
     #[test]
@@ -18088,6 +18981,8 @@ mod tests {
             redirect_uris_json: r#"["https://app.example.com/callback"]"#.to_owned(),
             allowed_origins_json: r#"["https://app.example.com"]"#.to_owned(),
             allowed_email_domains_json: r#"["example.com"]"#.to_owned(),
+            issuer_token_audience: Some("yl-record-issuer".to_owned()),
+            issuer_token_ttl_seconds: Some(300),
             account_sharing_mode: Some(ACCOUNT_SHARING_MODE_GLOBAL.to_owned()),
             account_tenant_id: Some(ACCOUNT_NAMESPACE_GLOBAL.to_owned()),
             visible_login_methods_json: Some(r#"["passkey","magic_link"]"#.to_owned()),
@@ -18105,6 +19000,11 @@ mod tests {
             response.allowed_origins,
             vec!["https://app.example.com".to_owned()]
         );
+        assert_eq!(
+            response.issuer_token_audience,
+            Some("yl-record-issuer".to_owned())
+        );
+        assert_eq!(response.issuer_token_ttl_seconds, Some(300));
         assert!(response.confidential);
         assert!(response.disabled);
         assert!(response.has_secret);
@@ -18252,6 +19152,8 @@ mod tests {
             redirect_uris_json: r#"["https://app.example.com/callback"]"#.to_owned(),
             allowed_origins_json: r#"["https://app.example.com"]"#.to_owned(),
             allowed_email_domains_json: r#"["example.com"]"#.to_owned(),
+            issuer_token_audience: Some("yl-record-issuer".to_owned()),
+            issuer_token_ttl_seconds: Some(300),
             account_sharing_mode: None,
             account_tenant_id: None,
             visible_login_methods_json: Some(r#"["passkey"]"#.to_owned()),
@@ -18265,6 +19167,11 @@ mod tests {
         assert!(client.disabled);
         assert!(client.has_secret);
         assert_eq!(client.visible_login_methods, vec!["passkey".to_owned()]);
+        assert_eq!(
+            client.issuer_token_audience,
+            Some("yl-record-issuer".to_owned())
+        );
+        assert_eq!(client.issuer_token_ttl_seconds, Some(300));
     }
 
     #[test]
@@ -19701,6 +20608,51 @@ mod tests {
     }
 
     #[test]
+    fn issuer_access_token_signing_verifies_with_public_jwks() {
+        let signing_key = test_signing_key();
+        let jwks = jwks_response(&signing_key, None).unwrap();
+        let jwks = serde_json::from_value::<zeroth_oidc::ZerothJwks>(
+            serde_json::to_value(&jwks).unwrap(),
+        )
+        .unwrap();
+        let claims = build_issuer_access_token_claims(
+            "https://id.example.com",
+            "usr_123",
+            "yl-web",
+            "yl-record-issuer",
+            1_780_000_000,
+            300,
+            "jti-123".to_owned(),
+        );
+        let token = sign_jwt(&signing_key, &claims).unwrap();
+
+        let verified = zeroth_oidc::verify_zeroth_issued_access_token(
+            &token,
+            &jwks,
+            "https://id.example.com",
+            "yl-record-issuer",
+            1_780_000_100,
+        )
+        .unwrap();
+
+        assert_eq!(verified.iss, "https://id.example.com");
+        assert_eq!(verified.sub, "usr_123");
+        assert_eq!(verified.aud, "yl-record-issuer");
+        assert_eq!(verified.client_id, "yl-web");
+        assert_eq!(verified.jti, "jti-123");
+        assert_eq!(verified.exp - verified.iat, 300);
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[test]
+    fn json_status_no_store_sets_cache_control_header() {
+        let response = json_status_no_store(&serde_json::json!({ "ok": true }), 200).unwrap();
+        let cache_control = response.headers().get("Cache-Control").unwrap();
+
+        assert_eq!(cache_control.as_deref(), Some("no-store"));
+    }
+
+    #[test]
     fn apple_client_secret_signs_expected_claims() {
         let signing_key = test_signing_key();
         let config = AppleClientSecretConfig {
@@ -20120,14 +21072,14 @@ mod tests {
     }
 
     #[test]
-    fn session_cookie_is_secure_http_only_and_lax() {
+    fn session_cookie_is_secure_http_only_and_cross_site() {
         let cookie = session_cookie("zeroth_session", "sess_123", SESSION_TTL_SECONDS, None);
 
         assert!(cookie.starts_with("zeroth_session=sess_123; Path=/;"));
         assert!(cookie.contains("Max-Age=2592000"));
         assert!(cookie.contains("HttpOnly"));
         assert!(cookie.contains("Secure"));
-        assert!(cookie.contains("SameSite=Lax"));
+        assert!(cookie.contains("SameSite=None"));
         assert!(!cookie.contains("Domain="));
     }
 
@@ -20143,7 +21095,7 @@ mod tests {
         assert!(cookie.contains("Domain=.wavey.ai"));
         assert!(cookie.contains("HttpOnly"));
         assert!(cookie.contains("Secure"));
-        assert!(cookie.contains("SameSite=Lax"));
+        assert!(cookie.contains("SameSite=None"));
     }
 
     #[test]
@@ -20152,7 +21104,7 @@ mod tests {
 
         assert_eq!(
             cookie,
-            "zeroth_session=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax"
+            "zeroth_session=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=None"
         );
     }
 
@@ -20162,7 +21114,7 @@ mod tests {
 
         assert_eq!(
             cookie,
-            "zeroth_session=; Path=/; Max-Age=0; Domain=.wavey.ai; HttpOnly; Secure; SameSite=Lax"
+            "zeroth_session=; Path=/; Max-Age=0; Domain=.wavey.ai; HttpOnly; Secure; SameSite=None"
         );
     }
 
@@ -20276,6 +21228,11 @@ mod tests {
             compatibility_route_path("/api/local-auth/status").as_ref(),
             "/local-auth/status"
         );
+        assert_eq!(
+            compatibility_route_path("/api/client-branding").as_ref(),
+            "/client-branding"
+        );
+        assert_eq!(compatibility_route_path("/api/tokens").as_ref(), "/tokens");
         assert_eq!(
             compatibility_route_path("/api/profile").as_ref(),
             "/profile"
@@ -20392,6 +21349,9 @@ mod tests {
         assert!(known_route_path("/profile-menu.js"));
         assert!(known_route_path("/profile-panel.js"));
         assert!(known_route_path(
+            compatibility_route_path("/api/client-branding").as_ref()
+        ));
+        assert!(known_route_path(
             compatibility_route_path("/callback/apple").as_ref()
         ));
         assert!(known_route_path(
@@ -20411,6 +21371,32 @@ mod tests {
     fn profile_menu_script_exposes_profile_menu_api() {
         assert!(ZEROTH_PROFILE_MENU_JS.contains("ZerothProfileMenu"));
         assert!(ZEROTH_PROFILE_MENU_JS.contains("zeroth-profile-menu"));
+        assert!(ZEROTH_PROFILE_MENU_JS.contains("zeroth-mark"));
+        assert!(ZEROTH_PROFILE_MENU_JS.contains("ZEROTH_COOKIE_NAME = \"zeroth\""));
+        assert!(ZEROTH_PROFILE_MENU_JS.contains("cookieValue(ZEROTH_COOKIE_NAME)"));
+        assert!(ZEROTH_PROFILE_MENU_JS.contains("ZEROTH_COOKIE_MAX_AGE_SECONDS = 31536000"));
+        assert!(ZEROTH_PROFILE_MENU_JS.contains("anonId"));
+        assert!(ZEROTH_PROFILE_MENU_JS.contains("userIcon"));
+        assert!(ZEROTH_PROFILE_MENU_JS.contains("setUserIcon"));
+        assert!(ZEROTH_PROFILE_MENU_JS.contains("setAnonymousName"));
+        assert!(ZEROTH_PROFILE_MENU_JS.contains("nameSource"));
+        assert!(ZEROTH_PROFILE_MENU_JS.contains("clearAnonymousIdentity"));
+        assert!(ZEROTH_PROFILE_MENU_JS.contains("zeroth:identity-cleared"));
+        assert!(ZEROTH_PROFILE_MENU_JS.contains("data-zeroth-menu-clear"));
+        assert!(ZEROTH_PROFILE_MENU_JS.contains("zeroth-menu-actions"));
+        assert!(ZEROTH_PROFILE_MENU_JS.contains("Reset Anon"));
+        assert!(ZEROTH_PROFILE_MENU_JS.contains("anonymousIdentity"));
+        assert!(ZEROTH_PROFILE_MENU_JS.contains("/client-branding"));
+        assert!(ZEROTH_PROFILE_MENU_JS.contains("zeroth-menu-item-primary"));
+        assert!(ZEROTH_PROFILE_MENU_JS.contains("compactMenuOption"));
+        assert!(ZEROTH_PROFILE_MENU_JS.contains("zeroth-menu-button-compact"));
+        assert!(ZEROTH_PROFILE_MENU_JS.contains("zeroth-menu-link-compact"));
+        assert!(ZEROTH_PROFILE_MENU_JS.contains("zeroth-menu-loading"));
+        assert!(ZEROTH_PROFILE_MENU_JS.contains("data-compact"));
+        assert!(ZEROTH_PROFILE_MENU_JS.contains("data-zeroth-menu-open"));
+        assert!(ZEROTH_PROFILE_MENU_JS.contains("data-zeroth-popover-portal"));
+        assert!(ZEROTH_PROFILE_MENU_JS.contains("data-zeroth-portal-popover"));
+        assert!(ZEROTH_PROFILE_MENU_JS.contains("positionPopoverPortal"));
         assert!(ZEROTH_PROFILE_MENU_JS.contains("/session"));
         assert!(ZEROTH_PROFILE_MENU_JS.contains("/profile"));
         assert!(ZEROTH_PROFILE_MENU_JS.contains("/logout"));
@@ -20857,6 +21843,8 @@ mod tests {
         assert!(cors_path("/oauth/token"));
         assert!(cors_path("/oauth/revoke"));
         assert!(cors_path("/oauth/introspect"));
+        assert!(cors_path("/tokens"));
+        assert!(cors_path("/client-branding"));
         assert!(cors_path("/userinfo"));
         assert!(cors_path("/session"));
         assert!(cors_path("/sessions"));
@@ -20883,9 +21871,12 @@ mod tests {
         assert!(cors_method_allowed("/oauth/token", "POST"));
         assert!(cors_method_allowed("/oauth/revoke", "POST"));
         assert!(cors_method_allowed("/oauth/introspect", "POST"));
+        assert!(cors_method_allowed("/tokens", "POST"));
         assert!(!cors_method_allowed("/oauth/token", "GET"));
         assert!(!cors_method_allowed("/oauth/revoke", "GET"));
         assert!(!cors_method_allowed("/oauth/introspect", "GET"));
+        assert!(cors_method_allowed("/client-branding", "GET"));
+        assert!(!cors_method_allowed("/client-branding", "POST"));
         assert!(cors_method_allowed("/userinfo", "GET"));
         assert!(cors_method_allowed("/profile", "GET"));
         assert!(cors_method_allowed("/profile", "PATCH"));
