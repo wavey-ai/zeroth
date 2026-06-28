@@ -4278,7 +4278,7 @@ async fn client_issuer_access_token(request: Request, env: Env) -> worker::Resul
         audience,
         i64::from(now),
         i64::from(ttl_seconds),
-        random_token().map_err(worker_error)?,
+        random_token()?,
     );
     let access_token = sign_jwt(&material.signing_key, &claims).map_err(worker_error)?;
     let response = json_status_no_store(
@@ -7871,7 +7871,7 @@ async fn upsert_client(
     let secret_hash = d1_optional_text(client.secret_hash.as_deref());
     let issuer_token_audience = d1_optional_text(client.issuer_token_audience.as_deref());
     let issuer_token_ttl_seconds = match client.issuer_token_ttl_seconds {
-        Some(value) => worker::d1::D1Type::Integer(i64::from(value)),
+        Some(value) => worker::d1::D1Type::Integer(value),
         None => worker::d1::D1Type::Null,
     };
     let disabled_at = if client.disabled {
