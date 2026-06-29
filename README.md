@@ -2,6 +2,8 @@
 
 Zeroth is a minimal first-party identity provider and social login broker.
 
+Designed for free-tier Cloudflare worker deployment.
+
 It is intended to cover the Auth0-shaped role for owned products:
 
 - hosted login
