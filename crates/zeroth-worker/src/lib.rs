@@ -137,7 +137,7 @@ const ID_TOKEN_SUBJECT_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:id_t
 const ACCESS_TOKEN_SUBJECT_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:access_token";
 const DEFAULT_NATIVE_TOKEN_SCOPE: &str = "openid profile email";
 const CORS_ALLOW_METHODS: &str = "GET, POST, PATCH, DELETE, OPTIONS";
-const CORS_ALLOW_HEADERS: &str = "Authorization, Content-Type";
+const CORS_ALLOW_HEADERS: &str = "Authorization, Content-Type, X-Zeroth-Token-Purpose";
 const CORS_MAX_AGE_SECONDS: &str = "600";
 const ZEROTH_FAVICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><defs><linearGradient id="g" x1="0" x2="1" y1="0" y2="1"><stop stop-color="#2d333b"/><stop offset="0.58" stop-color="#1f2328"/><stop offset="1" stop-color="#0b0f19"/></linearGradient></defs><rect width="64" height="64" rx="12" fill="url(#g)"/><path d="M17 16h30L25 48h25" fill="none" stroke="#f9fafb" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/></svg>"##;
 const ZEROTH_PROFILE_MENU_JS: &str = r###"
@@ -4198,11 +4198,22 @@ async fn client_issuer_access_token(request: Request, env: Env) -> worker::Resul
     let db = env.d1(D1_BINDING)?;
     let now = unix_timestamp_seconds();
 
-    let Some(current) = current_session_from_request(&request, &db, &config, now).await? else {
+    let Some(current) = (match current_session_from_request(&request, &db, &config, now).await {
+        Ok(current) => current,
+        Err(_) => {
+            return token_issuer_error_json(
+                "token_signing_unavailable",
+                "the access token could not be issued",
+                503,
+                origin.as_deref(),
+            );
+        }
+    }) else {
         return token_issuer_error_json(
             "unauthenticated",
             "an active Zeroth session is required",
             401,
+            origin.as_deref(),
         );
     };
     let Some(origin) = origin.as_deref() else {
@@ -4210,23 +4221,44 @@ async fn client_issuer_access_token(request: Request, env: Env) -> worker::Resul
             "origin_not_allowed",
             "this origin is not permitted to request an issuer token",
             403,
+            None,
         );
     };
-    if let Err(error) = validate_session_cors_origin(&db, Some(origin), &current.session).await? {
-        return token_issuer_error_json("origin_not_allowed", error, 403);
+    if validate_session_cors_origin(&db, Some(origin), &current.session)
+        .await
+        .is_err()
+    {
+        return token_issuer_error_json(
+            "origin_not_allowed",
+            "this origin is not permitted to request an issuer token",
+            403,
+            Some(origin),
+        );
     }
     let Some(client_id) = current.session.client_id.as_deref() else {
         return token_issuer_error_json(
             "token_signing_unavailable",
             "issuer token minting is not configured for this session",
             503,
+            Some(origin),
         );
     };
-    let Some(client_row) = get_client_row_for_admin(&db, client_id).await? else {
+    let Some(client_row) = (match get_client_row_for_admin(&db, client_id).await {
+        Ok(client_row) => client_row,
+        Err(_) => {
+            return token_issuer_error_json(
+                "token_signing_unavailable",
+                "the access token could not be issued",
+                503,
+                Some(origin),
+            );
+        }
+    }) else {
         return token_issuer_error_json(
             "token_signing_unavailable",
             "issuer token minting is not configured for this client",
             503,
+            Some(origin),
         );
     };
     if client_row.disabled_at.is_some() {
@@ -4234,6 +4266,7 @@ async fn client_issuer_access_token(request: Request, env: Env) -> worker::Resul
             "token_signing_unavailable",
             "issuer token minting is not configured for this client",
             503,
+            Some(origin),
         );
     }
     let Some(audience) = client_row
@@ -4246,12 +4279,13 @@ async fn client_issuer_access_token(request: Request, env: Env) -> worker::Resul
             "token_signing_unavailable",
             "issuer token minting is not configured for this client",
             503,
+            Some(origin),
         );
     };
     let ttl_seconds = match issuer_token_ttl_seconds(client_row.issuer_token_ttl_seconds) {
         Ok(ttl_seconds) => ttl_seconds,
         Err(error) => {
-            return token_issuer_error_json("token_signing_unavailable", error, 503);
+            return token_issuer_error_json("token_signing_unavailable", error, 503, Some(origin));
         }
     };
     let material = match signing_material_from_env(&env) {
@@ -4261,6 +4295,7 @@ async fn client_issuer_access_token(request: Request, env: Env) -> worker::Resul
                 "token_signing_unavailable",
                 "the access token could not be issued",
                 503,
+                Some(origin),
             )
         }
     };
@@ -4269,6 +4304,7 @@ async fn client_issuer_access_token(request: Request, env: Env) -> worker::Resul
             "token_signing_unavailable",
             "issuer token minting is not configured for this session",
             503,
+            Some(origin),
         );
     };
     let claims = build_issuer_access_token_claims(
@@ -4278,9 +4314,29 @@ async fn client_issuer_access_token(request: Request, env: Env) -> worker::Resul
         audience,
         i64::from(now),
         i64::from(ttl_seconds),
-        random_token()?,
+        match random_token() {
+            Ok(token) => token,
+            Err(_) => {
+                return token_issuer_error_json(
+                    "token_signing_unavailable",
+                    "the access token could not be issued",
+                    503,
+                    Some(origin),
+                );
+            }
+        },
     );
-    let access_token = sign_jwt(&material.signing_key, &claims).map_err(worker_error)?;
+    let access_token = match sign_jwt(&material.signing_key, &claims) {
+        Ok(token) => token,
+        Err(_) => {
+            return token_issuer_error_json(
+                "token_signing_unavailable",
+                "the access token could not be issued",
+                503,
+                Some(origin),
+            );
+        }
+    };
     let response = json_status_no_store(
         &IssuerAccessTokenResponse {
             access_token,
@@ -16337,14 +16393,16 @@ fn token_issuer_error_json(
     error: &str,
     message: impl Into<String>,
     status: u16,
+    origin: Option<&str>,
 ) -> worker::Result<Response> {
-    json_status_no_store(
+    let response = json_status_no_store(
         &serde_json::json!({
             "error": error,
             "message": message.into(),
         }),
         status,
-    )
+    )?;
+    with_cors_actual_headers(response, origin)
 }
 
 #[cfg(target_arch = "wasm32")]
