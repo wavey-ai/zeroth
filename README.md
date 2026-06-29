@@ -2,18 +2,15 @@
 
 Zeroth is a minimal first-party identity provider and social login broker.
 
+Designed for free-tier Cloudflare worker deployment.
+
 It is intended to cover the Auth0-shaped role for owned products:
 
 - hosted login
 - upstream provider brokering
 - OIDC authorization-code flow with PKCE
-- Wavey-owned tokens and JWKS
 - browser sessions
 - native app login for Swift/iOS clients
-
-`wavey-id` should become a deployment of Zeroth. Zeroth should stay generic:
-no Wavey domains, provider credentials, branding, or deployment-specific
-policy should live in these crates.
 
 ## Workspace
 
@@ -29,10 +26,6 @@ crates/zeroth-ui
 crates/zeroth-worker
 ```
 
-The crates are intentionally thin for now. They define the ownership boundaries
-for extracting generic auth code from `wavey-id` and reworking `hyper-idp`
-concepts into a persistent, deployable server.
-
 The facade crate keeps the Leptos UI behind the optional `ui` feature so API and
 Worker consumers do not pull UI dependencies by default.
 
@@ -41,10 +34,6 @@ Worker consumers do not pull UI dependencies by default.
 `ZEROTH_DB` binding.
 
 ## UI Screenshots
-
-Captured from the live `https://id.wavey.ai` Zeroth deployment on 2026-06-05
-using a disposable admin account. Session and user identifiers are redacted in
-the captures, and the disposable account was disabled after capture.
 
 | Hosted login | Account management |
 | --- | --- |
