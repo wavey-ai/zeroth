@@ -2992,7 +2992,7 @@ async fn handle_request(request: Request, env: Env) -> worker::Result<Response> 
             ok: true,
             service: "zeroth",
         }),
-        (Method::Get, "/ready") => ready(request, env),
+        (Method::Get, "/ready") => ready(request, env).await,
         (Method::Get, "/providers") => json(&provider_responses(&env)),
         (Method::Get, "/providers/status") => provider_status(request, env).await,
         (Method::Get, "/client-branding") => client_branding(request, env).await,
@@ -5784,7 +5784,8 @@ async fn password_login(mut request: Request, env: Env) -> worker::Result<Respon
     }
 
     let Some(credential) = get_local_credential(&db, &email).await? else {
-        password_dummy_verify(&env, &body.password).await?;
+        let peppers = password_pepper_from_env(&env).map_err(worker_error)?;
+        password_dummy_verify_with_config(&peppers, &body.password).await?;
         if let Some(blocked) =
             rate_limit_increment_subjects(&db, &rate_limit_key, now, &failure_rate_limit_subjects)
                 .await?
@@ -7938,7 +7939,7 @@ async fn local_auth_readiness(
     env: &Env,
     db: &worker::d1::D1Database,
 ) -> worker::Result<ReadinessCheck> {
-    let magic_link_delivery = magic_link_delivery_status(db).await.ok();
+    let magic_link_delivery = magic_link_delivery_status(db).await?;
     let methods = local_auth_status_rows(env, magic_link_delivery);
     let password_enabled = methods
         .iter()
@@ -15029,10 +15030,10 @@ async fn csrf_token_from_request(request: &mut Request) -> worker::Result<Option
         return Ok(Some(token));
     }
     let form = request.form_data().await?;
-    Ok(form
-        .get("_csrf")
-        .and_then(|value| value.as_string())
-        .filter(|value| !value.trim().is_empty()))
+    Ok(match form.get("_csrf") {
+        Some(worker::FormEntry::Field(value)) if !value.trim().is_empty() => Some(value),
+        _ => None,
+    })
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -15111,11 +15112,11 @@ async fn admin_bootstrap_allowed(
             "could not check active admin membership: {error}"
         ))
     })?;
+    let emergency_enabled = binding_value_from_env(env, ADMIN_BOOTSTRAP_EMERGENCY_ENV)
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("true") || value.trim() == "1");
     if active_admin_exists && !emergency_enabled {
         return Ok(false);
     }
-    let emergency_enabled = binding_value_from_env(env, ADMIN_BOOTSTRAP_EMERGENCY_ENV)
-        .is_some_and(|value| value.trim().eq_ignore_ascii_case("true") || value.trim() == "1");
     let emergency_expires_at =
         binding_value_from_env(env, ADMIN_BOOTSTRAP_EMERGENCY_EXPIRES_AT_ENV)
             .map(|value| value.trim().parse::<i32>())
@@ -18126,7 +18127,7 @@ async fn authorize_admin_write_request(
         ));
     }
 
-    if let Err(error) = validate_browser_session_mutation(
+    let browser_session_validation = validate_browser_session_mutation(
         request,
         env,
         db,
@@ -18137,8 +18138,13 @@ async fn authorize_admin_write_request(
         csrf_token.as_deref(),
         now,
     )
-    .await?
-    {
+    .await
+    .map_err(|error| {
+        ClientManagementError::server_error(format!(
+            "could not validate browser session mutation: {error}"
+        ))
+    })?;
+    if let Err(error) = browser_session_validation {
         return Err(ClientManagementError::unauthorized(error));
     }
 
@@ -18208,7 +18214,7 @@ async fn maybe_authorize_admin_write_request(
     let csrf_token = csrf_token_from_request(request).await.map_err(|error| {
         ClientManagementError::server_error(format!("could not read CSRF token: {error}"))
     })?;
-    if let Err(error) = validate_browser_session_mutation(
+    let browser_session_validation = validate_browser_session_mutation(
         request,
         env,
         db,
@@ -18219,8 +18225,13 @@ async fn maybe_authorize_admin_write_request(
         csrf_token.as_deref(),
         now,
     )
-    .await?
-    {
+    .await
+    .map_err(|error| {
+        ClientManagementError::server_error(format!(
+            "could not validate browser session mutation: {error}"
+        ))
+    })?;
+    if let Err(error) = browser_session_validation {
         return Err(ClientManagementError::unauthorized(error));
     }
 
