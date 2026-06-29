@@ -169,9 +169,14 @@ const RATE_LIMIT_SCOPE_OAUTH_TOKEN_IP: &str = "oauth_token:ip";
 const RATE_LIMIT_SCOPE_OAUTH_TOKEN_CLIENT: &str = "oauth_token:client";
 const RATE_LIMIT_SCOPE_OAUTH_TOKEN_GRANT: &str = "oauth_token:grant";
 const CSRF_ROUTE_FAMILY_ACCOUNT: &str = "account";
+const CSRF_ROUTE_FAMILY_ADMIN: &str = "admin";
 const CSRF_ROUTE_FAMILY_LOGOUT: &str = "logout";
 const CSRF_ROUTE_FAMILY_MAGIC_LINK_CONFIRM: &str = "magic-link-confirm";
 const MAGIC_LINK_CONFIRM_TOKEN_FIELD: &str = "confirm";
+const PUBLIC_LOCAL_AUTH_RESPONSE_MESSAGE: &str =
+    "If this account can use this method, the next step has been initiated.";
+const ADMIN_BOOTSTRAP_EMERGENCY_ENV: &str = "ADMIN_BOOTSTRAP_EMERGENCY";
+const ADMIN_BOOTSTRAP_EMERGENCY_EXPIRES_AT_ENV: &str = "ADMIN_BOOTSTRAP_EMERGENCY_EXPIRES_AT";
 const APPLE_CLIENT_SECRET_DEFAULT_TTL_SECONDS: i64 = 60 * 60 * 24 * 180;
 const APPLE_CLIENT_SECRET_MAX_TTL_SECONDS: i64 = 60 * 60 * 24 * 180;
 const APPLE_CLIENT_SECRET_CACHE_REFRESH_SECONDS: i64 = 60 * 60;
@@ -2308,11 +2313,9 @@ struct LocalAuthResponse {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct MagicLinkResponse {
+struct PublicLocalAuthResponse {
     ok: bool,
-    sent: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    dev_link: Option<String>,
+    message: &'static str,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3447,7 +3450,28 @@ async fn clients(mut request: Request, env: Env) -> worker::Result<Response> {
     let db = env.d1(D1_BINDING)?;
     let config = server_config(&env, &request_url);
     let now = unix_timestamp_seconds();
-    if let Err(error) = validate_admin_request(&request, &env, &db, &config, now).await {
+    if !matches!(request.method(), Method::Get) {
+        match maybe_authorize_admin_write_request(
+            &mut request,
+            &env,
+            &db,
+            &config,
+            now,
+            CSRF_ROUTE_FAMILY_ADMIN,
+            false,
+            "client_admin_mutation",
+        )
+        .await
+        {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return client_management_error_json(&ClientManagementError::unauthorized(
+                    "admin bearer token or allowed Zeroth session is required",
+                ))
+            }
+            Err(error) => return client_management_error_json(&error),
+        };
+    } else if let Err(error) = validate_admin_request(&request, &env, &db, &config, now).await {
         return client_management_error_json(&error);
     }
 
@@ -3570,10 +3594,32 @@ async fn users(mut request: Request, env: Env) -> worker::Result<Response> {
     let db = env.d1(D1_BINDING)?;
     let config = server_config(&env, &request_url);
     let now = unix_timestamp_seconds();
-    let admin_authorization = match authorize_admin_request(&request, &env, &db, &config, now).await
-    {
-        Ok(admin_authorization) => admin_authorization,
-        Err(error) => return client_management_error_json(&error),
+    let admin_authorization = if matches!(request.method(), Method::Patch) {
+        match maybe_authorize_admin_write_request(
+            &mut request,
+            &env,
+            &db,
+            &config,
+            now,
+            CSRF_ROUTE_FAMILY_ADMIN,
+            false,
+            "user_admin_mutation",
+        )
+        .await
+        {
+            Ok(Some(admin_authorization)) => admin_authorization,
+            Ok(None) => {
+                return client_management_error_json(&ClientManagementError::unauthorized(
+                    "admin bearer token or allowed Zeroth session is required",
+                ))
+            }
+            Err(error) => return client_management_error_json(&error),
+        }
+    } else {
+        match authorize_admin_request(&request, &env, &db, &config, now).await {
+            Ok(admin_authorization) => admin_authorization,
+            Err(error) => return client_management_error_json(&error),
+        }
     };
 
     match request.method() {
@@ -3761,9 +3807,10 @@ async fn local_auth_status(request: Request, env: Env) -> worker::Result<Respons
 }
 
 #[cfg(target_arch = "wasm32")]
-fn ready(request: Request, env: Env) -> worker::Result<Response> {
+async fn ready(request: Request, env: Env) -> worker::Result<Response> {
     let url = request.url()?;
-    let response = readiness_response(&env, &server_config(&env, &url));
+    let db = env.d1(D1_BINDING)?;
+    let response = readiness_response(&env, &server_config(&env, &url), &db).await?;
     let status = if response.ready { 200 } else { 503 };
     json_status(&response, status)
 }
@@ -5012,9 +5059,21 @@ async fn passkey_register_verify(mut request: Request, env: Env) -> worker::Resu
             return oauth_error_json("invalid_request", error, 400);
         }
     };
-    let admin_authorization = authorize_admin_request(&request, &env, &db, &config, now)
-        .await
-        .ok();
+    let admin_authorization = match maybe_authorize_admin_write_request(
+        &mut request,
+        &env,
+        &db,
+        &config,
+        now,
+        CSRF_ROUTE_FAMILY_ADMIN,
+        true,
+        "first_admin_creation",
+    )
+    .await
+    {
+        Ok(admin_authorization) => admin_authorization,
+        Err(error) => return client_management_error_json(&error),
+    };
     let challenge_hash =
         match passkey_challenge_hash_from_client_data(&body.response.client_data_json) {
             Ok(challenge_hash) => challenge_hash,
@@ -5496,9 +5555,6 @@ async fn password_register(mut request: Request, env: Env) -> worker::Result<Res
     if let Err(error) = validate_local_auth_origin(&request, &db, &client, &config).await? {
         return oauth_error_json("invalid_request", error, 403);
     }
-    if let Err(error) = validate_local_auth_client_email_policy(&client, &email) {
-        return oauth_error_json(&error.code, &error.description, 403);
-    }
     let ip = rate_limit_request_ip(&request)?.unwrap_or_else(|| "missing".to_owned());
     let rate_limit_subjects = [
         rate_limit_subject(
@@ -5531,33 +5587,107 @@ async fn password_register(mut request: Request, env: Env) -> worker::Result<Res
 
     let current = current_session_from_request(&request, &db, &config, now).await?;
     let existing_user = get_user_by_primary_email(&db, &email).await?;
-    let user_id =
-        match local_auth_registration_user_id(current.as_ref(), existing_user.as_ref(), &email) {
-            Ok(Some(user_id)) => user_id,
-            Ok(None) => {
-                let user_id = format!("usr_{}", random_token()?);
-                insert_passkey_user(&db, &user_id, &email, display_name.as_deref(), now).await?;
-                user_id
+    let registration_target = match current.as_ref() {
+        Some(current) => {
+            if current.user.disabled_at.is_some() {
+                return oauth_error_json("invalid_request", "user is disabled", 403);
             }
-            Err(error) => {
-                return oauth_error_json(local_auth_registration_error_code(&error), error, 409)
+            if let Some(primary_email) = current.user.primary_email.as_deref() {
+                if !primary_email.eq_ignore_ascii_case(&email) {
+                    return oauth_error_json(
+                        "invalid_request",
+                        "password email must match the signed-in user",
+                        403,
+                    );
+                }
             }
-        };
-    if let Some(user) = get_user(&db, &user_id).await? {
-        if user.disabled_at.is_some() {
-            return oauth_error_json("invalid_request", "user is disabled", 403);
+            if let Some(existing_user) = existing_user.as_ref() {
+                if existing_user.id != current.user.id {
+                    return oauth_error_json(
+                        "invalid_request",
+                        "email is already attached to another user",
+                        409,
+                    );
+                }
+            }
+            Some(current.user.id.clone())
+        }
+        None if existing_user.is_some() => None,
+        None => {
+            let user_id = format!("usr_{}", random_token()?);
+            insert_passkey_user(&db, &user_id, &email, display_name.as_deref(), now).await?;
+            Some(user_id)
+        }
+    };
+
+    if let Some(user_id) = registration_target.as_deref() {
+        if let Some(user) = get_user(&db, user_id).await? {
+            if user.disabled_at.is_some() {
+                return oauth_error_json("invalid_request", "user is disabled", 403);
+            }
         }
     }
 
     let peppers = password_pepper_from_env(&env).map_err(worker_error)?;
     let salt = random_token()?;
-    let password_hash =
+    let _password_hash =
         password_hash_current(&body.password, &salt, peppers.current.value.as_slice()).await?;
+    let public_response = || {
+        json_status(
+            &PublicLocalAuthResponse {
+                ok: true,
+                message: PUBLIC_LOCAL_AUTH_RESPONSE_MESSAGE,
+            },
+            202,
+        )
+    };
+
+    if existing_user.is_some() && current.is_none() {
+        record_audit_event(
+            &db,
+            &request,
+            "password.register.suppressed",
+            existing_user.as_ref().map(|user| user.id.as_str()),
+            Some(&client.id.0),
+            Some(LOCAL_AUTH_PROVIDER_ID),
+            serde_json::json!({
+                "reason": "account_exists"
+            }),
+            now,
+        )
+        .await;
+        return public_response();
+    }
+
+    if let Err(error) = validate_local_auth_client_email_policy(&client, &email) {
+        if current.is_none() {
+            record_audit_event(
+                &db,
+                &request,
+                "password.register.suppressed",
+                existing_user.as_ref().map(|user| user.id.as_str()),
+                Some(&client.id.0),
+                Some(LOCAL_AUTH_PROVIDER_ID),
+                serde_json::json!({
+                    "reason": error.code,
+                    "description": error.description
+                }),
+                now,
+            )
+            .await;
+            return public_response();
+        }
+        return oauth_error_json(&error.code, &error.description, 403);
+    }
+
+    let Some(user_id) = registration_target else {
+        return public_response();
+    };
     upsert_local_credential(
         &db,
         &email,
         &user_id,
-        &password_hash,
+        &_password_hash,
         &salt,
         &peppers.current.id,
         PASSWORD_PBKDF2_ITERATIONS,
@@ -5618,9 +5748,6 @@ async fn password_login(mut request: Request, env: Env) -> worker::Result<Respon
     };
     if let Err(error) = validate_local_auth_origin(&request, &db, &client, &config).await? {
         return oauth_error_json("invalid_request", error, 403);
-    }
-    if let Err(error) = validate_local_auth_client_email_policy(&client, &email) {
-        return oauth_error_json(&error.code, &error.description, 403);
     }
     let ip = rate_limit_request_ip(&request)?.unwrap_or_else(|| "missing".to_owned());
     let ip_email = format!("{ip}:{email}");
@@ -6128,12 +6255,39 @@ async fn magic_link_request(mut request: Request, env: Env) -> worker::Result<Re
     }
 
     cleanup_expired_magic_links(&db, now).await?;
-    let user_id = get_user_by_primary_email(&db, &email)
-        .await?
-        .and_then(|user| user.disabled_at.is_none().then_some(user.id));
+    let user = get_user_by_primary_email(&db, &email).await?;
+    let policy_ok = validate_local_auth_client_email_policy(&client, &email).is_ok();
+    let user_id = user.as_ref().map(|user| user.id.clone());
     let token = random_token()?;
     let token_hash = hash_secret(&token);
     let audit_context = audit_request_context(&request).unwrap_or_default();
+    let public_response = || {
+        json_status(
+            &PublicLocalAuthResponse {
+                ok: true,
+                message: PUBLIC_LOCAL_AUTH_RESPONSE_MESSAGE,
+            },
+            202,
+        )
+    };
+
+    if !policy_ok || user.is_none() {
+        record_audit_event(
+            &db,
+            &request,
+            "magic_link.issue.suppressed",
+            user_id.as_deref(),
+            Some(&client.id.0),
+            Some(LOCAL_AUTH_PROVIDER_ID),
+            serde_json::json!({
+                "reason": if policy_ok { "account_missing_or_disabled" } else { "policy_denied" }
+            }),
+            now,
+        )
+        .await;
+        return public_response();
+    }
+
     put_magic_link(
         &db,
         &token_hash,
@@ -6176,15 +6330,7 @@ async fn magic_link_request(mut request: Request, env: Env) -> worker::Result<Re
         now,
     )
     .await;
-    let dev_link = magic_link_dev_echo_enabled(&env).then_some(link);
-    json_status(
-        &MagicLinkResponse {
-            ok: true,
-            sent,
-            dev_link,
-        },
-        202,
-    )
+    public_response()
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -6211,7 +6357,7 @@ async fn magic_link_confirm(request: Request, env: Env) -> worker::Result<Respon
         now,
     );
     let action = format!(
-        "{}/magic-link/consume",
+        "{}/magic-links/consume",
         config.public_base_url.trim_end_matches('/')
     );
     let cancel_href = format!("{}/login", config.public_base_url.trim_end_matches('/'));
@@ -6367,11 +6513,7 @@ async fn identity_link(request: Request, env: Env) -> worker::Result<Response> {
     let db = env.d1(D1_BINDING)?;
     let now = unix_timestamp_seconds();
     let mut request = request;
-    let form = request.form_data().await?;
-    let csrf_token = form
-        .get("_csrf")
-        .and_then(|value| value.as_string())
-        .filter(|value| !value.trim().is_empty());
+    let csrf_token = csrf_token_from_request(&mut request).await?;
     let Some(current) = current_session_from_request(&request, &db, &config, now).await? else {
         return oauth_error_json(
             "login_required",
@@ -6573,14 +6715,8 @@ async fn logout(request: Request, env: Env) -> worker::Result<Response> {
         }
         Method::Post => {
             let origin = request_origin_for_config(&request, &config)?;
-            let csrf_from_header = csrf_token_from_header(&request)?;
             let mut request = request;
-            let form = request.form_data().await?;
-            let csrf_token = csrf_from_header.or_else(|| {
-                form.get("_csrf")
-                    .and_then(|value| value.as_string())
-                    .filter(|value| !value.trim().is_empty())
-            });
+            let csrf_token = csrf_token_from_request(&mut request).await?;
             if let Some(current) = &current {
                 if let Err(error) = validate_browser_session_mutation(
                     &request,
@@ -7591,21 +7727,44 @@ fn provider_disabled(env: &Env, provider_id: &str) -> bool {
 }
 
 #[cfg(target_arch = "wasm32")]
-fn readiness_response(env: &Env, config: &ZerothServerConfig) -> ReadinessResponse {
+async fn readiness_response(
+    env: &Env,
+    config: &ZerothServerConfig,
+    db: &worker::d1::D1Database,
+) -> worker::Result<ReadinessResponse> {
     let issuer_check = issuer_readiness(config);
     let signing = signing_readiness(env);
     let providers = provider_readiness_rows(env, config);
     let apple_app_site_association = apple_app_site_association_readiness(env);
-    let ready = readiness_is_ready(&issuer_check, &signing, &providers);
+    let schema = db_readiness(db).await?;
+    let csrf = csrf_secret_readiness(env);
+    let rate_limit = rate_limit_key_readiness(env);
+    let admin_bootstrap = admin_bootstrap_readiness(env);
+    let local_auth = local_auth_readiness(env, db).await?;
+    let ready = readiness_is_ready(
+        &issuer_check,
+        &signing,
+        &providers,
+        &schema,
+        &csrf,
+        &rate_limit,
+        &admin_bootstrap,
+        &local_auth,
+    );
     let mut notes = Vec::new();
     if !ready {
         notes.push("not_ready");
     }
+    notes.extend(schema.notes.iter().copied());
+    notes.extend(csrf.notes.iter().copied());
+    notes.extend(rate_limit.notes.iter().copied());
+    notes.extend(admin_bootstrap.notes.iter().copied());
+    notes.extend(local_auth.notes.iter().copied());
     if !apple_app_site_association.configured {
         notes.push("apple_app_site_association_optional");
     }
 
-    ReadinessResponse {
+    Ok(ReadinessResponse {
         ready,
         service: "zeroth",
         issuer: config.issuer().issuer,
@@ -7614,16 +7773,26 @@ fn readiness_response(env: &Env, config: &ZerothServerConfig) -> ReadinessRespon
         providers,
         apple_app_site_association,
         notes,
-    }
+    })
 }
 
 fn readiness_is_ready(
     issuer_check: &ReadinessCheck,
     signing: &ReadinessCheck,
     providers: &[ProviderReadiness],
+    schema: &ReadinessCheck,
+    csrf: &ReadinessCheck,
+    rate_limit: &ReadinessCheck,
+    admin_bootstrap: &ReadinessCheck,
+    local_auth: &ReadinessCheck,
 ) -> bool {
     issuer_check.configured
         && signing.configured
+        && schema.configured
+        && csrf.configured
+        && rate_limit.configured
+        && admin_bootstrap.configured
+        && local_auth.configured
         && !providers.is_empty()
         && providers.iter().all(|provider| provider.configured)
 }
@@ -7672,6 +7841,120 @@ fn signing_readiness(env: &Env) -> ReadinessCheck {
         configured: signing_material_valid,
         notes,
     }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn rate_limit_key_readiness(env: &Env) -> ReadinessCheck {
+    let mut notes = Vec::new();
+    let configured = match rate_limit_key_from_env(env) {
+        Ok(_) => true,
+        Err(_) => {
+            notes.push("invalid_or_missing_rate_limit_key");
+            false
+        }
+    };
+    ReadinessCheck { configured, notes }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn csrf_secret_readiness(env: &Env) -> ReadinessCheck {
+    let mut notes = Vec::new();
+    let configured = match csrf_secret_from_env(env) {
+        Ok(_) => true,
+        Err(_) => {
+            notes.push("invalid_or_missing_csrf_secret");
+            false
+        }
+    };
+    ReadinessCheck { configured, notes }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn admin_bootstrap_readiness(env: &Env) -> ReadinessCheck {
+    let mut notes = Vec::new();
+    if binding_value_from_env(env, "ADMIN_TOKEN").is_some() {
+        notes.push("plaintext_admin_token_not_allowed");
+        return ReadinessCheck {
+            configured: false,
+            notes,
+        };
+    }
+    let configured = match binding_value_from_env(env, "ADMIN_TOKEN_SHA256") {
+        Some(value) => match normalize_admin_token_hash(&value) {
+            Ok(_) => true,
+            Err(_) => {
+                notes.push("invalid_admin_token_sha256");
+                false
+            }
+        },
+        None => {
+            notes.push("missing_admin_token_sha256");
+            false
+        }
+    };
+    if binding_value_from_env(env, ADMIN_BOOTSTRAP_EMERGENCY_ENV).is_some() {
+        match binding_value_from_env(env, ADMIN_BOOTSTRAP_EMERGENCY_EXPIRES_AT_ENV) {
+            Some(value) if value.trim().parse::<i32>().is_ok() => {}
+            Some(_) => notes.push("invalid_admin_bootstrap_emergency_expires_at"),
+            None => notes.push("missing_admin_bootstrap_emergency_expires_at"),
+        }
+    }
+    ReadinessCheck { configured, notes }
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn db_readiness(db: &worker::d1::D1Database) -> worker::Result<ReadinessCheck> {
+    let tables = db_table_statuses(db).await?;
+    let migrations_table_present = tables
+        .iter()
+        .any(|table| table.name == zeroth_storage::SCHEMA_MIGRATIONS_TABLE && table.present);
+    let applied_migration_versions = if migrations_table_present {
+        applied_schema_migration_versions(db).await?
+    } else {
+        Vec::new()
+    };
+    let migrations = zeroth_storage::migrations::ALL
+        .iter()
+        .map(|migration| DbMigrationStatus {
+            version: migration.version,
+            name: migration.name,
+            applied: applied_migration_versions.contains(&migration.version),
+        })
+        .collect::<Vec<_>>();
+    let compatibility_columns = db_compatibility_column_statuses(db).await?;
+    let configured = db_schema_status_ok(&tables, &migrations, &compatibility_columns);
+    Ok(ReadinessCheck {
+        configured,
+        notes: if configured {
+            Vec::new()
+        } else {
+            vec!["database_schema_not_ready"]
+        },
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn local_auth_readiness(
+    env: &Env,
+    db: &worker::d1::D1Database,
+) -> worker::Result<ReadinessCheck> {
+    let magic_link_delivery = magic_link_delivery_status(db).await.ok();
+    let methods = local_auth_status_rows(env, magic_link_delivery);
+    let password_enabled = methods
+        .iter()
+        .any(|method| method.id == "password" && method.enabled);
+    let magic_link_enabled = methods
+        .iter()
+        .any(|method| method.id == "magic_link" && method.enabled);
+    let rate_limit_ready = rate_limit_key_from_env(env).is_ok();
+    let mut notes = Vec::new();
+    if (password_enabled || magic_link_enabled) && !rate_limit_ready {
+        notes.push("rate_limit_key_required_for_public_local_auth");
+    }
+    Ok(ReadinessCheck {
+        configured: (!password_enabled && !magic_link_enabled) || rate_limit_ready,
+        notes,
+    })
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -11429,8 +11712,26 @@ async fn ensure_d1_schema(request: Request, env: Env) -> worker::Result<Response
     let config = server_config(&env, &url);
     let db = env.d1(D1_BINDING)?;
     let now = unix_timestamp_seconds();
-    if let Err(error) = validate_admin_request(&request, &env, &db, &config, now).await {
-        return client_management_error_json(&error);
+    let mut request = request;
+    match maybe_authorize_admin_write_request(
+        &mut request,
+        &env,
+        &db,
+        &config,
+        now,
+        CSRF_ROUTE_FAMILY_ADMIN,
+        true,
+        "schema_bootstrap",
+    )
+    .await
+    {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return client_management_error_json(&ClientManagementError::unauthorized(
+                "admin bearer token or allowed Zeroth session is required",
+            ))
+        }
+        Err(error) => return client_management_error_json(&error),
     }
 
     let mut migrations_applied = Vec::new();
@@ -14723,6 +15024,18 @@ fn csrf_token_from_header(request: &Request) -> worker::Result<Option<String>> {
 }
 
 #[cfg(target_arch = "wasm32")]
+async fn csrf_token_from_request(request: &mut Request) -> worker::Result<Option<String>> {
+    if let Some(token) = csrf_token_from_header(request)?.filter(|value| !value.trim().is_empty()) {
+        return Ok(Some(token));
+    }
+    let form = request.form_data().await?;
+    Ok(form
+        .get("_csrf")
+        .and_then(|value| value.as_string())
+        .filter(|value| !value.trim().is_empty()))
+}
+
+#[cfg(target_arch = "wasm32")]
 async fn validate_browser_session_mutation(
     request: &Request,
     env: &Env,
@@ -14768,6 +15081,81 @@ async fn validate_browser_session_mutation(
         csrf_token.trim(),
         now,
     ))
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn active_admin_membership_exists(db: &worker::d1::D1Database) -> worker::Result<bool> {
+    let row = db
+        .prepare(
+            "SELECT user_id
+             FROM zeroth_admin_memberships
+             WHERE disabled_at IS NULL
+             LIMIT 1",
+        )
+        .first::<AdminMembershipProbeRow>(None)
+        .await?;
+    Ok(row.is_some())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn admin_bootstrap_allowed(
+    request: &Request,
+    env: &Env,
+    db: &worker::d1::D1Database,
+    now: i32,
+    bootstrap_reason: &str,
+    allow_first_admin: bool,
+) -> Result<bool, ClientManagementError> {
+    let active_admin_exists = active_admin_membership_exists(db).await.map_err(|error| {
+        ClientManagementError::server_error(format!(
+            "could not check active admin membership: {error}"
+        ))
+    })?;
+    if active_admin_exists && !emergency_enabled {
+        return Ok(false);
+    }
+    let emergency_enabled = binding_value_from_env(env, ADMIN_BOOTSTRAP_EMERGENCY_ENV)
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("true") || value.trim() == "1");
+    let emergency_expires_at =
+        binding_value_from_env(env, ADMIN_BOOTSTRAP_EMERGENCY_EXPIRES_AT_ENV)
+            .map(|value| value.trim().parse::<i32>())
+            .transpose()
+            .map_err(|_| {
+                ClientManagementError::server_error(
+                    "ADMIN_BOOTSTRAP_EMERGENCY_EXPIRES_AT must be an integer timestamp",
+                )
+            })?;
+    if emergency_enabled {
+        let Some(expires_at) = emergency_expires_at else {
+            return Err(ClientManagementError::server_error(
+                "ADMIN_BOOTSTRAP_EMERGENCY_EXPIRES_AT is required when ADMIN_BOOTSTRAP_EMERGENCY is enabled",
+            ));
+        };
+        if expires_at < now {
+            return Err(ClientManagementError::unauthorized(
+                "bootstrap credential emergency access has expired",
+            ));
+        }
+    }
+    if !allow_first_admin && !emergency_enabled {
+        return Ok(false);
+    }
+    record_audit_event(
+        db,
+        request,
+        "admin.bootstrap.use",
+        None,
+        None,
+        None,
+        serde_json::json!({
+            "reason": bootstrap_reason,
+            "emergency": emergency_enabled,
+            "expiresAt": emergency_expires_at,
+        }),
+        now,
+    )
+    .await;
+    Ok(true)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -17672,6 +18060,176 @@ async fn authorize_admin_request(
 }
 
 #[cfg(target_arch = "wasm32")]
+async fn authorize_admin_write_request(
+    request: &mut Request,
+    env: &Env,
+    db: &worker::d1::D1Database,
+    config: &ZerothServerConfig,
+    now: i32,
+    route_family: &'static str,
+    allow_bootstrap: bool,
+    bootstrap_reason: &'static str,
+) -> Result<AdminAuthorization, ClientManagementError> {
+    if validate_admin_bearer_request(request, env).is_ok() {
+        if !allow_bootstrap {
+            return Err(ClientManagementError::unauthorized(
+                "admin bootstrap token is not allowed for this route",
+            ));
+        }
+        if !admin_bootstrap_allowed(request, env, db, now, bootstrap_reason, allow_bootstrap)
+            .await?
+        {
+            return Err(ClientManagementError::unauthorized(
+                "admin bootstrap token is not allowed",
+            ));
+        }
+        return Ok(AdminAuthorization::BootstrapToken);
+    }
+
+    let Some(current) = current_session_from_request(request, db, config, now)
+        .await
+        .map_err(|error| {
+            ClientManagementError::server_error(format!(
+                "could not validate admin session: {error}"
+            ))
+        })?
+    else {
+        return Err(ClientManagementError::unauthorized(
+            "admin bearer token or allowed Zeroth session is required",
+        ));
+    };
+    let csrf_token = csrf_token_from_request(request).await.map_err(|error| {
+        ClientManagementError::server_error(format!("could not read CSRF token: {error}"))
+    })?;
+    let Some(admin_user) = get_admin_user_row(db, &current.user.id, now)
+        .await
+        .map_err(|error| {
+            ClientManagementError::server_error(format!("could not load admin user: {error}"))
+        })?
+    else {
+        return Err(ClientManagementError::unauthorized(
+            "admin session user was not found",
+        ));
+    };
+
+    if !(admin_user_allowed(env, &admin_user)
+        || user_has_active_admin_membership(db, &admin_user.id)
+            .await
+            .map_err(|error| {
+                ClientManagementError::server_error(format!(
+                    "could not load admin membership: {error}"
+                ))
+            })?)
+    {
+        return Err(ClientManagementError::unauthorized(
+            "admin session user is not allowlisted",
+        ));
+    }
+
+    if let Err(error) = validate_browser_session_mutation(
+        request,
+        env,
+        db,
+        config,
+        current.session.client_id.as_deref(),
+        &current.session.id,
+        route_family,
+        csrf_token.as_deref(),
+        now,
+    )
+    .await?
+    {
+        return Err(ClientManagementError::unauthorized(error));
+    }
+
+    Ok(AdminAuthorization::Session {
+        user_id: current.user.id,
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn maybe_authorize_admin_write_request(
+    request: &mut Request,
+    env: &Env,
+    db: &worker::d1::D1Database,
+    config: &ZerothServerConfig,
+    now: i32,
+    route_family: &'static str,
+    allow_bootstrap: bool,
+    bootstrap_reason: &'static str,
+) -> Result<Option<AdminAuthorization>, ClientManagementError> {
+    if validate_admin_bearer_request(request, env).is_ok() {
+        if !allow_bootstrap {
+            return Err(ClientManagementError::unauthorized(
+                "admin bootstrap token is not allowed for this route",
+            ));
+        }
+        if !admin_bootstrap_allowed(request, env, db, now, bootstrap_reason, allow_bootstrap)
+            .await?
+        {
+            return Err(ClientManagementError::unauthorized(
+                "admin bootstrap token is not allowed",
+            ));
+        }
+        return Ok(Some(AdminAuthorization::BootstrapToken));
+    }
+
+    let Some(current) = current_session_from_request(request, db, config, now)
+        .await
+        .map_err(|error| {
+            ClientManagementError::server_error(format!(
+                "could not validate admin session: {error}"
+            ))
+        })?
+    else {
+        return Ok(None);
+    };
+    let Some(admin_user) = get_admin_user_row(db, &current.user.id, now)
+        .await
+        .map_err(|error| {
+            ClientManagementError::server_error(format!("could not load admin user: {error}"))
+        })?
+    else {
+        return Ok(None);
+    };
+
+    if !(admin_user_allowed(env, &admin_user)
+        || user_has_active_admin_membership(db, &admin_user.id)
+            .await
+            .map_err(|error| {
+                ClientManagementError::server_error(format!(
+                    "could not load admin membership: {error}"
+                ))
+            })?)
+    {
+        return Ok(None);
+    }
+
+    let csrf_token = csrf_token_from_request(request).await.map_err(|error| {
+        ClientManagementError::server_error(format!("could not read CSRF token: {error}"))
+    })?;
+    if let Err(error) = validate_browser_session_mutation(
+        request,
+        env,
+        db,
+        config,
+        current.session.client_id.as_deref(),
+        &current.session.id,
+        route_family,
+        csrf_token.as_deref(),
+        now,
+    )
+    .await?
+    {
+        return Err(ClientManagementError::unauthorized(error));
+    }
+
+    Ok(Some(AdminAuthorization::Session {
+        user_id: current.user.id,
+    }))
+}
+
+#[cfg(target_arch = "wasm32")]
 fn validate_admin_bearer_request(
     request: &Request,
     env: &Env,
@@ -17740,27 +18298,19 @@ fn token_list_contains(values: Option<&str>, needle: &str, ascii_case_insensitiv
 
 #[cfg(target_arch = "wasm32")]
 fn admin_token_hash_from_env(env: &Env) -> Result<String, ClientManagementError> {
-    if let Some(hash) =
+    if binding_value_from_env(env, "ADMIN_TOKEN").is_some() {
+        return Err(ClientManagementError::server_error(
+            "ADMIN_TOKEN is not allowed; configure ADMIN_TOKEN_SHA256 instead",
+        ));
+    }
+    let Some(hash) =
         secret_string(env, "ADMIN_TOKEN_SHA256").or_else(|| env_string(env, "ADMIN_TOKEN_SHA256"))
-    {
-        return normalize_admin_token_hash(&hash).map_err(ClientManagementError::server_error);
-    }
-
-    if let Some(token) =
-        secret_string(env, "ADMIN_TOKEN").or_else(|| env_string(env, "ADMIN_TOKEN"))
-    {
-        let token = token.trim();
-        if token.is_empty() {
-            return Err(ClientManagementError::server_error(
-                "ADMIN_TOKEN must not be empty",
-            ));
-        }
-        return Ok(hash_secret(token));
-    }
-
-    Err(ClientManagementError::server_error(
-        "ADMIN_TOKEN or ADMIN_TOKEN_SHA256 is not configured",
-    ))
+    else {
+        return Err(ClientManagementError::server_error(
+            "ADMIN_TOKEN_SHA256 is not configured",
+        ));
+    };
+    normalize_admin_token_hash(&hash).map_err(ClientManagementError::server_error)
 }
 
 fn bearer_token_from_authorization_header(
@@ -19092,15 +19642,20 @@ mod tests {
     }
 
     #[test]
-    fn readiness_requires_https_issuer_signing_and_all_providers() {
-        let issuer = ReadinessCheck {
+    fn readiness_requires_all_mandatory_checks_and_all_providers() {
+        let ready_check = || ReadinessCheck {
             configured: true,
             notes: Vec::new(),
         };
-        let signing = ReadinessCheck {
-            configured: true,
-            notes: Vec::new(),
-        };
+
+        let issuer = ready_check();
+        let signing = ready_check();
+        let schema = ready_check();
+        let csrf = ready_check();
+        let rate_limit = ready_check();
+        let admin_bootstrap = ready_check();
+        let local_auth = ready_check();
+
         let providers = vec![
             ProviderReadiness {
                 id: "apple",
@@ -19125,17 +19680,46 @@ mod tests {
             },
         ];
 
-        assert!(readiness_is_ready(&issuer, &signing, &providers));
+        assert!(readiness_is_ready(
+            &issuer,
+            &signing,
+            &providers,
+            &schema,
+            &csrf,
+            &rate_limit,
+            &admin_bootstrap,
+            &local_auth,
+        ));
 
         let mut missing_provider = providers.clone();
         missing_provider[2].configured = false;
-        assert!(!readiness_is_ready(&issuer, &signing, &missing_provider));
+
+        assert!(!readiness_is_ready(
+            &issuer,
+            &signing,
+            &missing_provider,
+            &schema,
+            &csrf,
+            &rate_limit,
+            &admin_bootstrap,
+            &local_auth,
+        ));
 
         let missing_signing = ReadinessCheck {
             configured: false,
             notes: vec!["missing_jwt_es256_private_key"],
         };
-        assert!(!readiness_is_ready(&issuer, &missing_signing, &providers));
+
+        assert!(!readiness_is_ready(
+            &issuer,
+            &missing_signing,
+            &providers,
+            &schema,
+            &csrf,
+            &rate_limit,
+            &admin_bootstrap,
+            &local_auth,
+        ));
     }
 
     #[test]
