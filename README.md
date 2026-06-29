@@ -13,10 +13,6 @@ It is intended to cover the Auth0-shaped role for owned products:
 - browser sessions
 - native app login for Swift/iOS clients
 
-`wavey-id` should become a deployment of Zeroth. Zeroth should stay generic:
-no Wavey domains, provider credentials, branding, or deployment-specific
-policy should live in these crates.
-
 ## Workspace
 
 ```text
