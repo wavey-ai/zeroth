@@ -7,3 +7,4 @@ license.workspace = true
 homepage.workspace = true
 
 [dependencies]
+serde = { workspace = true, features = ["derive"] }

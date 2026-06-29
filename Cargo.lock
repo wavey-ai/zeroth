@@ -2610,9 +2610,12 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "getrandom 0.2.17",
+ "hmac",
  "p256",
  "serde",
  "serde_json",
+ "sha2",
+ "zeroth-core",
  "zeroth-server",
  "zeroth-storage",
 ]
@@ -2620,6 +2623,9 @@ dependencies = [
 [[package]]
 name = "zeroth-core"
 version = "0.1.0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "zeroth-oidc"
@@ -2675,6 +2681,7 @@ dependencies = [
  "base64",
  "console_error_panic_hook",
  "getrandom 0.2.17",
+ "hmac",
  "k256",
  "p256",
  "rsa",

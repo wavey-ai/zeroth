@@ -14,6 +14,7 @@ crate-type = ["cdylib", "rlib"]
 base64.workspace = true
 console_error_panic_hook.workspace = true
 getrandom.workspace = true
+hmac.workspace = true
 k256.workspace = true
 p256.workspace = true
 serde.workspace = true

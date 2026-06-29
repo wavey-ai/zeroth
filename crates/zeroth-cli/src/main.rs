@@ -7,9 +7,14 @@ use p256::{
     pkcs8::DecodePrivateKey,
 };
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use std::{
     io::{self, Read},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
+};
+use zeroth_core::{
+    PasswordScheme, PASSWORD_CURRENT_VERSION, PASSWORD_PBKDF2_ITERATIONS,
+    PASSWORD_PBKDF2_MAX_ITERATIONS, PASSWORD_PBKDF2_MIN_ITERATIONS,
 };
 use zeroth_server::{ZerothServerConfig, ROUTES};
 
@@ -43,6 +48,20 @@ fn main() {
             match SchemaOptions::from_args(args).and_then(|options| print_schema(options)) {
                 Ok(()) => Ok(()),
                 Err(error) => Err(error),
+            }
+        }
+        "password-policy" => {
+            let subcommand = args.first().cloned().unwrap_or_else(|| "help".to_owned());
+            if !args.is_empty() {
+                args.remove(0);
+            }
+            match subcommand.as_str() {
+                "benchmark" => benchmark_password_policy(),
+                "validate" => validate_password_policy(),
+                _ => {
+                    print_password_policy_usage();
+                    Ok(())
+                }
             }
         }
         "validate-secret" => match SecretKind::from_args(args).and_then(validate_secret_stdin) {
@@ -733,10 +752,155 @@ fn print_usage() {
   zeroth routes
   zeroth issuer [base-url]
   zeroth schema [--only all|migrations|compatibility] [--format sql|lines]
+  zeroth password-policy benchmark
+  zeroth password-policy validate
   zeroth validate-secret es256-private-key|apple-private-key|previous-public-jwks < secret-value
   zeroth apple-client-secret --team-id TEAM --key-id KEY --client-id CLIENT --private-key AuthKey.p8 [--ttl-days 180]
   zeroth signing-key [--kid KID] [--format env|json]"
     );
+}
+
+fn print_password_policy_usage() {
+    eprintln!("usage:");
+    eprintln!("  zeroth password-policy benchmark");
+    eprintln!("  zeroth password-policy validate");
+}
+
+fn validate_password_policy() -> Result<(), String> {
+    if PasswordScheme::Pbkdf2Sha256.as_str() != "pbkdf2-sha256" {
+        return Err("password scheme identifier is inconsistent".to_owned());
+    }
+    if !(PASSWORD_PBKDF2_MIN_ITERATIONS..=PASSWORD_PBKDF2_MAX_ITERATIONS)
+        .contains(&PASSWORD_PBKDF2_ITERATIONS)
+    {
+        return Err("password iteration count is out of range".to_owned());
+    }
+
+    let params_json = serde_json::json!({
+        "iterations": PASSWORD_PBKDF2_ITERATIONS,
+        "prehash": "hmac-sha256",
+    })
+    .to_string();
+    let parsed: PasswordParamsJson = serde_json::from_str(&params_json)
+        .map_err(|error| format!("password params json is invalid: {error}"))?;
+    if parsed.iterations != PASSWORD_PBKDF2_ITERATIONS {
+        return Err("password params json lost the iteration count".to_owned());
+    }
+    if parsed.prehash.as_deref() != Some("hmac-sha256") {
+        return Err("password params json lost the prehash policy".to_owned());
+    }
+
+    println!(
+        "ok algorithm={} version={} iterations={}",
+        PasswordScheme::Pbkdf2Sha256.as_str(),
+        PASSWORD_CURRENT_VERSION,
+        PASSWORD_PBKDF2_ITERATIONS
+    );
+    Ok(())
+}
+
+fn benchmark_password_policy() -> Result<(), String> {
+    let salt = "benchmark-salt-v1";
+    let pepper = "benchmark-pepper-v1";
+    let password = "benchmark-password-v1";
+
+    let start = Instant::now();
+    let hash = password_hash_current(password, salt, pepper)?;
+    let elapsed = start.elapsed();
+
+    println!(
+        "algorithm={} version={} iterations={} duration_ms={} hash_len={}",
+        PasswordScheme::Pbkdf2Sha256.as_str(),
+        PASSWORD_CURRENT_VERSION,
+        PASSWORD_PBKDF2_ITERATIONS,
+        elapsed.as_millis(),
+        hash.len()
+    );
+    Ok(())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PasswordParamsJson {
+    iterations: u32,
+    #[serde(default)]
+    prehash: Option<String>,
+}
+
+fn password_hash_current(password: &str, salt: &str, pepper: &str) -> Result<String, String> {
+    let prehash = password_prehash(pepper.as_bytes(), password.as_bytes());
+    let digest = pbkdf2_sha256(&prehash, salt.as_bytes(), PASSWORD_PBKDF2_ITERATIONS, 32)?;
+    Ok(bytes_to_hex(&digest))
+}
+
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        hex.push(HEX[(byte >> 4) as usize] as char);
+        hex.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    hex
+}
+
+fn password_prehash(pepper: &[u8], password: &[u8]) -> [u8; 32] {
+    use hmac::{Hmac, Mac};
+    type HmacSha256 = Hmac<Sha256>;
+
+    let mut mac =
+        HmacSha256::new_from_slice(pepper).expect("HMAC-SHA256 accepts arbitrary-length keys");
+    mac.update(password);
+    let result = mac.finalize().into_bytes();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&result);
+    out
+}
+
+fn pbkdf2_sha256(
+    password: &[u8],
+    salt: &[u8],
+    iterations: u32,
+    output_len: usize,
+) -> Result<Vec<u8>, String> {
+    if iterations == 0 {
+        return Err("password iterations must be positive".to_owned());
+    }
+    let blocks = output_len.div_ceil(32);
+    let mut output = Vec::with_capacity(blocks * 32);
+    for block_index in 1..=blocks {
+        output.extend_from_slice(&pbkdf2_block(
+            password,
+            salt,
+            iterations,
+            block_index as u32,
+        ));
+    }
+    output.truncate(output_len);
+    Ok(output)
+}
+
+fn pbkdf2_block(password: &[u8], salt: &[u8], iterations: u32, block_index: u32) -> [u8; 32] {
+    use hmac::{Hmac, Mac};
+    type HmacSha256 = Hmac<Sha256>;
+
+    let mut mac =
+        HmacSha256::new_from_slice(password).expect("HMAC-SHA256 accepts arbitrary-length keys");
+    mac.update(salt);
+    mac.update(&block_index.to_be_bytes());
+    let u = mac.finalize().into_bytes();
+    let mut block = [0u8; 32];
+    block.copy_from_slice(&u);
+
+    let mut previous = u;
+    for _ in 1..iterations {
+        let mut mac = HmacSha256::new_from_slice(password)
+            .expect("HMAC-SHA256 accepts arbitrary-length keys");
+        mac.update(&previous);
+        previous = mac.finalize().into_bytes();
+        for (slot, value) in block.iter_mut().zip(previous.iter()) {
+            *slot ^= value;
+        }
+    }
+    block
 }
 
 #[cfg(test)]

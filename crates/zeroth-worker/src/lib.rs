@@ -25,6 +25,12 @@ use std::cell::RefCell;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{borrow::Cow, collections::BTreeMap};
 use zeroth_core::{AuthTransaction, Client, ClientId, ProviderId, ScopeSet, Subject, UserId};
+#[cfg(target_arch = "wasm32")]
+use zeroth_core::{
+    PasswordScheme, PASSWORD_CURRENT_VERSION, PASSWORD_PBKDF2_MAX_ITERATIONS,
+    PASSWORD_PBKDF2_MIN_ITERATIONS,
+};
+use zeroth_core::{PASSWORD_PBKDF2_ITERATIONS, PASSWORD_SCHEME_PBKDF2_SHA256};
 use zeroth_oidc::authorization_request_redirect_uri_registered_for_client;
 #[cfg(target_arch = "wasm32")]
 use zeroth_oidc::parse_authorization_request;
@@ -113,10 +119,16 @@ const LOCAL_AUTH_BODY_LIMIT: usize = 8 * 1024;
 const LOCAL_AUTH_PROVIDER_ID: &str = "zeroth";
 const PASSWORD_MIN_BYTES: usize = 8;
 const PASSWORD_MAX_BYTES: usize = 1024;
-const PASSWORD_PBKDF2_ALG: &str = "pbkdf2-sha256";
-const PASSWORD_PBKDF2_DEFAULT_ITERATIONS: u32 = 8_192;
-const PASSWORD_PBKDF2_MIN_ITERATIONS: u32 = 1_000;
-const PASSWORD_PBKDF2_MAX_ITERATIONS: u32 = 100_000;
+const PASSWORD_PEPPER_ENV: &str = "PASSWORD_PEPPER";
+const PASSWORD_PEPPER_ID_ENV: &str = "PASSWORD_PEPPER_ID";
+const PASSWORD_PEPPER_PREVIOUS_ENV: &str = "PASSWORD_PEPPER_PREVIOUS";
+const PASSWORD_PEPPER_PREVIOUS_ID_ENV: &str = "PASSWORD_PEPPER_PREVIOUS_ID";
+const RATE_LIMIT_KEY_ENV: &str = "RATE_LIMIT_KEY";
+const CSRF_SECRET_ENV: &str = "CSRF_SECRET";
+const PASSWORD_PBKDF2_ALG: &str = PASSWORD_SCHEME_PBKDF2_SHA256;
+const PASSWORD_DUMMY_SALT: &str = "f1a2c3d4e5b60718293a4b5c6d7e8f90";
+const PASSWORD_DUMMY_HASH: &str =
+    "0000000000000000000000000000000000000000000000000000000000000000";
 const MAGIC_LINK_TTL_SECONDS: i32 = 10 * 60;
 const MAGIC_LINK_CLEANUP_LIMIT: i32 = 64;
 const MAGIC_LINK_EMAIL_ERROR_DETAIL_MAX_CHARS: usize = 160;
@@ -128,6 +140,38 @@ const MAGIC_LINK_DELIVERY_UNSUPPORTED: &str = "unsupported";
 const PROFILE_PATCH_BODY_LIMIT: usize = 4 * 1024;
 const PROFILE_NAME_MAX_CHARS: usize = 128;
 const PROFILE_PICTURE_MAX_BYTES: usize = 2048;
+const RATE_LIMIT_CLEANUP_MODULUS: u8 = 100;
+const RATE_LIMIT_CLEANUP_LIMIT: i32 = 100;
+const RATE_LIMIT_RETENTION_SECONDS: i32 = 48 * 60 * 60;
+const RATE_LIMIT_BLOCK_STEPS_SECONDS: [i32; 4] = [60, 5 * 60, 15 * 60, 60 * 60];
+const RATE_LIMIT_SCOPE_PASSWORD_LOGIN_IP: &str = "password_login:ip";
+const RATE_LIMIT_SCOPE_PASSWORD_LOGIN_EMAIL: &str = "password_login:email";
+const RATE_LIMIT_SCOPE_PASSWORD_LOGIN_IP_EMAIL: &str = "password_login:ip_email";
+const RATE_LIMIT_SCOPE_PASSWORD_REGISTER_IP: &str = "password_register:ip";
+const RATE_LIMIT_SCOPE_PASSWORD_REGISTER_EMAIL: &str = "password_register:email";
+const RATE_LIMIT_SCOPE_MAGIC_LINK_REQUEST_IP: &str = "magic_link_request:ip";
+const RATE_LIMIT_SCOPE_MAGIC_LINK_REQUEST_EMAIL: &str = "magic_link_request:email";
+const RATE_LIMIT_SCOPE_MAGIC_LINK_REQUEST_CLIENT: &str = "magic_link_request:client";
+const RATE_LIMIT_SCOPE_MAGIC_LINK_CONSUME_IP: &str = "magic_link_consume:ip";
+const RATE_LIMIT_SCOPE_MAGIC_LINK_CONSUME_TOKEN: &str = "magic_link_consume:token";
+const RATE_LIMIT_SCOPE_PASSKEY_OPTIONS_IP: &str = "passkey_options:ip";
+const RATE_LIMIT_SCOPE_PASSKEY_OPTIONS_CLIENT: &str = "passkey_options:client";
+const RATE_LIMIT_SCOPE_PASSKEY_OPTIONS_EMAIL: &str = "passkey_options:email";
+const RATE_LIMIT_SCOPE_PASSKEY_VERIFY_IP: &str = "passkey_verify:ip";
+const RATE_LIMIT_SCOPE_PASSKEY_VERIFY_CREDENTIAL: &str = "passkey_verify:credential";
+const RATE_LIMIT_SCOPE_WALLET_CHALLENGE_IP: &str = "wallet_challenge:ip";
+const RATE_LIMIT_SCOPE_WALLET_CHALLENGE_ADDRESS: &str = "wallet_challenge:address";
+const RATE_LIMIT_SCOPE_WALLET_CHALLENGE_CLIENT: &str = "wallet_challenge:client";
+const RATE_LIMIT_SCOPE_WALLET_VERIFY_IP: &str = "wallet_verify:ip";
+const RATE_LIMIT_SCOPE_WALLET_VERIFY_ADDRESS: &str = "wallet_verify:address";
+const RATE_LIMIT_SCOPE_WALLET_VERIFY_CHALLENGE: &str = "wallet_verify:challenge";
+const RATE_LIMIT_SCOPE_OAUTH_TOKEN_IP: &str = "oauth_token:ip";
+const RATE_LIMIT_SCOPE_OAUTH_TOKEN_CLIENT: &str = "oauth_token:client";
+const RATE_LIMIT_SCOPE_OAUTH_TOKEN_GRANT: &str = "oauth_token:grant";
+const CSRF_ROUTE_FAMILY_ACCOUNT: &str = "account";
+const CSRF_ROUTE_FAMILY_LOGOUT: &str = "logout";
+const CSRF_ROUTE_FAMILY_MAGIC_LINK_CONFIRM: &str = "magic-link-confirm";
+const MAGIC_LINK_CONFIRM_TOKEN_FIELD: &str = "confirm";
 const APPLE_CLIENT_SECRET_DEFAULT_TTL_SECONDS: i64 = 60 * 60 * 24 * 180;
 const APPLE_CLIENT_SECRET_MAX_TTL_SECONDS: i64 = 60 * 60 * 24 * 180;
 const APPLE_CLIENT_SECRET_CACHE_REFRESH_SECONDS: i64 = 60 * 60;
@@ -565,6 +609,7 @@ const ZEROTH_PROFILE_MENU_JS: &str = r###"
       adminUrl: options.adminUrl || attr(host, "admin-url") || attr(host, "data-admin-url"),
       loginUrl: options.loginUrl || attr(host, "login-url") || attr(host, "data-login-url"),
       logoutUrl: options.logoutUrl || attr(host, "logout-url") || attr(host, "data-logout-url"),
+      csrfToken: options.csrfToken || attr(host, "csrf-token") || attr(host, "data-csrf-token"),
       sessionPath: options.sessionPath || attr(host, "session-path") || attr(host, "data-session-path") || "/session",
       profilePath: options.profilePath || attr(host, "profile-path") || attr(host, "data-profile-path") || "/profile",
       brandingPath: options.brandingPath || attr(host, "branding-path") || attr(host, "data-branding-path") || "/client-branding",
@@ -686,10 +731,12 @@ const ZEROTH_PROFILE_MENU_JS: &str = r###"
         return;
       }
       const logoutUrl = endpoint(state.issuer, state.logoutUrl, "/logout");
+      const headers = { Accept: "application/json" };
+      if (state.csrfToken) headers["X-Zeroth-CSRF"] = state.csrfToken;
       await fetch(logoutUrl, {
         method: "POST",
         credentials: "include",
-        headers: { Accept: "application/json" },
+        headers,
       }).catch(() => null);
       state.authenticated = false;
       state.user = null;
@@ -1703,6 +1750,35 @@ struct AuditRequestContext {
     user_agent: Option<String>,
 }
 
+#[cfg(target_arch = "wasm32")]
+#[derive(Debug, Clone)]
+struct RateLimitPolicy {
+    scope: &'static str,
+    window_seconds: i32,
+    max_attempts: i32,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Debug, Clone)]
+struct RateLimitSubject<'a> {
+    policy: RateLimitPolicy,
+    subject: Cow<'a, str>,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Debug, Clone, Copy)]
+struct RateLimitExceeded {
+    retry_after_seconds: i32,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Debug, Clone)]
+struct RateLimitSecret([u8; 32]);
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Debug, Clone)]
+struct CsrfSecret([u8; 32]);
+
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
 struct AuditEventFilter {
     event_type: Option<String>,
@@ -2021,12 +2097,56 @@ struct LocalCredentialRow {
     password_salt: String,
     password_alg: String,
     password_iterations: i32,
+    password_scheme: String,
+    password_params_json: String,
+    password_version: i32,
     created_at: i32,
     updated_at: i32,
     #[serde(default)]
     last_used_at: Option<i32>,
     #[serde(default)]
     disabled_at: Option<i32>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PasswordParamsJson {
+    iterations: u32,
+    prehash: PasswordPrehash,
+    pepper_id: String,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum PasswordPrehash {
+    HmacSha256,
+}
+
+#[derive(Debug, Clone)]
+struct PasswordPepperConfig {
+    current: PasswordPepperSecret,
+    previous: Option<PasswordPepperSecret>,
+}
+
+#[derive(Debug, Clone)]
+struct PasswordPepperSecret {
+    id: String,
+    value: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct PasswordVerification {
+    valid: bool,
+    needs_rehash: bool,
+}
+
+impl PasswordVerification {
+    fn invalid() -> Self {
+        Self {
+            valid: false,
+            needs_rehash: false,
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -2067,6 +2187,18 @@ struct WalletChallengeRow {
     ip_hash: Option<String>,
     #[serde(default)]
     user_agent: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RateLimitStateRow {
+    bucket_count: i32,
+    #[serde(default)]
+    blocked_until: Option<i32>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RateLimitCountRow {
+    count: i32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2137,6 +2269,8 @@ struct MagicLinkRequest {
 #[serde(rename_all = "camelCase")]
 struct MagicLinkConsumeRequest {
     token: String,
+    #[serde(default)]
+    confirm: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2846,9 +2980,9 @@ pub async fn main(request: Request, env: Env, _ctx: worker::Context) -> worker::
 async fn handle_request(request: Request, env: Env) -> worker::Result<Response> {
     let url = request.url()?;
     let canonical_path = canonical_route_path(url.path());
-    let route_path = compatibility_route_path(canonical_path.as_ref());
+    let route_path = canonical_path.as_ref();
 
-    match (request.method(), route_path.as_ref()) {
+    match (request.method(), route_path) {
         (Method::Options, path) if cors_path(path) => cors_preflight(request, env).await,
         (Method::Get, "/") => redirect_to_path(&url, "/login"),
         (Method::Get, "/health") => json(&HealthResponse {
@@ -2858,19 +2992,11 @@ async fn handle_request(request: Request, env: Env) -> worker::Result<Response> 
         (Method::Get, "/ready") => ready(request, env),
         (Method::Get, "/providers") => json(&provider_responses(&env)),
         (Method::Get, "/providers/status") => provider_status(request, env).await,
-        (Method::Get, "/api/providers/status") => provider_status(request, env).await,
         (Method::Get, "/client-branding") => client_branding(request, env).await,
-        (Method::Get, "/api/client-branding") => client_branding(request, env).await,
         (Method::Get, "/local-auth/status") => local_auth_status(request, env).await,
-        (Method::Get, "/api/local-auth/status") => local_auth_status(request, env).await,
         (Method::Get | Method::Post | Method::Delete, "/clients") => clients(request, env).await,
-        (Method::Get | Method::Post | Method::Delete, "/api/clients") => {
-            clients(request, env).await
-        }
         (Method::Get | Method::Patch, "/users") => users(request, env).await,
-        (Method::Get | Method::Patch, "/api/users") => users(request, env).await,
         (Method::Get, "/events") => events(request, env).await,
-        (Method::Get, "/api/events") => events(request, env).await,
         (Method::Get, "/routes") => json(&RoutesResponse {
             routes: ROUTES
                 .iter()
@@ -2899,19 +3025,9 @@ async fn handle_request(request: Request, env: Env) -> worker::Result<Response> 
         (Method::Get, "/profile-panel.js") => profile_panel_script(),
         (Method::Get, "/admin") => hosted_clients_admin(request, env).await,
         (Method::Get, "/admin/clients") => hosted_clients_admin(request, env).await,
-        (Method::Get, path) if admin_console_alias_path(path) => {
-            hosted_clients_admin(request, env).await
-        }
-        (Method::Get, path) if provider_authorize_alias_path(path) => {
-            redirect_to_provider_authorize_alias(&url)
-        }
         (Method::Get, "/authorize") => authorize(request, env).await,
         (Method::Get, "/__zeroth/db/status") => d1_schema_status(request, env).await,
-        (Method::Get, "/api/__zeroth/db/status") => d1_schema_status(request, env).await,
         (Method::Post, "/__zeroth/db/ensure") => ensure_d1_schema(request, env).await,
-        (Method::Get | Method::Post, path) if provider_callback_alias_path(path) => {
-            provider_callback(request, env).await
-        }
         (Method::Get | Method::Post, "/oauth2/callback") => provider_callback(request, env).await,
         (Method::Post, "/oauth/token") => oauth_token(request, env).await,
         (Method::Post, "/oauth/revoke") => oauth_revoke(request, env).await,
@@ -2921,54 +3037,35 @@ async fn handle_request(request: Request, env: Env) -> worker::Result<Response> 
         (Method::Get, "/session") => session(request, env).await,
         (Method::Get | Method::Delete, "/sessions") => sessions(request, env).await,
         (Method::Get | Method::Patch, "/profile") => profile(request, env).await,
-        (Method::Get, "/identities/link") => identity_link(request, env).await,
+        (Method::Post, "/identities/link") => identity_link(request, env).await,
         (Method::Get | Method::Delete, "/identities") => identities(request, env).await,
-        (Method::Post, "/passkeys/register/options" | "/passkeys/registration/options") => {
+        (Method::Post, "/passkeys/register/options") => {
             passkey_register_options(request, env).await
         }
-        (
-            Method::Post,
-            "/passkeys/register/verify"
-            | "/passkeys/register/finish"
-            | "/passkeys/registration/finish",
-        ) => passkey_register_verify(request, env).await,
-        (Method::Post, "/passkeys/authenticate/options" | "/passkeys/authentication/options") => {
+        (Method::Post, "/passkeys/register/verify" | "/passkeys/register/finish") => {
+            passkey_register_verify(request, env).await
+        }
+        (Method::Post, "/passkeys/authenticate/options") => {
             passkey_authenticate_options(request, env).await
         }
-        (Method::Post, "/passkeys/login/options") => {
-            passkey_authenticate_options(request, env).await
-        }
-        (
-            Method::Post,
-            "/passkeys/authenticate/verify"
-            | "/passkeys/authenticate/finish"
-            | "/passkeys/authentication/finish",
-        ) => passkey_authenticate_verify(request, env).await,
-        (Method::Post, "/passkeys/login/verify" | "/passkeys/login/finish") => {
+        (Method::Post, "/passkeys/authenticate/verify" | "/passkeys/authenticate/finish") => {
             passkey_authenticate_verify(request, env).await
         }
         (
             Method::Get,
-            "/password/register" | "/password/login" | "/magic-links" | "/magic-link"
-            | "/magic_link" | "/wallet/challenge" | "/wallet/nonce" | "/wallet/verify"
-            | "/wallet/login",
+            "/password/register" | "/password/login" | "/magic-links" | "/wallet/challenge"
+            | "/wallet/verify",
         ) => redirect_local_auth_get_to_login(request, env),
         (Method::Post, "/password/register") => password_register(request, env).await,
         (Method::Post, "/password/login") => password_login(request, env).await,
-        (Method::Post, "/wallet/challenge" | "/wallet/nonce") => {
-            evm_wallet_challenge(request, env).await
-        }
-        (Method::Post, "/wallet/verify" | "/wallet/login") => evm_wallet_verify(request, env).await,
-        (Method::Post, "/magic-links" | "/magic-link" | "/magic_link" | "/magic-links/request") => {
-            magic_link_request(request, env).await
-        }
-        (
-            Method::Get | Method::Post,
-            "/magic-links/consume" | "/magic-link/consume" | "/magic_link/consume",
-        ) => magic_link_consume(request, env).await,
+        (Method::Post, "/wallet/challenge") => evm_wallet_challenge(request, env).await,
+        (Method::Post, "/wallet/verify") => evm_wallet_verify(request, env).await,
+        (Method::Post, "/magic-links") => magic_link_request(request, env).await,
+        (Method::Get, "/magic-link/confirm") => magic_link_confirm(request, env).await,
+        (Method::Post, "/magic-links/consume") => magic_link_consume(request, env).await,
         (Method::Get, "/validate") => validate(request, env).await,
         (Method::Get | Method::Post, "/logout") => logout(request, env).await,
-        _ if known_route_path(route_path.as_ref()) => json_status(
+        _ if known_route_path(route_path) => json_status(
             &serde_json::json!({
                 "error": "method_not_allowed",
                 "errorDescription": "route exists but does not allow this method"
@@ -3698,6 +3795,7 @@ async fn events(request: Request, env: Env) -> worker::Result<Response> {
 async fn oauth_token(mut request: Request, env: Env) -> worker::Result<Response> {
     let request_url = request.url()?;
     let origin = request_origin(&request)?;
+    let rate_limit_key = rate_limit_key_from_env(&env).map_err(worker_error)?;
     let form = match token_exchange_form_from_request(&mut request).await {
         Ok(form) => form,
         Err(error) => return token_exchange_error_json(&error, 400),
@@ -3707,18 +3805,76 @@ async fn oauth_token(mut request: Request, env: Env) -> worker::Result<Response>
     }
 
     let db = env.d1(D1_BINDING)?;
+    let ip = rate_limit_request_ip(&request)?.unwrap_or_else(|| "missing".to_owned());
+    let grant_subject = format!("{}:{}", form.client_id, form.grant_type);
+    let rate_limit_subjects = [
+        rate_limit_subject(
+            RateLimitPolicy {
+                scope: RATE_LIMIT_SCOPE_OAUTH_TOKEN_IP,
+                window_seconds: 5 * 60,
+                max_attempts: 30,
+            },
+            ip.as_str(),
+        ),
+        rate_limit_subject(
+            RateLimitPolicy {
+                scope: RATE_LIMIT_SCOPE_OAUTH_TOKEN_CLIENT,
+                window_seconds: 5 * 60,
+                max_attempts: 30,
+            },
+            form.client_id.as_str(),
+        ),
+        rate_limit_subject(
+            RateLimitPolicy {
+                scope: RATE_LIMIT_SCOPE_OAUTH_TOKEN_GRANT,
+                window_seconds: 5 * 60,
+                max_attempts: 30,
+            },
+            grant_subject.as_str(),
+        ),
+    ];
+    if let Some(blocked) = rate_limit_check_subjects(
+        &db,
+        &rate_limit_key,
+        unix_timestamp_seconds(),
+        &rate_limit_subjects,
+    )
+    .await?
+    {
+        return rate_limit_oauth_error_json(blocked.retry_after_seconds, origin.as_deref());
+    }
     let registered_client = match get_registered_client(&db, &form.client_id).await? {
         Some(client) => client,
         None => {
+            if let Some(blocked) = rate_limit_increment_subjects(
+                &db,
+                &rate_limit_key,
+                unix_timestamp_seconds(),
+                &rate_limit_subjects,
+            )
+            .await?
+            {
+                return rate_limit_oauth_error_json(blocked.retry_after_seconds, origin.as_deref());
+            }
             return token_exchange_error_json(
                 &TokenExchangeError::invalid_client("client is not registered"),
                 401,
-            )
+            );
         }
     };
     if let Err(error) =
         validate_token_client_auth(&registered_client, &form.client_id, &form.client_auth)
     {
+        if let Some(blocked) = rate_limit_increment_subjects(
+            &db,
+            &rate_limit_key,
+            unix_timestamp_seconds(),
+            &rate_limit_subjects,
+        )
+        .await?
+        {
+            return rate_limit_oauth_error_json(blocked.retry_after_seconds, origin.as_deref());
+        }
         return token_exchange_error_json(&error, 401);
     }
     if let Err(error) =
@@ -3754,6 +3910,13 @@ async fn oauth_token(mut request: Request, env: Env) -> worker::Result<Response>
             400,
         ),
     }?;
+    if response.status_code() >= 400 {
+        if let Some(blocked) =
+            rate_limit_increment_subjects(&db, &rate_limit_key, now, &rate_limit_subjects).await?
+        {
+            return rate_limit_oauth_error_json(blocked.retry_after_seconds, origin.as_deref());
+        }
+    }
     record_audit_event(
         &db,
         &request,
@@ -4412,6 +4575,22 @@ async fn sessions(request: Request, env: Env) -> worker::Result<Response> {
                     403,
                 );
             }
+            let csrf_token = csrf_token_from_header(&request)?;
+            if let Err(error) = validate_browser_session_mutation(
+                &request,
+                &env,
+                &db,
+                &config,
+                current.client_id.as_deref(),
+                current.session_id.as_deref().unwrap_or_default(),
+                CSRF_ROUTE_FAMILY_ACCOUNT,
+                csrf_token.as_deref(),
+                now,
+            )
+            .await?
+            {
+                return oauth_error_json("invalid_request", error, 403);
+            }
             let Some(session_id) =
                 query_param(&request_url, "session_id").filter(|id| !id.is_empty())
             else {
@@ -4476,6 +4655,24 @@ async fn profile(mut request: Request, env: Env) -> worker::Result<Response> {
         Method::Patch => {
             if let Err(error) = current.require_profile_scope() {
                 return oauth_error_json(error.code, error.description, error.status);
+            }
+            let csrf_token = csrf_token_from_header(&request)?;
+            if !current.access_token {
+                if let Err(error) = validate_browser_session_mutation(
+                    &request,
+                    &env,
+                    &db,
+                    &config,
+                    current.client_id.as_deref(),
+                    current.session_id.as_deref().unwrap_or_default(),
+                    CSRF_ROUTE_FAMILY_ACCOUNT,
+                    csrf_token.as_deref(),
+                    now,
+                )
+                .await?
+                {
+                    return oauth_error_json("invalid_request", error, 403);
+                }
             }
             let patch = match profile_patch_from_request(&mut request).await {
                 Ok(patch) => patch,
@@ -4542,6 +4739,22 @@ async fn identities(request: Request, env: Env) -> worker::Result<Response> {
                     403,
                 );
             }
+            let csrf_token = csrf_token_from_header(&request)?;
+            if let Err(error) = validate_browser_session_mutation(
+                &request,
+                &env,
+                &db,
+                &config,
+                current.client_id.as_deref(),
+                current.session_id.as_deref().unwrap_or_default(),
+                CSRF_ROUTE_FAMILY_ACCOUNT,
+                csrf_token.as_deref(),
+                now,
+            )
+            .await?
+            {
+                return oauth_error_json("invalid_request", error, 403);
+            }
             let identity = match identity_reference_from_url(&request_url) {
                 Ok(identity) => identity,
                 Err(error) => return oauth_error_json("invalid_request", error, 400),
@@ -4602,6 +4815,7 @@ async fn passkey_register_options(mut request: Request, env: Env) -> worker::Res
     let config = server_config(&env, &url);
     let db = env.d1(D1_BINDING)?;
     let now = unix_timestamp_seconds();
+    let rate_limit_key = rate_limit_key_from_env(&env).map_err(worker_error)?;
     let body = match passkey_json_from_request::<PasskeyRegisterOptionsRequest>(&mut request).await
     {
         Ok(body) => body,
@@ -4612,6 +4826,28 @@ async fn passkey_register_options(mut request: Request, env: Env) -> worker::Res
     if current.is_none() {
         if let Err(error) = validate_admin_request(&request, &env, &db, &config, now).await {
             return client_management_error_json(&error);
+        }
+    } else {
+        let csrf_token = csrf_token_from_header(&request)?;
+        if let Err(error) = validate_browser_session_mutation(
+            &request,
+            &env,
+            &db,
+            &config,
+            current
+                .as_ref()
+                .and_then(|current| current.session.client_id.as_deref()),
+            current
+                .as_ref()
+                .map(|current| current.session.id.as_str())
+                .unwrap_or_default(),
+            CSRF_ROUTE_FAMILY_ACCOUNT,
+            csrf_token.as_deref(),
+            now,
+        )
+        .await?
+        {
+            return oauth_error_json("invalid_request", error, 403);
         }
     }
     let (user_id, email, display_name) = match passkey_registration_subject(current.as_ref(), &body)
@@ -4641,6 +4877,43 @@ async fn passkey_register_options(mut request: Request, env: Env) -> worker::Res
         Ok(label) => label,
         Err(error) => return oauth_error_json("invalid_request", error, 400),
     };
+    let ip = rate_limit_request_ip(&request)?.unwrap_or_else(|| "missing".to_owned());
+    let mut rate_limit_subjects = vec![
+        rate_limit_subject(
+            RateLimitPolicy {
+                scope: RATE_LIMIT_SCOPE_PASSKEY_OPTIONS_IP,
+                window_seconds: 15 * 60,
+                max_attempts: 20,
+            },
+            ip.as_str(),
+        ),
+        rate_limit_subject(
+            RateLimitPolicy {
+                scope: RATE_LIMIT_SCOPE_PASSKEY_OPTIONS_CLIENT,
+                window_seconds: 15 * 60,
+                max_attempts: 20,
+            },
+            client_id.as_str(),
+        ),
+    ];
+    rate_limit_subjects.push(rate_limit_subject(
+        RateLimitPolicy {
+            scope: RATE_LIMIT_SCOPE_PASSKEY_OPTIONS_EMAIL,
+            window_seconds: 15 * 60,
+            max_attempts: 10,
+        },
+        email.as_str(),
+    ));
+    if let Some(blocked) =
+        rate_limit_check_subjects(&db, &rate_limit_key, now, &rate_limit_subjects).await?
+    {
+        return rate_limit_error_json(blocked.retry_after_seconds);
+    }
+    if let Some(blocked) =
+        rate_limit_increment_subjects(&db, &rate_limit_key, now, &rate_limit_subjects).await?
+    {
+        return rate_limit_error_json(blocked.retry_after_seconds);
+    }
     let challenge = random_token()?;
 
     cleanup_expired_passkey_challenges(&db, now).await?;
@@ -4693,13 +4966,51 @@ async fn passkey_register_verify(mut request: Request, env: Env) -> worker::Resu
     let config = server_config(&env, &url);
     let db = env.d1(D1_BINDING)?;
     let now = unix_timestamp_seconds();
+    let rate_limit_key = rate_limit_key_from_env(&env).map_err(worker_error)?;
     let body = match passkey_json_from_request::<PasskeyRegisterVerifyRequest>(&mut request).await {
         Ok(body) => body,
         Err(error) => return oauth_error_json("invalid_request", error, 400),
     };
+    let ip = rate_limit_request_ip(&request)?.unwrap_or_else(|| "missing".to_owned());
+    let credential_subject = hash_secret(&body.raw_id);
+    let failure_rate_limit_subjects = [
+        rate_limit_subject(
+            RateLimitPolicy {
+                scope: RATE_LIMIT_SCOPE_PASSKEY_VERIFY_IP,
+                window_seconds: 15 * 60,
+                max_attempts: 20,
+            },
+            ip.as_str(),
+        ),
+        rate_limit_subject(
+            RateLimitPolicy {
+                scope: RATE_LIMIT_SCOPE_PASSKEY_VERIFY_CREDENTIAL,
+                window_seconds: 15 * 60,
+                max_attempts: 10,
+            },
+            credential_subject.as_str(),
+        ),
+    ];
+    if let Some(blocked) =
+        rate_limit_check_subjects(&db, &rate_limit_key, now, &failure_rate_limit_subjects).await?
+    {
+        return rate_limit_error_json(blocked.retry_after_seconds);
+    }
     let validation = match validate_passkey_registration_response(&config, &body) {
         Ok(validation) => validation,
-        Err(error) => return oauth_error_json("invalid_request", error, 400),
+        Err(error) => {
+            if let Some(blocked) = rate_limit_increment_subjects(
+                &db,
+                &rate_limit_key,
+                now,
+                &failure_rate_limit_subjects,
+            )
+            .await?
+            {
+                return rate_limit_error_json(blocked.retry_after_seconds);
+            }
+            return oauth_error_json("invalid_request", error, 400);
+        }
     };
     let admin_authorization = authorize_admin_request(&request, &env, &db, &config, now)
         .await
@@ -4707,21 +5018,82 @@ async fn passkey_register_verify(mut request: Request, env: Env) -> worker::Resu
     let challenge_hash =
         match passkey_challenge_hash_from_client_data(&body.response.client_data_json) {
             Ok(challenge_hash) => challenge_hash,
-            Err(error) => return oauth_error_json("invalid_request", error, 400),
+            Err(error) => {
+                if let Some(blocked) = rate_limit_increment_subjects(
+                    &db,
+                    &rate_limit_key,
+                    now,
+                    &failure_rate_limit_subjects,
+                )
+                .await?
+                {
+                    return rate_limit_error_json(blocked.retry_after_seconds);
+                }
+                return oauth_error_json("invalid_request", error, 400);
+            }
         };
     let Some(challenge) = get_passkey_challenge_by_hash(&db, &challenge_hash).await? else {
+        if let Some(blocked) =
+            rate_limit_increment_subjects(&db, &rate_limit_key, now, &failure_rate_limit_subjects)
+                .await?
+        {
+            return rate_limit_error_json(blocked.retry_after_seconds);
+        }
         return oauth_error_json("invalid_request", "passkey challenge was not found", 400);
     };
     if let Err(error) = validate_passkey_challenge(&challenge, "registration", now) {
+        if let Some(blocked) =
+            rate_limit_increment_subjects(&db, &rate_limit_key, now, &failure_rate_limit_subjects)
+                .await?
+        {
+            return rate_limit_error_json(blocked.retry_after_seconds);
+        }
         return oauth_error_json("invalid_request", error, 400);
     }
     if !passkey_challenge_matches_client_data(
         &challenge.challenge_hash,
         &body.response.client_data_json,
     ) {
+        if let Some(blocked) =
+            rate_limit_increment_subjects(&db, &rate_limit_key, now, &failure_rate_limit_subjects)
+                .await?
+        {
+            return rate_limit_error_json(blocked.retry_after_seconds);
+        }
         return oauth_error_json("invalid_request", "passkey challenge did not match", 400);
     }
+    if admin_authorization.is_none() {
+        let Some(current) = current_session_from_request(&request, &db, &config, now).await? else {
+            return oauth_error_json(
+                "login_required",
+                "active browser session was not found",
+                401,
+            );
+        };
+        let csrf_token = csrf_token_from_header(&request)?;
+        if let Err(error) = validate_browser_session_mutation(
+            &request,
+            &env,
+            &db,
+            &config,
+            current.session.client_id.as_deref(),
+            &current.session.id,
+            CSRF_ROUTE_FAMILY_ACCOUNT,
+            csrf_token.as_deref(),
+            now,
+        )
+        .await?
+        {
+            return oauth_error_json("invalid_request", error, 403);
+        }
+    }
     if !consume_passkey_challenge(&db, &challenge.challenge_hash, now).await? {
+        if let Some(blocked) =
+            rate_limit_increment_subjects(&db, &rate_limit_key, now, &failure_rate_limit_subjects)
+                .await?
+        {
+            return rate_limit_error_json(blocked.retry_after_seconds);
+        }
         return oauth_error_json("invalid_request", "passkey challenge was already used", 400);
     }
 
@@ -4783,6 +5155,7 @@ async fn passkey_register_verify(mut request: Request, env: Env) -> worker::Resu
 async fn passkey_authenticate_options(mut request: Request, env: Env) -> worker::Result<Response> {
     let url = request.url()?;
     let config = server_config(&env, &url);
+    let rate_limit_key = rate_limit_key_from_env(&env).map_err(worker_error)?;
     let body =
         match passkey_json_from_request::<PasskeyAuthenticateOptionsRequest>(&mut request).await {
             Ok(body) => body,
@@ -4808,6 +5181,35 @@ async fn passkey_authenticate_options(mut request: Request, env: Env) -> worker:
         Err(error) => return oauth_error_json("invalid_request", error.to_string(), 400),
     };
     let now = unix_timestamp_seconds();
+    let ip = rate_limit_request_ip(&request)?.unwrap_or_else(|| "missing".to_owned());
+    let rate_limit_subjects = [
+        rate_limit_subject(
+            RateLimitPolicy {
+                scope: RATE_LIMIT_SCOPE_PASSKEY_OPTIONS_IP,
+                window_seconds: 15 * 60,
+                max_attempts: 20,
+            },
+            ip.as_str(),
+        ),
+        rate_limit_subject(
+            RateLimitPolicy {
+                scope: RATE_LIMIT_SCOPE_PASSKEY_OPTIONS_CLIENT,
+                window_seconds: 15 * 60,
+                max_attempts: 20,
+            },
+            client_id.as_str(),
+        ),
+    ];
+    if let Some(blocked) =
+        rate_limit_check_subjects(&db, &rate_limit_key, now, &rate_limit_subjects).await?
+    {
+        return rate_limit_error_json(blocked.retry_after_seconds);
+    }
+    if let Some(blocked) =
+        rate_limit_increment_subjects(&db, &rate_limit_key, now, &rate_limit_subjects).await?
+    {
+        return rate_limit_error_json(blocked.retry_after_seconds);
+    }
     let challenge = random_token()?;
     cleanup_expired_passkey_challenges(&db, now).await?;
     put_passkey_challenge(
@@ -4847,38 +5249,124 @@ async fn passkey_authenticate_verify(mut request: Request, env: Env) -> worker::
     let config = server_config(&env, &url);
     let db = env.d1(D1_BINDING)?;
     let now = unix_timestamp_seconds();
+    let rate_limit_key = rate_limit_key_from_env(&env).map_err(worker_error)?;
     let body =
         match passkey_json_from_request::<PasskeyAuthenticateVerifyRequest>(&mut request).await {
             Ok(body) => body,
             Err(error) => return oauth_error_json("invalid_request", error, 400),
         };
+    let ip = rate_limit_request_ip(&request)?.unwrap_or_else(|| "missing".to_owned());
+    let credential_subject = hash_secret(&body.raw_id);
+    let failure_rate_limit_subjects = [
+        rate_limit_subject(
+            RateLimitPolicy {
+                scope: RATE_LIMIT_SCOPE_PASSKEY_VERIFY_IP,
+                window_seconds: 15 * 60,
+                max_attempts: 20,
+            },
+            ip.as_str(),
+        ),
+        rate_limit_subject(
+            RateLimitPolicy {
+                scope: RATE_LIMIT_SCOPE_PASSKEY_VERIFY_CREDENTIAL,
+                window_seconds: 15 * 60,
+                max_attempts: 10,
+            },
+            credential_subject.as_str(),
+        ),
+    ];
+    if let Some(blocked) =
+        rate_limit_check_subjects(&db, &rate_limit_key, now, &failure_rate_limit_subjects).await?
+    {
+        return rate_limit_error_json(blocked.retry_after_seconds);
+    }
     let challenge_hash =
         match passkey_challenge_hash_from_client_data(&body.response.client_data_json) {
             Ok(challenge_hash) => challenge_hash,
-            Err(error) => return oauth_error_json("invalid_request", error, 400),
+            Err(error) => {
+                if let Some(blocked) = rate_limit_increment_subjects(
+                    &db,
+                    &rate_limit_key,
+                    now,
+                    &failure_rate_limit_subjects,
+                )
+                .await?
+                {
+                    return rate_limit_error_json(blocked.retry_after_seconds);
+                }
+                return oauth_error_json("invalid_request", error, 400);
+            }
         };
     let Some(challenge) = get_passkey_challenge_by_hash(&db, &challenge_hash).await? else {
+        if let Some(blocked) =
+            rate_limit_increment_subjects(&db, &rate_limit_key, now, &failure_rate_limit_subjects)
+                .await?
+        {
+            return rate_limit_error_json(blocked.retry_after_seconds);
+        }
         return oauth_error_json("invalid_request", "passkey challenge was not found", 400);
     };
     if let Err(error) = validate_passkey_challenge(&challenge, "authentication", now) {
+        if let Some(blocked) =
+            rate_limit_increment_subjects(&db, &rate_limit_key, now, &failure_rate_limit_subjects)
+                .await?
+        {
+            return rate_limit_error_json(blocked.retry_after_seconds);
+        }
         return oauth_error_json("invalid_request", error, 400);
     }
     let credential_id = match passkey_raw_id(&body.raw_id) {
         Ok(credential_id) => credential_id,
-        Err(error) => return oauth_error_json("invalid_request", error, 400),
+        Err(error) => {
+            if let Some(blocked) = rate_limit_increment_subjects(
+                &db,
+                &rate_limit_key,
+                now,
+                &failure_rate_limit_subjects,
+            )
+            .await?
+            {
+                return rate_limit_error_json(blocked.retry_after_seconds);
+            }
+            return oauth_error_json("invalid_request", error, 400);
+        }
     };
     let Some(credential) = get_passkey_credential(&db, &credential_id).await? else {
+        if let Some(blocked) =
+            rate_limit_increment_subjects(&db, &rate_limit_key, now, &failure_rate_limit_subjects)
+                .await?
+        {
+            return rate_limit_error_json(blocked.retry_after_seconds);
+        }
         return oauth_error_json("invalid_request", "passkey credential was not found", 400);
     };
     if credential.disabled_at.is_some() {
+        if let Some(blocked) =
+            rate_limit_increment_subjects(&db, &rate_limit_key, now, &failure_rate_limit_subjects)
+                .await?
+        {
+            return rate_limit_error_json(blocked.retry_after_seconds);
+        }
         return oauth_error_json("invalid_request", "passkey credential is disabled", 400);
     }
     if let Err(error) =
         validate_passkey_authentication_response(&config, &body, &credential, &challenge)
     {
+        if let Some(blocked) =
+            rate_limit_increment_subjects(&db, &rate_limit_key, now, &failure_rate_limit_subjects)
+                .await?
+        {
+            return rate_limit_error_json(blocked.retry_after_seconds);
+        }
         return oauth_error_json("invalid_request", error, 400);
     }
     if !consume_passkey_challenge(&db, &challenge.challenge_hash, now).await? {
+        if let Some(blocked) =
+            rate_limit_increment_subjects(&db, &rate_limit_key, now, &failure_rate_limit_subjects)
+                .await?
+        {
+            return rate_limit_error_json(blocked.retry_after_seconds);
+        }
         return oauth_error_json("invalid_request", "passkey challenge was already used", 400);
     }
     update_passkey_credential_use(
@@ -4889,9 +5377,21 @@ async fn passkey_authenticate_verify(mut request: Request, env: Env) -> worker::
     )
     .await?;
     let Some(user) = get_user(&db, &credential.user_id).await? else {
+        if let Some(blocked) =
+            rate_limit_increment_subjects(&db, &rate_limit_key, now, &failure_rate_limit_subjects)
+                .await?
+        {
+            return rate_limit_error_json(blocked.retry_after_seconds);
+        }
         return oauth_error_json("invalid_request", "passkey user was not found", 400);
     };
     if user.disabled_at.is_some() {
+        if let Some(blocked) =
+            rate_limit_increment_subjects(&db, &rate_limit_key, now, &failure_rate_limit_subjects)
+                .await?
+        {
+            return rate_limit_error_json(blocked.retry_after_seconds);
+        }
         return oauth_error_json("invalid_request", "passkey user is disabled", 400);
     }
     let client_id = challenge
@@ -4900,6 +5400,15 @@ async fn passkey_authenticate_verify(mut request: Request, env: Env) -> worker::
         .ok_or_else(|| worker_error("passkey challenge did not include a client_id".to_owned()))?;
     let session_id = format!("sess_{}", random_token()?);
     let audit_context = audit_request_context(&request).unwrap_or_default();
+    let success_rate_limit_subjects = [rate_limit_subject(
+        RateLimitPolicy {
+            scope: RATE_LIMIT_SCOPE_PASSKEY_VERIFY_CREDENTIAL,
+            window_seconds: 15 * 60,
+            max_attempts: 10,
+        },
+        credential_subject.as_str(),
+    )];
+    rate_limit_clear_subjects(&db, &rate_limit_key, &success_rate_limit_subjects).await?;
     put_session(
         &db,
         &session_id,
@@ -4950,6 +5459,7 @@ async fn password_register(mut request: Request, env: Env) -> worker::Result<Res
     let config = server_config(&env, &url);
     let db = env.d1(D1_BINDING)?;
     let now = unix_timestamp_seconds();
+    let rate_limit_key = rate_limit_key_from_env(&env).map_err(worker_error)?;
     let body = match local_auth_body_from_request::<PasswordRegisterRequest>(&mut request).await {
         Ok(body) => body,
         Err(error) => return oauth_error_json("invalid_request", error, 400),
@@ -4989,6 +5499,35 @@ async fn password_register(mut request: Request, env: Env) -> worker::Result<Res
     if let Err(error) = validate_local_auth_client_email_policy(&client, &email) {
         return oauth_error_json(&error.code, &error.description, 403);
     }
+    let ip = rate_limit_request_ip(&request)?.unwrap_or_else(|| "missing".to_owned());
+    let rate_limit_subjects = [
+        rate_limit_subject(
+            RateLimitPolicy {
+                scope: RATE_LIMIT_SCOPE_PASSWORD_REGISTER_IP,
+                window_seconds: 15 * 60,
+                max_attempts: 20,
+            },
+            ip.as_str(),
+        ),
+        rate_limit_subject(
+            RateLimitPolicy {
+                scope: RATE_LIMIT_SCOPE_PASSWORD_REGISTER_EMAIL,
+                window_seconds: 15 * 60,
+                max_attempts: 5,
+            },
+            email.as_str(),
+        ),
+    ];
+    if let Some(blocked) =
+        rate_limit_check_subjects(&db, &rate_limit_key, now, &rate_limit_subjects).await?
+    {
+        return rate_limit_error_json(blocked.retry_after_seconds);
+    }
+    if let Some(blocked) =
+        rate_limit_increment_subjects(&db, &rate_limit_key, now, &rate_limit_subjects).await?
+    {
+        return rate_limit_error_json(blocked.retry_after_seconds);
+    }
 
     let current = current_session_from_request(&request, &db, &config, now).await?;
     let existing_user = get_user_by_primary_email(&db, &email).await?;
@@ -5010,16 +5549,18 @@ async fn password_register(mut request: Request, env: Env) -> worker::Result<Res
         }
     }
 
+    let peppers = password_pepper_from_env(&env).map_err(worker_error)?;
     let salt = random_token()?;
-    let iterations = password_iterations_from_env(&env).map_err(worker_error)?;
-    let password_hash = password_hash(&body.password, &salt, iterations).await?;
+    let password_hash =
+        password_hash_current(&body.password, &salt, peppers.current.value.as_slice()).await?;
     upsert_local_credential(
         &db,
         &email,
         &user_id,
         &password_hash,
         &salt,
-        iterations,
+        &peppers.current.id,
+        PASSWORD_PBKDF2_ITERATIONS,
         now,
     )
     .await?;
@@ -5053,6 +5594,7 @@ async fn password_login(mut request: Request, env: Env) -> worker::Result<Respon
     let config = server_config(&env, &url);
     let db = env.d1(D1_BINDING)?;
     let now = unix_timestamp_seconds();
+    let rate_limit_key = rate_limit_key_from_env(&env).map_err(worker_error)?;
     let body = match local_auth_body_from_request::<PasswordLoginRequest>(&mut request).await {
         Ok(body) => body,
         Err(error) => return oauth_error_json("invalid_request", error, 400),
@@ -5080,21 +5622,117 @@ async fn password_login(mut request: Request, env: Env) -> worker::Result<Respon
     if let Err(error) = validate_local_auth_client_email_policy(&client, &email) {
         return oauth_error_json(&error.code, &error.description, 403);
     }
+    let ip = rate_limit_request_ip(&request)?.unwrap_or_else(|| "missing".to_owned());
+    let ip_email = format!("{ip}:{email}");
+    let failure_rate_limit_subjects = [
+        rate_limit_subject(
+            RateLimitPolicy {
+                scope: RATE_LIMIT_SCOPE_PASSWORD_LOGIN_IP,
+                window_seconds: 15 * 60,
+                max_attempts: 20,
+            },
+            ip.as_str(),
+        ),
+        rate_limit_subject(
+            RateLimitPolicy {
+                scope: RATE_LIMIT_SCOPE_PASSWORD_LOGIN_EMAIL,
+                window_seconds: 15 * 60,
+                max_attempts: 5,
+            },
+            email.as_str(),
+        ),
+        rate_limit_subject(
+            RateLimitPolicy {
+                scope: RATE_LIMIT_SCOPE_PASSWORD_LOGIN_IP_EMAIL,
+                window_seconds: 15 * 60,
+                max_attempts: 5,
+            },
+            ip_email.as_str(),
+        ),
+    ];
+    if let Some(blocked) =
+        rate_limit_check_subjects(&db, &rate_limit_key, now, &failure_rate_limit_subjects).await?
+    {
+        return rate_limit_error_json(blocked.retry_after_seconds);
+    }
 
     let Some(credential) = get_local_credential(&db, &email).await? else {
+        password_dummy_verify(&env, &body.password).await?;
+        if let Some(blocked) =
+            rate_limit_increment_subjects(&db, &rate_limit_key, now, &failure_rate_limit_subjects)
+                .await?
+        {
+            return rate_limit_error_json(blocked.retry_after_seconds);
+        }
         return oauth_error_json("invalid_grant", "invalid email or password", 401);
     };
-    let password_valid = local_auth_password_matches(&credential, &body.password).await?;
-    if credential.disabled_at.is_some() || !password_valid {
+    let password_verification =
+        local_auth_password_matches(&env, &credential, &body.password).await?;
+    if credential.disabled_at.is_some() || !password_verification.valid {
+        if let Some(blocked) =
+            rate_limit_increment_subjects(&db, &rate_limit_key, now, &failure_rate_limit_subjects)
+                .await?
+        {
+            return rate_limit_error_json(blocked.retry_after_seconds);
+        }
         return oauth_error_json("invalid_grant", "invalid email or password", 401);
     }
     let Some(user) = get_user(&db, &credential.user_id).await? else {
+        if let Some(blocked) =
+            rate_limit_increment_subjects(&db, &rate_limit_key, now, &failure_rate_limit_subjects)
+                .await?
+        {
+            return rate_limit_error_json(blocked.retry_after_seconds);
+        }
         return oauth_error_json("invalid_grant", "invalid email or password", 401);
     };
     if user.disabled_at.is_some() {
+        if let Some(blocked) =
+            rate_limit_increment_subjects(&db, &rate_limit_key, now, &failure_rate_limit_subjects)
+                .await?
+        {
+            return rate_limit_error_json(blocked.retry_after_seconds);
+        }
         return oauth_error_json("invalid_grant", "invalid email or password", 401);
     }
+    if password_verification.needs_rehash {
+        let peppers = password_pepper_from_env(&env).map_err(worker_error)?;
+        let new_salt = random_token()?;
+        let new_hash =
+            password_hash_current(&body.password, &new_salt, peppers.current.value.as_slice())
+                .await?;
+        upsert_local_credential(
+            &db,
+            &credential.email,
+            &credential.user_id,
+            &new_hash,
+            &new_salt,
+            &peppers.current.id,
+            PASSWORD_PBKDF2_ITERATIONS,
+            now,
+        )
+        .await?;
+    }
     mark_local_credential_used(&db, &credential.email, now).await?;
+    let success_rate_limit_subjects = [
+        rate_limit_subject(
+            RateLimitPolicy {
+                scope: RATE_LIMIT_SCOPE_PASSWORD_LOGIN_EMAIL,
+                window_seconds: 15 * 60,
+                max_attempts: 5,
+            },
+            email.as_str(),
+        ),
+        rate_limit_subject(
+            RateLimitPolicy {
+                scope: RATE_LIMIT_SCOPE_PASSWORD_LOGIN_IP_EMAIL,
+                window_seconds: 15 * 60,
+                max_attempts: 5,
+            },
+            ip_email.as_str(),
+        ),
+    ];
+    rate_limit_clear_subjects(&db, &rate_limit_key, &success_rate_limit_subjects).await?;
     let response = issue_local_auth_session_response(
         &request,
         &db,
@@ -5116,6 +5754,7 @@ async fn evm_wallet_challenge(mut request: Request, env: Env) -> worker::Result<
     let config = server_config(&env, &url);
     let db = env.d1(D1_BINDING)?;
     let now = unix_timestamp_seconds();
+    let rate_limit_key = rate_limit_key_from_env(&env).map_err(worker_error)?;
     let body = match wallet_json_from_request::<WalletChallengeRequest>(&mut request).await {
         Ok(body) => body,
         Err(error) => return oauth_error_json("invalid_request", error, 400),
@@ -5147,6 +5786,43 @@ async fn evm_wallet_challenge(mut request: Request, env: Env) -> worker::Result<
     let Some(registered_client) = get_registered_client(&db, &client.id.0).await? else {
         return oauth_error_json("invalid_request", "wallet client is not registered", 400);
     };
+    let ip = rate_limit_request_ip(&request)?.unwrap_or_else(|| "missing".to_owned());
+    let rate_limit_subjects = [
+        rate_limit_subject(
+            RateLimitPolicy {
+                scope: RATE_LIMIT_SCOPE_WALLET_CHALLENGE_IP,
+                window_seconds: 15 * 60,
+                max_attempts: 20,
+            },
+            ip.as_str(),
+        ),
+        rate_limit_subject(
+            RateLimitPolicy {
+                scope: RATE_LIMIT_SCOPE_WALLET_CHALLENGE_ADDRESS,
+                window_seconds: 15 * 60,
+                max_attempts: 10,
+            },
+            address.as_str(),
+        ),
+        rate_limit_subject(
+            RateLimitPolicy {
+                scope: RATE_LIMIT_SCOPE_WALLET_CHALLENGE_CLIENT,
+                window_seconds: 15 * 60,
+                max_attempts: 20,
+            },
+            client.id.0.as_str(),
+        ),
+    ];
+    if let Some(blocked) =
+        rate_limit_check_subjects(&db, &rate_limit_key, now, &rate_limit_subjects).await?
+    {
+        return rate_limit_error_json(blocked.retry_after_seconds);
+    }
+    if let Some(blocked) =
+        rate_limit_increment_subjects(&db, &rate_limit_key, now, &rate_limit_subjects).await?
+    {
+        return rate_limit_error_json(blocked.retry_after_seconds);
+    }
 
     cleanup_expired_wallet_challenges(&db, now).await?;
     let nonce = random_token()?;
@@ -5208,6 +5884,7 @@ async fn evm_wallet_verify(mut request: Request, env: Env) -> worker::Result<Res
     let config = server_config(&env, &url);
     let db = env.d1(D1_BINDING)?;
     let now = unix_timestamp_seconds();
+    let rate_limit_key = rate_limit_key_from_env(&env).map_err(worker_error)?;
     let body = match wallet_json_from_request::<WalletVerifyRequest>(&mut request).await {
         Ok(body) => body,
         Err(error) => return oauth_error_json("invalid_request", error, 400),
@@ -5224,10 +5901,54 @@ async fn evm_wallet_verify(mut request: Request, env: Env) -> worker::Result<Res
         return oauth_error_json("invalid_grant", "invalid wallet challenge", 401);
     }
     let challenge_hash = hash_secret(&body.nonce);
+    let ip = rate_limit_request_ip(&request)?.unwrap_or_else(|| "missing".to_owned());
+    let failure_rate_limit_subjects = [
+        rate_limit_subject(
+            RateLimitPolicy {
+                scope: RATE_LIMIT_SCOPE_WALLET_VERIFY_IP,
+                window_seconds: 15 * 60,
+                max_attempts: 20,
+            },
+            ip.as_str(),
+        ),
+        rate_limit_subject(
+            RateLimitPolicy {
+                scope: RATE_LIMIT_SCOPE_WALLET_VERIFY_ADDRESS,
+                window_seconds: 15 * 60,
+                max_attempts: 10,
+            },
+            address.as_str(),
+        ),
+        rate_limit_subject(
+            RateLimitPolicy {
+                scope: RATE_LIMIT_SCOPE_WALLET_VERIFY_CHALLENGE,
+                window_seconds: 15 * 60,
+                max_attempts: 10,
+            },
+            challenge_hash.as_str(),
+        ),
+    ];
+    if let Some(blocked) =
+        rate_limit_check_subjects(&db, &rate_limit_key, now, &failure_rate_limit_subjects).await?
+    {
+        return rate_limit_error_json(blocked.retry_after_seconds);
+    }
     let Some(challenge) = get_wallet_challenge(&db, &challenge_hash).await? else {
+        if let Some(blocked) =
+            rate_limit_increment_subjects(&db, &rate_limit_key, now, &failure_rate_limit_subjects)
+                .await?
+        {
+            return rate_limit_error_json(blocked.retry_after_seconds);
+        }
         return oauth_error_json("invalid_grant", "invalid wallet challenge", 401);
     };
     if let Err(error) = validate_wallet_challenge(&challenge, now) {
+        if let Some(blocked) =
+            rate_limit_increment_subjects(&db, &rate_limit_key, now, &failure_rate_limit_subjects)
+                .await?
+        {
+            return rate_limit_error_json(blocked.retry_after_seconds);
+        }
         return oauth_error_json("invalid_grant", error, 401);
     }
     if challenge.provider_id != EVM_WALLET_PROVIDER_ID
@@ -5235,6 +5956,12 @@ async fn evm_wallet_verify(mut request: Request, env: Env) -> worker::Result<Res
         || challenge.chain_id != chain_id
         || challenge.message != body.message
     {
+        if let Some(blocked) =
+            rate_limit_increment_subjects(&db, &rate_limit_key, now, &failure_rate_limit_subjects)
+                .await?
+        {
+            return rate_limit_error_json(blocked.retry_after_seconds);
+        }
         return oauth_error_json(
             "invalid_grant",
             "wallet challenge did not match request",
@@ -5243,12 +5970,36 @@ async fn evm_wallet_verify(mut request: Request, env: Env) -> worker::Result<Res
     }
     let recovered_address = match recover_evm_wallet_address(&body.message, &body.signature) {
         Ok(recovered_address) => recovered_address,
-        Err(_) => return oauth_error_json("invalid_grant", "invalid wallet signature", 401),
+        Err(_) => {
+            if let Some(blocked) = rate_limit_increment_subjects(
+                &db,
+                &rate_limit_key,
+                now,
+                &failure_rate_limit_subjects,
+            )
+            .await?
+            {
+                return rate_limit_error_json(blocked.retry_after_seconds);
+            }
+            return oauth_error_json("invalid_grant", "invalid wallet signature", 401);
+        }
     };
     if recovered_address != address {
+        if let Some(blocked) =
+            rate_limit_increment_subjects(&db, &rate_limit_key, now, &failure_rate_limit_subjects)
+                .await?
+        {
+            return rate_limit_error_json(blocked.retry_after_seconds);
+        }
         return oauth_error_json("invalid_grant", "invalid wallet signature", 401);
     }
     if !consume_wallet_challenge(&db, &challenge_hash, now).await? {
+        if let Some(blocked) =
+            rate_limit_increment_subjects(&db, &rate_limit_key, now, &failure_rate_limit_subjects)
+                .await?
+        {
+            return rate_limit_error_json(blocked.retry_after_seconds);
+        }
         return oauth_error_json("invalid_grant", "wallet challenge was already used", 401);
     }
 
@@ -5272,8 +6023,23 @@ async fn evm_wallet_verify(mut request: Request, env: Env) -> worker::Result<Res
         return oauth_error_json("invalid_request", "wallet user was not found", 400);
     };
     if user.disabled_at.is_some() {
+        if let Some(blocked) =
+            rate_limit_increment_subjects(&db, &rate_limit_key, now, &failure_rate_limit_subjects)
+                .await?
+        {
+            return rate_limit_error_json(blocked.retry_after_seconds);
+        }
         return oauth_error_json("invalid_request", "wallet user is disabled", 403);
     }
+    let success_rate_limit_subjects = [rate_limit_subject(
+        RateLimitPolicy {
+            scope: RATE_LIMIT_SCOPE_WALLET_VERIFY_ADDRESS,
+            window_seconds: 15 * 60,
+            max_attempts: 10,
+        },
+        address.as_str(),
+    )];
+    rate_limit_clear_subjects(&db, &rate_limit_key, &success_rate_limit_subjects).await?;
     let response = issue_wallet_session_response(
         &request,
         &db,
@@ -5295,6 +6061,7 @@ async fn magic_link_request(mut request: Request, env: Env) -> worker::Result<Re
     let config = server_config(&env, &url);
     let db = env.d1(D1_BINDING)?;
     let now = unix_timestamp_seconds();
+    let rate_limit_key = rate_limit_key_from_env(&env).map_err(worker_error)?;
     let body = match local_auth_body_from_request::<MagicLinkRequest>(&mut request).await {
         Ok(body) => body,
         Err(error) => return oauth_error_json("invalid_request", error, 400),
@@ -5321,6 +6088,43 @@ async fn magic_link_request(mut request: Request, env: Env) -> worker::Result<Re
     }
     if let Err(error) = validate_local_auth_client_email_policy(&client, &email) {
         return oauth_error_json(&error.code, &error.description, 403);
+    }
+    let ip = rate_limit_request_ip(&request)?.unwrap_or_else(|| "missing".to_owned());
+    let rate_limit_subjects = [
+        rate_limit_subject(
+            RateLimitPolicy {
+                scope: RATE_LIMIT_SCOPE_MAGIC_LINK_REQUEST_IP,
+                window_seconds: 60 * 60,
+                max_attempts: 20,
+            },
+            ip.as_str(),
+        ),
+        rate_limit_subject(
+            RateLimitPolicy {
+                scope: RATE_LIMIT_SCOPE_MAGIC_LINK_REQUEST_EMAIL,
+                window_seconds: 60 * 60,
+                max_attempts: 3,
+            },
+            email.as_str(),
+        ),
+        rate_limit_subject(
+            RateLimitPolicy {
+                scope: RATE_LIMIT_SCOPE_MAGIC_LINK_REQUEST_CLIENT,
+                window_seconds: 60 * 60,
+                max_attempts: 20,
+            },
+            client.id.0.as_str(),
+        ),
+    ];
+    if let Some(blocked) =
+        rate_limit_check_subjects(&db, &rate_limit_key, now, &rate_limit_subjects).await?
+    {
+        return rate_limit_error_json(blocked.retry_after_seconds);
+    }
+    if let Some(blocked) =
+        rate_limit_increment_subjects(&db, &rate_limit_key, now, &rate_limit_subjects).await?
+    {
+        return rate_limit_error_json(blocked.retry_after_seconds);
     }
 
     cleanup_expired_magic_links(&db, now).await?;
@@ -5384,25 +6188,121 @@ async fn magic_link_request(mut request: Request, env: Env) -> worker::Result<Re
 }
 
 #[cfg(target_arch = "wasm32")]
+async fn magic_link_confirm(request: Request, env: Env) -> worker::Result<Response> {
+    let url = request.url()?;
+    let config = server_config(&env, &url);
+    let db = env.d1(D1_BINDING)?;
+    let now = unix_timestamp_seconds();
+    let Some(token) = query_param(&url, "token").filter(|token| !token.trim().is_empty()) else {
+        return oauth_error_json("invalid_request", "missing magic link token", 400);
+    };
+    let token_hash = hash_secret(token.trim());
+    let Some(row) = get_magic_link(&db, &token_hash).await? else {
+        return oauth_error_json("invalid_request", "magic link is invalid or expired", 400);
+    };
+    if let Err(error) = validate_magic_link(&row, now) {
+        return oauth_error_json("invalid_request", error, 400);
+    }
+    let secret = csrf_secret_from_env(&env).map_err(worker_error)?;
+    let confirm_token = csrf_token(
+        &secret,
+        &token_hash,
+        CSRF_ROUTE_FAMILY_MAGIC_LINK_CONFIRM,
+        now,
+    );
+    let action = format!(
+        "{}/magic-link/consume",
+        config.public_base_url.trim_end_matches('/')
+    );
+    let cancel_href = format!("{}/login", config.public_base_url.trim_end_matches('/'));
+    let document = render_confirmation_document(
+        "Confirm Magic Link",
+        "Continue with magic link?",
+        "This will sign you in and create a browser session.",
+        &action,
+        "Continue",
+        &cancel_href,
+        &[
+            ("token", token.trim()),
+            (MAGIC_LINK_CONFIRM_TOKEN_FIELD, &confirm_token),
+        ],
+    );
+    let response = html(document)?;
+    with_confirmation_document_headers(response)
+}
+
+#[cfg(target_arch = "wasm32")]
 async fn magic_link_consume(mut request: Request, env: Env) -> worker::Result<Response> {
     let url = request.url()?;
     let config = server_config(&env, &url);
     let db = env.d1(D1_BINDING)?;
     let now = unix_timestamp_seconds();
-    let token = match request.method() {
-        Method::Get => query_param(&url, "token"),
-        Method::Post => {
-            match local_auth_body_from_request::<MagicLinkConsumeRequest>(&mut request).await {
-                Ok(body) => Some(body.token),
-                Err(error) => return oauth_error_json("invalid_request", error, 400),
-            }
-        }
-        _ => None,
+    let rate_limit_key = rate_limit_key_from_env(&env).map_err(worker_error)?;
+    let origin = request_origin_for_config(&request, &config)?;
+    let Some(origin) = origin else {
+        return oauth_error_json("invalid_request", "Origin header is required", 403);
     };
-    let Some(token) = token.filter(|token| !token.trim().is_empty()) else {
+    if !origin_matches_public_base_url(&origin, &config.public_base_url) {
+        return oauth_error_json("invalid_request", cors_disallowed_origin(&origin), 403);
+    }
+    let body = match local_auth_body_from_request::<MagicLinkConsumeRequest>(&mut request).await {
+        Ok(body) => body,
+        Err(error) => return oauth_error_json("invalid_request", error, 400),
+    };
+    let Some(token) = Some(body.token).filter(|token| !token.trim().is_empty()) else {
         return oauth_error_json("invalid_request", "missing magic link token", 400);
     };
     let token_hash = hash_secret(token.trim());
+    let Some(confirm_token) = body
+        .confirm
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return oauth_error_json(
+            "invalid_request",
+            "missing magic link confirmation token",
+            403,
+        );
+    };
+    let secret = csrf_secret_from_env(&env).map_err(worker_error)?;
+    if let Err(error) = validate_csrf_token(
+        &secret,
+        &token_hash,
+        CSRF_ROUTE_FAMILY_MAGIC_LINK_CONFIRM,
+        confirm_token.trim(),
+        now,
+    ) {
+        return oauth_error_json("invalid_request", error, 403);
+    }
+    let ip = rate_limit_request_ip(&request)?.unwrap_or_else(|| "missing".to_owned());
+    let rate_limit_subjects = [
+        rate_limit_subject(
+            RateLimitPolicy {
+                scope: RATE_LIMIT_SCOPE_MAGIC_LINK_CONSUME_IP,
+                window_seconds: 15 * 60,
+                max_attempts: 20,
+            },
+            ip.as_str(),
+        ),
+        rate_limit_subject(
+            RateLimitPolicy {
+                scope: RATE_LIMIT_SCOPE_MAGIC_LINK_CONSUME_TOKEN,
+                window_seconds: 15 * 60,
+                max_attempts: 10,
+            },
+            rate_limit_token_subject(&token_hash),
+        ),
+    ];
+    if let Some(blocked) =
+        rate_limit_check_subjects(&db, &rate_limit_key, now, &rate_limit_subjects).await?
+    {
+        return rate_limit_error_json(blocked.retry_after_seconds);
+    }
+    if let Some(blocked) =
+        rate_limit_increment_subjects(&db, &rate_limit_key, now, &rate_limit_subjects).await?
+    {
+        return rate_limit_error_json(blocked.retry_after_seconds);
+    }
     let Some(row) = get_magic_link(&db, &token_hash).await? else {
         return oauth_error_json("invalid_request", "magic link is invalid or expired", 400);
     };
@@ -5440,20 +6340,6 @@ async fn magic_link_consume(mut request: Request, env: Env) -> worker::Result<Re
         now,
     )
     .await?;
-    if request.method() == Method::Get {
-        let target = url::Url::parse(&row.return_to)
-            .map_err(|error| worker_error(format!("invalid magic link return_to: {error}")))?;
-        let response = Response::redirect(target)?;
-        return with_set_cookie(
-            response,
-            &session_cookie(
-                &config.cookie_name,
-                &issue.session_id,
-                SESSION_TTL_SECONDS,
-                config.cookie_domain.as_deref(),
-            ),
-        );
-    }
     let response = json(&LocalAuthResponse {
         ok: true,
         return_to: issue.return_to,
@@ -5473,24 +6359,38 @@ async fn magic_link_consume(mut request: Request, env: Env) -> worker::Result<Re
 #[cfg(target_arch = "wasm32")]
 async fn identity_link(request: Request, env: Env) -> worker::Result<Response> {
     let request_url = request.url()?;
-    let origin = request_origin(&request)?;
     let provider_id = match provider_id_from_url(&request_url) {
         Ok(provider_id) => provider_id,
         Err(error) => return auth_error_json(&error, 400),
     };
     let config = server_config(&env, &request_url);
     let db = env.d1(D1_BINDING)?;
-    let Some(current) =
-        current_session_from_request(&request, &db, &config, unix_timestamp_seconds()).await?
-    else {
+    let now = unix_timestamp_seconds();
+    let mut request = request;
+    let form = request.form_data().await?;
+    let csrf_token = form
+        .get("_csrf")
+        .and_then(|value| value.as_string())
+        .filter(|value| !value.trim().is_empty());
+    let Some(current) = current_session_from_request(&request, &db, &config, now).await? else {
         return oauth_error_json(
             "login_required",
             "active browser session was not found",
             401,
         );
     };
-    if let Err(error) =
-        validate_session_cors_origin(&db, origin.as_deref(), &current.session).await?
+    if let Err(error) = validate_browser_session_mutation(
+        &request,
+        &env,
+        &db,
+        &config,
+        current.session.client_id.as_deref(),
+        &current.session.id,
+        CSRF_ROUTE_FAMILY_ACCOUNT,
+        csrf_token.as_deref(),
+        now,
+    )
+    .await?
     {
         return oauth_error_json("invalid_request", error, 403);
     }
@@ -5532,7 +6432,6 @@ async fn identity_link(request: Request, env: Env) -> worker::Result<Response> {
     let provider_redirect_uri = config.issuer().provider_callback_endpoint();
     let provider_state = random_token()?;
     let provider_nonce = random_token()?;
-    let now = unix_timestamp_seconds();
     cleanup_expired_auth_transactions(&db, now).await?;
     let transaction = auth_transaction_from_link_request(
         &client,
@@ -5636,58 +6535,124 @@ async fn validate(request: Request, env: Env) -> worker::Result<Response> {
 async fn logout(request: Request, env: Env) -> worker::Result<Response> {
     let request_url = request.url()?;
     let config = server_config(&env, &request_url);
-    let origin = request_origin_for_config(&request, &config)?;
     let db = env.d1(D1_BINDING)?;
     let now = unix_timestamp_seconds();
     let current = current_session_from_request(&request, &db, &config, now).await?;
-    if let Some(current) = &current {
-        if let Err(error) =
-            validate_session_cors_origin(&db, origin.as_deref(), &current.session).await?
-        {
-            return oauth_error_json("invalid_request", error, 403);
+    match request.method() {
+        Method::Get => {
+            let cancel_href = current
+                .as_ref()
+                .map(|_| format!("{}/account", config.public_base_url.trim_end_matches('/')))
+                .unwrap_or_else(|| {
+                    format!("{}/login", config.public_base_url.trim_end_matches('/'))
+                });
+            let action = request_url.to_string();
+            let hidden_inputs = if let Some(current) = &current {
+                let secret = csrf_secret_from_env(&env).map_err(worker_error)?;
+                let csrf_token =
+                    csrf_token(&secret, &current.session.id, CSRF_ROUTE_FAMILY_LOGOUT, now);
+                vec![("_csrf", csrf_token)]
+            } else {
+                Vec::new()
+            };
+            let hidden_inputs_ref = hidden_inputs
+                .iter()
+                .map(|(name, value)| (*name, value.as_str()))
+                .collect::<Vec<_>>();
+            let document = render_confirmation_document(
+                "Confirm Logout",
+                "Sign out of this session?",
+                "This will revoke the current browser session.",
+                &action,
+                "Sign out",
+                &cancel_href,
+                &hidden_inputs_ref,
+            );
+            let response = html(document)?;
+            return with_confirmation_document_headers(response);
         }
-        revoke_session(&db, &current.session.id, now).await?;
-        revoke_refresh_token_family_for_session(&db, &current.session.id, &current.user.id, now)
-            .await?;
-        record_audit_event(
-            &db,
-            &request,
-            "session.logout",
-            Some(&current.user.id),
-            current.session.client_id.as_deref(),
-            None,
-            serde_json::json!({}),
-            now,
-        )
-        .await;
-    } else {
-        if let Err(error) = validate_any_client_cors_origin(&db, origin.as_deref()).await? {
-            return oauth_error_json("invalid_request", error, 403);
-        }
-    }
+        Method::Post => {
+            let origin = request_origin_for_config(&request, &config)?;
+            let csrf_from_header = csrf_token_from_header(&request)?;
+            let mut request = request;
+            let form = request.form_data().await?;
+            let csrf_token = csrf_from_header.or_else(|| {
+                form.get("_csrf")
+                    .and_then(|value| value.as_string())
+                    .filter(|value| !value.trim().is_empty())
+            });
+            if let Some(current) = &current {
+                if let Err(error) = validate_browser_session_mutation(
+                    &request,
+                    &env,
+                    &db,
+                    &config,
+                    current.session.client_id.as_deref(),
+                    &current.session.id,
+                    CSRF_ROUTE_FAMILY_LOGOUT,
+                    csrf_token.as_deref(),
+                    now,
+                )
+                .await?
+                {
+                    return oauth_error_json("invalid_request", error, 403);
+                }
+                revoke_session(&db, &current.session.id, now).await?;
+                revoke_refresh_token_family_for_session(
+                    &db,
+                    &current.session.id,
+                    &current.user.id,
+                    now,
+                )
+                .await?;
+                record_audit_event(
+                    &db,
+                    &request,
+                    "session.logout",
+                    Some(&current.user.id),
+                    current.session.client_id.as_deref(),
+                    None,
+                    serde_json::json!({}),
+                    now,
+                )
+                .await;
+            } else if let Err(error) =
+                validate_any_client_cors_origin(&db, origin.as_deref()).await?
+            {
+                return oauth_error_json("invalid_request", error, 403);
+            }
 
-    let redirect_target =
-        match logout_redirect_target(&request_url, current.as_ref(), &db, &config, &env, now)
+            let redirect_target = match logout_redirect_target(
+                &request_url,
+                current.as_ref(),
+                &db,
+                &config,
+                &env,
+                now,
+            )
             .await?
-        {
-            Ok(redirect_target) => redirect_target,
-            Err(error) => return oauth_error_json("invalid_request", error, 400),
-        };
+            {
+                Ok(redirect_target) => redirect_target,
+                Err(error) => return oauth_error_json("invalid_request", error, 400),
+            };
 
-    if let Some(target) = redirect_target {
-        let response = Response::redirect(target)?;
-        return with_set_cookie(
-            response,
-            &clear_session_cookie(&config.cookie_name, config.cookie_domain.as_deref()),
-        );
+            if let Some(target) = redirect_target {
+                let response = Response::redirect(target)?;
+                return with_set_cookie(
+                    response,
+                    &clear_session_cookie(&config.cookie_name, config.cookie_domain.as_deref()),
+                );
+            }
+
+            let response = json(&serde_json::json!({ "ok": true }))?;
+            let response = with_set_cookie(
+                response,
+                &clear_session_cookie(&config.cookie_name, config.cookie_domain.as_deref()),
+            )?;
+            with_cors_actual_headers(response, origin.as_deref())
+        }
+        _ => json_status(&serde_json::json!({ "error": "method_not_allowed" }), 405),
     }
-
-    let response = json(&serde_json::json!({ "ok": true }))?;
-    let response = with_set_cookie(
-        response,
-        &clear_session_cookie(&config.cookie_name, config.cookie_domain.as_deref()),
-    )?;
-    with_cors_actual_headers(response, origin.as_deref())
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -5701,8 +6666,7 @@ async fn cors_preflight(request: Request, env: Env) -> worker::Result<Response> 
         .unwrap_or_default()
         .to_ascii_uppercase();
     let canonical_path = canonical_route_path(url.path());
-    let route_path = compatibility_route_path(canonical_path.as_ref());
-    if !cors_method_allowed(route_path.as_ref(), &requested_method) {
+    if !cors_method_allowed(canonical_path.as_ref(), &requested_method) {
         return Response::empty().map(|response| response.with_status(405));
     }
 
@@ -5869,199 +6833,6 @@ fn canonical_route_path(path: &str) -> Cow<'_, str> {
     }
 }
 
-fn compatibility_route_path(path: &str) -> Cow<'_, str> {
-    match path {
-        "/api/health" => Cow::Borrowed("/health"),
-        "/status" | "/api/status" | "/api/ready" => Cow::Borrowed("/ready"),
-        "/api/providers" => Cow::Borrowed("/providers"),
-        "/api/providers/status" => Cow::Borrowed("/providers/status"),
-        "/api/client-branding" => Cow::Borrowed("/client-branding"),
-        "/api/local-auth/status" => Cow::Borrowed("/local-auth/status"),
-        "/api/clients" => Cow::Borrowed("/clients"),
-        "/api/users" => Cow::Borrowed("/users"),
-        "/api/events" => Cow::Borrowed("/events"),
-        "/api/routes" => Cow::Borrowed("/routes"),
-        "/api/__zeroth/db/status" => Cow::Borrowed("/__zeroth/db/status"),
-        "/api/authorize" => Cow::Borrowed("/authorize"),
-        "/api/oauth/token" => Cow::Borrowed("/oauth/token"),
-        "/api/oauth/revoke" => Cow::Borrowed("/oauth/revoke"),
-        "/api/oauth/introspect" => Cow::Borrowed("/oauth/introspect"),
-        "/api/userinfo" => Cow::Borrowed("/userinfo"),
-        "/api/tokens" => Cow::Borrowed("/tokens"),
-        "/api/session" => Cow::Borrowed("/session"),
-        "/api/sessions" => Cow::Borrowed("/sessions"),
-        "/api/profile" => Cow::Borrowed("/profile"),
-        "/api/identities/link" => Cow::Borrowed("/identities/link"),
-        "/api/identities" => Cow::Borrowed("/identities"),
-        "/api/validate" => Cow::Borrowed("/validate"),
-        "/api/logout" => Cow::Borrowed("/logout"),
-        "/auth/password/register"
-        | "/api/auth/password/register"
-        | "/api/password/register"
-        | "/api/local-auth/password/register"
-        | "/local-auth/password/register" => Cow::Borrowed("/password/register"),
-        "/auth/password/login"
-        | "/api/auth/password/login"
-        | "/api/password/login"
-        | "/api/local-auth/password/login"
-        | "/local-auth/password/login" => Cow::Borrowed("/password/login"),
-        "/api/wallet/challenge"
-        | "/api/wallet/nonce"
-        | "/auth/wallet/challenge"
-        | "/auth/wallet/nonce"
-        | "/api/auth/wallet/challenge"
-        | "/api/auth/wallet/nonce"
-        | "/api/local-auth/wallet/challenge"
-        | "/api/local-auth/wallet/nonce"
-        | "/local-auth/wallet/challenge"
-        | "/local-auth/wallet/nonce" => Cow::Borrowed("/wallet/challenge"),
-        "/api/wallet/verify"
-        | "/api/wallet/login"
-        | "/auth/wallet/verify"
-        | "/auth/wallet/login"
-        | "/api/auth/wallet/verify"
-        | "/api/auth/wallet/login"
-        | "/api/local-auth/wallet/verify"
-        | "/api/local-auth/wallet/login"
-        | "/local-auth/wallet/verify"
-        | "/local-auth/wallet/login" => Cow::Borrowed("/wallet/verify"),
-        "/magic-link"
-        | "/magic_link"
-        | "/magic-links/request"
-        | "/magic-link/request"
-        | "/magic_link/request"
-        | "/magic-links/send"
-        | "/magic-link/send"
-        | "/magic_link/send"
-        | "/auth/magic-links"
-        | "/auth/magic-link"
-        | "/auth/magic_link"
-        | "/auth/magic-links/request"
-        | "/auth/magic-link/request"
-        | "/auth/magic_link/request"
-        | "/auth/magic-links/send"
-        | "/auth/magic-link/send"
-        | "/auth/magic_link/send"
-        | "/api/auth/magic-links"
-        | "/api/auth/magic-link"
-        | "/api/auth/magic_link"
-        | "/api/auth/magic-links/request"
-        | "/api/auth/magic-link/request"
-        | "/api/auth/magic_link/request"
-        | "/api/auth/magic-links/send"
-        | "/api/auth/magic-link/send"
-        | "/api/auth/magic_link/send"
-        | "/api/magic-links"
-        | "/api/magic-link"
-        | "/api/magic_link"
-        | "/api/magic-links/request"
-        | "/api/magic-link/request"
-        | "/api/magic_link/request"
-        | "/api/magic-links/send"
-        | "/api/magic-link/send"
-        | "/api/magic_link/send"
-        | "/api/local-auth/magic-links"
-        | "/api/local-auth/magic-link"
-        | "/api/local-auth/magic_link"
-        | "/api/local-auth/magic-links/request"
-        | "/api/local-auth/magic-link/request"
-        | "/api/local-auth/magic_link/request"
-        | "/api/local-auth/magic-links/send"
-        | "/api/local-auth/magic-link/send"
-        | "/api/local-auth/magic_link/send"
-        | "/local-auth/magic-links"
-        | "/local-auth/magic-link"
-        | "/local-auth/magic_link"
-        | "/local-auth/magic-links/request"
-        | "/local-auth/magic-link/request"
-        | "/local-auth/magic_link/request"
-        | "/local-auth/magic-links/send"
-        | "/local-auth/magic-link/send"
-        | "/local-auth/magic_link/send" => Cow::Borrowed("/magic-links"),
-        "/magic-link/consume"
-        | "/magic_link/consume"
-        | "/magic-links/verify"
-        | "/magic-link/verify"
-        | "/magic_link/verify"
-        | "/magic-links/login"
-        | "/magic-link/login"
-        | "/magic_link/login"
-        | "/auth/magic-links/consume"
-        | "/auth/magic-link/consume"
-        | "/auth/magic_link/consume"
-        | "/auth/magic-links/verify"
-        | "/auth/magic-link/verify"
-        | "/auth/magic_link/verify"
-        | "/auth/magic-links/login"
-        | "/auth/magic-link/login"
-        | "/auth/magic_link/login"
-        | "/api/auth/magic-links/consume"
-        | "/api/auth/magic-link/consume"
-        | "/api/auth/magic_link/consume"
-        | "/api/auth/magic-links/verify"
-        | "/api/auth/magic-link/verify"
-        | "/api/auth/magic_link/verify"
-        | "/api/auth/magic-links/login"
-        | "/api/auth/magic-link/login"
-        | "/api/auth/magic_link/login"
-        | "/api/magic-links/consume"
-        | "/api/magic-link/consume"
-        | "/api/magic_link/consume"
-        | "/api/magic-links/verify"
-        | "/api/magic-link/verify"
-        | "/api/magic_link/verify"
-        | "/api/magic-links/login"
-        | "/api/magic-link/login"
-        | "/api/magic_link/login"
-        | "/api/local-auth/magic-links/consume"
-        | "/api/local-auth/magic-link/consume"
-        | "/api/local-auth/magic_link/consume"
-        | "/api/local-auth/magic-links/verify"
-        | "/api/local-auth/magic-link/verify"
-        | "/api/local-auth/magic_link/verify"
-        | "/api/local-auth/magic-links/login"
-        | "/api/local-auth/magic-link/login"
-        | "/api/local-auth/magic_link/login"
-        | "/local-auth/magic-links/consume"
-        | "/local-auth/magic-link/consume"
-        | "/local-auth/magic_link/consume"
-        | "/local-auth/magic-links/verify"
-        | "/local-auth/magic-link/verify"
-        | "/local-auth/magic_link/verify"
-        | "/local-auth/magic-links/login"
-        | "/local-auth/magic-link/login"
-        | "/local-auth/magic_link/login" => Cow::Borrowed("/magic-links/consume"),
-        "/api/passkeys/register/options" => Cow::Borrowed("/passkeys/register/options"),
-        "/api/passkeys/registration/options" => Cow::Borrowed("/passkeys/registration/options"),
-        "/api/passkeys/register/verify" | "/api/passkeys/registration/verify" => {
-            Cow::Borrowed("/passkeys/register/verify")
-        }
-        "/api/passkeys/register/finish" | "/api/passkeys/registration/finish" => {
-            Cow::Borrowed("/passkeys/register/finish")
-        }
-        "/api/passkeys/authenticate/options" => Cow::Borrowed("/passkeys/authenticate/options"),
-        "/api/passkeys/authentication/options" => Cow::Borrowed("/passkeys/authentication/options"),
-        "/api/passkeys/authenticate/verify" | "/api/passkeys/authentication/verify" => {
-            Cow::Borrowed("/passkeys/authenticate/verify")
-        }
-        "/api/passkeys/authenticate/finish" | "/api/passkeys/authentication/finish" => {
-            Cow::Borrowed("/passkeys/authenticate/finish")
-        }
-        "/api/passkeys/login/options" | "/passkeys/login/options" => {
-            Cow::Borrowed("/passkeys/authenticate/options")
-        }
-        "/api/passkeys/login/verify" | "/passkeys/login/verify" => {
-            Cow::Borrowed("/passkeys/authenticate/verify")
-        }
-        "/api/passkeys/login/finish" | "/passkeys/login/finish" => {
-            Cow::Borrowed("/passkeys/authenticate/finish")
-        }
-        _ if admin_console_alias_path(path) => Cow::Borrowed("/admin"),
-        _ if provider_callback_alias_path(path) => Cow::Borrowed("/oauth2/callback"),
-        _ => Cow::Borrowed(path),
-    }
-}
-
 fn quiet_browser_asset_path(path: &str) -> bool {
     apple_touch_icon_path(path)
         || matches!(
@@ -6137,28 +6908,21 @@ fn known_route_path(path: &str) -> bool {
             | "/identities/link"
             | "/identities"
             | "/passkeys/register/options"
-            | "/passkeys/registration/options"
             | "/passkeys/register/verify"
             | "/passkeys/register/finish"
-            | "/passkeys/registration/finish"
             | "/passkeys/authenticate/options"
-            | "/passkeys/authentication/options"
             | "/passkeys/authenticate/verify"
             | "/passkeys/authenticate/finish"
-            | "/passkeys/authentication/finish"
             | "/password/register"
             | "/password/login"
             | "/wallet/challenge"
-            | "/wallet/nonce"
             | "/wallet/verify"
-            | "/wallet/login"
             | "/magic-links"
+            | "/magic-link/confirm"
             | "/magic-links/consume"
             | "/validate"
             | "/logout"
-    ) || provider_authorize_alias_path(path)
-        || provider_callback_alias_path(path)
-        || quiet_browser_asset_path(path)
+    ) || quiet_browser_asset_path(path)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -6336,6 +7100,11 @@ async fn hosted_account(request: Request, env: Env) -> worker::Result<Response> 
     ui_config.code_challenge = None;
     ui_config.code_challenge_method = None;
     ui_config.link_identities = true;
+    ui_config.csrf_token = current.as_ref().and_then(|current| {
+        csrf_secret_from_env(&env)
+            .ok()
+            .map(|secret| csrf_token(&secret, &current.session.id, CSRF_ROUTE_FAMILY_ACCOUNT, now))
+    });
 
     let mut state = ZerothUiState::new(ui_config).with_product_name(product_name_from_env(&env));
     state.providers = provider_ui_rows(&env, &identities, client.is_some());
@@ -6369,6 +7138,12 @@ async fn hosted_clients_admin(request: Request, env: Env) -> worker::Result<Resp
 
     match authorize_admin_request(&request, &env, &db, &config, now).await {
         Ok(_) => {
+            let current = current_session_from_request(&request, &db, &config, now).await?;
+            state = state.with_csrf_token(current.as_ref().and_then(|current| {
+                csrf_secret_from_env(&env).ok().map(|secret| {
+                    csrf_token(&secret, &current.session.id, CSRF_ROUTE_FAMILY_ACCOUNT, now)
+                })
+            }));
             let provider_failures = provider_failure_statuses(&db).await?;
             state.providers = provider_admin_ui_rows(&env, &config, &provider_failures);
             state.local_auth =
@@ -6600,6 +7375,11 @@ async fn hosted_session_login_document(
     ui_config.code_challenge_method = None;
     ui_config.link_identities = false;
     ui_config.provider_authorize_path = "/login".to_owned();
+    ui_config.csrf_token = current.as_ref().and_then(|current| {
+        csrf_secret_from_env(env)
+            .ok()
+            .map(|secret| csrf_token(&secret, &current.session.id, CSRF_ROUTE_FAMILY_ACCOUNT, now))
+    });
     apply_client_login_method_visibility(&mut ui_config, &registered_client.visible_login_methods);
     let target_url = ui_config.return_to.clone();
 
@@ -6646,6 +7426,11 @@ async fn hosted_authorization_document(
     let mut ui_config = ui_config_from_authorization_request(&config, authorization_request);
     ui_config.return_to = query_param(url, "return_to");
     ui_config.link_identities = false;
+    ui_config.csrf_token = current.as_ref().and_then(|current| {
+        csrf_secret_from_env(env)
+            .ok()
+            .map(|secret| csrf_token(&secret, &current.session.id, CSRF_ROUTE_FAMILY_ACCOUNT, now))
+    });
     apply_client_login_method_visibility(&mut ui_config, &registered_client.visible_login_methods);
     let target_url = ui_config
         .return_to
@@ -7081,7 +7866,7 @@ fn local_auth_status_rows(
     env: &Env,
     magic_link_delivery: Option<LocalAuthDeliveryStatus>,
 ) -> Vec<LocalAuthStatus> {
-    let password_ready = password_iterations_from_env(env).is_ok();
+    let password_ready = password_policy_ready(env);
     let magic_link_delivery_config = magic_link_delivery_config_from_env(env);
 
     local_auth_status_rows_from_config(
@@ -7498,74 +8283,6 @@ fn client_admin_ui_from_row(row: ClientRow) -> Result<ClientAdminUi, String> {
     })
 }
 
-fn provider_authorize_alias_path(path: &str) -> bool {
-    provider_segment_alias(path, "/providers/", "/authorize").is_some()
-}
-
-fn admin_console_alias_path(path: &str) -> bool {
-    matches!(
-        path,
-        "/ui"
-            | "/dashboard"
-            | "/console"
-            | "/admin/users"
-            | "/admin/events"
-            | "/admin/providers"
-            | "/admin/local-auth"
-            | "/admin/database"
-    )
-}
-
-fn provider_callback_alias_path(path: &str) -> bool {
-    provider_segment_alias(path, "/oauth/callback/", "").is_some()
-        || provider_segment_alias(path, "/oauth2/callback/", "").is_some()
-        || provider_segment_alias(path, "/callback/", "").is_some()
-        || provider_segment_alias(path, "/auth/callback/", "").is_some()
-        || provider_segment_alias(path, "/api/callback/", "").is_some()
-        || provider_segment_alias(path, "/api/auth/callback/", "").is_some()
-        || path == "/callback"
-        || path == "/auth/callback"
-        || path == "/api/callback"
-        || path == "/api/auth/callback"
-}
-
-fn provider_authorize_alias_url(request_url: &url::Url) -> Option<url::Url> {
-    let provider_id = provider_segment_alias(request_url.path(), "/providers/", "/authorize")?;
-    let query_pairs = request_url
-        .query_pairs()
-        .filter(|(key, _)| key != "provider")
-        .map(|(key, value)| (key.into_owned(), value.into_owned()))
-        .collect::<Vec<_>>();
-    let mut target = request_url.clone();
-    target.set_path("/authorize");
-    target.set_query(None);
-    target.set_fragment(None);
-    {
-        let mut pairs = target.query_pairs_mut();
-        for (key, value) in query_pairs {
-            pairs.append_pair(&key, &value);
-        }
-        pairs.append_pair("provider", provider_id);
-    }
-    Some(target)
-}
-
-fn provider_segment_alias<'a>(path: &'a str, prefix: &str, suffix: &str) -> Option<&'a str> {
-    let provider_id = path.strip_prefix(prefix)?.strip_suffix(suffix)?;
-    if provider_alias_id_valid(provider_id) {
-        Some(provider_id)
-    } else {
-        None
-    }
-}
-
-fn provider_alias_id_valid(provider_id: &str) -> bool {
-    !provider_id.is_empty()
-        && provider_id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-}
-
 #[cfg(target_arch = "wasm32")]
 fn product_name_from_env(env: &Env) -> String {
     env_string(env, "PRODUCT_NAME").unwrap_or_else(|| "Zeroth".to_owned())
@@ -7734,18 +8451,64 @@ fn html(document: String) -> worker::Result<Response> {
 }
 
 #[cfg(target_arch = "wasm32")]
+fn with_confirmation_document_headers(response: Response) -> worker::Result<Response> {
+    response.headers().set("Cache-Control", "no-store")?;
+    response.headers().set("Referrer-Policy", "no-referrer")?;
+    response.headers().set("X-Frame-Options", "DENY")?;
+    response.headers().set(
+        "Content-Security-Policy",
+        "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+    )?;
+    Ok(response)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn render_confirmation_document(
+    title: &str,
+    heading: &str,
+    message: &str,
+    form_action: &str,
+    submit_label: &str,
+    cancel_href: &str,
+    hidden_inputs: &[(&str, &str)],
+) -> String {
+    let hidden_inputs = hidden_inputs
+        .iter()
+        .map(|(name, value)| {
+            format!(
+                "<input type=\"hidden\" name=\"{}\" value=\"{}\">",
+                html_escape(name),
+                html_escape(value)
+            )
+        })
+        .collect::<String>();
+    format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{}</title><style>body{{font:16px/1.5 system-ui,sans-serif;background:#f8fafc;color:#0f172a;margin:0;padding:2rem}}main{{max-width:32rem;margin:4rem auto;background:#fff;border:1px solid #cbd5e1;border-radius:1rem;padding:2rem;box-shadow:0 10px 30px rgba(15,23,42,.08)}}h1{{margin-top:0;font-size:1.5rem}}p{{margin:0 0 1rem}}form{{display:flex;gap:.75rem;align-items:center;flex-wrap:wrap}}button,a{{border-radius:.75rem;padding:.75rem 1rem;text-decoration:none;font:inherit}}button{{border:0;background:#0f172a;color:#fff;cursor:pointer}}a{{border:1px solid #cbd5e1;color:#0f172a;background:#fff}}</style></head><body><main><h1>{}</h1><p>{}</p><form method=\"post\" action=\"{}\">{}<button type=\"submit\">{}</button><a href=\"{}\">Cancel</a></form></main></body></html>",
+        html_escape(title),
+        html_escape(heading),
+        html_escape(message),
+        html_escape(form_action),
+        hidden_inputs,
+        html_escape(submit_label),
+        html_escape(cancel_href),
+    )
+}
+
+#[cfg(target_arch = "wasm32")]
+fn html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+#[cfg(target_arch = "wasm32")]
 fn redirect_to_path(request_url: &url::Url, path: &str) -> worker::Result<Response> {
     let mut target = request_url.clone();
     target.set_path(path);
     target.set_query(None);
     target.set_fragment(None);
-    Response::redirect(target)
-}
-
-#[cfg(target_arch = "wasm32")]
-fn redirect_to_provider_authorize_alias(request_url: &url::Url) -> worker::Result<Response> {
-    let target = provider_authorize_alias_url(request_url)
-        .ok_or_else(|| worker::Error::RustError("invalid provider authorize alias".to_owned()))?;
     Response::redirect(target)
 }
 
@@ -8465,7 +9228,8 @@ async fn get_local_credential(
     let args = [worker::d1::D1Type::Text(email)];
     db.prepare(
         "SELECT email, user_id, password_hash, password_salt, password_alg,
-                password_iterations, created_at, updated_at, last_used_at, disabled_at
+                password_iterations, password_scheme, password_params_json, password_version,
+                created_at, updated_at, last_used_at, disabled_at
          FROM zeroth_local_credentials
          WHERE lower(email) = lower(?)
          LIMIT 1",
@@ -8482,11 +9246,14 @@ async fn upsert_local_credential(
     user_id: &str,
     password_hash: &str,
     password_salt: &str,
+    pepper_id: &str,
     password_iterations: u32,
     now: i32,
 ) -> worker::Result<()> {
     let password_iterations = i32::try_from(password_iterations)
         .map_err(|_| worker_error("password iteration count is too large".to_owned()))?;
+    let password_scheme = PasswordScheme::Pbkdf2Sha256.as_str();
+    let password_params_json = password_params_json(pepper_id);
     let args = [
         worker::d1::D1Type::Text(email),
         worker::d1::D1Type::Text(user_id),
@@ -8494,19 +9261,26 @@ async fn upsert_local_credential(
         worker::d1::D1Type::Text(password_salt),
         worker::d1::D1Type::Text(PASSWORD_PBKDF2_ALG),
         worker::d1::D1Type::Integer(password_iterations),
+        worker::d1::D1Type::Text(password_scheme),
+        worker::d1::D1Type::Text(&password_params_json),
+        worker::d1::D1Type::Integer(PASSWORD_CURRENT_VERSION),
         worker::d1::D1Type::Integer(now),
         worker::d1::D1Type::Integer(now),
     ];
     db.prepare(
         "INSERT INTO zeroth_local_credentials (
              email, user_id, password_hash, password_salt, password_alg,
-             password_iterations, created_at, updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             password_iterations, password_scheme, password_params_json,
+             password_version, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(email) DO UPDATE SET
              password_hash = excluded.password_hash,
              password_salt = excluded.password_salt,
              password_alg = excluded.password_alg,
              password_iterations = excluded.password_iterations,
+             password_scheme = excluded.password_scheme,
+             password_params_json = excluded.password_params_json,
+             password_version = excluded.password_version,
              updated_at = excluded.updated_at,
              disabled_at = NULL
          WHERE zeroth_local_credentials.user_id = excluded.user_id",
@@ -13773,54 +14547,721 @@ fn local_auth_registration_error_code(error: &str) -> &'static str {
 }
 
 #[cfg(target_arch = "wasm32")]
-fn password_iterations_from_env(env: &Env) -> Result<u32, String> {
-    let Some(value) = binding_value_from_env(env, "PASSWORD_PBKDF2_ITERATIONS") else {
-        return Ok(PASSWORD_PBKDF2_DEFAULT_ITERATIONS);
-    };
-    let iterations = value
-        .trim()
-        .parse::<u32>()
-        .map_err(|error| format!("PASSWORD_PBKDF2_ITERATIONS must be an integer: {error}"))?;
-    if !(PASSWORD_PBKDF2_MIN_ITERATIONS..=PASSWORD_PBKDF2_MAX_ITERATIONS).contains(&iterations) {
-        return Err(format!(
-            "PASSWORD_PBKDF2_ITERATIONS must be between {PASSWORD_PBKDF2_MIN_ITERATIONS} and {PASSWORD_PBKDF2_MAX_ITERATIONS}"
-        ));
+fn decode_password_pepper(value: &str, name: &str) -> Result<Vec<u8>, String> {
+    if value.is_empty() {
+        return Err(format!("{name} must not be empty"));
     }
-    Ok(iterations)
+    let bytes = URL_SAFE_NO_PAD
+        .decode(value)
+        .map_err(|error| format!("{name} must be base64url without padding: {error}"))?;
+    if bytes.len() != 32 {
+        return Err(format!("{name} must decode to exactly 32 bytes"));
+    }
+    Ok(bytes)
 }
 
 #[cfg(target_arch = "wasm32")]
-async fn password_hash(password: &str, salt: &str, iterations: u32) -> worker::Result<String> {
-    let digest = pbkdf2_sha256(password.as_bytes(), salt.as_bytes(), iterations, 32).await?;
-    Ok(bytes_to_hex(&digest))
+fn decode_password_pepper_id(value: &str, name: &str) -> Result<String, String> {
+    if value.is_empty() {
+        return Err(format!("{name} must not be empty"));
+    }
+    if value.len() > 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return Err(format!("{name} contains unsupported characters"));
+    }
+    Ok(value.to_owned())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn password_pepper_from_env(env: &Env) -> Result<PasswordPepperConfig, String> {
+    let current = decode_password_pepper(
+        &binding_value_from_env(env, PASSWORD_PEPPER_ENV)
+            .ok_or_else(|| format!("{PASSWORD_PEPPER_ENV} is not configured"))?,
+        PASSWORD_PEPPER_ENV,
+    )?;
+    let current_id = decode_password_pepper_id(
+        &binding_value_from_env(env, PASSWORD_PEPPER_ID_ENV)
+            .ok_or_else(|| format!("{PASSWORD_PEPPER_ID_ENV} is not configured"))?,
+        PASSWORD_PEPPER_ID_ENV,
+    )?;
+
+    let previous = match (
+        binding_value_from_env(env, PASSWORD_PEPPER_PREVIOUS_ENV),
+        binding_value_from_env(env, PASSWORD_PEPPER_PREVIOUS_ID_ENV),
+    ) {
+        (None, None) => None,
+        (Some(previous), Some(previous_id)) => {
+            let previous = decode_password_pepper(&previous, PASSWORD_PEPPER_PREVIOUS_ENV)?;
+            let previous_id =
+                decode_password_pepper_id(&previous_id, PASSWORD_PEPPER_PREVIOUS_ID_ENV)?;
+            if previous == current {
+                return Err(format!(
+                    "{PASSWORD_PEPPER_PREVIOUS_ENV} must differ from {PASSWORD_PEPPER_ENV}"
+                ));
+            }
+            if previous_id == current_id {
+                return Err(format!(
+                    "{PASSWORD_PEPPER_PREVIOUS_ID_ENV} must differ from {PASSWORD_PEPPER_ID_ENV}"
+                ));
+            }
+            Some(PasswordPepperSecret {
+                id: previous_id,
+                value: previous,
+            })
+        }
+        _ => {
+            return Err(format!(
+                "{PASSWORD_PEPPER_PREVIOUS_ENV} and {PASSWORD_PEPPER_PREVIOUS_ID_ENV} must both be set"
+            ));
+        }
+    };
+
+    Ok(PasswordPepperConfig {
+        current: PasswordPepperSecret {
+            id: current_id,
+            value: current,
+        },
+        previous,
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+fn password_policy_ready(env: &Env) -> bool {
+    password_pepper_from_env(env).is_ok()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn rate_limit_key_from_env(env: &Env) -> Result<RateLimitSecret, String> {
+    let value = binding_value_from_env(env, RATE_LIMIT_KEY_ENV)
+        .ok_or_else(|| format!("{RATE_LIMIT_KEY_ENV} is not configured"))?;
+    let decoded = URL_SAFE_NO_PAD.decode(value.trim()).map_err(|error| {
+        format!("{RATE_LIMIT_KEY_ENV} must be base64url without padding: {error}")
+    })?;
+    let bytes: [u8; 32] = decoded
+        .as_slice()
+        .try_into()
+        .map_err(|_| format!("{RATE_LIMIT_KEY_ENV} must decode to exactly 32 bytes"))?;
+    Ok(RateLimitSecret(bytes))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn csrf_secret_from_env(env: &Env) -> Result<CsrfSecret, String> {
+    let value = binding_value_from_env(env, CSRF_SECRET_ENV)
+        .ok_or_else(|| format!("{CSRF_SECRET_ENV} is not configured"))?;
+    let decoded = URL_SAFE_NO_PAD
+        .decode(value.trim())
+        .map_err(|error| format!("{CSRF_SECRET_ENV} must be base64url without padding: {error}"))?;
+    let bytes: [u8; 32] = decoded
+        .as_slice()
+        .try_into()
+        .map_err(|_| format!("{CSRF_SECRET_ENV} must decode to exactly 32 bytes"))?;
+    Ok(CsrfSecret(bytes))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn csrf_bucket(now: i32) -> i32 {
+    now.div_euclid(24 * 60 * 60)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn csrf_mac(secret: &CsrfSecret, subject: &str, bucket: i32, route_family: &str) -> String {
+    use hmac::{Hmac, Mac};
+
+    type HmacSha256 = Hmac<Sha256>;
+    let mut mac =
+        HmacSha256::new_from_slice(&secret.0).expect("HMAC-SHA256 accepts arbitrary-length keys");
+    mac.update(subject.as_bytes());
+    mac.update(&[0]);
+    mac.update(bucket.to_string().as_bytes());
+    mac.update(&[0]);
+    mac.update(route_family.as_bytes());
+    URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn csrf_token(secret: &CsrfSecret, session_id: &str, route_family: &str, now: i32) -> String {
+    let bucket = csrf_bucket(now);
+    let mac = csrf_mac(secret, session_id, bucket, route_family);
+    format!("v1.{bucket}.{mac}")
+}
+
+#[cfg(target_arch = "wasm32")]
+fn validate_csrf_token(
+    secret: &CsrfSecret,
+    subject: &str,
+    route_family: &str,
+    token: &str,
+    now: i32,
+) -> Result<(), String> {
+    let mut parts = token.split('.');
+    let version = parts.next().unwrap_or_default();
+    let bucket = parts.next().unwrap_or_default();
+    let mac = parts.next().unwrap_or_default();
+    if version != "v1" || mac.is_empty() || parts.next().is_some() {
+        return Err("invalid CSRF token".to_owned());
+    }
+    let bucket = bucket
+        .parse::<i32>()
+        .map_err(|_| "invalid CSRF token".to_owned())?;
+    let current_bucket = csrf_bucket(now);
+    if bucket != current_bucket && bucket != current_bucket.saturating_sub(1) {
+        return Err("CSRF token is stale".to_owned());
+    }
+    let expected = csrf_mac(secret, subject, bucket, route_family);
+    if !constant_time_eq(&expected, mac) {
+        return Err("CSRF token did not match this session".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn csrf_token_from_header(request: &Request) -> worker::Result<Option<String>> {
+    request_header(request, "X-Zeroth-CSRF")
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn validate_browser_session_mutation(
+    request: &Request,
+    env: &Env,
+    db: &worker::d1::D1Database,
+    config: &ZerothServerConfig,
+    client_id: Option<&str>,
+    session_id: &str,
+    route_family: &str,
+    csrf_token: Option<&str>,
+    now: i32,
+) -> worker::Result<Result<(), String>> {
+    let Some(origin) = request_origin_for_config(request, config)? else {
+        return Ok(Err(
+            "Origin header is required for browser session mutations".to_owned(),
+        ));
+    };
+    if origin == "null" {
+        return Ok(Err(
+            "opaque origins are not allowed for browser session mutations".to_owned(),
+        ));
+    }
+    let origin_allowed = if origin_matches_public_base_url(&origin, &config.public_base_url) {
+        true
+    } else if let Some(client_id) = client_id {
+        match active_client_allowed_origins(db, client_id).await? {
+            Ok(allowed_origins) => origin_allowed(&allowed_origins, &origin),
+            Err(_) => false,
+        }
+    } else {
+        false
+    };
+    if !origin_allowed {
+        return Ok(Err(cors_disallowed_origin(&origin)));
+    }
+    let Some(csrf_token) = csrf_token.filter(|value| !value.trim().is_empty()) else {
+        return Ok(Err("CSRF token is required".to_owned()));
+    };
+    let secret = csrf_secret_from_env(env).map_err(worker_error)?;
+    Ok(validate_csrf_token(
+        &secret,
+        session_id,
+        route_family,
+        csrf_token.trim(),
+        now,
+    ))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn rate_limit_request_ip(request: &Request) -> worker::Result<Option<String>> {
+    Ok(request_header(request, "CF-Connecting-IP")?.map(|value| value.trim().to_owned()))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn rate_limit_subject<'a>(
+    policy: RateLimitPolicy,
+    subject: impl Into<Cow<'a, str>>,
+) -> RateLimitSubject<'a> {
+    RateLimitSubject {
+        policy,
+        subject: subject.into(),
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn rate_limit_subject_hash(secret: &RateLimitSecret, subject: &str) -> String {
+    use hmac::{Hmac, Mac};
+
+    type HmacSha256 = Hmac<Sha256>;
+    let mut mac =
+        HmacSha256::new_from_slice(&secret.0).expect("HMAC-SHA256 accepts arbitrary-length keys");
+    mac.update(subject.as_bytes());
+    bytes_to_hex(&mac.finalize().into_bytes())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn rate_limit_bucket_start(now: i32, window_seconds: i32) -> i32 {
+    now - now.rem_euclid(window_seconds)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn rate_limit_retry_after_seconds(blocked_until: i32, now: i32) -> i32 {
+    blocked_until.saturating_sub(now).max(1)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn rate_limit_blocked_until(count: i32, max_attempts: i32, now: i32) -> Option<i32> {
+    if count <= max_attempts {
+        return None;
+    }
+    let step_index = usize::try_from(count - max_attempts - 1).unwrap_or(0);
+    let duration = RATE_LIMIT_BLOCK_STEPS_SECONDS
+        .get(step_index)
+        .copied()
+        .unwrap_or(*RATE_LIMIT_BLOCK_STEPS_SECONDS.last().unwrap_or(&3600));
+    Some(now.saturating_add(duration))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn rate_limit_worst_exceeded(
+    current: Option<RateLimitExceeded>,
+    next: RateLimitExceeded,
+) -> Option<RateLimitExceeded> {
+    match current {
+        Some(existing) if existing.retry_after_seconds >= next.retry_after_seconds => {
+            Some(existing)
+        }
+        _ => Some(next),
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn rate_limit_token_subject(token_hash: &str) -> &str {
+    let prefix_len = usize::min(token_hash.len(), 16);
+    &token_hash[..prefix_len]
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn rate_limit_current_state(
+    db: &worker::d1::D1Database,
+    scope: &str,
+    subject_hash: &str,
+    bucket_start: i32,
+    now: i32,
+) -> worker::Result<RateLimitStateRow> {
+    let args = [
+        worker::d1::D1Type::Integer(bucket_start),
+        worker::d1::D1Type::Integer(now),
+        worker::d1::D1Type::Text(scope),
+        worker::d1::D1Type::Text(subject_hash),
+        worker::d1::D1Type::Integer(bucket_start),
+        worker::d1::D1Type::Integer(now),
+    ];
+    Ok(db
+        .prepare(
+            "SELECT
+                 COALESCE(MAX(CASE WHEN bucket_start = ? THEN count END), 0) AS bucket_count,
+                 MAX(CASE WHEN blocked_until IS NOT NULL AND blocked_until > ? THEN blocked_until END) AS blocked_until
+             FROM zeroth_rate_limits
+             WHERE scope = ?
+               AND subject_hash = ?
+               AND (bucket_start = ? OR blocked_until > ?)",
+        )
+        .bind_refs(&args)?
+        .first::<RateLimitStateRow>(None)
+        .await?
+        .unwrap_or(RateLimitStateRow {
+            bucket_count: 0,
+            blocked_until: None,
+        }))
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn maybe_cleanup_rate_limits(db: &worker::d1::D1Database, now: i32) -> worker::Result<()> {
+    let mut roll = [0u8; 1];
+    fill_random(&mut roll)?;
+    if roll[0] % RATE_LIMIT_CLEANUP_MODULUS != 0 {
+        return Ok(());
+    }
+    let cutoff = now.saturating_sub(RATE_LIMIT_RETENTION_SECONDS);
+    let args = [
+        worker::d1::D1Type::Integer(cutoff),
+        worker::d1::D1Type::Integer(RATE_LIMIT_CLEANUP_LIMIT),
+    ];
+    db.prepare(
+        "DELETE FROM zeroth_rate_limits
+         WHERE rowid IN (
+             SELECT rowid
+             FROM zeroth_rate_limits
+             WHERE updated_at < ?
+             ORDER BY updated_at
+             LIMIT ?
+         )",
+    )
+    .bind_refs(&args)?
+    .run()
+    .await?;
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn rate_limit_check_subjects<'a>(
+    db: &worker::d1::D1Database,
+    secret: &RateLimitSecret,
+    now: i32,
+    subjects: &[RateLimitSubject<'a>],
+) -> worker::Result<Option<RateLimitExceeded>> {
+    let mut blocked = None;
+    for subject in subjects {
+        let bucket_start = rate_limit_bucket_start(now, subject.policy.window_seconds);
+        let subject_hash = rate_limit_subject_hash(secret, subject.subject.as_ref());
+        let state =
+            rate_limit_current_state(db, subject.policy.scope, &subject_hash, bucket_start, now)
+                .await?;
+        if let Some(blocked_until) = state.blocked_until.filter(|value| *value > now) {
+            blocked = rate_limit_worst_exceeded(
+                blocked,
+                RateLimitExceeded {
+                    retry_after_seconds: rate_limit_retry_after_seconds(blocked_until, now),
+                },
+            );
+        }
+    }
+    Ok(blocked)
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn rate_limit_increment_subjects<'a>(
+    db: &worker::d1::D1Database,
+    secret: &RateLimitSecret,
+    now: i32,
+    subjects: &[RateLimitSubject<'a>],
+) -> worker::Result<Option<RateLimitExceeded>> {
+    let mut blocked = None;
+    for subject in subjects {
+        let bucket_start = rate_limit_bucket_start(now, subject.policy.window_seconds);
+        let subject_hash = rate_limit_subject_hash(secret, subject.subject.as_ref());
+        let args = [
+            worker::d1::D1Type::Text(subject.policy.scope),
+            worker::d1::D1Type::Text(&subject_hash),
+            worker::d1::D1Type::Integer(bucket_start),
+            worker::d1::D1Type::Integer(now),
+        ];
+        db.prepare(
+            "INSERT INTO zeroth_rate_limits (
+                 scope, subject_hash, bucket_start, count, blocked_until, updated_at
+             ) VALUES (?, ?, ?, 1, NULL, ?)
+             ON CONFLICT(scope, subject_hash, bucket_start)
+             DO UPDATE SET
+                 count = count + 1,
+                 updated_at = excluded.updated_at",
+        )
+        .bind_refs(&args)?
+        .run()
+        .await?;
+
+        let state =
+            rate_limit_current_state(db, subject.policy.scope, &subject_hash, bucket_start, now)
+                .await?;
+        let mut blocked_until = state.blocked_until;
+        if let Some(next_blocked_until) =
+            rate_limit_blocked_until(state.bucket_count, subject.policy.max_attempts, now)
+        {
+            if blocked_until.unwrap_or_default() < next_blocked_until {
+                let update_args = [
+                    worker::d1::D1Type::Integer(next_blocked_until),
+                    worker::d1::D1Type::Integer(now),
+                    worker::d1::D1Type::Text(subject.policy.scope),
+                    worker::d1::D1Type::Text(&subject_hash),
+                    worker::d1::D1Type::Integer(bucket_start),
+                ];
+                db.prepare(
+                    "UPDATE zeroth_rate_limits
+                     SET blocked_until = ?, updated_at = ?
+                     WHERE scope = ? AND subject_hash = ? AND bucket_start = ?",
+                )
+                .bind_refs(&update_args)?
+                .run()
+                .await?;
+                blocked_until = Some(next_blocked_until);
+            }
+        }
+        if let Some(active_until) = blocked_until.filter(|value| *value > now) {
+            blocked = rate_limit_worst_exceeded(
+                blocked,
+                RateLimitExceeded {
+                    retry_after_seconds: rate_limit_retry_after_seconds(active_until, now),
+                },
+            );
+        }
+    }
+    maybe_cleanup_rate_limits(db, now).await?;
+    Ok(blocked)
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn rate_limit_clear_subjects<'a>(
+    db: &worker::d1::D1Database,
+    secret: &RateLimitSecret,
+    subjects: &[RateLimitSubject<'a>],
+) -> worker::Result<()> {
+    for subject in subjects {
+        let subject_hash = rate_limit_subject_hash(secret, subject.subject.as_ref());
+        let args = [
+            worker::d1::D1Type::Text(subject.policy.scope),
+            worker::d1::D1Type::Text(&subject_hash),
+        ];
+        db.prepare("DELETE FROM zeroth_rate_limits WHERE scope = ? AND subject_hash = ?")
+            .bind_refs(&args)?
+            .run()
+            .await?;
+    }
+    Ok(())
+}
+
+fn password_params_json(pepper_id: &str) -> String {
+    serde_json::json!({
+        "iterations": PASSWORD_PBKDF2_ITERATIONS,
+        "prehash": "hmac-sha256",
+        "pepper_id": pepper_id,
+    })
+    .to_string()
 }
 
 #[cfg(target_arch = "wasm32")]
 async fn local_auth_password_matches(
+    env: &Env,
     credential: &LocalCredentialRow,
     password: &str,
-) -> worker::Result<bool> {
-    if credential.password_alg != PASSWORD_PBKDF2_ALG {
-        return Ok(false);
+) -> worker::Result<PasswordVerification> {
+    let peppers = password_pepper_from_env(env).map_err(worker_error)?;
+    match local_auth_password_record(credential) {
+        PasswordRecordKind::Invalid => {
+            password_dummy_verify_with_config(&peppers, password).await?;
+            Ok(PasswordVerification::invalid())
+        }
+        PasswordRecordKind::Legacy(record) => {
+            let actual = password_hash_legacy(password, &record.salt, record.iterations).await?;
+            let valid = constant_time_eq(&record.hash, &actual);
+            Ok(PasswordVerification {
+                valid,
+                needs_rehash: valid,
+            })
+        }
+        PasswordRecordKind::Current(record) => {
+            let Some(pepper) = configured_pepper_for_id(&peppers, &record.pepper_id) else {
+                password_dummy_verify_with_config(&peppers, password).await?;
+                return Ok(PasswordVerification::invalid());
+            };
+            let actual =
+                password_hash_with_policy(password, &record.salt, pepper, record.iterations)
+                    .await?;
+            if constant_time_eq(&record.hash, &actual) {
+                return Ok(PasswordVerification {
+                    valid: true,
+                    needs_rehash: record.needs_rehash(&peppers.current.id),
+                });
+            }
+
+            Ok(PasswordVerification::invalid())
+        }
     }
-    let Ok(iterations) = u32::try_from(credential.password_iterations) else {
-        return Ok(false);
-    };
-    if !(PASSWORD_PBKDF2_MIN_ITERATIONS..=PASSWORD_PBKDF2_MAX_ITERATIONS).contains(&iterations) {
-        return Ok(false);
-    }
-    let actual = password_hash(password, &credential.password_salt, iterations).await?;
-    Ok(constant_time_eq(&credential.password_hash, &actual))
 }
 
 #[cfg(target_arch = "wasm32")]
-async fn pbkdf2_sha256(
+async fn password_hash_current(
+    password: &str,
+    salt: &str,
+    pepper: &[u8],
+) -> worker::Result<String> {
+    password_hash_with_policy(password, salt, pepper, PASSWORD_PBKDF2_ITERATIONS).await
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn password_hash_legacy(
+    password: &str,
+    salt: &str,
+    iterations: u32,
+) -> worker::Result<String> {
+    password_hash_without_pepper(password.as_bytes(), salt.as_bytes(), iterations).await
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn password_dummy_verify_with_config(
+    peppers: &PasswordPepperConfig,
+    password: &str,
+) -> worker::Result<()> {
+    let actual = password_hash_current(
+        password,
+        PASSWORD_DUMMY_SALT,
+        peppers.current.value.as_slice(),
+    )
+    .await?;
+    let _ = constant_time_eq(PASSWORD_DUMMY_HASH, &actual);
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn configured_pepper_for_id<'a>(
+    peppers: &'a PasswordPepperConfig,
+    pepper_id: &str,
+) -> Option<&'a [u8]> {
+    if pepper_id == peppers.current.id {
+        return Some(peppers.current.value.as_slice());
+    }
+    peppers
+        .previous
+        .as_ref()
+        .filter(|previous| previous.id == pepper_id)
+        .map(|previous| previous.value.as_slice())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn password_hash_with_policy(
+    password: &str,
+    salt: &str,
+    pepper: &[u8],
+    iterations: u32,
+) -> worker::Result<String> {
+    let prehash = password_prehash(pepper, password.as_bytes());
+    let digest = pbkdf2_sha256_webcrypto(&prehash, salt.as_bytes(), iterations, 32).await?;
+    Ok(bytes_to_hex(&digest))
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn password_hash_without_pepper(
+    password: &[u8],
+    salt: &[u8],
+    iterations: u32,
+) -> worker::Result<String> {
+    let digest = pbkdf2_sha256_webcrypto(password, salt, iterations, 32).await?;
+    Ok(bytes_to_hex(&digest))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn local_auth_password_record(credential: &LocalCredentialRow) -> PasswordRecordKind {
+    if credential.password_hash.len() != 64
+        || !credential
+            .password_hash
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || credential.password_salt.len() != 64
+        || !credential
+            .password_salt
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return PasswordRecordKind::Invalid;
+    }
+    if credential.password_version < 1 {
+        return PasswordRecordKind::Invalid;
+    }
+    if credential.password_scheme != PasswordScheme::Pbkdf2Sha256.as_str() {
+        return PasswordRecordKind::Invalid;
+    }
+
+    match credential.password_version {
+        version if version < PASSWORD_CURRENT_VERSION => {
+            let Ok(iterations) = u32::try_from(credential.password_iterations) else {
+                return PasswordRecordKind::Invalid;
+            };
+            if !(PASSWORD_PBKDF2_MIN_ITERATIONS..=PASSWORD_PBKDF2_MAX_ITERATIONS)
+                .contains(&iterations)
+            {
+                return PasswordRecordKind::Invalid;
+            }
+            if credential.password_alg != PASSWORD_PBKDF2_ALG {
+                return PasswordRecordKind::Invalid;
+            }
+            PasswordRecordKind::Legacy(LegacyPasswordRecord {
+                hash: credential.password_hash.clone(),
+                salt: credential.password_salt.clone(),
+                iterations,
+            })
+        }
+        PASSWORD_CURRENT_VERSION => {
+            let params: PasswordParamsJson =
+                match serde_json::from_str(&credential.password_params_json) {
+                    Ok(params) => params,
+                    Err(_) => return PasswordRecordKind::Invalid,
+                };
+            if params.pepper_id.trim().is_empty() {
+                return PasswordRecordKind::Invalid;
+            }
+            if decode_password_pepper_id(&params.pepper_id, "password_params_json.pepper_id")
+                .is_err()
+            {
+                return PasswordRecordKind::Invalid;
+            }
+            if params.prehash != PasswordPrehash::HmacSha256 {
+                return PasswordRecordKind::Invalid;
+            }
+            if params.iterations < PASSWORD_PBKDF2_MIN_ITERATIONS
+                || params.iterations > PASSWORD_PBKDF2_MAX_ITERATIONS
+            {
+                return PasswordRecordKind::Invalid;
+            }
+            if credential.password_alg != PASSWORD_PBKDF2_ALG {
+                return PasswordRecordKind::Invalid;
+            }
+            if credential.password_iterations != i32::try_from(params.iterations).unwrap_or(-1) {
+                return PasswordRecordKind::Invalid;
+            }
+            PasswordRecordKind::Current(CurrentPasswordRecord {
+                hash: credential.password_hash.clone(),
+                salt: credential.password_salt.clone(),
+                iterations: params.iterations,
+                pepper_id: params.pepper_id,
+            })
+        }
+        _ => PasswordRecordKind::Invalid,
+    }
+}
+
+enum PasswordRecordKind {
+    Invalid,
+    Legacy(LegacyPasswordRecord),
+    Current(CurrentPasswordRecord),
+}
+
+struct LegacyPasswordRecord {
+    hash: String,
+    salt: String,
+    iterations: u32,
+}
+
+struct CurrentPasswordRecord {
+    hash: String,
+    salt: String,
+    iterations: u32,
+    pepper_id: String,
+}
+
+impl CurrentPasswordRecord {
+    fn needs_rehash(&self, current_pepper_id: &str) -> bool {
+        self.iterations != PASSWORD_PBKDF2_ITERATIONS || self.pepper_id != current_pepper_id
+    }
+}
+
+fn password_prehash(pepper: &[u8], password: &[u8]) -> [u8; 32] {
+    use hmac::{Hmac, Mac};
+
+    type HmacSha256 = Hmac<Sha256>;
+    let mut mac =
+        HmacSha256::new_from_slice(pepper).expect("HMAC-SHA256 accepts arbitrary-length keys");
+    mac.update(password);
+    let result = mac.finalize().into_bytes();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&result);
+    out
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn pbkdf2_sha256_webcrypto(
     password: &[u8],
     salt: &[u8],
     iterations: u32,
     output_len: usize,
 ) -> worker::Result<Vec<u8>> {
-    let subtle = worker_global_subtle().map_err(worker_error)?;
+    let subtle = password_worker_global_subtle().map_err(worker_error)?;
     let password_bytes = worker::js_sys::Uint8Array::from(password);
     let key_usages = single_js_string_array("deriveBits");
     let key_value = JsFuture::from(
@@ -13832,20 +15273,21 @@ async fn pbkdf2_sha256(
                 false,
                 &key_usages,
             )
-            .map_err(js_worker_error)?,
+            .map_err(password_js_worker_error)?,
     )
     .await
-    .map_err(js_worker_error)?;
+    .map_err(password_js_worker_error)?;
     let key = key_value
         .dyn_into::<worker::web_sys::CryptoKey>()
-        .map_err(js_worker_error)?;
+        .map_err(password_js_worker_error)?;
 
     let params = worker::js_sys::Object::new();
-    set_js_value_property_for_worker(&params, "name", &JsValue::from_str("PBKDF2"))?;
+    password_set_js_string_property(&params, "name", "PBKDF2").map_err(worker_error)?;
     let salt = worker::js_sys::Uint8Array::from(salt);
-    set_js_value_property_for_worker(&params, "salt", salt.as_ref())?;
-    set_js_value_property_for_worker(&params, "iterations", &JsValue::from_f64(iterations as f64))?;
-    set_js_value_property_for_worker(&params, "hash", &JsValue::from_str("SHA-256"))?;
+    password_set_js_value_property(&params, "salt", salt.as_ref()).map_err(worker_error)?;
+    password_set_js_value_property(&params, "iterations", &JsValue::from_f64(iterations as f64))
+        .map_err(worker_error)?;
+    password_set_js_string_property(&params, "hash", "SHA-256").map_err(worker_error)?;
     let bit_len = u32::try_from(output_len)
         .ok()
         .and_then(|len| len.checked_mul(8))
@@ -13853,47 +15295,56 @@ async fn pbkdf2_sha256(
     let bits = JsFuture::from(
         subtle
             .derive_bits_with_object(&params, &key, bit_len)
-            .map_err(js_worker_error)?,
+            .map_err(password_js_worker_error)?,
     )
     .await
-    .map_err(js_worker_error)?;
+    .map_err(password_js_worker_error)?;
     let array = worker::js_sys::Uint8Array::new(&bits);
     Ok(array.to_vec())
 }
 
 #[cfg(target_arch = "wasm32")]
-fn worker_global_subtle() -> Result<worker::web_sys::SubtleCrypto, String> {
+fn password_worker_global_subtle() -> Result<worker::web_sys::SubtleCrypto, String> {
     let global: worker::web_sys::WorkerGlobalScope = worker::js_sys::global().unchecked_into();
     let crypto = global
         .crypto()
-        .map_err(|error| js_error_string("could not access Worker crypto", error))?;
+        .map_err(|error| password_js_error_string("could not access Worker crypto", error))?;
     Ok(crypto.subtle())
 }
 
 #[cfg(target_arch = "wasm32")]
-fn set_js_value_property_for_worker(
+fn password_set_js_string_property(
+    target: &worker::js_sys::Object,
+    name: &str,
+    value: &str,
+) -> Result<(), String> {
+    password_set_js_value_property(target, name, &JsValue::from_str(value))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn password_set_js_value_property(
     target: &worker::js_sys::Object,
     name: &str,
     value: &JsValue,
-) -> worker::Result<()> {
-    let ok = worker::js_sys::Reflect::set(target, &JsValue::from_str(name), value)
-        .map_err(js_worker_error)?;
+) -> Result<(), String> {
+    let ok =
+        worker::js_sys::Reflect::set(target, &JsValue::from_str(name), value).map_err(|error| {
+            password_js_error_string("could not set password hash parameter", error)
+        })?;
     if ok {
         Ok(())
     } else {
-        Err(worker_error(format!(
-            "could not set JavaScript property: {name}"
-        )))
+        Err(format!("could not set password hash parameter: {name}"))
     }
 }
 
 #[cfg(target_arch = "wasm32")]
-fn js_worker_error(error: JsValue) -> worker::Error {
-    worker_error(js_error_string("JavaScript error", error))
+fn password_js_worker_error(error: JsValue) -> worker::Error {
+    worker_error(password_js_error_string("JavaScript error", error))
 }
 
 #[cfg(target_arch = "wasm32")]
-fn js_error_string(context: &str, error: JsValue) -> String {
+fn password_js_error_string(context: &str, error: JsValue) -> String {
     let detail = error
         .dyn_ref::<worker::js_sys::Error>()
         .map(|error| error.message().into())
@@ -14044,7 +15495,7 @@ async fn issue_wallet_session_response(
 #[cfg(target_arch = "wasm32")]
 fn magic_link_url(config: &ZerothServerConfig, token: &str) -> worker::Result<String> {
     let mut url = url::Url::parse(&format!(
-        "{}/magic-links/consume",
+        "{}/magic-link/confirm",
         config.public_base_url.trim_end_matches('/')
     ))
     .map_err(|error| worker_error(format!("invalid magic link base URL: {error}")))?;
@@ -15175,33 +16626,18 @@ fn cors_path(path: &str) -> bool {
             | "/identities/link"
             | "/identities"
             | "/passkeys/register/options"
-            | "/passkeys/registration/options"
             | "/passkeys/register/verify"
             | "/passkeys/register/finish"
-            | "/passkeys/registration/finish"
             | "/passkeys/authenticate/options"
-            | "/passkeys/authentication/options"
-            | "/passkeys/login/options"
             | "/passkeys/authenticate/verify"
             | "/passkeys/authenticate/finish"
-            | "/passkeys/authentication/finish"
-            | "/passkeys/login/verify"
-            | "/passkeys/login/finish"
             | "/password/register"
             | "/password/login"
             | "/wallet/challenge"
-            | "/wallet/nonce"
             | "/wallet/verify"
-            | "/wallet/login"
             | "/magic-links"
-            | "/magic-link"
-            | "/magic_link"
-            | "/magic-links/request"
-            | "/magic-link/request"
-            | "/magic_link/request"
+            | "/magic-link/confirm"
             | "/magic-links/consume"
-            | "/magic-link/consume"
-            | "/magic_link/consume"
             | "/validate"
             | "/logout"
     )
@@ -15212,35 +16648,20 @@ fn cors_method_allowed(path: &str, method: &str) -> bool {
         "/oauth/token" | "/oauth/revoke" | "/oauth/introspect" | "/tokens" => method == "POST",
         "/client-branding" | "/userinfo" | "/session" | "/validate" => method == "GET",
         "/profile" => method == "GET" || method == "PATCH",
-        "/identities/link" => method == "GET",
+        "/identities/link" => method == "POST",
         "/identities" => method == "GET" || method == "DELETE",
         "/passkeys/register/options"
-        | "/passkeys/registration/options"
         | "/passkeys/register/verify"
         | "/passkeys/register/finish"
-        | "/passkeys/registration/finish"
         | "/passkeys/authenticate/options"
-        | "/passkeys/authentication/options"
-        | "/passkeys/login/options"
         | "/passkeys/authenticate/verify"
-        | "/passkeys/authenticate/finish"
-        | "/passkeys/authentication/finish"
-        | "/passkeys/login/verify"
-        | "/passkeys/login/finish" => method == "POST",
+        | "/passkeys/authenticate/finish" => method == "POST",
         "/password/register" => method == "POST",
         "/password/login" => method == "POST",
-        "/wallet/challenge" | "/wallet/nonce" | "/wallet/verify" | "/wallet/login" => {
-            method == "POST"
-        }
-        "/magic-links"
-        | "/magic-link"
-        | "/magic_link"
-        | "/magic-links/request"
-        | "/magic-link/request"
-        | "/magic_link/request" => method == "POST",
-        "/magic-links/consume" | "/magic-link/consume" | "/magic_link/consume" => {
-            method == "GET" || method == "POST"
-        }
+        "/wallet/challenge" | "/wallet/verify" => method == "POST",
+        "/magic-links" => method == "POST",
+        "/magic-link/confirm" => method == "GET",
+        "/magic-links/consume" => method == "POST",
         "/sessions" => method == "GET" || method == "DELETE",
         "/logout" => method == "GET" || method == "POST",
         _ => false,
@@ -16447,6 +17868,38 @@ fn oauth_error_json(
         },
         status,
     )
+}
+
+#[cfg(target_arch = "wasm32")]
+fn with_retry_after_header(
+    response: Response,
+    retry_after_seconds: i32,
+) -> worker::Result<Response> {
+    response
+        .headers()
+        .set("Retry-After", &retry_after_seconds.max(1).to_string())?;
+    Ok(response)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn rate_limit_error_json(retry_after_seconds: i32) -> worker::Result<Response> {
+    let response = json_status_no_store(
+        &OAuthErrorResponse {
+            error: "temporarily_unavailable".to_owned(),
+            error_description: "too many requests".to_owned(),
+        },
+        429,
+    )?;
+    with_retry_after_header(response, retry_after_seconds)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn rate_limit_oauth_error_json(
+    retry_after_seconds: i32,
+    origin: Option<&str>,
+) -> worker::Result<Response> {
+    let response = rate_limit_error_json(retry_after_seconds)?;
+    with_cors_actual_headers(response, origin)
 }
 
 fn query_param(url: &url::Url, name: &str) -> Option<String> {
@@ -20669,10 +22122,9 @@ mod tests {
     fn issuer_access_token_signing_verifies_with_public_jwks() {
         let signing_key = test_signing_key();
         let jwks = jwks_response(&signing_key, None).unwrap();
-        let jwks = serde_json::from_value::<zeroth_oidc::ZerothJwks>(
-            serde_json::to_value(&jwks).unwrap(),
-        )
-        .unwrap();
+        let jwks =
+            serde_json::from_value::<zeroth_oidc::ZerothJwks>(serde_json::to_value(&jwks).unwrap())
+                .unwrap();
         let claims = build_issuer_access_token_claims(
             "https://id.example.com",
             "usr_123",
@@ -21209,220 +22661,19 @@ mod tests {
     }
 
     #[test]
-    fn provider_authorize_alias_rewrites_to_canonical_authorize_url() {
-        let url = url::Url::parse(
-            "https://id.example.com/providers/apple/authorize?client_id=browser&provider=google&state=one#frag",
-        )
-        .unwrap();
-
-        let alias = provider_authorize_alias_url(&url).unwrap();
-
-        assert_eq!(
-            alias.as_str(),
-            "https://id.example.com/authorize?client_id=browser&state=one&provider=apple"
-        );
-    }
-
-    #[test]
-    fn provider_alias_paths_reject_nested_provider_segments() {
-        assert!(provider_authorize_alias_path("/providers/google/authorize"));
-        assert!(provider_callback_alias_path("/oauth/callback/apple"));
-        assert!(provider_callback_alias_path("/oauth2/callback/apple"));
-        assert!(provider_callback_alias_path("/callback"));
-        assert!(provider_callback_alias_path("/callback/apple"));
-        assert!(provider_callback_alias_path("/auth/callback"));
-        assert!(provider_callback_alias_path("/auth/callback/apple"));
-        assert!(provider_callback_alias_path("/api/callback"));
-        assert!(provider_callback_alias_path("/api/auth/callback/google"));
-        assert!(!provider_authorize_alias_path(
-            "/providers/google/extra/authorize"
-        ));
-        assert!(!provider_callback_alias_path("/oauth/callback/apple/extra"));
-        assert!(!provider_callback_alias_path("/auth/callback/apple/extra"));
-        assert!(!provider_callback_alias_path("/callback/apple/extra"));
-    }
-
-    #[test]
-    fn admin_console_alias_paths_are_bounded() {
-        assert!(admin_console_alias_path("/ui"));
-        assert!(admin_console_alias_path("/dashboard"));
-        assert!(admin_console_alias_path("/console"));
-        assert!(admin_console_alias_path("/admin/users"));
-        assert!(admin_console_alias_path("/admin/events"));
-        assert!(admin_console_alias_path("/admin/providers"));
-        assert!(admin_console_alias_path("/admin/local-auth"));
-        assert!(admin_console_alias_path("/admin/database"));
-        assert!(!admin_console_alias_path("/admin"));
-        assert!(!admin_console_alias_path("/admin/users/export"));
-    }
-
-    #[test]
-    fn compatibility_route_path_maps_bounded_aliases_to_canonical_routes() {
-        assert_eq!(compatibility_route_path("/status").as_ref(), "/ready");
-        assert_eq!(compatibility_route_path("/api/status").as_ref(), "/ready");
-        assert_eq!(compatibility_route_path("/ui").as_ref(), "/admin");
-        assert_eq!(compatibility_route_path("/dashboard").as_ref(), "/admin");
-        assert_eq!(
-            compatibility_route_path("/callback/apple").as_ref(),
-            "/oauth2/callback"
-        );
-        assert_eq!(
-            compatibility_route_path("/auth/callback/apple").as_ref(),
-            "/oauth2/callback"
-        );
-        assert_eq!(
-            compatibility_route_path("/api/auth/callback").as_ref(),
-            "/oauth2/callback"
-        );
-        assert_eq!(compatibility_route_path("/admin/users").as_ref(), "/admin");
-        assert_eq!(compatibility_route_path("/api/health").as_ref(), "/health");
-        assert_eq!(compatibility_route_path("/api/ready").as_ref(), "/ready");
-        assert_eq!(
-            compatibility_route_path("/api/clients").as_ref(),
-            "/clients"
-        );
-        assert_eq!(compatibility_route_path("/api/routes").as_ref(), "/routes");
-        assert_eq!(
-            compatibility_route_path("/api/local-auth/status").as_ref(),
-            "/local-auth/status"
-        );
-        assert_eq!(
-            compatibility_route_path("/api/client-branding").as_ref(),
-            "/client-branding"
-        );
-        assert_eq!(compatibility_route_path("/api/tokens").as_ref(), "/tokens");
-        assert_eq!(
-            compatibility_route_path("/api/profile").as_ref(),
-            "/profile"
-        );
-        assert_eq!(
-            compatibility_route_path("/api/session").as_ref(),
-            "/session"
-        );
-        assert_eq!(compatibility_route_path("/api/logout").as_ref(), "/logout");
-        assert_eq!(
-            compatibility_route_path("/local-auth/magic-links").as_ref(),
-            "/magic-links"
-        );
-        assert_eq!(
-            compatibility_route_path("/api/local-auth/magic-links").as_ref(),
-            "/magic-links"
-        );
-        assert_eq!(
-            compatibility_route_path("/api/magic_link").as_ref(),
-            "/magic-links"
-        );
-        assert_eq!(
-            compatibility_route_path("/api/magic-links/request").as_ref(),
-            "/magic-links"
-        );
-        assert_eq!(
-            compatibility_route_path("/magic-link/request").as_ref(),
-            "/magic-links"
-        );
-        assert_eq!(
-            compatibility_route_path("/auth/magic-link/request").as_ref(),
-            "/magic-links"
-        );
-        assert_eq!(
-            compatibility_route_path("/api/auth/magic-link/request").as_ref(),
-            "/magic-links"
-        );
-        assert_eq!(
-            compatibility_route_path("/local-auth/magic-link/request").as_ref(),
-            "/magic-links"
-        );
-        assert_eq!(
-            compatibility_route_path("/api/magic-links/send").as_ref(),
-            "/magic-links"
-        );
-        assert_eq!(
-            compatibility_route_path("/auth/magic-link/send").as_ref(),
-            "/magic-links"
-        );
-        assert_eq!(
-            compatibility_route_path("/api/auth/magic-link/send").as_ref(),
-            "/magic-links"
-        );
-        assert_eq!(
-            compatibility_route_path("/local-auth/magic-links/consume").as_ref(),
-            "/magic-links/consume"
-        );
-        assert_eq!(
-            compatibility_route_path("/auth/magic-link/verify").as_ref(),
-            "/magic-links/consume"
-        );
-        assert_eq!(
-            compatibility_route_path("/api/local-auth/magic-link/consume").as_ref(),
-            "/magic-links/consume"
-        );
-        assert_eq!(
-            compatibility_route_path("/magic-link/verify").as_ref(),
-            "/magic-links/consume"
-        );
-        assert_eq!(
-            compatibility_route_path("/local-auth/magic_link/consume").as_ref(),
-            "/magic-links/consume"
-        );
-        assert_eq!(
-            compatibility_route_path("/api/password/login").as_ref(),
-            "/password/login"
-        );
-        assert_eq!(
-            compatibility_route_path("/auth/password/login").as_ref(),
-            "/password/login"
-        );
-        assert_eq!(
-            compatibility_route_path("/api/passkeys/registration/options").as_ref(),
-            "/passkeys/registration/options"
-        );
-        assert_eq!(
-            compatibility_route_path("/api/passkeys/registration/verify").as_ref(),
-            "/passkeys/register/verify"
-        );
-        assert_eq!(
-            compatibility_route_path("/api/passkeys/authentication/options").as_ref(),
-            "/passkeys/authentication/options"
-        );
-        assert_eq!(
-            compatibility_route_path("/api/passkeys/authentication/finish").as_ref(),
-            "/passkeys/authenticate/finish"
-        );
-        assert_eq!(
-            compatibility_route_path("/api/passkeys/login/options").as_ref(),
-            "/passkeys/authenticate/options"
-        );
-        assert_eq!(
-            compatibility_route_path("/admin/users/export").as_ref(),
-            "/admin/users/export"
-        );
-    }
-
-    #[test]
-    fn known_route_path_covers_aliases_after_normalization() {
-        assert!(known_route_path(
-            compatibility_route_path("/status").as_ref()
-        ));
-        assert!(known_route_path(compatibility_route_path("/ui").as_ref()));
+    fn known_route_path_covers_canonical_routes() {
+        assert!(known_route_path("/ready"));
+        assert!(known_route_path("/admin"));
         assert!(known_route_path("/profile-menu.js"));
         assert!(known_route_path("/profile-panel.js"));
-        assert!(known_route_path(
-            compatibility_route_path("/api/client-branding").as_ref()
-        ));
-        assert!(known_route_path(
-            compatibility_route_path("/callback/apple").as_ref()
-        ));
-        assert!(known_route_path(
-            compatibility_route_path("/auth/callback/apple").as_ref()
-        ));
-        assert!(known_route_path(
-            compatibility_route_path("/api/passkeys/login/options").as_ref()
-        ));
-        assert!(known_route_path(
-            compatibility_route_path("/api/magic_link").as_ref()
-        ));
+        assert!(known_route_path("/client-branding"));
+        assert!(known_route_path("/oauth2/callback"));
+        assert!(known_route_path("/passkeys/authenticate/options"));
+        assert!(known_route_path("/magic-links"));
         assert!(known_route_path("/.well-known/assetlinks.json"));
         assert!(!known_route_path("/admin/users/export"));
+        assert!(!known_route_path("/api/client-branding"));
+        assert!(!known_route_path("/magic_link"));
     }
 
     #[test]
@@ -21910,18 +23161,13 @@ mod tests {
         assert!(cors_path("/identities"));
         assert!(cors_path("/passkeys/register/options"));
         assert!(cors_path("/passkeys/authenticate/options"));
-        assert!(cors_path("/passkeys/login/options"));
         assert!(cors_path("/password/register"));
         assert!(cors_path("/password/login"));
+        assert!(cors_path("/wallet/challenge"));
+        assert!(cors_path("/wallet/verify"));
         assert!(cors_path("/magic-links"));
-        assert!(cors_path("/magic-link"));
-        assert!(cors_path("/magic_link"));
-        assert!(cors_path("/magic-links/request"));
-        assert!(cors_path("/magic-link/request"));
-        assert!(cors_path("/magic_link/request"));
         assert!(cors_path("/magic-links/consume"));
-        assert!(cors_path("/magic-link/consume"));
-        assert!(cors_path("/magic_link/consume"));
+        assert!(cors_path("/magic-link/confirm"));
         assert!(cors_path("/validate"));
         assert!(cors_path("/logout"));
         assert!(!cors_path("/authorize"));
@@ -21950,18 +23196,15 @@ mod tests {
             "/passkeys/authenticate/options",
             "POST"
         ));
-        assert!(cors_method_allowed("/passkeys/login/options", "POST"));
-        assert!(!cors_method_allowed("/passkeys/login/options", "GET"));
         assert!(cors_method_allowed("/password/register", "POST"));
         assert!(!cors_method_allowed("/password/register", "GET"));
         assert!(cors_method_allowed("/password/login", "POST"));
         assert!(!cors_method_allowed("/password/login", "GET"));
+        assert!(cors_method_allowed("/wallet/challenge", "POST"));
+        assert!(!cors_method_allowed("/wallet/challenge", "GET"));
+        assert!(cors_method_allowed("/wallet/verify", "POST"));
+        assert!(!cors_method_allowed("/wallet/verify", "GET"));
         assert!(cors_method_allowed("/magic-links", "POST"));
-        assert!(cors_method_allowed("/magic-link", "POST"));
-        assert!(cors_method_allowed("/magic_link", "POST"));
-        assert!(cors_method_allowed("/magic-links/request", "POST"));
-        assert!(cors_method_allowed("/magic-link/request", "POST"));
-        assert!(cors_method_allowed("/magic_link/request", "POST"));
         assert!(!cors_method_allowed("/magic-links", "GET"));
         let magic_links_trailing_slash = canonical_route_path("/magic-links/");
         assert!(cors_path(magic_links_trailing_slash.as_ref()));
@@ -21969,24 +23212,15 @@ mod tests {
             magic_links_trailing_slash.as_ref(),
             "POST"
         ));
-        assert!(cors_method_allowed("/magic-links/consume", "GET"));
+        assert!(cors_method_allowed("/magic-link/confirm", "GET"));
+        assert!(!cors_method_allowed("/magic-link/confirm", "POST"));
+        assert!(!cors_method_allowed("/magic-links/consume", "GET"));
         assert!(cors_method_allowed("/magic-links/consume", "POST"));
         assert!(!cors_method_allowed("/magic-links/consume", "DELETE"));
-        assert!(cors_method_allowed("/magic-link/consume", "GET"));
-        assert!(cors_method_allowed("/magic-link/consume", "POST"));
-        assert!(cors_method_allowed("/magic_link/consume", "GET"));
-        assert!(cors_method_allowed("/magic_link/consume", "POST"));
         assert!(cors_method_allowed("/validate", "GET"));
         assert!(cors_method_allowed("/logout", "GET"));
         assert!(cors_method_allowed("/logout", "POST"));
         assert!(!cors_method_allowed("/logout", "PUT"));
-
-        let local_auth_magic_links = compatibility_route_path("/local-auth/magic-links");
-        assert!(cors_path(local_auth_magic_links.as_ref()));
-        assert!(cors_method_allowed(local_auth_magic_links.as_ref(), "POST"));
-        let auth_magic_link_send = compatibility_route_path("/auth/magic-link/send");
-        assert!(cors_path(auth_magic_link_send.as_ref()));
-        assert!(cors_method_allowed(auth_magic_link_send.as_ref(), "POST"));
     }
 
     #[test]

@@ -1121,6 +1121,7 @@ pub struct ClientsAdminUiState {
     pub issuer_base_url: String,
     pub product_name: String,
     pub admin_login_url: String,
+    pub csrf_token: Option<String>,
     pub clients: Vec<ClientAdminUi>,
     pub providers: Vec<ProviderAdminUi>,
     pub local_auth: Vec<LocalAuthAdminUi>,
@@ -1136,6 +1137,7 @@ impl ClientsAdminUiState {
             issuer_base_url,
             product_name: "Zeroth".to_owned(),
             admin_login_url,
+            csrf_token: None,
             clients: Vec::new(),
             providers: Vec::new(),
             local_auth: Vec::new(),
@@ -1151,6 +1153,11 @@ impl ClientsAdminUiState {
 
     pub fn with_admin_login_url(mut self, admin_login_url: impl Into<String>) -> Self {
         self.admin_login_url = admin_login_url.into();
+        self
+    }
+
+    pub fn with_csrf_token(mut self, csrf_token: Option<String>) -> Self {
+        self.csrf_token = csrf_token;
         self
     }
 }
@@ -1452,6 +1459,7 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
                 <form class=passkey_register_class id="zeroth-account-passkey-register-form">
                     <input type="hidden" name="clientId" value=config.client_id.clone() />
                     <input type="hidden" name="returnTo" value=login_return_to.clone() />
+                    <input type="hidden" name="_csrf" value=csrf_token.clone() />
                     <div class="zeroth-login-actions">
                         <div class="zeroth-field">
                             <label for="zeroth-account-passkey-label">"New passkey"</label>
@@ -1507,6 +1515,7 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
                             data-admin-url=admin_url
                             data-login-url=login_url.clone()
                             data-logout-url=logout_action.clone()
+                            data-csrf-token=csrf_token.clone()
                             data-signed-out-url=login_url
                             data-show-admin="true"
                         ></div>
@@ -1677,6 +1686,7 @@ pub fn ClientsAdminApp(state: ClientsAdminUiState) -> impl IntoView {
         issuer_base_url,
         product_name,
         admin_login_url,
+        csrf_token,
         clients,
         providers,
         local_auth,
@@ -1756,6 +1766,7 @@ pub fn ClientsAdminApp(state: ClientsAdminUiState) -> impl IntoView {
                             data-admin-url="/admin"
                             data-login-url="/login"
                             data-logout-url="/logout"
+                            data-csrf-token=csrf_token.unwrap_or_default()
                             data-signed-out-url="/login"
                             data-show-admin="false"
                         ></div>
@@ -2088,13 +2099,6 @@ pub fn ClientsAdminApp(state: ClientsAdminUiState) -> impl IntoView {
 fn provider_row(config: &ZerothUiConfig, provider: ProviderUi, signed_in: bool) -> impl IntoView {
     let linking = signed_in && config.link_identities;
     let login_mode = !signed_in && !config.link_identities;
-    let href = if !provider.enabled || (provider.connected && linking) {
-        "#".to_owned()
-    } else if linking {
-        provider_link_url(config, &provider.id)
-    } else {
-        provider_authorize_url(config, &provider.id)
-    };
     let action = if provider.connected && linking {
         "Connected".to_owned()
     } else if linking {
@@ -2111,12 +2115,34 @@ fn provider_row(config: &ZerothUiConfig, provider: ProviderUi, signed_in: bool) 
     } else {
         "Disabled"
     };
-    let disabled = (!provider.enabled || (provider.connected && linking)).to_string();
     let class = format!(
         "zeroth-provider {}",
         provider_kind_class(&provider.kind, provider.connected)
     );
     let initial = provider_initial(&provider);
+    let disabled = !provider.enabled || (provider.connected && linking);
+    let csrf_token = config.csrf_token.clone().unwrap_or_default();
+    let link_action = provider_link_url(config, &provider.id);
+    let href = if provider.enabled {
+        provider_authorize_url(config, &provider.id)
+    } else {
+        "#".to_owned()
+    };
+
+    let action_view = if linking {
+        view! {
+            <form method="post" action=link_action>
+                <input type="hidden" name="_csrf" value=csrf_token />
+                <button class="zeroth-action" type="submit" disabled=disabled>{action}</button>
+            </form>
+        }
+        .into_any()
+    } else {
+        view! {
+            <a class="zeroth-action" href=href aria-disabled=disabled.to_string()>{action}</a>
+        }
+        .into_any()
+    };
 
     view! {
         <div class=class>
@@ -2125,7 +2151,7 @@ fn provider_row(config: &ZerothUiConfig, provider: ProviderUi, signed_in: bool) 
                 <div class="zeroth-provider-name">{provider.label}</div>
                 <div class="zeroth-provider-meta">{status}</div>
             </div>
-            <a class="zeroth-action" href=href aria-disabled=disabled>{action}</a>
+            {action_view}
         </div>
     }
 }
@@ -2846,13 +2872,18 @@ function zerothAuthenticationCredentialPayload(credential) {
 }
 
 async function zerothPasskeyApi(path, payload) {
+  const headers = {
+    "Accept": "application/json",
+    "Content-Type": "application/json"
+  };
+  const csrf = zerothCsrfToken();
+  if (csrf) {
+    headers["X-Zeroth-CSRF"] = csrf;
+  }
   const response = await fetch(path, {
     method: "POST",
     credentials: "include",
-    headers: {
-      "Accept": "application/json",
-      "Content-Type": "application/json"
-    },
+    headers,
     body: JSON.stringify(payload)
   });
   let body = {};
@@ -2883,6 +2914,27 @@ async function zerothWalletApi(path, payload) {
     throw new Error(zerothErrorMessage(body, `HTTP ${response.status}`));
   }
   return body;
+}
+
+function zerothCsrfToken(form) {
+  if (form instanceof HTMLFormElement) {
+    const token = form.querySelector("input[name='_csrf']");
+    if (token instanceof HTMLInputElement && token.value.trim()) {
+      return token.value.trim();
+    }
+  }
+  const token = document.querySelector("input[name='_csrf']");
+  if (token instanceof HTMLInputElement && token.value.trim()) {
+    return token.value.trim();
+  }
+  const host = document.querySelector("[data-zeroth-profile-menu]");
+  if (host instanceof HTMLElement) {
+    const value = host.dataset.csrfToken || host.getAttribute("data-csrf-token") || "";
+    if (value.trim()) {
+      return value.trim();
+    }
+  }
+  return "";
 }
 
 async function zerothRegisterPasskey(form) {
@@ -3085,6 +3137,10 @@ document.addEventListener("submit", async (event) => {
     credentials: "include",
     headers: { "Accept": "application/json" }
   };
+  const csrf = zerothCsrfToken(form);
+  if (csrf) {
+    options.headers["X-Zeroth-CSRF"] = csrf;
+  }
   if (method === "PATCH") {
     const data = new FormData(form);
     const payload = {};

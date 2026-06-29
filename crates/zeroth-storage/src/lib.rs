@@ -125,6 +125,18 @@ pub mod migrations {
         sql: include_str!("../migrations/0007_client_login_methods.sql"),
     };
 
+    pub const PASSWORD_HASHING: Migration = Migration {
+        version: 8,
+        name: "password_hashing",
+        sql: include_str!("../migrations/0008_password_hashing.sql"),
+    };
+
+    pub const RATE_LIMITS: Migration = Migration {
+        version: 9,
+        name: "rate_limits",
+        sql: include_str!("../migrations/0009_rate_limits.sql"),
+    };
+
     pub const ALL: &[Migration] = &[
         INIT,
         PASSKEYS,
@@ -133,6 +145,8 @@ pub mod migrations {
         ACCOUNT_NAMESPACES,
         WALLET_AUTH,
         CLIENT_LOGIN_METHODS,
+        PASSWORD_HASHING,
+        RATE_LIMITS,
     ];
 }
 
@@ -152,6 +166,7 @@ pub const REQUIRED_TABLES: &[&str] = &[
     "zeroth_local_credentials",
     "zeroth_magic_links",
     "zeroth_wallet_challenges",
+    "zeroth_rate_limits",
     "zeroth_signing_keys",
     "zeroth_audit_events",
 ];
@@ -262,6 +277,7 @@ mod tests {
                 && *table != "zeroth_local_credentials"
                 && *table != "zeroth_magic_links"
                 && *table != "zeroth_wallet_challenges"
+                && *table != "zeroth_rate_limits"
                 && *table != "zeroth_account_identities"
         }) {
             assert!(sql.contains(table), "missing table {table}");
@@ -275,7 +291,7 @@ mod tests {
         for table in ["zeroth_passkey_credentials", "zeroth_passkey_challenges"] {
             assert!(sql.contains(table), "missing table {table}");
         }
-        assert_eq!(migrations::ALL.len(), 7);
+        assert_eq!(migrations::ALL.len(), 9);
         assert_eq!(migrations::ALL[1].version, 2);
     }
 
@@ -308,7 +324,7 @@ mod tests {
         assert!(sql.contains("account_sharing_mode TEXT NOT NULL DEFAULT 'global'"));
         assert!(sql.contains("account_tenant_id TEXT NOT NULL DEFAULT 'global'"));
         assert!(sql.contains("INSERT OR IGNORE INTO zeroth_account_identities"));
-        assert_eq!(migrations::ALL.len(), 7);
+        assert_eq!(migrations::ALL.len(), 9);
         assert_eq!(migrations::ALL[4].version, 5);
     }
 
@@ -319,7 +335,7 @@ mod tests {
         assert!(sql.contains("zeroth_wallet_challenges"));
         assert!(sql.contains("challenge_hash TEXT PRIMARY KEY"));
         assert!(sql.contains("account_namespace TEXT NOT NULL"));
-        assert_eq!(migrations::ALL.len(), 7);
+        assert_eq!(migrations::ALL.len(), 9);
         assert_eq!(migrations::ALL[5].version, 6);
     }
 
@@ -328,8 +344,29 @@ mod tests {
         let sql = migrations::CLIENT_LOGIN_METHODS.sql;
 
         assert!(sql.contains("visible_login_methods_json TEXT NOT NULL DEFAULT '[]'"));
-        assert_eq!(migrations::ALL.len(), 7);
+        assert_eq!(migrations::ALL.len(), 9);
         assert_eq!(migrations::ALL[6].version, 7);
+    }
+
+    #[test]
+    fn password_hashing_migration_contains_password_columns() {
+        let sql = migrations::PASSWORD_HASHING.sql;
+
+        assert!(sql.contains("zeroth_local_credentials"));
+        assert!(sql.contains("password_scheme TEXT NOT NULL DEFAULT 'pbkdf2-sha256'"));
+        assert!(sql.contains("password_params_json TEXT NOT NULL DEFAULT '{}'"));
+        assert!(sql.contains("password_version INTEGER NOT NULL DEFAULT 1"));
+        assert_eq!(migrations::ALL[7].version, 8);
+    }
+
+    #[test]
+    fn rate_limits_migration_contains_counter_table() {
+        let sql = migrations::RATE_LIMITS.sql;
+
+        assert!(sql.contains("CREATE TABLE IF NOT EXISTS zeroth_rate_limits"));
+        assert!(sql.contains("PRIMARY KEY (scope, subject_hash, bucket_start)"));
+        assert!(sql.contains("idx_zeroth_rate_limits_updated_at"));
+        assert_eq!(migrations::ALL[8].version, 9);
     }
 
     #[test]

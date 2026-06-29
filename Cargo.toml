@@ -39,6 +39,7 @@ zeroth-ui = { version = "0.1.0", path = "crates/zeroth-ui" }
 zeroth-worker = { version = "0.1.0", path = "crates/zeroth-worker" }
 base64 = "0.22"
 console_error_panic_hook = "0.1"
+hmac = "0.12"
 getrandom = { version = "0.2", features = ["js"] }
 k256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
 leptos = { version = "0.8.12", default-features = false, features = ["ssr"] }

@@ -1,7 +1,14 @@
 //! Core domain model for Zeroth.
 
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::time::SystemTime;
+
+pub const PASSWORD_SCHEME_PBKDF2_SHA256: &str = "pbkdf2-sha256";
+pub const PASSWORD_CURRENT_VERSION: i32 = 2;
+pub const PASSWORD_PBKDF2_ITERATIONS: u32 = 150_000;
+pub const PASSWORD_PBKDF2_MIN_ITERATIONS: u32 = 1_000;
+pub const PASSWORD_PBKDF2_MAX_ITERATIONS: u32 = 1_000_000;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct UserId(pub String);
@@ -43,6 +50,31 @@ pub struct Client {
     pub allowed_origins: Vec<String>,
     pub allowed_email_domains: Vec<String>,
     pub confidential: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PasswordScheme {
+    Pbkdf2Sha256,
+    Argon2id,
+}
+
+impl PasswordScheme {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pbkdf2Sha256 => "pbkdf2-sha256",
+            Self::Argon2id => "argon2id",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PasswordHashRecord {
+    pub scheme: PasswordScheme,
+    pub version: i32,
+    pub hash: String,
+    pub salt: String,
+    pub params_json: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

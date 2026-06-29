@@ -687,11 +687,7 @@ pub fn verify_zeroth_access_token(
     now: i64,
 ) -> Result<ZerothJwtClaims, ZerothTokenError> {
     let validation = ZerothTokenValidation::access_token(issuer, audience, now);
-    let claims = verify_zeroth_signed_token(
-        token,
-        jwks,
-        &validation,
-    )?;
+    let claims = verify_zeroth_signed_token(token, jwks, &validation)?;
     validate_zeroth_claims(&claims, &validation)?;
     Ok(claims)
 }
@@ -1961,11 +1957,7 @@ mod tests {
         }
     }
 
-    fn signed_test_token<T: Serialize>(
-        signing_key: &SigningKey,
-        kid: &str,
-        claims: &T,
-    ) -> String {
+    fn signed_test_token<T: Serialize>(signing_key: &SigningKey, kid: &str, claims: &T) -> String {
         let header = serde_json::json!({
             "alg": "ES256",
             "kid": kid,
