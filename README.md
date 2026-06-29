@@ -9,7 +9,6 @@ It is intended to cover the Auth0-shaped role for owned products:
 - hosted login
 - upstream provider brokering
 - OIDC authorization-code flow with PKCE
-- Wavey-owned tokens and JWKS
 - browser sessions
 - native app login for Swift/iOS clients
 
