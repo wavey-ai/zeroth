@@ -27,10 +27,6 @@ crates/zeroth-ui
 crates/zeroth-worker
 ```
 
-The crates are intentionally thin for now. They define the ownership boundaries
-for extracting generic auth code from `wavey-id` and reworking `hyper-idp`
-concepts into a persistent, deployable server.
-
 The facade crate keeps the Leptos UI behind the optional `ui` feature so API and
 Worker consumers do not pull UI dependencies by default.
 
@@ -39,10 +35,6 @@ Worker consumers do not pull UI dependencies by default.
 `ZEROTH_DB` binding.
 
 ## UI Screenshots
-
-Captured from the live `https://id.wavey.ai` Zeroth deployment on 2026-06-05
-using a disposable admin account. Session and user identifiers are redacted in
-the captures, and the disposable account was disabled after capture.
 
 | Hosted login | Account management |
 | --- | --- |
