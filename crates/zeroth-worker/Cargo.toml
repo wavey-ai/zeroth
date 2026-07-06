@@ -37,4 +37,5 @@ zeroth-ui.workspace = true
 rsa.workspace = true
 
 [dev-dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
 rsa.workspace = true

@@ -1,0 +1,25 @@
+[package]
+name = "zeroth-web-auth"
+version.workspace = true
+edition.workspace = true
+description = "Shared web-auth helpers for Zeroth and first-party Workers"
+license.workspace = true
+homepage.workspace = true
+
+[features]
+default = ["native"]
+native = []
+worker = []
+
+[dependencies]
+base64.workspace = true
+getrandom.workspace = true
+hmac.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+url.workspace = true
+urlencoding.workspace = true
+
+[dev-dependencies]
+

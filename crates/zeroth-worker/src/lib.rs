@@ -737,18 +737,30 @@ const ZEROTH_PROFILE_MENU_JS: &str = r###"
       }
       const logoutUrl = endpoint(state.issuer, state.logoutUrl, "/logout");
       const headers = { Accept: "application/json" };
-      if (state.csrfToken) headers["X-Zeroth-CSRF"] = state.csrfToken;
+      const body = new URLSearchParams();
+      if (state.csrfToken) {
+        headers["X-Zeroth-CSRF"] = state.csrfToken;
+        headers["Content-Type"] = "application/x-www-form-urlencoded;charset=UTF-8";
+        body.set("_csrf", state.csrfToken);
+      }
       await fetch(logoutUrl, {
         method: "POST",
         credentials: "include",
         headers,
+        body: body.toString(),
       }).catch(() => null);
       state.authenticated = false;
       state.user = null;
       state.open = false;
       renderState();
       const signedOutUrl = options.signedOutUrl || attr(host, "signed-out-url") || attr(host, "data-signed-out-url");
-      if (signedOutUrl) window.location.assign(signedOutUrl);
+      if (signedOutUrl) {
+        const target = new URL(signedOutUrl, window.location.href);
+        if (state.returnTo && !target.searchParams.has("return_to")) {
+          target.searchParams.set("return_to", state.returnTo);
+        }
+        window.location.assign(target.toString());
+      }
     }
 
     function handleMenuClick(event) {
@@ -2171,6 +2183,10 @@ struct MagicLinkRow {
     ip_hash: Option<String>,
     #[serde(default)]
     user_agent: Option<String>,
+    #[serde(default)]
+    poll_token_hash: Option<String>,
+    #[serde(default)]
+    consumed_session_id: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -2252,6 +2268,8 @@ struct PasswordRegisterRequest {
 struct PasswordLoginRequest {
     email: String,
     password: String,
+    #[serde(default, alias = "confirm_password")]
+    confirm_password: Option<String>,
     #[serde(default, alias = "return_to")]
     return_to: Option<String>,
     #[serde(default, alias = "client_id")]
@@ -3066,6 +3084,7 @@ async fn handle_request(request: Request, env: Env) -> worker::Result<Response> 
         (Method::Post, "/magic-links") => magic_link_request(request, env).await,
         (Method::Get, "/magic-link/confirm") => magic_link_confirm(request, env).await,
         (Method::Post, "/magic-links/consume") => magic_link_consume(request, env).await,
+        (Method::Get, "/magic-links/poll") => magic_link_poll(request, env).await,
         (Method::Get, "/validate") => validate(request, env).await,
         (Method::Get | Method::Post, "/logout") => logout(request, env).await,
         _ if known_route_path(route_path) => json_status(
@@ -5783,7 +5802,63 @@ async fn password_login(mut request: Request, env: Env) -> worker::Result<Respon
         return rate_limit_error_json(blocked.retry_after_seconds);
     }
 
-    let Some(credential) = get_local_credential(&db, &email).await? else {
+    let credential_opt = get_local_credential(&db, &email).await?;
+    if credential_opt.is_none() {
+        let allow_signup = binding_value_from_env(&env, "PASSWORD_ALLOW_SIGNUP")
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if allow_signup {
+            if let Err(error) = validate_local_auth_password(&body.password) {
+                return oauth_error_json("invalid_request", error, 400);
+            }
+            let Some(confirm_password) = body.confirm_password.as_deref() else {
+                return json_status(
+                    &serde_json::json!({"needConfirm": true}),
+                    202,
+                );
+            };
+            if confirm_password != body.password {
+                return oauth_error_json("invalid_request", "passwords do not match", 400);
+            }
+            let existing_user = get_user_by_primary_email(&db, &email).await?;
+            let user_id = if let Some(user) = existing_user {
+                user.id
+            } else {
+                let id = format!("usr_{}", random_token()?);
+                insert_passkey_user(&db, &id, &email, None, now).await?;
+                id
+            };
+            let peppers = password_pepper_from_env(&env).map_err(worker_error)?;
+            let salt = random_token()?;
+            let password_hash =
+                password_hash_current(&body.password, &salt, peppers.current.value.as_slice())
+                    .await?;
+            upsert_local_credential(
+                &db,
+                &email,
+                &user_id,
+                &password_hash,
+                &salt,
+                &peppers.current.id,
+                PASSWORD_PBKDF2_ITERATIONS,
+                now,
+            )
+            .await?;
+            upsert_local_auth_identity(&db, &user_id, &email, None, "password", now).await?;
+            let response = issue_local_auth_session_response(
+                &request,
+                &db,
+                &config,
+                &client.id.0,
+                &user_id,
+                &return_to,
+                "password.register",
+                "password_register",
+                now,
+            )
+            .await?;
+            return Ok(response);
+        }
         let peppers = password_pepper_from_env(&env).map_err(worker_error)?;
         password_dummy_verify_with_config(&peppers, &body.password).await?;
         if let Some(blocked) =
@@ -5793,6 +5868,9 @@ async fn password_login(mut request: Request, env: Env) -> worker::Result<Respon
             return rate_limit_error_json(blocked.retry_after_seconds);
         }
         return oauth_error_json("invalid_grant", "invalid email or password", 401);
+    }
+    let Some(credential) = credential_opt else {
+        unreachable!()
     };
     let password_verification =
         local_auth_password_matches(&env, &credential, &body.password).await?;
@@ -6223,7 +6301,7 @@ async fn magic_link_request(mut request: Request, env: Env) -> worker::Result<Re
             RateLimitPolicy {
                 scope: RATE_LIMIT_SCOPE_MAGIC_LINK_REQUEST_IP,
                 window_seconds: 60 * 60,
-                max_attempts: 20,
+                max_attempts: 50,
             },
             ip.as_str(),
         ),
@@ -6231,7 +6309,7 @@ async fn magic_link_request(mut request: Request, env: Env) -> worker::Result<Re
             RateLimitPolicy {
                 scope: RATE_LIMIT_SCOPE_MAGIC_LINK_REQUEST_EMAIL,
                 window_seconds: 60 * 60,
-                max_attempts: 3,
+                max_attempts: 20,
             },
             email.as_str(),
         ),
@@ -6239,7 +6317,7 @@ async fn magic_link_request(mut request: Request, env: Env) -> worker::Result<Re
             RateLimitPolicy {
                 scope: RATE_LIMIT_SCOPE_MAGIC_LINK_REQUEST_CLIENT,
                 window_seconds: 60 * 60,
-                max_attempts: 20,
+                max_attempts: 100,
             },
             client.id.0.as_str(),
         ),
@@ -6258,9 +6336,14 @@ async fn magic_link_request(mut request: Request, env: Env) -> worker::Result<Re
     cleanup_expired_magic_links(&db, now).await?;
     let user = get_user_by_primary_email(&db, &email).await?;
     let policy_ok = validate_local_auth_client_email_policy(&client, &email).is_ok();
+    let allow_signup = binding_value_from_env(&env, "MAGIC_LINK_ALLOW_SIGNUP")
+        .map(|v| v.trim().to_lowercase() == "true")
+        .unwrap_or(false);
     let user_id = user.as_ref().map(|user| user.id.clone());
     let token = random_token()?;
     let token_hash = hash_secret(&token);
+    let poll_token = random_token()?;
+    let poll_token_hash = hash_secret(&poll_token);
     let audit_context = audit_request_context(&request).unwrap_or_default();
     let public_response = || {
         json_status(
@@ -6272,7 +6355,7 @@ async fn magic_link_request(mut request: Request, env: Env) -> worker::Result<Re
         )
     };
 
-    if !policy_ok || user.is_none() {
+    if !policy_ok || (user.is_none() && !allow_signup) {
         record_audit_event(
             &db,
             &request,
@@ -6289,9 +6372,38 @@ async fn magic_link_request(mut request: Request, env: Env) -> worker::Result<Re
         return public_response();
     }
 
+    // Create account on first magic link if signup is allowed
+    let user_id = if user.is_none() && allow_signup {
+        let new_id = format!("usr_{}", random_token()?);
+        let profile = ProviderProfile {
+            provider_id: ProviderId(LOCAL_AUTH_PROVIDER_ID.to_owned()),
+            subject: Subject(email.clone()),
+            email: Some(email.clone()),
+            email_verified: false,
+            display_name: None,
+            picture_url: None,
+        };
+        insert_user_from_profile(&db, &new_id, &profile, now).await?;
+        record_audit_event(
+            &db,
+            &request,
+            "magic_link.signup",
+            Some(&new_id),
+            Some(&client.id.0),
+            Some(LOCAL_AUTH_PROVIDER_ID),
+            serde_json::json!({}),
+            now,
+        )
+        .await;
+        Some(new_id)
+    } else {
+        user_id
+    };
+
     put_magic_link(
         &db,
         &token_hash,
+        &poll_token_hash,
         &email,
         user_id.as_deref(),
         &client.id.0,
@@ -6331,7 +6443,14 @@ async fn magic_link_request(mut request: Request, env: Env) -> worker::Result<Re
         now,
     )
     .await;
-    public_response()
+    json_status(
+        &serde_json::json!({
+            "ok": true,
+            "message": PUBLIC_LOCAL_AUTH_RESPONSE_MESSAGE,
+            "pollToken": poll_token,
+        }),
+        202,
+    )
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -6386,11 +6505,12 @@ async fn magic_link_consume(mut request: Request, env: Env) -> worker::Result<Re
     let now = unix_timestamp_seconds();
     let rate_limit_key = rate_limit_key_from_env(&env).map_err(worker_error)?;
     let origin = request_origin_for_config(&request, &config)?;
-    let Some(origin) = origin else {
-        return oauth_error_json("invalid_request", "Origin header is required", 403);
-    };
-    if !origin_matches_public_base_url(&origin, &config.public_base_url) {
-        return oauth_error_json("invalid_request", cors_disallowed_origin(&origin), 403);
+    if let Some(ref origin) = origin {
+        // "null" origin means the browser is hiding the real origin (e.g. after a cross-site
+        // redirect chain). The CSRF token already provides replay protection here.
+        if origin != "null" && !origin_matches_public_base_url(origin, &config.public_base_url) {
+            return oauth_error_json("invalid_request", cors_disallowed_origin(origin), 403);
+        }
     }
     let body = match local_auth_body_from_request::<MagicLinkConsumeRequest>(&mut request).await {
         Ok(body) => body,
@@ -6456,9 +6576,6 @@ async fn magic_link_consume(mut request: Request, env: Env) -> worker::Result<Re
     if let Err(error) = validate_magic_link(&row, now) {
         return oauth_error_json("invalid_request", error, 400);
     }
-    if !consume_magic_link(&db, &token_hash, now).await? {
-        return oauth_error_json("invalid_request", "magic link is invalid or expired", 400);
-    }
     let Some(client) = get_client(&db, &row.client_id).await? else {
         return oauth_error_json(
             "invalid_request",
@@ -6487,12 +6604,13 @@ async fn magic_link_consume(mut request: Request, env: Env) -> worker::Result<Re
         now,
     )
     .await?;
-    let response = json(&LocalAuthResponse {
-        ok: true,
-        return_to: issue.return_to,
-        user: userinfo_response(&issue.user, Some("email profile")),
-    })?;
-    with_set_cookie(
+    if !consume_magic_link(&db, &token_hash, &issue.session_id, now).await? {
+        return oauth_error_json("invalid_request", "magic link is invalid or expired", 400);
+    }
+    let return_to = url::Url::parse(&issue.return_to)
+        .map_err(|e| worker_error(format!("invalid return_to: {e}")))?;
+    let mut response = Response::redirect(return_to)?;
+    response = with_set_cookie(
         response,
         &session_cookie(
             &config.cookie_name,
@@ -6500,7 +6618,70 @@ async fn magic_link_consume(mut request: Request, env: Env) -> worker::Result<Re
             SESSION_TTL_SECONDS,
             config.cookie_domain.as_deref(),
         ),
+    )?;
+    Ok(response)
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn magic_link_poll(request: Request, env: Env) -> worker::Result<Response> {
+    let url = request.url()?;
+    let config = server_config(&env, &url);
+    let db = env.d1(D1_BINDING)?;
+    let now = unix_timestamp_seconds();
+    let origin = request_origin_for_config(&request, &config)?;
+    let Some(poll_token) = query_param(&url, "token").filter(|t| !t.trim().is_empty()) else {
+        return oauth_error_json("invalid_request", "missing poll token", 400);
+    };
+    let poll_token_hash = hash_secret(poll_token.trim());
+    let args = [worker::d1::D1Type::Text(&poll_token_hash)];
+    let row = db
+        .prepare(
+            "SELECT token_hash, poll_token_hash, email, user_id, client_id, return_to,
+                    created_at, expires_at, consumed_at, consumed_session_id, ip_hash, user_agent
+             FROM zeroth_magic_links WHERE poll_token_hash = ? LIMIT 1",
+        )
+        .bind_refs(&args)?
+        .first::<MagicLinkRow>(None)
+        .await?;
+    let Some(row) = row else {
+        return json_status(&serde_json::json!({"status": "not_found"}), 404);
+    };
+    if row.expires_at < now && row.consumed_at.is_none() {
+        return json_status(&serde_json::json!({"status": "expired"}), 200);
+    }
+    let Some(session_id) = row.consumed_session_id else {
+        return json_status(&serde_json::json!({"status": "pending"}), 200);
+    };
+    // Magic link was consumed on another device — issue a fresh session for this device
+    let Some(user_id) = row.user_id else {
+        return json_status(&serde_json::json!({"status": "pending"}), 200);
+    };
+    let issue = issue_local_auth_session(
+        &request,
+        &db,
+        &row.client_id,
+        &user_id,
+        &row.return_to,
+        "session.login",
+        "magic_link_poll",
+        now,
     )
+    .await?;
+    let _ = session_id; // original session was on the other device; issue a new one here
+    let response = json_status(
+        &serde_json::json!({"status": "complete", "returnTo": issue.return_to}),
+        200,
+    )?;
+    let response = with_set_cookie(
+        response,
+        &session_cookie(
+            &config.cookie_name,
+            &issue.session_id,
+            SESSION_TTL_SECONDS,
+            config.cookie_domain.as_deref(),
+        ),
+    )?;
+    with_cors_actual_headers(response, origin.as_deref())
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -6717,7 +6898,12 @@ async fn logout(request: Request, env: Env) -> worker::Result<Response> {
         Method::Post => {
             let origin = request_origin_for_config(&request, &config)?;
             let mut request = request;
-            let csrf_token = csrf_token_from_request(&mut request).await?;
+            let csrf_token = match csrf_token_from_request(&mut request).await {
+                Ok(token) => token,
+                Err(error) => {
+                    return oauth_error_json("invalid_request", error.to_string(), 403)
+                }
+            };
             if let Some(current) = &current {
                 if let Err(error) = validate_browser_session_mutation(
                     &request,
@@ -6732,7 +6918,21 @@ async fn logout(request: Request, env: Env) -> worker::Result<Response> {
                 )
                 .await?
                 {
-                    return oauth_error_json("invalid_request", error, 403);
+                    if let Err(_) = validate_browser_session_mutation(
+                        &request,
+                        &env,
+                        &db,
+                        &config,
+                        current.session.client_id.as_deref(),
+                        &current.session.id,
+                        CSRF_ROUTE_FAMILY_ACCOUNT,
+                        csrf_token.as_deref(),
+                        now,
+                    )
+                    .await?
+                    {
+                        return oauth_error_json("invalid_request", error, 403);
+                    }
                 }
                 revoke_session(&db, &current.session.id, now).await?;
                 revoke_refresh_token_family_for_session(
@@ -7201,12 +7401,18 @@ async fn hosted_account(request: Request, env: Env) -> worker::Result<Response> 
     let now = unix_timestamp_seconds();
     let current = current_session_from_request(&request, &db, &config, now).await?;
 
-    let mut client = None;
+    let mut registered_client = None;
     if let Some(current) = &current {
         if let Some(client_id) = current.session.client_id.as_deref() {
-            client = get_client(&db, client_id).await?;
+            registered_client = get_registered_client(&db, client_id).await?;
         }
     }
+    if registered_client.is_none() {
+        if let Some(client_id) = env_string(&env, "DEFAULT_LOGIN_CLIENT_ID") {
+            registered_client = get_registered_client(&db, &client_id).await?;
+        }
+    }
+    let client = registered_client.as_ref().map(|rc| rc.client.clone());
 
     let identities = if let Some(current) = &current {
         list_identities_for_user(&db, &current.user.id).await?
@@ -7237,11 +7443,17 @@ async fn hosted_account(request: Request, env: Env) -> worker::Result<Response> 
     ui_config.code_challenge = None;
     ui_config.code_challenge_method = None;
     ui_config.link_identities = true;
+    if current.is_none() {
+        ui_config.provider_authorize_path = "/login".to_owned();
+    }
     ui_config.csrf_token = current.as_ref().and_then(|current| {
         csrf_secret_from_env(&env)
             .ok()
             .map(|secret| csrf_token(&secret, &current.session.id, CSRF_ROUTE_FAMILY_ACCOUNT, now))
     });
+    if let Some(rc) = &registered_client {
+        apply_client_login_method_visibility(&mut ui_config, &rc.visible_login_methods);
+    }
 
     let mut state = ZerothUiState::new(ui_config).with_product_name(product_name_from_env(&env));
     state.providers = provider_ui_rows(&env, &identities, client.is_some());
@@ -7364,6 +7576,47 @@ async fn authorize(request: Request, env: Env) -> worker::Result<Response> {
             )
         }
     };
+    if provider_id.is_none() {
+        let now = unix_timestamp_seconds();
+        if let Some(current) = current_session_from_request(&request, &db, &config, now)
+            .await?
+            .filter(|current| {
+                authorization_request_may_reuse_session(&authorization_request, &current.session, now)
+            })
+        {
+            let zeroth_code = random_token()?;
+            put_authorization_code_for_request(
+                &db,
+                &zeroth_code,
+                &authorization_request,
+                &current.user.id,
+                Some(&current.session.id),
+                current.session.created_at,
+                now,
+            )
+            .await?;
+            record_audit_event(
+                &db,
+                &request,
+                "authorization.code.issue",
+                Some(&current.user.id),
+                Some(&authorization_request.client_id.0),
+                None,
+                serde_json::json!({
+                    "scope": authorization_request.scope.as_slice().join(" "),
+                    "mode": "session_reuse"
+                }),
+                now,
+            )
+            .await;
+
+            return redirect_to_authorization_request_client(
+                &authorization_request,
+                &config.issuer().issuer,
+                &zeroth_code,
+            );
+        }
+    }
     if authorization_request.prompt == AuthorizationPrompt::None {
         let now = unix_timestamp_seconds();
         let Some(current) = current_session_from_request(&request, &db, &config, now).await? else {
@@ -8767,7 +9020,7 @@ fn render_confirmation_document(
         })
         .collect::<String>();
     format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{}</title><style>body{{font:16px/1.5 system-ui,sans-serif;background:#f8fafc;color:#0f172a;margin:0;padding:2rem}}main{{max-width:32rem;margin:4rem auto;background:#fff;border:1px solid #cbd5e1;border-radius:1rem;padding:2rem;box-shadow:0 10px 30px rgba(15,23,42,.08)}}h1{{margin-top:0;font-size:1.5rem}}p{{margin:0 0 1rem}}form{{display:flex;gap:.75rem;align-items:center;flex-wrap:wrap}}button,a{{border-radius:.75rem;padding:.75rem 1rem;text-decoration:none;font:inherit}}button{{border:0;background:#0f172a;color:#fff;cursor:pointer}}a{{border:1px solid #cbd5e1;color:#0f172a;background:#fff}}</style></head><body><main><h1>{}</h1><p>{}</p><form method=\"post\" action=\"{}\">{}<button type=\"submit\">{}</button><a href=\"{}\">Cancel</a></form></main></body></html>",
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{}</title><style>body{{font:16px/1.5 system-ui,sans-serif;background:#f8fafc;color:#0f172a;margin:0;padding:2rem}}main{{max-width:32rem;margin:4rem auto;background:#fff;border:1px solid #cbd5e1;border-radius:1rem;padding:2rem;box-shadow:0 10px 30px rgba(15,23,42,.08)}}h1{{margin-top:0;font-size:1.5rem}}p{{margin:0 0 1rem}}form{{display:flex;gap:.75rem;align-items:center;flex-wrap:wrap}}button,a{{border-radius:.75rem;padding:.75rem 1rem;text-decoration:none;font:inherit}}button{{border:0;background:#0f172a;color:#fff;cursor:pointer}}a{{border:1px solid #cbd5e1;color:#0f172a;background:#fff}}</style></head><body><main><h1>{}</h1><p>{}</p><form id=\"cf\" method=\"post\" action=\"{}\">{}<button type=\"submit\">{}</button><a href=\"{}\">Cancel</a></form><div id=\"done\" style=\"display:none\"><p>You can close this window.</p></div></main><script>document.getElementById(\"cf\").addEventListener(\"submit\",async function(e){{e.preventDefault();const btn=this.querySelector(\"button[type=submit]\");if(btn)btn.disabled=true;try{{const r=await fetch(this.action,{{method:\"POST\",credentials:\"include\",redirect:\"manual\",body:new FormData(this)}});if(r.ok||r.type===\"opaqueredirect\"){{this.style.display=\"none\";document.getElementById(\"done\").style.display=\"\";return;}}}}catch(_){{}}if(btn)btn.disabled=false;}});</script></body></html>",
         html_escape(title),
         html_escape(heading),
         html_escape(message),
@@ -9725,6 +9978,7 @@ async fn cleanup_expired_wallet_challenges(
 async fn put_magic_link(
     db: &worker::d1::D1Database,
     token_hash: &str,
+    poll_token_hash: &str,
     email: &str,
     user_id: Option<&str>,
     client_id: &str,
@@ -9738,6 +9992,7 @@ async fn put_magic_link(
     let ip_hash = d1_optional_text(ip_hash);
     let args = [
         worker::d1::D1Type::Text(token_hash),
+        worker::d1::D1Type::Text(poll_token_hash),
         worker::d1::D1Type::Text(email),
         user_id,
         worker::d1::D1Type::Text(client_id),
@@ -9749,9 +10004,9 @@ async fn put_magic_link(
     ];
     db.prepare(
         "INSERT INTO zeroth_magic_links (
-             token_hash, email, user_id, client_id, return_to, created_at,
+             token_hash, poll_token_hash, email, user_id, client_id, return_to, created_at,
              expires_at, ip_hash, user_agent
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind_refs(&args)?
     .run()
@@ -9766,8 +10021,8 @@ async fn get_magic_link(
 ) -> worker::Result<Option<MagicLinkRow>> {
     let args = [worker::d1::D1Type::Text(token_hash)];
     db.prepare(
-        "SELECT token_hash, email, user_id, client_id, return_to, created_at,
-                expires_at, consumed_at, ip_hash, user_agent
+        "SELECT token_hash, poll_token_hash, email, user_id, client_id, return_to, created_at,
+                expires_at, consumed_at, consumed_session_id, ip_hash, user_agent
          FROM zeroth_magic_links
          WHERE token_hash = ?
          LIMIT 1",
@@ -9781,17 +10036,19 @@ async fn get_magic_link(
 async fn consume_magic_link(
     db: &worker::d1::D1Database,
     token_hash: &str,
+    session_id: &str,
     now: i32,
 ) -> worker::Result<bool> {
     let args = [
         worker::d1::D1Type::Integer(now),
+        worker::d1::D1Type::Text(session_id),
         worker::d1::D1Type::Text(token_hash),
         worker::d1::D1Type::Integer(now),
     ];
     let result = db
         .prepare(
             "UPDATE zeroth_magic_links
-             SET consumed_at = ?
+             SET consumed_at = ?, consumed_session_id = ?
              WHERE token_hash = ? AND consumed_at IS NULL AND expires_at > ?",
         )
         .bind_refs(&args)?
@@ -12366,7 +12623,7 @@ fn session_login_return_to_from_url(
 ) -> Result<String, String> {
     let return_to = query_param(url, "return_to")
         .or_else(|| query_param(url, "redirect_uri"))
-        .unwrap_or_else(|| format!("{}/account", issuer_base_url.trim_end_matches('/')));
+        .unwrap_or_else(|| format!("{}/", issuer_base_url.trim_end_matches('/')));
 
     validate_client_return_to(&return_to, client, Some(issuer_base_url))?;
     Ok(return_to)
@@ -15048,7 +15305,7 @@ async fn validate_browser_session_mutation(
     csrf_token: Option<&str>,
     now: i32,
 ) -> worker::Result<Result<(), String>> {
-    let Some(origin) = request_origin_for_config(request, config)? else {
+    let Some(origin) = request_origin(request)? else {
         return Ok(Err(
             "Origin header is required for browser session mutations".to_owned(),
         ));
@@ -16334,7 +16591,7 @@ fn passkey_return_to(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
-        .unwrap_or_else(|| format!("{}/account", config.issuer().issuer));
+        .unwrap_or_else(|| format!("{}/", config.issuer().issuer.trim_end_matches('/')));
     let value = if value.starts_with('/') {
         let mut target = request_url.clone();
         target.set_path(&value);
@@ -16947,6 +17204,9 @@ async fn validate_any_client_cors_origin(
     let Some(origin) = origin else {
         return Ok(Ok(()));
     };
+    if origin == "null" {
+        return Ok(Ok(()));
+    }
     if origin_allowed_by_any_client(db, origin).await? {
         Ok(Ok(()))
     } else {
@@ -16958,6 +17218,11 @@ fn validate_cors_origin(origin: Option<&str>, allowed_origins: &[String]) -> Res
     let Some(origin) = origin else {
         return Ok(());
     };
+    // "null" means the browser is protecting the actual origin (sandboxed iframe, privacy
+    // restrictions, cross-origin redirect). Treat it as opaque/unknown — allow through.
+    if origin == "null" {
+        return Ok(());
+    }
     if origin_allowed(allowed_origins, origin) {
         Ok(())
     } else {
@@ -17027,6 +17292,7 @@ fn cors_path(path: &str) -> bool {
             | "/magic-links"
             | "/magic-link/confirm"
             | "/magic-links/consume"
+            | "/magic-links/poll"
             | "/validate"
             | "/logout"
     )
@@ -17051,6 +17317,7 @@ fn cors_method_allowed(path: &str, method: &str) -> bool {
         "/magic-links" => method == "POST",
         "/magic-link/confirm" => method == "GET",
         "/magic-links/consume" => method == "POST",
+        "/magic-links/poll" => method == "GET",
         "/sessions" => method == "GET" || method == "DELETE",
         "/logout" => method == "GET" || method == "POST",
         _ => false,
@@ -19591,6 +19858,7 @@ fn json_status_no_store<T: Serialize>(value: &T, status: u16) -> worker::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::{params, Connection};
     use p256::pkcs8::{EncodePrivateKey, LineEnding};
     use rsa::{
         pkcs1v15::SigningKey as RsaPkcs1v15SigningKey,
@@ -19600,6 +19868,144 @@ mod tests {
         RsaPrivateKey,
     };
     use zeroth_oidc::PkceChallengeMethod;
+
+    fn sqlite_bootstrap() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        conn.execute_batch(zeroth_storage::SCHEMA_MIGRATIONS_CREATE_SQL)
+            .unwrap();
+
+        for migration in zeroth_storage::migrations::ALL {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+
+        for migration in zeroth_storage::migrations::ALL {
+            conn.execute(
+                "INSERT OR IGNORE INTO zeroth_schema_migrations (version, name, applied_at)
+                 VALUES (?, ?, ?)",
+                params![migration.version, migration.name, 1_780_000_000_i32],
+            )
+            .unwrap();
+        }
+
+        for column in zeroth_storage::compatibility::ALL {
+            if !sqlite_column_exists(&conn, column.table, column.name) {
+                let sql = column.alter_table_sql();
+                conn.execute_batch(&sql).unwrap();
+            }
+        }
+
+        conn
+    }
+
+    fn sqlite_column_exists(conn: &Connection, table: &str, column: &str) -> bool {
+        let pragma = format!("PRAGMA table_info({table})");
+        let mut statement = conn.prepare(&pragma).unwrap();
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        columns.iter().any(|name| name == column)
+    }
+
+    fn sqlite_seed_authorize_fixtures(conn: &Connection) {
+        conn.execute(
+            "INSERT INTO zeroth_users (
+                id, primary_email, display_name, picture_url, created_at, updated_at, disabled_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            params![
+                "usr_123",
+                Some("user@example.com"),
+                Some("Example User"),
+                Some("https://example.com/user.jpg"),
+                1_780_000_000_i32,
+                1_780_000_000_i32,
+                Option::<i32>::None,
+            ],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO zeroth_clients (
+                id, name, secret_hash, confidential, redirect_uris_json,
+                allowed_origins_json, allowed_email_domains_json, issuer_token_audience,
+                issuer_token_ttl_seconds, account_sharing_mode, account_tenant_id,
+                visible_login_methods_json, created_at, updated_at, disabled_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                "yl-web",
+                "YL Web",
+                Option::<String>::None,
+                0_i32,
+                r#"["https://yl.vin/auth/callback"]"#,
+                r#"["https://yl.vin"]"#,
+                "[]",
+                Option::<String>::None,
+                Option::<i32>::None,
+                "global",
+                "global",
+                "[]",
+                1_780_000_000_i32,
+                1_780_000_000_i32,
+                Option::<i32>::None,
+            ],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO zeroth_sessions (
+                id, user_id, client_id, created_at, expires_at, revoked_at, user_agent, ip_hash
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                "sess_123",
+                "usr_123",
+                "yl-web",
+                1_780_000_000_i32,
+                1_780_003_600_i32,
+                Option::<i32>::None,
+                Some("Mozilla/5.0"),
+                Some("ip-hash"),
+            ],
+        )
+        .unwrap();
+    }
+
+    fn sqlite_client_from_row(conn: &Connection, client_id: &str) -> Client {
+        let (name, redirect_uris_json, allowed_origins_json, allowed_email_domains_json, confidential): (
+            String,
+            String,
+            String,
+            String,
+            i32,
+        ) = conn
+            .query_row(
+                "SELECT name, redirect_uris_json, allowed_origins_json,
+                        allowed_email_domains_json, confidential
+                 FROM zeroth_clients
+                 WHERE id = ?",
+                params![client_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+
+        Client {
+            id: ClientId(client_id.to_owned()),
+            name,
+            redirect_uris: serde_json::from_str(&redirect_uris_json).unwrap(),
+            allowed_origins: serde_json::from_str(&allowed_origins_json).unwrap(),
+            allowed_email_domains: serde_json::from_str(&allowed_email_domains_json).unwrap(),
+            confidential: confidential != 0,
+        }
+    }
 
     #[test]
     fn discovery_uses_base_url() {
@@ -21896,7 +22302,7 @@ mod tests {
     }
 
     #[test]
-    fn session_login_return_to_defaults_to_hosted_account() {
+    fn session_login_return_to_defaults_to_home() {
         let client = Client {
             id: ClientId("wavey-browser".to_owned()),
             name: "Wavey Browser SSO".to_owned(),
@@ -21909,7 +22315,7 @@ mod tests {
 
         assert_eq!(
             session_login_return_to_from_url(&url, &client, "https://id.example.com").unwrap(),
-            "https://id.example.com/account"
+            "https://id.example.com/"
         );
     }
 
@@ -22004,6 +22410,63 @@ mod tests {
         )
         .unwrap()
         .is_none());
+    }
+
+    #[test]
+    fn sqlite_bootstrap_exposes_authorize_dependencies_for_yl_web() {
+        let conn = sqlite_bootstrap();
+        sqlite_seed_authorize_fixtures(&conn);
+
+        let client = sqlite_client_from_row(&conn, "yl-web");
+        assert_eq!(client.id, ClientId("yl-web".to_owned()));
+        assert_eq!(client.redirect_uris, vec!["https://yl.vin/auth/callback".to_owned()]);
+        assert_eq!(client.allowed_origins, vec!["https://yl.vin".to_owned()]);
+        assert!(client.allowed_email_domains.is_empty());
+        assert!(!client.confidential);
+
+        let authorize_request = AuthorizationRequest {
+            client_id: ClientId("yl-web".to_owned()),
+            redirect_uri: "https://yl.vin/auth/callback".to_owned(),
+            scope: zeroth_core::ScopeSet::new(["openid", "profile", "email"]),
+            state: Some("state-123".to_owned()),
+            nonce: Some("nonce-123".to_owned()),
+            prompt: AuthorizationPrompt::Default,
+            max_age: None,
+            code_challenge: Some("challenge-123".to_owned()),
+            code_challenge_method: Some(PkceChallengeMethod::S256),
+        };
+
+        validate_authorization_request_for_client(&authorize_request, &client).unwrap();
+
+        let session_client_id: String = conn
+            .query_row(
+                "SELECT client_id FROM zeroth_sessions WHERE id = ? AND revoked_at IS NULL",
+                params!["sess_123"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(session_client_id, "yl-web");
+
+        let active_session_count: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM zeroth_sessions
+                 WHERE user_id = ? AND revoked_at IS NULL AND expires_at > ?",
+                params!["usr_123", 1_780_000_100_i32],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active_session_count, 1);
+
+        let migration_versions = conn
+            .prepare(
+                "SELECT version FROM zeroth_schema_migrations ORDER BY version",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, i32>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(migration_versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
     }
 
     #[test]

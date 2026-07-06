@@ -16,6 +16,7 @@ members = [
     "crates/zeroth-storage",
     "crates/zeroth-ui",
     "crates/zeroth-worker",
+    "crates/zeroth-web-auth",
 ]
 resolver = "2"
 
@@ -37,6 +38,7 @@ zeroth-server = { version = "0.1.0", path = "crates/zeroth-server" }
 zeroth-storage = { version = "0.1.0", path = "crates/zeroth-storage" }
 zeroth-ui = { version = "0.1.0", path = "crates/zeroth-ui" }
 zeroth-worker = { version = "0.1.0", path = "crates/zeroth-worker" }
+zeroth-web-auth = { version = "0.1.0", path = "crates/zeroth-web-auth" }
 base64 = "0.22"
 console_error_panic_hook = "0.1"
 hmac = "0.12"

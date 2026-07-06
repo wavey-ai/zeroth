@@ -1423,7 +1423,7 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
         view! {
             <div class="zeroth-auth-group">
                 <div class="zeroth-divider">"Magic link"</div>
-                <form class="zeroth-form zeroth-login-form" method="post" action=magic_link_action.clone() data-zeroth-local-auth="magic-link">
+                <form id="zeroth-magic-link-form" class="zeroth-form zeroth-login-form" method="post" action=magic_link_action.clone() data-zeroth-local-auth="magic-link">
                     <input type="hidden" name="clientId" value=config.client_id.clone() />
                     <input type="hidden" name="returnTo" value=login_return_to.clone() />
                     <div class="zeroth-login-actions">
@@ -1434,6 +1434,10 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
                         <button class="zeroth-action" type="submit">"Send link"</button>
                     </div>
                 </form>
+                <div id="zeroth-magic-link-waiting" style="display:none" class="zeroth-login-actions">
+                    <p class="zeroth-row-meta">"Check your email — click the link to sign in. This page will update automatically."</p>
+                    <button class="zeroth-action" type="button" onclick="document.getElementById('zeroth-magic-link-form').style.display='';document.getElementById('zeroth-magic-link-waiting').style.display='none';zerothMagicLinkStopPolling();">"Use a different email"</button>
+                </div>
             </div>
         }
     });
@@ -1581,8 +1585,11 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
                                                 <label for="zeroth-login-password">"Password"</label>
                                                 <input id="zeroth-login-password" name="password" type="password" autocomplete="current-password" />
                                             </div>
+                                            <div class="zeroth-field zeroth-password-confirm-field" style="display:none">
+                                                <label for="zeroth-login-confirm-password">"Confirm password"</label>
+                                                <input id="zeroth-login-confirm-password" name="confirmPassword" type="password" autocomplete="new-password" />
+                                            </div>
                                             <button class="zeroth-action zeroth-primary" type="submit">"Sign in"</button>
-                                            <button class="zeroth-action" type="submit" formaction=password_register_action data-zeroth-local-mode="password-register">"Create account"</button>
                                         </div>
                                     </form>
 
@@ -2981,7 +2988,7 @@ async function zerothSignInWithPasskey(button) {
     zerothAuthenticationCredentialPayload(credential)
   );
   zerothSetPasskeyStatus("Signed in");
-  window.location.assign((result && result.returnTo) || payload.returnTo || "/account");
+  window.location.assign((result && result.returnTo) || payload.returnTo || "/");
 }
 
 async function zerothSignInWithWallet(button) {
@@ -3030,7 +3037,7 @@ async function zerothSignInWithWallet(button) {
     }
   );
   zerothSetWalletStatus("Signed in");
-  window.location.assign((result && result.returnTo) || payload.returnTo || "/account");
+  window.location.assign((result && result.returnTo) || payload.returnTo || "/");
 }
 
 function zerothSubmitAction(form, submitter) {
@@ -3043,6 +3050,53 @@ function zerothSubmitAction(form, submitter) {
   }
   const action = form.getAttribute("action");
   return action ? new URL(action, window.location.href).toString() : form.action;
+}
+
+let zerothMagicLinkPollTimer = null;
+
+function zerothMagicLinkStartPolling(returnTo, pollToken) {
+  zerothMagicLinkStopPolling();
+  const poll = async () => {
+    try {
+      let url, resp, data;
+      if (pollToken) {
+        url = new URL("/magic-links/poll", window.location.href);
+        url.searchParams.set("token", pollToken);
+        resp = await fetch(url.toString(), { credentials: "include", headers: { Accept: "application/json" } });
+        if (resp.ok) {
+          data = await resp.json();
+          if (data && data.status === "complete") {
+            zerothMagicLinkStopPolling();
+            window.location.assign(data.returnTo || returnTo);
+            return;
+          }
+          if (data && (data.status === "expired" || data.status === "not_found")) {
+            zerothMagicLinkStopPolling();
+            return;
+          }
+        }
+      } else {
+        resp = await fetch("/session", { credentials: "include", headers: { Accept: "application/json" } });
+        if (resp.ok) {
+          data = await resp.json();
+          if (data && data.authenticated) {
+            zerothMagicLinkStopPolling();
+            window.location.assign(returnTo);
+            return;
+          }
+        }
+      }
+    } catch (_) {}
+    zerothMagicLinkPollTimer = window.setTimeout(poll, 3000);
+  };
+  zerothMagicLinkPollTimer = window.setTimeout(poll, 3000);
+}
+
+function zerothMagicLinkStopPolling() {
+  if (zerothMagicLinkPollTimer !== null) {
+    window.clearTimeout(zerothMagicLinkPollTimer);
+    zerothMagicLinkPollTimer = null;
+  }
 }
 
 function zerothBindSectionNav() {
@@ -3089,6 +3143,8 @@ document.addEventListener("submit", async (event) => {
     };
     if (mode !== "magic-link") {
       payload.password = String(data.get("password") || "");
+      const confirmPassword = String(data.get("confirmPassword") || "");
+      if (confirmPassword) payload.confirmPassword = confirmPassword;
     }
     const action = zerothSubmitAction(form, submitter);
     const response = await fetch(action, {
@@ -3108,9 +3164,24 @@ document.addEventListener("submit", async (event) => {
       window.location.assign(body.returnTo);
       return;
     }
+    if (response.ok && body.needConfirm) {
+      const confirmField = form.querySelector(".zeroth-password-confirm-field");
+      if (confirmField) {
+        confirmField.style.display = "";
+        const confirmInput = confirmField.querySelector("input");
+        if (confirmInput) confirmInput.focus();
+      }
+      return;
+    }
     if (response.ok) {
       if (mode === "magic-link") {
-        window.alert(body && body.sent ? "Magic link sent" : "Magic link email could not be sent");
+        const formEl = document.getElementById("zeroth-magic-link-form");
+        const waitEl = document.getElementById("zeroth-magic-link-waiting");
+        if (formEl) formEl.style.display = "none";
+        if (waitEl) waitEl.style.display = "";
+        const returnTo = payload.returnTo || window.location.href;
+        const pollToken = body && body.pollToken;
+        zerothMagicLinkStartPolling(returnTo, pollToken);
       }
       return;
     }
@@ -3140,6 +3211,9 @@ document.addEventListener("submit", async (event) => {
   const csrf = zerothCsrfToken(form);
   if (csrf) {
     options.headers["X-Zeroth-CSRF"] = csrf;
+  }
+  if (method === "POST") {
+    options.body = new FormData(form);
   }
   if (method === "PATCH") {
     const data = new FormData(form);
