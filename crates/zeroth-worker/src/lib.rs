@@ -7890,7 +7890,9 @@ async fn hosted_authorization_document(
     };
 
     let mut ui_config = ui_config_from_authorization_request(&config, authorization_request);
-    ui_config.return_to = query_param(url, "return_to");
+    // Local authentication creates the browser session first. Return through the
+    // original authorization request so that it can issue the OAuth code.
+    ui_config.return_to = Some(url.to_string());
     ui_config.link_identities = false;
     ui_config.csrf_token = current.as_ref().and_then(|current| {
         csrf_secret_from_env(env)
@@ -12916,7 +12918,10 @@ fn return_to_is_hosted_url(url: &url::Url, issuer_base_url: Option<&str>) -> boo
     };
     matches!(url.scheme(), "http" | "https")
         && url.origin() == issuer_url.origin()
-        && matches!(url.path(), "/" | "/account" | "/admin" | "/admin/clients")
+        && matches!(
+            url.path(),
+            "/" | "/account" | "/admin" | "/admin/clients" | "/authorize"
+        )
 }
 
 fn identity_link_return_url(
@@ -22303,6 +22308,16 @@ mod tests {
             identity_link_return_to_from_url(&url, &client, Some("https://id.example.com"))
                 .unwrap(),
             "https://id.example.com/admin/clients"
+        );
+
+        let url = url::Url::parse(
+            "https://id.example.com/identities/link?return_to=https%3A%2F%2Fid.example.com%2Fauthorize%3Fclient_id%3Dweb",
+        )
+        .unwrap();
+        assert_eq!(
+            identity_link_return_to_from_url(&url, &client, Some("https://id.example.com"))
+                .unwrap(),
+            "https://id.example.com/authorize?client_id=web"
         );
 
         let url = url::Url::parse(
