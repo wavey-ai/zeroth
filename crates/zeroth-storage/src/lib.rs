@@ -137,6 +137,18 @@ pub mod migrations {
         sql: include_str!("../migrations/0009_rate_limits.sql"),
     };
 
+    pub const MAGIC_LINK_POLL_TOKEN: Migration = Migration {
+        version: 10,
+        name: "magic_link_poll_token",
+        sql: include_str!("../migrations/0010_magic_link_poll_token.sql"),
+    };
+
+    pub const PASSKEY_METADATA: Migration = Migration {
+        version: 11,
+        name: "passkey_metadata",
+        sql: include_str!("../migrations/0011_passkey_metadata.sql"),
+    };
+
     pub const ALL: &[Migration] = &[
         INIT,
         PASSKEYS,
@@ -147,6 +159,8 @@ pub mod migrations {
         CLIENT_LOGIN_METHODS,
         PASSWORD_HASHING,
         RATE_LIMITS,
+        MAGIC_LINK_POLL_TOKEN,
+        PASSKEY_METADATA,
     ];
 }
 
@@ -291,7 +305,7 @@ mod tests {
         for table in ["zeroth_passkey_credentials", "zeroth_passkey_challenges"] {
             assert!(sql.contains(table), "missing table {table}");
         }
-        assert_eq!(migrations::ALL.len(), 9);
+        assert_eq!(migrations::ALL.len(), 11);
         assert_eq!(migrations::ALL[1].version, 2);
     }
 
@@ -324,7 +338,7 @@ mod tests {
         assert!(sql.contains("account_sharing_mode TEXT NOT NULL DEFAULT 'global'"));
         assert!(sql.contains("account_tenant_id TEXT NOT NULL DEFAULT 'global'"));
         assert!(sql.contains("INSERT OR IGNORE INTO zeroth_account_identities"));
-        assert_eq!(migrations::ALL.len(), 9);
+        assert_eq!(migrations::ALL.len(), 11);
         assert_eq!(migrations::ALL[4].version, 5);
     }
 
@@ -335,7 +349,7 @@ mod tests {
         assert!(sql.contains("zeroth_wallet_challenges"));
         assert!(sql.contains("challenge_hash TEXT PRIMARY KEY"));
         assert!(sql.contains("account_namespace TEXT NOT NULL"));
-        assert_eq!(migrations::ALL.len(), 9);
+        assert_eq!(migrations::ALL.len(), 11);
         assert_eq!(migrations::ALL[5].version, 6);
     }
 
@@ -344,8 +358,20 @@ mod tests {
         let sql = migrations::CLIENT_LOGIN_METHODS.sql;
 
         assert!(sql.contains("visible_login_methods_json TEXT NOT NULL DEFAULT '[]'"));
-        assert_eq!(migrations::ALL.len(), 9);
+        assert_eq!(migrations::ALL.len(), 11);
         assert_eq!(migrations::ALL[6].version, 7);
+    }
+
+    #[test]
+    fn passkey_metadata_migration_captures_discoverable_credential_state() {
+        let sql = migrations::PASSKEY_METADATA.sql;
+
+        assert!(sql.contains("passkey_user_handle TEXT"));
+        assert!(sql.contains("user_handle TEXT"));
+        assert!(sql.contains("transports_json TEXT NOT NULL DEFAULT '[]'"));
+        assert!(sql.contains("backup_eligible INTEGER NOT NULL DEFAULT 0"));
+        assert!(sql.contains("backup_state INTEGER NOT NULL DEFAULT 0"));
+        assert_eq!(migrations::ALL[10].version, 11);
     }
 
     #[test]
@@ -367,6 +393,16 @@ mod tests {
         assert!(sql.contains("PRIMARY KEY (scope, subject_hash, bucket_start)"));
         assert!(sql.contains("idx_zeroth_rate_limits_updated_at"));
         assert_eq!(migrations::ALL[8].version, 9);
+    }
+
+    #[test]
+    fn magic_link_poll_migration_uses_an_opaque_unique_token() {
+        let sql = migrations::MAGIC_LINK_POLL_TOKEN.sql;
+
+        assert!(sql.contains("poll_token_hash TEXT"));
+        assert!(sql.contains("consumed_session_id TEXT"));
+        assert!(sql.contains("CREATE UNIQUE INDEX"));
+        assert_eq!(migrations::ALL[9].version, 10);
     }
 
     #[test]

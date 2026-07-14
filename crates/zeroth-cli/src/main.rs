@@ -406,12 +406,19 @@ fn print_schema(options: SchemaOptions) -> Result<(), String> {
             Ok(())
         }
         SchemaOutputFormat::Lines => {
-            for statement in schema_statements(options.only) {
-                println!("{statement}");
-            }
+            print!("{}", schema_lines(options.only));
             Ok(())
         }
     }
+}
+
+fn schema_lines(only: SchemaOnly) -> String {
+    let mut output = String::new();
+    for statement in schema_statements(only) {
+        output.push_str(&statement.split_whitespace().collect::<Vec<_>>().join(" "));
+        output.push('\n');
+    }
+    output
 }
 
 fn schema_sql(only: SchemaOnly) -> String {
@@ -1008,6 +1015,21 @@ mod tests {
         assert!(statements
             .iter()
             .all(|statement| !statement.ends_with(';') && !statement.trim().is_empty()));
+    }
+
+    #[test]
+    fn schema_lines_render_one_statement_per_physical_line() {
+        let statements = schema_statements(SchemaOnly::Migrations);
+        let output = schema_lines(SchemaOnly::Migrations);
+        let lines = output.lines().collect::<Vec<_>>();
+
+        assert_eq!(lines.len(), statements.len());
+        assert!(lines
+            .iter()
+            .all(|line| !line.contains('\n') && !line.ends_with(';') && !line.is_empty()));
+        assert!(lines
+            .iter()
+            .any(|line| line.starts_with("CREATE TABLE IF NOT EXISTS zeroth_clients (")));
     }
 
     #[test]

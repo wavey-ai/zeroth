@@ -6,7 +6,8 @@ use std::time::SystemTime;
 
 pub const PASSWORD_SCHEME_PBKDF2_SHA256: &str = "pbkdf2-sha256";
 pub const PASSWORD_CURRENT_VERSION: i32 = 2;
-pub const PASSWORD_PBKDF2_ITERATIONS: u32 = 150_000;
+// Cloudflare Workers WebCrypto rejects PBKDF2 iteration counts above 100,000.
+pub const PASSWORD_PBKDF2_ITERATIONS: u32 = 100_000;
 pub const PASSWORD_PBKDF2_MIN_ITERATIONS: u32 = 1_000;
 pub const PASSWORD_PBKDF2_MAX_ITERATIONS: u32 = 1_000_000;
 

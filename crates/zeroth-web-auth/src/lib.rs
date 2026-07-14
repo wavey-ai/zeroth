@@ -4,7 +4,11 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{collections::HashMap, fmt, time::{SystemTime, UNIX_EPOCH}};
+use std::{
+    collections::HashMap,
+    fmt,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use url::Url;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -342,7 +346,10 @@ mod tests {
             absolute_return_to(&origin, Some("/play"), "/").to_string(),
             "https://yl.vin/play"
         );
-        let appended = append_query(&Url::parse("https://yl.vin/path?a=1").unwrap(), &[("b", "2"), ("c", "")]);
+        let appended = append_query(
+            &Url::parse("https://yl.vin/path?a=1").unwrap(),
+            &[("b", "2"), ("c", "")],
+        );
         assert_eq!(appended.to_string(), "https://yl.vin/path?a=1&b=2");
     }
 }

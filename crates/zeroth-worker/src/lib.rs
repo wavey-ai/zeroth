@@ -117,7 +117,7 @@ const EVM_WALLET_MESSAGE_MAX_BYTES: usize = 2048;
 const EVM_WALLET_SIGNATURE_HEX_BYTES: usize = 65;
 const LOCAL_AUTH_BODY_LIMIT: usize = 8 * 1024;
 const LOCAL_AUTH_PROVIDER_ID: &str = "zeroth";
-const PASSWORD_MIN_BYTES: usize = 8;
+const PASSWORD_MIN_CHARS: usize = 15;
 const PASSWORD_MAX_BYTES: usize = 1024;
 const PASSWORD_PEPPER_ENV: &str = "PASSWORD_PEPPER";
 const PASSWORD_PEPPER_ID_ENV: &str = "PASSWORD_PEPPER_ID";
@@ -188,6 +188,8 @@ const DEFAULT_NATIVE_TOKEN_SCOPE: &str = "openid profile email";
 const CORS_ALLOW_METHODS: &str = "GET, POST, PATCH, DELETE, OPTIONS";
 const CORS_ALLOW_HEADERS: &str = "Authorization, Content-Type, X-Zeroth-Token-Purpose";
 const CORS_MAX_AGE_SECONDS: &str = "600";
+const HTML_CONTENT_SECURITY_POLICY: &str = "default-src 'none'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self'; font-src 'self' data:; manifest-src 'self'";
+const PERMISSIONS_POLICY: &str = "camera=(), geolocation=(), microphone=(), payment=(), publickey-credentials-create=(self), publickey-credentials-get=(self), usb=()";
 const ZEROTH_FAVICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><defs><linearGradient id="g" x1="0" x2="1" y1="0" y2="1"><stop stop-color="#2d333b"/><stop offset="0.58" stop-color="#1f2328"/><stop offset="1" stop-color="#0b0f19"/></linearGradient></defs><rect width="64" height="64" rx="12" fill="url(#g)"/><path d="M17 16h30L25 48h25" fill="none" stroke="#f9fafb" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/></svg>"##;
 const ZEROTH_PROFILE_MENU_JS: &str = r###"
 (() => {
@@ -2039,6 +2041,12 @@ struct IdentityCountRow {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+struct PasskeyUserHandleRow {
+    #[serde(default)]
+    passkey_user_handle: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct TableColumnRow {
     name: String,
 }
@@ -2070,10 +2078,16 @@ struct PasskeyCredentialRow {
     credential_id: String,
     user_id: String,
     #[serde(default)]
+    user_handle: Option<String>,
+    #[serde(default)]
     label: Option<String>,
     public_key_x: String,
     public_key_y: String,
-    sign_count: i32,
+    public_key_alg: i32,
+    transports_json: String,
+    backup_eligible: i32,
+    backup_state: i32,
+    sign_count: i64,
     created_at: i32,
     updated_at: i32,
     #[serde(default)]
@@ -2089,6 +2103,8 @@ struct PasskeyChallengeRow {
     kind: String,
     #[serde(default)]
     user_id: Option<String>,
+    #[serde(default)]
+    user_handle: Option<String>,
     #[serde(default)]
     client_id: Option<String>,
     #[serde(default)]
@@ -2299,6 +2315,14 @@ struct MagicLinkConsumeRequest {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[serde(rename_all = "camelCase")]
+struct MagicLinkPollRequest {
+    #[serde(alias = "token")]
+    poll_token: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 struct WalletChallengeRequest {
     address: String,
     #[serde(alias = "chain_id")]
@@ -2465,6 +2489,8 @@ struct PasskeyCredentialDescriptor {
     #[serde(rename = "type")]
     credential_type: &'static str,
     id: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    transports: Vec<String>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
@@ -2491,7 +2517,9 @@ struct PasskeyCredentialPublicKey {
 struct ParsedAuthenticatorData {
     rp_id_hash: Vec<u8>,
     flags: u8,
-    sign_count: i32,
+    sign_count: i64,
+    backup_eligible: bool,
+    backup_state: bool,
     credential_id: Option<Vec<u8>>,
     public_key: Option<PasskeyCredentialPublicKey>,
 }
@@ -2501,7 +2529,18 @@ struct ValidatedPasskeyRegistration {
     credential_id: String,
     public_key_x: String,
     public_key_y: String,
-    sign_count: i32,
+    public_key_alg: i32,
+    transports: Vec<String>,
+    sign_count: i64,
+    backup_eligible: bool,
+    backup_state: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct ValidatedPasskeyAuthentication {
+    user_handle: String,
+    sign_count: i64,
+    backup_state: bool,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -3003,7 +3042,7 @@ async fn handle_request(request: Request, env: Env) -> worker::Result<Response> 
     let canonical_path = canonical_route_path(url.path());
     let route_path = canonical_path.as_ref();
 
-    match (request.method(), route_path) {
+    let response = match (request.method(), route_path) {
         (Method::Options, path) if cors_path(path) => cors_preflight(request, env).await,
         (Method::Get, "/") => redirect_to_path(&url, "/login"),
         (Method::Get, "/health") => json(&HealthResponse {
@@ -3084,7 +3123,7 @@ async fn handle_request(request: Request, env: Env) -> worker::Result<Response> 
         (Method::Post, "/magic-links") => magic_link_request(request, env).await,
         (Method::Get, "/magic-link/confirm") => magic_link_confirm(request, env).await,
         (Method::Post, "/magic-links/consume") => magic_link_consume(request, env).await,
-        (Method::Get, "/magic-links/poll") => magic_link_poll(request, env).await,
+        (Method::Post, "/magic-links/poll") => magic_link_poll(request, env).await,
         (Method::Get, "/validate") => validate(request, env).await,
         (Method::Get | Method::Post, "/logout") => logout(request, env).await,
         _ if known_route_path(route_path) => json_status(
@@ -3095,7 +3134,29 @@ async fn handle_request(request: Request, env: Env) -> worker::Result<Response> 
             405,
         ),
         _ => json_status(&serde_json::json!({ "error": "not_found" }), 404),
+    }?;
+    with_response_security_headers(response)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn with_response_security_headers(response: Response) -> worker::Result<Response> {
+    let headers = response.headers();
+    headers.set("X-Content-Type-Options", "nosniff")?;
+    headers.set("Referrer-Policy", "no-referrer")?;
+    headers.set("X-Frame-Options", "DENY")?;
+    headers.set("Permissions-Policy", PERMISSIONS_POLICY)?;
+    headers.set("Strict-Transport-Security", "max-age=31536000")?;
+
+    let content_type = headers.get("Content-Type")?.unwrap_or_default();
+    if content_type.to_ascii_lowercase().starts_with("text/html")
+        && headers.get("Content-Security-Policy")?.is_none()
+    {
+        headers.set("Content-Security-Policy", HTML_CONTENT_SECURITY_POLICY)?;
     }
+    if headers.get("Cache-Control")?.is_none() {
+        headers.set("Cache-Control", "no-store")?;
+    }
+    Ok(response)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -4916,10 +4977,19 @@ async fn passkey_register_options(mut request: Request, env: Env) -> worker::Res
             return oauth_error_json("invalid_request", error, 403);
         }
     }
-    let (user_id, email, display_name) = match passkey_registration_subject(current.as_ref(), &body)
-    {
-        Ok(subject) => subject,
-        Err(error) => return oauth_error_json("invalid_request", error, 400),
+    let (mut user_id, email, display_name) =
+        match passkey_registration_subject(current.as_ref(), &body) {
+            Ok(subject) => subject,
+            Err(error) => return oauth_error_json("invalid_request", error, 400),
+        };
+    if user_id.is_none() {
+        user_id = get_user_by_primary_email(&db, &email)
+            .await?
+            .map(|user| user.id);
+    }
+    let user_handle = match user_id.as_deref() {
+        Some(user_id) => ensure_passkey_user_handle(&db, user_id).await?,
+        None => random_token()?,
     };
     let client_id = match passkey_client_id_from_request(&env, body.client_id.as_deref()) {
         Ok(client_id) => client_id,
@@ -4988,6 +5058,7 @@ async fn passkey_register_options(mut request: Request, env: Env) -> worker::Res
         &challenge,
         "registration",
         user_id.as_deref(),
+        Some(&user_handle),
         Some(&client_id),
         Some(&return_to),
         Some(&email),
@@ -5004,6 +5075,7 @@ async fn passkey_register_options(mut request: Request, env: Env) -> worker::Res
             .map(|credential| PasskeyCredentialDescriptor {
                 credential_type: "public-key",
                 id: credential.credential_id,
+                transports: passkey_transports_from_json(&credential.transports_json),
             })
             .collect()
     } else {
@@ -5012,7 +5084,7 @@ async fn passkey_register_options(mut request: Request, env: Env) -> worker::Res
     let options = match passkey_creation_options(
         &config,
         &challenge,
-        user_id.as_deref().unwrap_or(&email),
+        &user_handle,
         &email,
         display_name.as_deref().unwrap_or(&email),
         exclude_credentials,
@@ -5177,7 +5249,18 @@ async fn passkey_register_verify(mut request: Request, env: Env) -> worker::Resu
 
     let (user_id, email, display_name) =
         ensure_passkey_registration_user(&db, &challenge, now).await?;
-    put_passkey_credential(&db, &validation, &user_id, challenge.label.as_deref(), now).await?;
+    let user_handle = challenge.user_handle.as_deref().ok_or_else(|| {
+        worker_error("passkey registration challenge has no user handle".to_owned())
+    })?;
+    put_passkey_credential(
+        &db,
+        &validation,
+        &user_id,
+        user_handle,
+        challenge.label.as_deref(),
+        now,
+    )
+    .await?;
     upsert_passkey_identity(
         &db,
         &user_id,
@@ -5295,6 +5378,7 @@ async fn passkey_authenticate_options(mut request: Request, env: Env) -> worker:
         &challenge,
         "authentication",
         None,
+        None,
         Some(&client_id),
         Some(&return_to),
         None,
@@ -5303,15 +5387,10 @@ async fn passkey_authenticate_options(mut request: Request, env: Env) -> worker:
         now,
     )
     .await?;
-    let allow_credentials = list_active_passkey_credentials(&db)
-        .await?
-        .into_iter()
-        .map(|credential| PasskeyCredentialDescriptor {
-            credential_type: "public-key",
-            id: credential.credential_id,
-        })
-        .collect();
-    let options = match passkey_request_options(&config, &challenge, allow_credentials) {
+    // An empty allowCredentials list is intentional: Zeroth registers resident
+    // credentials and lets the authenticator discover the account without
+    // disclosing every registered credential ID to the browser.
+    let options = match passkey_request_options(&config, &challenge, Vec::new()) {
         Ok(options) => options,
         Err(error) => return oauth_error_json("invalid_request", error, 400),
     };
@@ -5427,17 +5506,23 @@ async fn passkey_authenticate_verify(mut request: Request, env: Env) -> worker::
         }
         return oauth_error_json("invalid_request", "passkey credential is disabled", 400);
     }
-    if let Err(error) =
-        validate_passkey_authentication_response(&config, &body, &credential, &challenge)
-    {
-        if let Some(blocked) =
-            rate_limit_increment_subjects(&db, &rate_limit_key, now, &failure_rate_limit_subjects)
+    let authentication =
+        match validate_passkey_authentication_response(&config, &body, &credential, &challenge) {
+            Ok(authentication) => authentication,
+            Err(error) => {
+                if let Some(blocked) = rate_limit_increment_subjects(
+                    &db,
+                    &rate_limit_key,
+                    now,
+                    &failure_rate_limit_subjects,
+                )
                 .await?
-        {
-            return rate_limit_error_json(blocked.retry_after_seconds);
-        }
-        return oauth_error_json("invalid_request", error, 400);
-    }
+                {
+                    return rate_limit_error_json(blocked.retry_after_seconds);
+                }
+                return oauth_error_json("invalid_request", error, 400);
+            }
+        };
     if !consume_passkey_challenge(&db, &challenge.challenge_hash, now).await? {
         if let Some(blocked) =
             rate_limit_increment_subjects(&db, &rate_limit_key, now, &failure_rate_limit_subjects)
@@ -5447,13 +5532,7 @@ async fn passkey_authenticate_verify(mut request: Request, env: Env) -> worker::
         }
         return oauth_error_json("invalid_request", "passkey challenge was already used", 400);
     }
-    update_passkey_credential_use(
-        &db,
-        &credential.credential_id,
-        passkey_authenticator_sign_count(&body.response.authenticator_data)?,
-        now,
-    )
-    .await?;
+    update_passkey_credential_use(&db, &credential.credential_id, &authentication, now).await?;
     let Some(user) = get_user(&db, &credential.user_id).await? else {
         if let Some(blocked) =
             rate_limit_increment_subjects(&db, &rate_limit_key, now, &failure_rate_limit_subjects)
@@ -5634,7 +5713,7 @@ async fn password_register(mut request: Request, env: Env) -> worker::Result<Res
         None if existing_user.is_some() => None,
         None => {
             let user_id = format!("usr_{}", random_token()?);
-            insert_passkey_user(&db, &user_id, &email, display_name.as_deref(), now).await?;
+            insert_passkey_user(&db, &user_id, &email, display_name.as_deref(), None, now).await?;
             Some(user_id)
         }
     };
@@ -5812,10 +5891,7 @@ async fn password_login(mut request: Request, env: Env) -> worker::Result<Respon
                 return oauth_error_json("invalid_request", error, 400);
             }
             let Some(confirm_password) = body.confirm_password.as_deref() else {
-                return json_status(
-                    &serde_json::json!({"needConfirm": true}),
-                    202,
-                );
+                return json_status(&serde_json::json!({"needConfirm": true}), 202);
             };
             if confirm_password != body.password {
                 return oauth_error_json("invalid_request", "passwords do not match", 400);
@@ -5825,7 +5901,7 @@ async fn password_login(mut request: Request, env: Env) -> worker::Result<Respon
                 user.id
             } else {
                 let id = format!("usr_{}", random_token()?);
-                insert_passkey_user(&db, &id, &email, None, now).await?;
+                insert_passkey_user(&db, &id, &email, None, None, now).await?;
                 id
             };
             let peppers = password_pepper_from_env(&env).map_err(worker_error)?;
@@ -6292,9 +6368,6 @@ async fn magic_link_request(mut request: Request, env: Env) -> worker::Result<Re
     if let Err(error) = validate_local_auth_origin(&request, &db, &client, &config).await? {
         return oauth_error_json("invalid_request", error, 403);
     }
-    if let Err(error) = validate_local_auth_client_email_policy(&client, &email) {
-        return oauth_error_json(&error.code, &error.description, 403);
-    }
     let ip = rate_limit_request_ip(&request)?.unwrap_or_else(|| "missing".to_owned());
     let rate_limit_subjects = [
         rate_limit_subject(
@@ -6347,15 +6420,18 @@ async fn magic_link_request(mut request: Request, env: Env) -> worker::Result<Re
     let audit_context = audit_request_context(&request).unwrap_or_default();
     let public_response = || {
         json_status(
-            &PublicLocalAuthResponse {
-                ok: true,
-                message: PUBLIC_LOCAL_AUTH_RESPONSE_MESSAGE,
-            },
+            &serde_json::json!({
+                "ok": true,
+                "message": PUBLIC_LOCAL_AUTH_RESPONSE_MESSAGE,
+                "pollToken": poll_token,
+            }),
             202,
         )
     };
 
-    if !policy_ok || (user.is_none() && !allow_signup) {
+    let account_allowed = user.as_ref().is_some_and(|user| user.disabled_at.is_none())
+        || (user.is_none() && allow_signup);
+    if !policy_ok || !account_allowed {
         record_audit_event(
             &db,
             &request,
@@ -6371,34 +6447,6 @@ async fn magic_link_request(mut request: Request, env: Env) -> worker::Result<Re
         .await;
         return public_response();
     }
-
-    // Create account on first magic link if signup is allowed
-    let user_id = if user.is_none() && allow_signup {
-        let new_id = format!("usr_{}", random_token()?);
-        let profile = ProviderProfile {
-            provider_id: ProviderId(LOCAL_AUTH_PROVIDER_ID.to_owned()),
-            subject: Subject(email.clone()),
-            email: Some(email.clone()),
-            email_verified: false,
-            display_name: None,
-            picture_url: None,
-        };
-        insert_user_from_profile(&db, &new_id, &profile, now).await?;
-        record_audit_event(
-            &db,
-            &request,
-            "magic_link.signup",
-            Some(&new_id),
-            Some(&client.id.0),
-            Some(LOCAL_AUTH_PROVIDER_ID),
-            serde_json::json!({}),
-            now,
-        )
-        .await;
-        Some(new_id)
-    } else {
-        user_id
-    };
 
     put_magic_link(
         &db,
@@ -6586,11 +6634,24 @@ async fn magic_link_consume(mut request: Request, env: Env) -> worker::Result<Re
     if let Err(error) = validate_local_auth_client_email_policy(&client, &row.email) {
         return oauth_error_json(&error.code, &error.description, 403);
     }
-    let user_id = ensure_magic_link_user(&db, &row, now).await?;
+    let (user_id, user_created) = ensure_magic_link_user(&db, &row, now).await?;
     if let Some(user) = get_user(&db, &user_id).await? {
         if user.disabled_at.is_some() {
             return oauth_error_json("invalid_request", "user is disabled", 403);
         }
+    }
+    if user_created {
+        record_audit_event(
+            &db,
+            &request,
+            "magic_link.signup",
+            Some(&user_id),
+            Some(&row.client_id),
+            Some(LOCAL_AUTH_PROVIDER_ID),
+            serde_json::json!({}),
+            now,
+        )
+        .await;
     }
     upsert_local_auth_identity(&db, &user_id, &row.email, None, "magic_link", now).await?;
     let issue = issue_local_auth_session(
@@ -6604,7 +6665,7 @@ async fn magic_link_consume(mut request: Request, env: Env) -> worker::Result<Re
         now,
     )
     .await?;
-    if !consume_magic_link(&db, &token_hash, &issue.session_id, now).await? {
+    if !consume_magic_link(&db, &token_hash, &user_id, &issue.session_id, now).await? {
         return oauth_error_json("invalid_request", "magic link is invalid or expired", 400);
     }
     let return_to = url::Url::parse(&issue.return_to)
@@ -6623,13 +6684,22 @@ async fn magic_link_consume(mut request: Request, env: Env) -> worker::Result<Re
 }
 
 #[cfg(target_arch = "wasm32")]
-async fn magic_link_poll(request: Request, env: Env) -> worker::Result<Response> {
+async fn magic_link_poll(mut request: Request, env: Env) -> worker::Result<Response> {
     let url = request.url()?;
     let config = server_config(&env, &url);
     let db = env.d1(D1_BINDING)?;
     let now = unix_timestamp_seconds();
-    let origin = request_origin_for_config(&request, &config)?;
-    let Some(poll_token) = query_param(&url, "token").filter(|t| !t.trim().is_empty()) else {
+    let Some(origin) = request_origin(&request)? else {
+        return oauth_error_json("invalid_request", "Origin header is required", 403);
+    };
+    if origin == "null" || !origin_matches_public_base_url(&origin, &config.public_base_url) {
+        return oauth_error_json("invalid_request", cors_disallowed_origin(&origin), 403);
+    }
+    let body = match local_auth_body_from_request::<MagicLinkPollRequest>(&mut request).await {
+        Ok(body) => body,
+        Err(error) => return oauth_error_json("invalid_request", error, 400),
+    };
+    let Some(poll_token) = Some(body.poll_token).filter(|token| !token.trim().is_empty()) else {
         return oauth_error_json("invalid_request", "missing poll token", 400);
     };
     let poll_token_hash = hash_secret(poll_token.trim());
@@ -6656,6 +6726,9 @@ async fn magic_link_poll(request: Request, env: Env) -> worker::Result<Response>
     let Some(user_id) = row.user_id else {
         return json_status(&serde_json::json!({"status": "pending"}), 200);
     };
+    if !consume_magic_link_poll_token(&db, &poll_token_hash, now).await? {
+        return json_status(&serde_json::json!({"status": "consumed"}), 409);
+    }
     let issue = issue_local_auth_session(
         &request,
         &db,
@@ -6681,7 +6754,7 @@ async fn magic_link_poll(request: Request, env: Env) -> worker::Result<Response>
             config.cookie_domain.as_deref(),
         ),
     )?;
-    with_cors_actual_headers(response, origin.as_deref())
+    Ok(response)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -6900,9 +6973,7 @@ async fn logout(request: Request, env: Env) -> worker::Result<Response> {
             let mut request = request;
             let csrf_token = match csrf_token_from_request(&mut request).await {
                 Ok(token) => token,
-                Err(error) => {
-                    return oauth_error_json("invalid_request", error.to_string(), 403)
-                }
+                Err(error) => return oauth_error_json("invalid_request", error.to_string(), 403),
             };
             if let Some(current) = &current {
                 if let Err(error) = validate_browser_session_mutation(
@@ -7257,6 +7328,7 @@ fn known_route_path(path: &str) -> bool {
             | "/magic-links"
             | "/magic-link/confirm"
             | "/magic-links/consume"
+            | "/magic-links/poll"
             | "/validate"
             | "/logout"
     ) || quiet_browser_asset_path(path)
@@ -7581,7 +7653,11 @@ async fn authorize(request: Request, env: Env) -> worker::Result<Response> {
         if let Some(current) = current_session_from_request(&request, &db, &config, now)
             .await?
             .filter(|current| {
-                authorization_request_may_reuse_session(&authorization_request, &current.session, now)
+                authorization_request_may_reuse_session(
+                    &authorization_request,
+                    &current.session,
+                    now,
+                )
             })
         {
             let zeroth_code = random_token()?;
@@ -7894,7 +7970,10 @@ fn provider_ui_rows(
             identities,
         ),
     ];
-    providers.retain(|provider| !provider_disabled(env, &provider.id));
+    // Keep Google visible in the YL login surface even before its secret is configured.
+    providers.retain(|provider| {
+        !provider_disabled(env, &provider.id) || provider.id == well_known::GOOGLE
+    });
     for provider in &mut providers {
         provider.enabled = actions_enabled && provider_configured_for_login(env, &provider.id);
     }
@@ -9652,25 +9731,76 @@ async fn get_user_by_primary_email(
 }
 
 #[cfg(target_arch = "wasm32")]
+async fn ensure_passkey_user_handle(
+    db: &worker::d1::D1Database,
+    user_id: &str,
+) -> worker::Result<String> {
+    let select_args = [worker::d1::D1Type::Text(user_id)];
+    let existing = db
+        .prepare(
+            "SELECT passkey_user_handle
+             FROM zeroth_users
+             WHERE id = ?
+             LIMIT 1",
+        )
+        .bind_refs(&select_args)?
+        .first::<PasskeyUserHandleRow>(None)
+        .await?
+        .ok_or_else(|| worker_error("passkey user was not found".to_owned()))?;
+    if let Some(user_handle) = existing.passkey_user_handle {
+        return Ok(user_handle);
+    }
+
+    let candidate = random_token()?;
+    let update_args = [
+        worker::d1::D1Type::Text(&candidate),
+        worker::d1::D1Type::Text(user_id),
+    ];
+    db.prepare(
+        "UPDATE zeroth_users
+         SET passkey_user_handle = ?
+         WHERE id = ? AND passkey_user_handle IS NULL",
+    )
+    .bind_refs(&update_args)?
+    .run()
+    .await?;
+
+    db.prepare(
+        "SELECT passkey_user_handle
+         FROM zeroth_users
+         WHERE id = ?
+         LIMIT 1",
+    )
+    .bind_refs(&select_args)?
+    .first::<PasskeyUserHandleRow>(None)
+    .await?
+    .and_then(|row| row.passkey_user_handle)
+    .ok_or_else(|| worker_error("passkey user handle could not be stored".to_owned()))
+}
+
+#[cfg(target_arch = "wasm32")]
 async fn insert_passkey_user(
     db: &worker::d1::D1Database,
     user_id: &str,
     email: &str,
     display_name: Option<&str>,
+    passkey_user_handle: Option<&str>,
     now: i32,
 ) -> worker::Result<()> {
     let display_name = d1_optional_text(display_name);
+    let passkey_user_handle = d1_optional_text(passkey_user_handle);
     let args = [
         worker::d1::D1Type::Text(user_id),
         worker::d1::D1Type::Text(email),
         display_name,
+        passkey_user_handle,
         worker::d1::D1Type::Integer(now),
         worker::d1::D1Type::Integer(now),
     ];
     db.prepare(
         "INSERT INTO zeroth_users (
-             id, primary_email, display_name, created_at, updated_at
-         ) VALUES (?, ?, ?, ?, ?)",
+             id, primary_email, display_name, passkey_user_handle, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?)",
     )
     .bind_refs(&args)?
     .run()
@@ -9684,6 +9814,9 @@ async fn ensure_passkey_registration_user(
     challenge: &PasskeyChallengeRow,
     now: i32,
 ) -> worker::Result<(String, String, Option<String>)> {
+    let challenge_user_handle = challenge.user_handle.as_deref().ok_or_else(|| {
+        worker_error("passkey registration challenge has no user handle".to_owned())
+    })?;
     if let Some(user_id) = challenge.user_id.as_deref() {
         let Some(user) = get_user(db, user_id).await? else {
             return Err(worker_error(
@@ -9695,6 +9828,12 @@ async fn ensure_passkey_registration_user(
             .or_else(|| challenge.email.clone())
             .ok_or_else(|| worker_error("passkey registration user has no email".to_owned()))?;
         let display_name = challenge.display_name.clone().or(user.display_name);
+        let stored_user_handle = ensure_passkey_user_handle(db, user_id).await?;
+        if stored_user_handle != challenge_user_handle {
+            return Err(worker_error(
+                "passkey registration user handle changed; restart registration".to_owned(),
+            ));
+        }
         return Ok((user_id.to_owned(), email, display_name));
     }
 
@@ -9703,11 +9842,25 @@ async fn ensure_passkey_registration_user(
         .as_deref()
         .ok_or_else(|| worker_error("passkey registration challenge has no email".to_owned()))?;
     if let Some(user) = get_user_by_primary_email(db, email).await? {
+        let stored_user_handle = ensure_passkey_user_handle(db, &user.id).await?;
+        if stored_user_handle != challenge_user_handle {
+            return Err(worker_error(
+                "passkey registration account changed; restart registration".to_owned(),
+            ));
+        }
         return Ok((user.id, email.to_owned(), challenge.display_name.clone()));
     }
 
     let user_id = format!("usr_{}", random_token()?);
-    insert_passkey_user(db, &user_id, email, challenge.display_name.as_deref(), now).await?;
+    insert_passkey_user(
+        db,
+        &user_id,
+        email,
+        challenge.display_name.as_deref(),
+        Some(challenge_user_handle),
+        now,
+    )
+    .await?;
     Ok((user_id, email.to_owned(), challenge.display_name.clone()))
 }
 
@@ -10036,11 +10189,13 @@ async fn get_magic_link(
 async fn consume_magic_link(
     db: &worker::d1::D1Database,
     token_hash: &str,
+    user_id: &str,
     session_id: &str,
     now: i32,
 ) -> worker::Result<bool> {
     let args = [
         worker::d1::D1Type::Integer(now),
+        worker::d1::D1Type::Text(user_id),
         worker::d1::D1Type::Text(session_id),
         worker::d1::D1Type::Text(token_hash),
         worker::d1::D1Type::Integer(now),
@@ -10048,8 +10203,33 @@ async fn consume_magic_link(
     let result = db
         .prepare(
             "UPDATE zeroth_magic_links
-             SET consumed_at = ?, consumed_session_id = ?
+             SET consumed_at = ?, user_id = ?, consumed_session_id = ?
              WHERE token_hash = ? AND consumed_at IS NULL AND expires_at > ?",
+        )
+        .bind_refs(&args)?
+        .run()
+        .await?;
+    d1_result_changed_one(result)
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn consume_magic_link_poll_token(
+    db: &worker::d1::D1Database,
+    poll_token_hash: &str,
+    now: i32,
+) -> worker::Result<bool> {
+    let args = [
+        worker::d1::D1Type::Text(poll_token_hash),
+        worker::d1::D1Type::Integer(now),
+    ];
+    let result = db
+        .prepare(
+            "UPDATE zeroth_magic_links
+             SET poll_token_hash = NULL
+             WHERE poll_token_hash = ?
+               AND consumed_at IS NOT NULL
+               AND consumed_session_id IS NOT NULL
+               AND expires_at > ?",
         )
         .bind_refs(&args)?
         .run()
@@ -10083,16 +10263,16 @@ async fn ensure_magic_link_user(
     db: &worker::d1::D1Database,
     row: &MagicLinkRow,
     now: i32,
-) -> worker::Result<String> {
+) -> worker::Result<(String, bool)> {
     if let Some(user_id) = row.user_id.as_deref() {
-        return Ok(user_id.to_owned());
+        return Ok((user_id.to_owned(), false));
     }
     if let Some(user) = get_user_by_primary_email(db, &row.email).await? {
-        return Ok(user.id);
+        return Ok((user.id, false));
     }
     let user_id = format!("usr_{}", random_token()?);
-    insert_passkey_user(db, &user_id, &row.email, None, now).await?;
-    Ok(user_id)
+    insert_passkey_user(db, &user_id, &row.email, None, None, now).await?;
+    Ok((user_id, true))
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -10101,6 +10281,7 @@ async fn put_passkey_challenge(
     challenge: &str,
     kind: &str,
     user_id: Option<&str>,
+    user_handle: Option<&str>,
     client_id: Option<&str>,
     return_to: Option<&str>,
     email: Option<&str>,
@@ -10110,6 +10291,7 @@ async fn put_passkey_challenge(
 ) -> worker::Result<()> {
     let challenge_hash = hash_secret(challenge);
     let user_id = d1_optional_text(user_id);
+    let user_handle = d1_optional_text(user_handle);
     let client_id = d1_optional_text(client_id);
     let return_to = d1_optional_text(return_to);
     let email = d1_optional_text(email);
@@ -10119,6 +10301,7 @@ async fn put_passkey_challenge(
         worker::d1::D1Type::Text(&challenge_hash),
         worker::d1::D1Type::Text(kind),
         user_id,
+        user_handle,
         client_id,
         return_to,
         email,
@@ -10129,9 +10312,9 @@ async fn put_passkey_challenge(
     ];
     db.prepare(
         "INSERT INTO zeroth_passkey_challenges (
-             challenge_hash, kind, user_id, client_id, return_to, email,
+             challenge_hash, kind, user_id, user_handle, client_id, return_to, email,
              display_name, label, created_at, expires_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind_refs(&args)?
     .run()
@@ -10146,7 +10329,7 @@ async fn get_passkey_challenge_by_hash(
 ) -> worker::Result<Option<PasskeyChallengeRow>> {
     let args = [worker::d1::D1Type::Text(challenge_hash)];
     db.prepare(
-        "SELECT challenge_hash, kind, user_id, client_id, return_to, email,
+        "SELECT challenge_hash, kind, user_id, user_handle, client_id, return_to, email,
                 display_name, label, created_at, expires_at, consumed_at
          FROM zeroth_passkey_challenges
          WHERE challenge_hash = ?
@@ -10225,25 +10408,34 @@ async fn put_passkey_credential(
     db: &worker::d1::D1Database,
     credential: &ValidatedPasskeyRegistration,
     user_id: &str,
+    user_handle: &str,
     label: Option<&str>,
     now: i32,
 ) -> worker::Result<()> {
     let label = d1_optional_text(label);
+    let transports_json = serde_json::to_string(&credential.transports)
+        .map_err(|error| worker_error(error.to_string()))?;
     let args = [
         worker::d1::D1Type::Text(&credential.credential_id),
         worker::d1::D1Type::Text(user_id),
+        worker::d1::D1Type::Text(user_handle),
         label,
         worker::d1::D1Type::Text(&credential.public_key_x),
         worker::d1::D1Type::Text(&credential.public_key_y),
-        worker::d1::D1Type::Integer(credential.sign_count),
+        worker::d1::D1Type::Integer(credential.public_key_alg),
+        worker::d1::D1Type::Text(&transports_json),
+        worker::d1::D1Type::Boolean(credential.backup_eligible),
+        worker::d1::D1Type::Boolean(credential.backup_state),
+        worker::d1::D1Type::Real(credential.sign_count as f64),
         worker::d1::D1Type::Integer(now),
         worker::d1::D1Type::Integer(now),
     ];
     db.prepare(
         "INSERT INTO zeroth_passkey_credentials (
-             credential_id, user_id, label, public_key_x, public_key_y,
+             credential_id, user_id, user_handle, label, public_key_x, public_key_y,
+             public_key_alg, transports_json, backup_eligible, backup_state,
              sign_count, created_at, updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind_refs(&args)?
     .run()
@@ -10258,7 +10450,8 @@ async fn get_passkey_credential(
 ) -> worker::Result<Option<PasskeyCredentialRow>> {
     let args = [worker::d1::D1Type::Text(credential_id)];
     db.prepare(
-        "SELECT credential_id, user_id, label, public_key_x, public_key_y,
+        "SELECT credential_id, user_id, user_handle, label, public_key_x, public_key_y,
+                public_key_alg, transports_json, backup_eligible, backup_state,
                 sign_count, created_at, updated_at, last_used_at, disabled_at
          FROM zeroth_passkey_credentials
          WHERE credential_id = ?
@@ -10267,25 +10460,6 @@ async fn get_passkey_credential(
     .bind_refs(&args)?
     .first::<PasskeyCredentialRow>(None)
     .await
-}
-
-#[cfg(target_arch = "wasm32")]
-async fn list_active_passkey_credentials(
-    db: &worker::d1::D1Database,
-) -> worker::Result<Vec<PasskeyCredentialRow>> {
-    let args = [worker::d1::D1Type::Integer(PASSKEY_CREDENTIAL_LIST_LIMIT)];
-    db.prepare(
-        "SELECT credential_id, user_id, label, public_key_x, public_key_y,
-                sign_count, created_at, updated_at, last_used_at, disabled_at
-         FROM zeroth_passkey_credentials
-         WHERE disabled_at IS NULL
-         ORDER BY created_at DESC
-         LIMIT ?",
-    )
-    .bind_refs(&args)?
-    .all()
-    .await?
-    .results::<PasskeyCredentialRow>()
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -10298,7 +10472,8 @@ async fn list_passkey_credentials_for_user(
         worker::d1::D1Type::Integer(PASSKEY_CREDENTIAL_LIST_LIMIT),
     ];
     db.prepare(
-        "SELECT credential_id, user_id, label, public_key_x, public_key_y,
+        "SELECT credential_id, user_id, user_handle, label, public_key_x, public_key_y,
+                public_key_alg, transports_json, backup_eligible, backup_state,
                 sign_count, created_at, updated_at, last_used_at, disabled_at
          FROM zeroth_passkey_credentials
          WHERE user_id = ? AND disabled_at IS NULL
@@ -10315,19 +10490,23 @@ async fn list_passkey_credentials_for_user(
 async fn update_passkey_credential_use(
     db: &worker::d1::D1Database,
     credential_id: &str,
-    sign_count: i32,
+    authentication: &ValidatedPasskeyAuthentication,
     now: i32,
 ) -> worker::Result<()> {
     let args = [
-        worker::d1::D1Type::Integer(sign_count),
-        worker::d1::D1Type::Integer(sign_count),
+        worker::d1::D1Type::Text(&authentication.user_handle),
+        worker::d1::D1Type::Real(authentication.sign_count as f64),
+        worker::d1::D1Type::Real(authentication.sign_count as f64),
+        worker::d1::D1Type::Boolean(authentication.backup_state),
         worker::d1::D1Type::Integer(now),
         worker::d1::D1Type::Integer(now),
         worker::d1::D1Type::Text(credential_id),
     ];
     db.prepare(
         "UPDATE zeroth_passkey_credentials
-         SET sign_count = CASE WHEN ? > sign_count THEN ? ELSE sign_count END,
+         SET user_handle = COALESCE(user_handle, ?),
+             sign_count = CASE WHEN ? > sign_count THEN ? ELSE sign_count END,
+             backup_state = ?,
              last_used_at = ?,
              updated_at = ?
          WHERE credential_id = ?",
@@ -12737,7 +12916,7 @@ fn return_to_is_hosted_url(url: &url::Url, issuer_base_url: Option<&str>) -> boo
     };
     matches!(url.scheme(), "http" | "https")
         && url.origin() == issuer_url.origin()
-        && matches!(url.path(), "/account" | "/admin" | "/admin/clients")
+        && matches!(url.path(), "/" | "/account" | "/admin" | "/admin/clients")
 }
 
 fn identity_link_return_url(
@@ -14998,13 +15177,13 @@ fn evm_address_from_verifying_key(key: &EvmVerifyingKey) -> String {
 }
 
 fn validate_local_auth_password(value: &str) -> Result<(), String> {
-    let len = value.as_bytes().len();
-    if len < PASSWORD_MIN_BYTES {
+    let chars = value.chars().count();
+    if chars < PASSWORD_MIN_CHARS {
         return Err(format!(
-            "password must be at least {PASSWORD_MIN_BYTES} bytes"
+            "password must be at least {PASSWORD_MIN_CHARS} characters"
         ));
     }
-    if len > PASSWORD_MAX_BYTES {
+    if value.len() > PASSWORD_MAX_BYTES {
         return Err(format!(
             "password must be at most {PASSWORD_MAX_BYTES} bytes"
         ));
@@ -16648,7 +16827,7 @@ fn validate_passkey_label(value: Option<&str>) -> Result<Option<String>, String>
 fn passkey_creation_options(
     config: &ZerothServerConfig,
     challenge: &str,
-    user_id: &str,
+    user_handle: &str,
     email: &str,
     display_name: &str,
     exclude_credentials: Vec<PasskeyCredentialDescriptor>,
@@ -16660,7 +16839,7 @@ fn passkey_creation_options(
             name: passkey_rp_name(config),
         },
         user: PasskeyUserEntity {
-            id: URL_SAFE_NO_PAD.encode(user_id.as_bytes()),
+            id: user_handle.to_owned(),
             name: email.to_owned(),
             display_name: display_name.to_owned(),
         },
@@ -16781,11 +16960,16 @@ fn validate_passkey_registration_response(
     let public_key = auth_data
         .public_key
         .ok_or_else(|| "passkey registration did not include a public key".to_owned())?;
+    let transports = validate_passkey_transports(&body.response.transports)?;
     Ok(ValidatedPasskeyRegistration {
         credential_id,
         public_key_x: URL_SAFE_NO_PAD.encode(public_key.x),
         public_key_y: URL_SAFE_NO_PAD.encode(public_key.y),
+        public_key_alg: -7,
+        transports,
         sign_count: auth_data.sign_count,
+        backup_eligible: auth_data.backup_eligible,
+        backup_state: auth_data.backup_state,
     })
 }
 
@@ -16794,7 +16978,7 @@ fn validate_passkey_authentication_response(
     body: &PasskeyAuthenticateVerifyRequest,
     credential: &PasskeyCredentialRow,
     challenge: &PasskeyChallengeRow,
-) -> Result<(), String> {
+) -> Result<ValidatedPasskeyAuthentication, String> {
     let raw_id = passkey_raw_id(&body.raw_id)?;
     if passkey_raw_id(&body.id)? != raw_id || raw_id != credential.credential_id {
         return Err("passkey credential id did not match".to_owned());
@@ -16808,12 +16992,28 @@ fn validate_passkey_authentication_response(
     let authenticator_data_bytes = decode_base64url(&body.response.authenticator_data)?;
     let auth_data = parse_passkey_authenticator_data(&authenticator_data_bytes)?;
     validate_passkey_authenticator_data(config, &auth_data, false)?;
-    validate_passkey_sign_count(credential.sign_count, auth_data.sign_count)?;
+    let backup_eligible = credential.backup_eligible != 0;
+    if auth_data.backup_eligible != backup_eligible {
+        return Err("passkey backup eligibility changed".to_owned());
+    }
+    validate_passkey_sign_count(credential.sign_count, auth_data.sign_count, backup_eligible)?;
+    let user_handle = validate_passkey_user_handle(
+        credential.user_handle.as_deref(),
+        body.response.user_handle.as_deref(),
+    )?;
+    if credential.public_key_alg != -7 {
+        return Err("stored passkey algorithm is not supported".to_owned());
+    }
     let client_data_bytes = decode_base64url(&body.response.client_data_json)?;
     let mut signed_data = authenticator_data_bytes;
     signed_data.extend_from_slice(&Sha256::digest(&client_data_bytes));
     let signature = decode_base64url(&body.response.signature)?;
-    verify_passkey_es256_signature(credential, &signed_data, &signature)
+    verify_passkey_es256_signature(credential, &signed_data, &signature)?;
+    Ok(ValidatedPasskeyAuthentication {
+        user_handle,
+        sign_count: auth_data.sign_count,
+        backup_state: auth_data.backup_state,
+    })
 }
 
 fn validate_passkey_authenticator_data(
@@ -16832,17 +17032,71 @@ fn validate_passkey_authenticator_data(
     if auth_data.flags & 0x04 == 0 {
         return Err("passkey user-verified flag was not set".to_owned());
     }
+    if auth_data.flags & 0x22 != 0 {
+        return Err("passkey authenticatorData used reserved flag bits".to_owned());
+    }
     if require_attested_credential && auth_data.flags & 0x40 == 0 {
         return Err("passkey attested-credential flag was not set".to_owned());
+    }
+    if !require_attested_credential && auth_data.flags & 0x40 != 0 {
+        return Err("passkey assertion unexpectedly included attested credential data".to_owned());
+    }
+    if auth_data.backup_state && !auth_data.backup_eligible {
+        return Err("passkey backup state was set without backup eligibility".to_owned());
     }
     Ok(())
 }
 
-fn validate_passkey_sign_count(stored: i32, incoming: i32) -> Result<(), String> {
-    if stored > 0 && incoming > 0 && incoming <= stored {
+fn validate_passkey_sign_count(
+    stored: i64,
+    incoming: i64,
+    backup_eligible: bool,
+) -> Result<(), String> {
+    if !backup_eligible && stored > 0 && incoming > 0 && incoming <= stored {
         return Err("passkey sign counter did not increase".to_owned());
     }
     Ok(())
+}
+
+fn validate_passkey_user_handle(
+    stored: Option<&str>,
+    response: Option<&str>,
+) -> Result<String, String> {
+    let response = response.ok_or_else(|| {
+        "discoverable passkey authentication did not return a user handle".to_owned()
+    })?;
+    let bytes = decode_base64url(response)?;
+    if bytes.is_empty() || bytes.len() > 64 {
+        return Err("passkey user handle must contain 1 to 64 bytes".to_owned());
+    }
+    let canonical = URL_SAFE_NO_PAD.encode(bytes);
+    if stored.is_some_and(|stored| stored != canonical) {
+        return Err("passkey user handle did not match the credential".to_owned());
+    }
+    Ok(canonical)
+}
+
+fn validate_passkey_transports(transports: &[String]) -> Result<Vec<String>, String> {
+    const ALLOWED: &[&str] = &["ble", "hybrid", "internal", "nfc", "smart-card", "usb"];
+    let mut normalized = Vec::new();
+    for transport in transports {
+        let transport = transport.trim().to_ascii_lowercase();
+        if !ALLOWED.contains(&transport.as_str()) {
+            return Err("passkey response included an unsupported transport".to_owned());
+        }
+        if !normalized.contains(&transport) {
+            normalized.push(transport);
+        }
+    }
+    normalized.sort();
+    Ok(normalized)
+}
+
+fn passkey_transports_from_json(value: &str) -> Vec<String> {
+    serde_json::from_str::<Vec<String>>(value)
+        .ok()
+        .and_then(|transports| validate_passkey_transports(&transports).ok())
+        .unwrap_or_default()
 }
 
 fn verify_passkey_es256_signature(
@@ -16866,14 +17120,6 @@ fn verify_passkey_es256_signature(
     verifying_key
         .verify(signed_data, &signature)
         .map_err(|_| "passkey signature did not verify".to_owned())
-}
-
-#[cfg(target_arch = "wasm32")]
-fn passkey_authenticator_sign_count(authenticator_data: &str) -> worker::Result<i32> {
-    let authenticator_data = decode_base64url(authenticator_data).map_err(worker_error)?;
-    parse_passkey_authenticator_data(&authenticator_data)
-        .map(|data| data.sign_count)
-        .map_err(worker_error)
 }
 
 fn passkey_raw_id(value: &str) -> Result<String, String> {
@@ -16903,9 +17149,12 @@ fn parse_passkey_authenticator_data(bytes: &[u8]) -> Result<ParsedAuthenticatorD
     }
     let rp_id_hash = bytes[0..32].to_vec();
     let flags = bytes[32];
-    let sign_count = i32::from_be_bytes([bytes[33], bytes[34], bytes[35], bytes[36]]);
+    let sign_count = u32::from_be_bytes([bytes[33], bytes[34], bytes[35], bytes[36]]) as i64;
+    let backup_eligible = flags & 0x08 != 0;
+    let backup_state = flags & 0x10 != 0;
     let mut credential_id = None;
     let mut public_key = None;
+    let mut cursor = 37;
 
     if flags & 0x40 != 0 {
         if bytes.len() < 55 {
@@ -16918,20 +17167,39 @@ fn parse_passkey_authenticator_data(bytes: &[u8]) -> Result<ParsedAuthenticatorD
             return Err("passkey credential public key is missing".to_owned());
         }
         credential_id = Some(bytes[credential_start..credential_end].to_vec());
-        public_key = Some(parse_passkey_cose_public_key(&bytes[credential_end..])?);
+        let (parsed_public_key, consumed) =
+            parse_passkey_cose_public_key(&bytes[credential_end..])?;
+        public_key = Some(parsed_public_key);
+        cursor = credential_end + consumed;
+    }
+
+    if flags & 0x80 != 0 {
+        if cursor >= bytes.len() {
+            return Err("passkey extension flag was set without extension data".to_owned());
+        }
+        let extensions = CborReader::new(&bytes[cursor..]).read_single()?;
+        if !matches!(extensions, CborValue::Map(_)) {
+            return Err("passkey extension data must be a CBOR map".to_owned());
+        }
+    } else if cursor != bytes.len() {
+        return Err("passkey authenticatorData had unexpected trailing bytes".to_owned());
     }
 
     Ok(ParsedAuthenticatorData {
         rp_id_hash,
         flags,
         sign_count,
+        backup_eligible,
+        backup_state,
         credential_id,
         public_key,
     })
 }
 
-fn parse_passkey_cose_public_key(bytes: &[u8]) -> Result<PasskeyCredentialPublicKey, String> {
-    let value = CborReader::new(bytes).read_single()?;
+fn parse_passkey_cose_public_key(
+    bytes: &[u8],
+) -> Result<(PasskeyCredentialPublicKey, usize), String> {
+    let (value, consumed) = CborReader::new(bytes).read_prefix()?;
     let CborValue::Map(entries) = value else {
         return Err("passkey public key must be a COSE_Key map".to_owned());
     };
@@ -16953,7 +17221,7 @@ fn parse_passkey_cose_public_key(bytes: &[u8]) -> Result<PasskeyCredentialPublic
     if x.len() != 32 || y.len() != 32 {
         return Err("passkey public key coordinates must be 32 bytes".to_owned());
     }
-    Ok(PasskeyCredentialPublicKey { x, y })
+    Ok((PasskeyCredentialPublicKey { x, y }, consumed))
 }
 
 fn cbor_map_text_bytes<'a>(entries: &'a [(CborValue, CborValue)], key: &str) -> Option<&'a [u8]> {
@@ -17012,6 +17280,11 @@ impl<'a> CborReader<'a> {
             return Err("CBOR value had trailing bytes".to_owned());
         }
         Ok(value)
+    }
+
+    fn read_prefix(mut self) -> Result<(CborValue, usize), String> {
+        let value = self.read_value()?;
+        Ok((value, self.offset))
     }
 
     fn read_value(&mut self) -> Result<CborValue, String> {
@@ -17317,7 +17590,7 @@ fn cors_method_allowed(path: &str, method: &str) -> bool {
         "/magic-links" => method == "POST",
         "/magic-link/confirm" => method == "GET",
         "/magic-links/consume" => method == "POST",
-        "/magic-links/poll" => method == "GET",
+        "/magic-links/poll" => method == "POST",
         "/sessions" => method == "GET" || method == "DELETE",
         "/logout" => method == "GET" || method == "POST",
         _ => false,
@@ -19858,7 +20131,6 @@ fn json_status_no_store<T: Serialize>(value: &T, status: u16) -> worker::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusqlite::{params, Connection};
     use p256::pkcs8::{EncodePrivateKey, LineEnding};
     use rsa::{
         pkcs1v15::SigningKey as RsaPkcs1v15SigningKey,
@@ -19867,6 +20139,7 @@ mod tests {
         traits::PublicKeyParts,
         RsaPrivateKey,
     };
+    use rusqlite::{params, Connection};
     use zeroth_oidc::PkceChallengeMethod;
 
     fn sqlite_bootstrap() -> Connection {
@@ -19972,13 +20245,13 @@ mod tests {
     }
 
     fn sqlite_client_from_row(conn: &Connection, client_id: &str) -> Client {
-        let (name, redirect_uris_json, allowed_origins_json, allowed_email_domains_json, confidential): (
-            String,
-            String,
-            String,
-            String,
-            i32,
-        ) = conn
+        let (
+            name,
+            redirect_uris_json,
+            allowed_origins_json,
+            allowed_email_domains_json,
+            confidential,
+        ): (String, String, String, String, i32) = conn
             .query_row(
                 "SELECT name, redirect_uris_json, allowed_origins_json,
                         allowed_email_domains_json, confidential
@@ -20287,6 +20560,9 @@ mod tests {
             canonical_route_path("/.well-known/openid-configuration/").as_ref(),
             "/.well-known/openid-configuration"
         );
+        assert!(known_route_path("/magic-links/poll"));
+        assert!(cors_method_allowed("/magic-links/poll", "POST"));
+        assert!(!cors_method_allowed("/magic-links/poll", "GET"));
     }
 
     #[test]
@@ -20698,7 +20974,96 @@ mod tests {
         );
         assert_eq!(validated.public_key_x, URL_SAFE_NO_PAD.encode(x));
         assert_eq!(validated.public_key_y, URL_SAFE_NO_PAD.encode(y));
+        assert_eq!(validated.public_key_alg, -7);
         assert_eq!(validated.sign_count, 9);
+        assert!(!validated.backup_eligible);
+        assert!(!validated.backup_state);
+    }
+
+    #[test]
+    fn passkey_creation_uses_opaque_handle_and_discoverable_authentication() {
+        let config = ZerothServerConfig {
+            public_base_url: "https://id.example.com".to_owned(),
+            ..ZerothServerConfig::default()
+        };
+        let handle = URL_SAFE_NO_PAD.encode(b"opaque-account-handle");
+        let creation = passkey_creation_options(
+            &config,
+            "challenge-1",
+            &handle,
+            "person@example.com",
+            "Person",
+            Vec::new(),
+        )
+        .unwrap();
+        let request = passkey_request_options(&config, "challenge-2", Vec::new()).unwrap();
+
+        assert_eq!(creation.user.id, handle);
+        assert_ne!(creation.user.id, creation.user.name);
+        assert_eq!(creation.authenticator_selection.resident_key, "required");
+        assert!(request.allow_credentials.is_empty());
+    }
+
+    #[test]
+    fn passkey_user_handle_and_backup_counter_policy_are_enforced() {
+        let handle = URL_SAFE_NO_PAD.encode(b"opaque-account-handle");
+
+        assert_eq!(
+            validate_passkey_user_handle(Some(&handle), Some(&handle)).unwrap(),
+            handle
+        );
+        assert!(validate_passkey_user_handle(Some(&handle), None).is_err());
+        assert!(validate_passkey_user_handle(
+            Some(&handle),
+            Some(&URL_SAFE_NO_PAD.encode(b"different-handle"))
+        )
+        .is_err());
+        assert!(validate_passkey_sign_count(4, 4, false).is_err());
+        assert!(validate_passkey_sign_count(4, 4, true).is_ok());
+        assert!(validate_passkey_sign_count(4, 5, false).is_ok());
+    }
+
+    #[test]
+    fn passkey_transport_metadata_is_normalized_and_bounded() {
+        let transports = vec![
+            "internal".to_owned(),
+            "HYBRID".to_owned(),
+            "internal".to_owned(),
+        ];
+
+        assert_eq!(
+            validate_passkey_transports(&transports).unwrap(),
+            vec!["hybrid".to_owned(), "internal".to_owned()]
+        );
+        assert!(validate_passkey_transports(&["carrier-pigeon".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn passkey_authenticator_data_preserves_u32_counter_and_backup_flags() {
+        let config = ZerothServerConfig {
+            public_base_url: "https://id.example.com".to_owned(),
+            ..ZerothServerConfig::default()
+        };
+        let mut bytes = Sha256::digest(b"id.example.com").to_vec();
+        bytes.push(0x1d);
+        bytes.extend_from_slice(&u32::MAX.to_be_bytes());
+
+        let parsed = parse_passkey_authenticator_data(&bytes).unwrap();
+
+        assert_eq!(parsed.sign_count, i64::from(u32::MAX));
+        assert!(parsed.backup_eligible);
+        assert!(parsed.backup_state);
+        validate_passkey_authenticator_data(&config, &parsed, false).unwrap();
+    }
+
+    #[test]
+    fn hosted_html_security_policy_is_deny_by_default_and_allows_passkeys() {
+        assert!(HTML_CONTENT_SECURITY_POLICY.contains("default-src 'none'"));
+        assert!(HTML_CONTENT_SECURITY_POLICY.contains("frame-ancestors 'none'"));
+        assert!(HTML_CONTENT_SECURITY_POLICY.contains("form-action 'self'"));
+        assert!(PERMISSIONS_POLICY.contains("publickey-credentials-create=(self)"));
+        assert!(PERMISSIONS_POLICY.contains("publickey-credentials-get=(self)"));
+        assert!(PERMISSIONS_POLICY.contains("camera=()"));
     }
 
     #[test]
@@ -20711,9 +21076,14 @@ mod tests {
         let credential = PasskeyCredentialRow {
             credential_id: "cred_1".to_owned(),
             user_id: "usr_1".to_owned(),
+            user_handle: Some("handle_1".to_owned()),
             label: None,
             public_key_x: URL_SAFE_NO_PAD.encode(x),
             public_key_y: URL_SAFE_NO_PAD.encode(y),
+            public_key_alg: -7,
+            transports_json: "[]".to_owned(),
+            backup_eligible: 0,
+            backup_state: 0,
             sign_count: 0,
             created_at: 1,
             updated_at: 1,
@@ -22419,7 +22789,10 @@ mod tests {
 
         let client = sqlite_client_from_row(&conn, "yl-web");
         assert_eq!(client.id, ClientId("yl-web".to_owned()));
-        assert_eq!(client.redirect_uris, vec!["https://yl.vin/auth/callback".to_owned()]);
+        assert_eq!(
+            client.redirect_uris,
+            vec!["https://yl.vin/auth/callback".to_owned()]
+        );
         assert_eq!(client.allowed_origins, vec!["https://yl.vin".to_owned()]);
         assert!(client.allowed_email_domains.is_empty());
         assert!(!client.confidential);
@@ -22458,15 +22831,13 @@ mod tests {
         assert_eq!(active_session_count, 1);
 
         let migration_versions = conn
-            .prepare(
-                "SELECT version FROM zeroth_schema_migrations ORDER BY version",
-            )
+            .prepare("SELECT version FROM zeroth_schema_migrations ORDER BY version")
             .unwrap()
             .query_map([], |row| row.get::<_, i32>(0))
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        assert_eq!(migration_versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(migration_versions, (1..=11).collect::<Vec<_>>());
     }
 
     #[test]
@@ -23988,6 +24359,14 @@ mod tests {
             validate_passkey_email("person+product@example.com").unwrap(),
             "person+product@example.com"
         );
+    }
+
+    #[test]
+    fn password_registration_uses_character_based_minimum_and_bounded_input() {
+        assert!(validate_local_auth_password("short password").is_err());
+        assert!(validate_local_auth_password("a long passphrase").is_ok());
+        assert!(validate_local_auth_password(&"安全".repeat(8)).is_ok());
+        assert!(validate_local_auth_password(&"x".repeat(PASSWORD_MAX_BYTES + 1)).is_err());
     }
 
     #[test]

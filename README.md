@@ -63,11 +63,18 @@ Implemented so far:
 - Worker hosted Leptos `/login` and `/account` pages; `/login` supports
   browser-session login with client-bounded `return_to`, and `/authorize`
   renders the provider picker when the OIDC request omits `provider`
+- discoverable WebAuthn passkeys with opaque user handles, required user
+  verification, conditional-mediation autofill, stored transport/backup
+  metadata, and synced-passkey-aware signature-counter handling
+- password and scanner-safe magic-link sign-in with layered D1 rate limits,
+  generic public responses, one-time POST confirmation, and one-time
+  cross-device polling credentials
 - Worker hosted Leptos `/admin` and `/admin/clients` page for provider
   readiness, D1 schema status, user list/disable/enable, audit events, and
   registered-client list/create/update operations through the generic management
   APIs, including a first-party Zeroth sign-in action for allowlisted admin
   sessions
+
 - Worker Apple App Site Association endpoint backed by deployment-provided JSON
 - Worker `/ready` public launch preflight for HTTPS issuer, parseable signing
   material, and Apple/Google/Spotify provider configuration without D1 reads or
@@ -199,6 +206,10 @@ Implemented so far:
   configuration without mutating Apple Developer records
 - Worker runtime minting and isolate caching of Sign in with Apple
   client-secret JWTs from deployment-provided Apple team/key/private-key secrets
+
+The current UI/security/implementation review and prioritized production gates
+are documented in
+[`docs/security-technical-feature-audit-2026-07-14.md`](docs/security-technical-feature-audit-2026-07-14.md).
 
 Still required before Auth0 can be removed:
 

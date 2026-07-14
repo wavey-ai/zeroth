@@ -330,6 +330,14 @@ pub const ROUTES: &[Route] = &[
         path: "/magic-links/consume",
     },
     Route {
+        method: "POST",
+        path: "/magic-links/poll",
+    },
+    Route {
+        method: "OPTIONS",
+        path: "/magic-links/poll",
+    },
+    Route {
         method: "GET",
         path: "/validate",
     },
@@ -428,6 +436,7 @@ mod tests {
             ("POST", "/magic-links"),
             ("GET", "/magic-link/confirm"),
             ("POST", "/magic-links/consume"),
+            ("POST", "/magic-links/poll"),
         ] {
             assert!(ROUTES
                 .iter()

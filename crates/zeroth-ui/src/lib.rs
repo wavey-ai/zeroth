@@ -9,6 +9,7 @@ use zeroth_providers::well_known;
 
 const TRANSPARENT_PIXEL_DATA_URI: &str =
     "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==";
+const YL_LOGO_SVG: &str = include_str!("yl_logo.svg");
 
 /// Stylesheet for the default Zeroth account UI.
 pub const ZEROTH_UI_CSS: &str = r#"
@@ -59,6 +60,20 @@ a {
 
 a:hover {
   text-decoration: underline;
+}
+
+a:focus-visible,
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+summary:focus-visible,
+textarea:focus-visible {
+  outline: 3px solid rgba(9, 105, 218, 0.35);
+  outline-offset: 2px;
+}
+
+[hidden] {
+  display: none !important;
 }
 
 .zeroth-shell {
@@ -128,6 +143,96 @@ a:hover {
   grid-template-columns: 1fr;
   background:
     linear-gradient(180deg, #ffffff 0%, #f6f8fa 54%, #eef7f1 100%);
+}
+
+.zeroth-yl-login {
+  --z-yl-pink: #ef035c;
+  --z-yl-red: #d51b14;
+  --z-yl-yellow: #f3b511;
+  --z-yl-blue: #0e7c8c;
+  background:
+    radial-gradient(circle at 12% 8%, rgba(243, 181, 17, 0.22), transparent 28rem),
+    radial-gradient(circle at 88% 92%, rgba(14, 124, 140, 0.16), transparent 30rem),
+    linear-gradient(145deg, #fffaf1 0%, #ffffff 48%, #fff2ee 100%);
+}
+
+.zeroth-yl-login .zeroth-login-card {
+  border-color: rgba(3, 8, 10, 0.2);
+  border-radius: 18px;
+  box-shadow: 0 26px 70px rgba(3, 8, 10, 0.13);
+}
+
+.zeroth-yl-login .zeroth-sidebar {
+  display: none;
+}
+
+.zeroth-yl-login .zeroth-main {
+  padding-top: 48px;
+}
+
+.zeroth-yl-login .zeroth-panel-header {
+  border-bottom-color: rgba(3, 8, 10, 0.12);
+}
+
+.zeroth-yl-login .zeroth-action.zeroth-primary {
+  background: var(--z-yl-pink);
+  border-color: var(--z-yl-pink);
+}
+
+.zeroth-yl-login .zeroth-action.zeroth-primary:hover {
+  background: var(--z-yl-red);
+  border-color: var(--z-yl-red);
+}
+
+.zeroth-login-intro {
+  width: min(440px, 100%);
+  margin: 0 auto 18px;
+}
+
+.zeroth-yl-logo {
+  display: block;
+  width: 92px;
+  height: 46px;
+  margin: 0 auto 22px;
+  color: #03080a;
+}
+
+.zeroth-login-intro-mark {
+  display: inline-block;
+  color: var(--z-yl-pink, var(--z-blue));
+  font-size: 12px;
+  font-weight: 900;
+  letter-spacing: 0.18em;
+}
+
+.zeroth-login-intro-copy {
+  margin: 7px 0 0;
+  color: var(--z-ink);
+  font-size: clamp(24px, 4vw, 34px);
+  font-weight: 900;
+  letter-spacing: -0.04em;
+  line-height: 1.02;
+}
+
+.zeroth-more-options {
+  border-top: 1px solid var(--z-line);
+  padding-top: 12px;
+}
+
+.zeroth-more-options > summary {
+  cursor: pointer;
+  color: var(--z-muted);
+  font-weight: 800;
+  list-style-position: inside;
+}
+
+.zeroth-more-options[open] > summary {
+  color: var(--z-ink);
+  margin-bottom: 12px;
+}
+
+.zeroth-more-options .zeroth-auth-group {
+  margin-top: 12px;
 }
 
 .zeroth-login-mode .zeroth-sidebar {
@@ -291,6 +396,57 @@ a:hover {
 .zeroth-login-mode .provider-google .zeroth-action:hover {
   border-color: #0969da;
   color: #0969da;
+}
+
+.zeroth-yl-login .zeroth-provider-list {
+  gap: 8px;
+}
+
+.zeroth-yl-login .zeroth-provider {
+  grid-template-columns: 1fr;
+  gap: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+
+.zeroth-yl-login .zeroth-provider-badge,
+.zeroth-yl-login .zeroth-provider > div {
+  display: none;
+}
+
+.zeroth-yl-login .zeroth-provider .zeroth-action {
+  grid-column: 1;
+  min-height: 48px;
+  border-radius: 999px;
+  font-weight: 800;
+}
+
+.zeroth-yl-login .provider-apple .zeroth-action {
+  border-color: #03080a;
+  background: #03080a;
+  color: #ffffff;
+}
+
+.zeroth-yl-login .provider-apple .zeroth-action:hover {
+  border-color: #1c2528;
+  background: #1c2528;
+}
+
+.zeroth-yl-login .provider-google .zeroth-action {
+  border-color: #d0d7de;
+  background: #ffffff;
+  color: #03080a;
+}
+
+.zeroth-yl-login .provider-google .zeroth-action:hover {
+  border-color: #5f6368;
+  color: #03080a;
+}
+
+.zeroth-yl-login .provider-google .zeroth-action[aria-disabled="true"] {
+  cursor: not-allowed;
+  opacity: 0.55;
 }
 
 .zeroth-nav {
@@ -730,6 +886,10 @@ a:hover {
   align-items: start;
 }
 
+.zeroth-client-layout:has(> aside[hidden]) {
+  grid-template-columns: minmax(0, 1fr);
+}
+
 .zeroth-toolbar {
   display: flex;
   flex-wrap: wrap;
@@ -838,6 +998,17 @@ a:hover {
 
   .zeroth-login-actions {
     grid-template-columns: 1fr;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
   }
 }
 "#;
@@ -1321,11 +1492,15 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
     let login_url = endpoint_url(&config, "/login");
     let profile_action = endpoint_url(&config, "/profile");
     let logout_action = endpoint_url(&config, "/logout");
+    let sessions_action = endpoint_url(&config, "/sessions");
     let csrf_token = config.csrf_token.clone().unwrap_or_default();
     let signed_in_account_mode = signed_in && config.link_identities;
     let signed_in_login_flow = signed_in && !config.link_identities;
     let login_mode = !signed_in;
-    let shell_class = if login_mode {
+    let is_yl_brand = product_name.to_ascii_uppercase().contains("YL");
+    let shell_class = if login_mode && is_yl_brand {
+        "zeroth-shell zeroth-login-mode zeroth-yl-login"
+    } else if login_mode {
         "zeroth-shell zeroth-login-mode"
     } else {
         "zeroth-shell"
@@ -1365,6 +1540,15 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
     } else {
         "zeroth-auth-group"
     };
+    let login_intro = (login_mode && is_yl_brand).then(|| {
+        view! {
+            <div class="zeroth-login-intro">
+                <div class="zeroth-yl-logo" aria-label="YL.VIN" inner_html=YL_LOGO_SVG></div>
+                <span class="zeroth-login-intro-mark">"YL.VIN"</span>
+                <p class="zeroth-login-intro-copy">"Create and release playable records."</p>
+            </div>
+        }
+    });
     let provider_list_class = if signed_in_login_flow {
         "zeroth-provider-list zeroth-hidden"
     } else {
@@ -1402,7 +1586,6 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
         .clone()
         .unwrap_or(config.redirect_uri.clone());
     let password_login_action = endpoint_url(&config, "/password/login");
-    let password_register_action = endpoint_url(&config, "/password/register");
     let magic_link_action = endpoint_url(&config, "/magic-links");
     let wallet_challenge_action = endpoint_url(&config, "/wallet/challenge");
     let wallet_verify_action = endpoint_url(&config, "/wallet/verify");
@@ -1416,22 +1599,22 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
         .collect_view();
     let session_rows = sessions
         .into_iter()
-        .map(|session| session_row(&logout_action, &csrf_token, session))
+        .map(|session| session_row(&logout_action, &sessions_action, &csrf_token, session))
         .collect_view();
     let application_rows = applications.into_iter().map(application_row).collect_view();
     let magic_link_section = config.show_magic_link_login.then(|| {
         view! {
             <div class="zeroth-auth-group">
-                <div class="zeroth-divider">"Magic link"</div>
+                <div class="zeroth-divider">"Continue with email"</div>
                 <form id="zeroth-magic-link-form" class="zeroth-form zeroth-login-form" method="post" action=magic_link_action.clone() data-zeroth-local-auth="magic-link">
                     <input type="hidden" name="clientId" value=config.client_id.clone() />
                     <input type="hidden" name="returnTo" value=login_return_to.clone() />
                     <div class="zeroth-login-actions">
                         <div class="zeroth-field">
                             <label for="zeroth-magic-email">"Email"</label>
-                            <input id="zeroth-magic-email" name="email" type="email" autocomplete="email" />
+                            <input id="zeroth-magic-email" name="email" type="email" autocomplete="username webauthn" placeholder="you@example.com" />
                         </div>
-                        <button class="zeroth-action" type="submit">"Send link"</button>
+                        <button class="zeroth-action zeroth-primary" type="submit">"Continue"</button>
                     </div>
                 </form>
                 <div id="zeroth-magic-link-waiting" style="display:none" class="zeroth-login-actions">
@@ -1447,8 +1630,8 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
                 <div class="zeroth-divider">"Passkey"</div>
                 <div class=passkey_login_class>
                     <div>
-                        <div class="zeroth-row-title">"Passkey"</div>
-                        <div class="zeroth-row-meta" id="zeroth-account-passkey-status">"Ready"</div>
+                        <div class="zeroth-row-title">"Use Face ID or Touch ID"</div>
+                        <div class="zeroth-row-meta" id="zeroth-account-passkey-status" role="status" aria-live="polite">"Ready"</div>
                     </div>
                     <button
                         class="zeroth-action"
@@ -1526,6 +1709,8 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
                     </div>
                 </header>
 
+                {login_intro}
+
                 <div class="zeroth-grid">
                     <div class="zeroth-stack">
                         <section id=login_panel_id class=login_panel_class>
@@ -1548,55 +1733,56 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
                                     </div>
                                 </div>
 
+                                {magic_link_section}
                                 <div class=provider_list_class>{provider_rows}</div>
 
-                                <div class=credential_auth_class>
-                                    <div class="zeroth-divider">"Wallet"</div>
-                                    <div class="zeroth-login-actions">
-                                        <div>
-                                            <div class="zeroth-row-title">"Ethereum wallet"</div>
-                                            <div class="zeroth-row-meta" id="zeroth-wallet-status">"MetaMask, Coinbase Wallet, Rabby"</div>
-                                        </div>
-                                        <button
-                                            class="zeroth-action"
-                                            id="zeroth-wallet-login"
-                                            type="button"
-                                            data-client-id=config.client_id.clone()
-                                            data-return-to=login_return_to.clone()
-                                            data-challenge-url=wallet_challenge_action
-                                            data-verify-url=wallet_verify_action
-                                        >
-                                            "Use wallet"
-                                        </button>
-                                    </div>
-                                </div>
-
-                                <div class=credential_auth_class>
-                                    <div class="zeroth-divider">"Email and password"</div>
-                                    <form class="zeroth-form zeroth-login-form" method="post" action=password_login_action data-zeroth-local-auth="password-login">
-                                        <input type="hidden" name="clientId" value=config.client_id.clone() />
-                                        <input type="hidden" name="returnTo" value=login_return_to.clone() />
-                                        <div class="zeroth-field">
-                                            <label for="zeroth-login-email">"Email"</label>
-                                            <input id="zeroth-login-email" name="email" type="email" autocomplete="email" />
-                                        </div>
+                                <details class="zeroth-more-options">
+                                    <summary>"More options"</summary>
+                                    {passkey_section}
+                                    <div class=credential_auth_class>
+                                        <div class="zeroth-divider">"Wallet"</div>
                                         <div class="zeroth-login-actions">
-                                            <div class="zeroth-field">
-                                                <label for="zeroth-login-password">"Password"</label>
-                                                <input id="zeroth-login-password" name="password" type="password" autocomplete="current-password" />
+                                            <div>
+                                                <div class="zeroth-row-title">"Connect an existing wallet"</div>
+                                                <div class="zeroth-row-meta" id="zeroth-wallet-status" role="status" aria-live="polite">"MetaMask, Coinbase Wallet, Rabby"</div>
                                             </div>
-                                            <div class="zeroth-field zeroth-password-confirm-field" style="display:none">
-                                                <label for="zeroth-login-confirm-password">"Confirm password"</label>
-                                                <input id="zeroth-login-confirm-password" name="confirmPassword" type="password" autocomplete="new-password" />
-                                            </div>
-                                            <button class="zeroth-action zeroth-primary" type="submit">"Sign in"</button>
+                                            <button
+                                                class="zeroth-action"
+                                                id="zeroth-wallet-login"
+                                                type="button"
+                                                data-client-id=config.client_id.clone()
+                                                data-return-to=login_return_to.clone()
+                                                data-challenge-url=wallet_challenge_action
+                                                data-verify-url=wallet_verify_action
+                                            >
+                                                "Connect wallet"
+                                            </button>
                                         </div>
-                                    </form>
+                                    </div>
+                                    <div class=credential_auth_class>
+                                        <div class="zeroth-divider">"Email and password"</div>
+                                        <form class="zeroth-form zeroth-login-form" method="post" action=password_login_action data-zeroth-local-auth="password-login">
+                                            <input type="hidden" name="clientId" value=config.client_id.clone() />
+                                            <input type="hidden" name="returnTo" value=login_return_to.clone() />
+                                            <div class="zeroth-field">
+                                                <label for="zeroth-login-email">"Email"</label>
+                                                <input id="zeroth-login-email" name="email" type="email" autocomplete="username webauthn" />
+                                            </div>
+                                            <div class="zeroth-login-actions">
+                                                <div class="zeroth-field">
+                                                    <label for="zeroth-login-password">"Password"</label>
+                                                    <input id="zeroth-login-password" name="password" type="password" autocomplete="current-password" />
+                                                </div>
+                                                <div class="zeroth-field zeroth-password-confirm-field" style="display:none">
+                                                    <label for="zeroth-login-confirm-password">"Confirm password"</label>
+                                                    <input id="zeroth-login-confirm-password" name="confirmPassword" type="password" autocomplete="new-password" />
+                                                </div>
+                                                <button class="zeroth-action zeroth-primary" type="submit">"Sign in"</button>
+                                            </div>
+                                        </form>
+                                    </div>
+                                </details>
 
-                                </div>
-
-                                {magic_link_section}
-                                {passkey_section}
                             </div>
                         </section>
 
@@ -1735,7 +1921,7 @@ pub fn ClientsAdminApp(state: ClientsAdminUiState) -> impl IntoView {
                         <span class="zeroth-brand-subtitle">"Dashboard"</span>
                     </span>
                 </div>
-                <nav class="zeroth-nav" aria-label="Management sections" data-zeroth-section-nav="true" data-zeroth-default-section="#overview">
+                <nav class="zeroth-nav" aria-label="Management sections" data-zeroth-section-nav="true" data-zeroth-tabs="true" data-zeroth-default-section="#overview">
                     <div class="zeroth-nav-section">"Dashboard"</div>
                     <a href="#overview" aria-current="page">"Overview"</a>
                     <div class="zeroth-nav-section">"User Management"</div>
@@ -1759,7 +1945,7 @@ pub fn ClientsAdminApp(state: ClientsAdminUiState) -> impl IntoView {
             <main class="zeroth-main">
                 <header class="zeroth-topbar">
                     <div>
-                        <h1 class="zeroth-title">"Dashboard"</h1>
+                        <h1 class="zeroth-title" id="zeroth-page-title">"Overview"</h1>
                         <div class="zeroth-subtitle" id="zeroth-admin-issuer">{issuer_base_url.clone()}</div>
                     </div>
                     <div class="zeroth-status-row">
@@ -1815,7 +2001,7 @@ pub fn ClientsAdminApp(state: ClientsAdminUiState) -> impl IntoView {
 
                 <div class="zeroth-client-layout">
                     <div class="zeroth-stack">
-                        <section class="zeroth-panel">
+                        <section class="zeroth-panel" data-zeroth-panel-for="#overview">
                             <div class="zeroth-panel-header">
                                 <h2 class="zeroth-panel-title">"Admin access"</h2>
                                 <span class="zeroth-status" id="zeroth-admin-status">"Disconnected"</span>
@@ -1833,10 +2019,10 @@ pub fn ClientsAdminApp(state: ClientsAdminUiState) -> impl IntoView {
                             </div>
                         </section>
 
-                        <section class="zeroth-panel">
+                        <section class="zeroth-panel" data-zeroth-panel-for="#overview">
                             <div class="zeroth-panel-header">
                                 <h2 class="zeroth-panel-title">"Admin passkey"</h2>
-                                <span class="zeroth-status" id="zeroth-passkey-status">"Ready"</span>
+                                <span class="zeroth-status" id="zeroth-passkey-status" role="status" aria-live="polite">"Ready"</span>
                             </div>
                             <div class="zeroth-panel-body zeroth-stack">
                                 <form class="zeroth-form" id="zeroth-passkey-register-form">
@@ -2014,7 +2200,7 @@ pub fn ClientsAdminApp(state: ClientsAdminUiState) -> impl IntoView {
                         </section>
                     </div>
 
-                    <aside class="zeroth-stack">
+                    <aside class="zeroth-stack" data-zeroth-panel-for="#clients">
                         <section class="zeroth-panel">
                             <div class="zeroth-panel-header">
                                 <h2 class="zeroth-panel-title">"Client editor"</h2>
@@ -2092,7 +2278,7 @@ pub fn ClientsAdminApp(state: ClientsAdminUiState) -> impl IntoView {
                                         <button class="zeroth-action" id="zeroth-client-reset" type="button">"Reset"</button>
                                         <button class="zeroth-action zeroth-primary" type="submit">"Save client"</button>
                                     </div>
-                                    <div class="zeroth-message" id="zeroth-admin-message" role="status"></div>
+                                    <div class="zeroth-message" id="zeroth-admin-message" role="status" aria-live="polite"></div>
                                 </form>
                             </div>
                         </section>
@@ -2144,9 +2330,14 @@ fn provider_row(config: &ZerothUiConfig, provider: ProviderUi, signed_in: bool) 
             </form>
         }
         .into_any()
+    } else if disabled {
+        view! {
+            <span class="zeroth-action" aria-disabled="true">{action}</span>
+        }
+        .into_any()
     } else {
         view! {
-            <a class="zeroth-action" href=href aria-disabled=disabled.to_string()>{action}</a>
+            <a class="zeroth-action" href=href>{action}</a>
         }
         .into_any()
     };
@@ -2192,11 +2383,33 @@ fn identity_row(
     }
 }
 
-fn session_row(logout_action: &str, csrf_token: &str, session: SessionUi) -> impl IntoView {
+fn session_row(
+    logout_action: &str,
+    sessions_action: &str,
+    csrf_token: &str,
+    session: SessionUi,
+) -> impl IntoView {
     let client = session.client_id.unwrap_or_else(|| "Browser".to_owned());
     let status = if session.current { "Current" } else { "Active" };
     let created_at = session.created_at.unwrap_or_else(|| "-".to_owned());
     let expires_at = session.expires_at.unwrap_or_else(|| "-".to_owned());
+    let (action, method, label) = if session.current {
+        (logout_action.to_owned(), "POST", "Sign out")
+    } else {
+        let query = form_urlencoded::Serializer::new(String::new())
+            .append_pair("session_id", &session.id)
+            .finish();
+        let separator = if sessions_action.contains('?') {
+            '&'
+        } else {
+            '?'
+        };
+        (
+            format!("{sessions_action}{separator}{query}"),
+            "DELETE",
+            "Revoke",
+        )
+    };
 
     view! {
         <div class="zeroth-row">
@@ -2206,9 +2419,9 @@ fn session_row(logout_action: &str, csrf_token: &str, session: SessionUi) -> imp
                 <div class="zeroth-row-meta">{session.id}</div>
                 <div class="zeroth-row-meta">{created_at} " to " {expires_at} " · " {status}</div>
             </div>
-            <form method="post" action=logout_action.to_owned() data-zeroth-method="POST">
+            <form method="post" action=action data-zeroth-method=method>
                 <input type="hidden" name="_csrf" value=csrf_token.to_owned() />
-                <button class="zeroth-action" type="submit" disabled=!session.current>"Sign out"</button>
+                <button class="zeroth-action" type="submit">{label}</button>
             </form>
         </div>
     }
@@ -2779,6 +2992,7 @@ const zerothPasskeyAuthenticateOptionsEndpoint = "/passkeys/authenticate/options
 const zerothPasskeyAuthenticateVerifyEndpoint = "/passkeys/authenticate/verify";
 const zerothWalletChallengeEndpoint = "/wallet/challenge";
 const zerothWalletVerifyEndpoint = "/wallet/verify";
+let zerothConditionalPasskeyAbortController = null;
 
 function zerothSetPasskeyStatus(value, error = false) {
   const status = document.getElementById("zeroth-account-passkey-status");
@@ -2832,10 +3046,16 @@ function zerothCreationOptionsFromServer(options) {
   publicKey.user = Object.assign({}, publicKey.user, {
     id: zerothBase64urlToBuffer(publicKey.user.id)
   });
-  publicKey.excludeCredentials = (publicKey.excludeCredentials || []).map((credential) => ({
-    type: credential.type,
-    id: zerothBase64urlToBuffer(credential.id)
-  }));
+  publicKey.excludeCredentials = (publicKey.excludeCredentials || []).map((credential) => {
+    const descriptor = {
+      type: credential.type,
+      id: zerothBase64urlToBuffer(credential.id)
+    };
+    if (Array.isArray(credential.transports) && credential.transports.length > 0) {
+      descriptor.transports = credential.transports;
+    }
+    return descriptor;
+  });
   return publicKey;
 }
 
@@ -2973,6 +3193,10 @@ async function zerothSignInWithPasskey(button) {
   if (!zerothPasskeysAvailable()) {
     throw new Error("Passkeys are not available in this browser");
   }
+  if (zerothConditionalPasskeyAbortController) {
+    zerothConditionalPasskeyAbortController.abort();
+    zerothConditionalPasskeyAbortController = null;
+  }
   const payload = {
     clientId: String(button.dataset.clientId || "").trim(),
     returnTo: String(button.dataset.returnTo || "").trim()
@@ -2989,6 +3213,47 @@ async function zerothSignInWithPasskey(button) {
   );
   zerothSetPasskeyStatus("Signed in");
   window.location.assign((result && result.returnTo) || payload.returnTo || "/");
+}
+
+async function zerothStartConditionalPasskeySignIn() {
+  const button = document.getElementById("zeroth-account-passkey-login");
+  if (!(button instanceof HTMLButtonElement) || !zerothPasskeysAvailable()) return;
+  if (typeof PublicKeyCredential.isConditionalMediationAvailable !== "function") return;
+  if (!(await PublicKeyCredential.isConditionalMediationAvailable())) return;
+
+  const controller = new AbortController();
+  zerothConditionalPasskeyAbortController = controller;
+  const payload = {
+    clientId: String(button.dataset.clientId || "").trim(),
+    returnTo: String(button.dataset.returnTo || "").trim()
+  };
+  try {
+    const options = await zerothPasskeyApi(zerothPasskeyAuthenticateOptionsEndpoint, payload);
+    if (controller.signal.aborted) return;
+    const credential = await navigator.credentials.get({
+      publicKey: zerothRequestOptionsFromServer(options),
+      mediation: "conditional",
+      signal: controller.signal
+    });
+    if (!credential || controller.signal.aborted) return;
+    zerothSetPasskeyStatus("Signing in");
+    const result = await zerothPasskeyApi(
+      zerothPasskeyAuthenticateVerifyEndpoint,
+      zerothAuthenticationCredentialPayload(credential)
+    );
+    zerothSetPasskeyStatus("Signed in");
+    window.location.assign((result && result.returnTo) || payload.returnTo || "/");
+  } catch (error) {
+    if (controller.signal.aborted || (error && error.name === "AbortError")) return;
+    // Conditional mediation is ambient autofill UI. A dismissal or an
+    // unavailable credential should leave the ordinary login choices alone.
+    if (error && error.name === "NotAllowedError") return;
+    zerothSetPasskeyStatus("Passkey autofill unavailable", true);
+  } finally {
+    if (zerothConditionalPasskeyAbortController === controller) {
+      zerothConditionalPasskeyAbortController = null;
+    }
+  }
 }
 
 async function zerothSignInWithWallet(button) {
@@ -3061,8 +3326,16 @@ function zerothMagicLinkStartPolling(returnTo, pollToken) {
       let url, resp, data;
       if (pollToken) {
         url = new URL("/magic-links/poll", window.location.href);
-        url.searchParams.set("token", pollToken);
-        resp = await fetch(url.toString(), { credentials: "include", headers: { Accept: "application/json" } });
+        resp = await fetch(url.toString(), {
+          method: "POST",
+          credentials: "include",
+          headers: { Accept: "application/json", "Content-Type": "application/json" },
+          body: JSON.stringify({ pollToken })
+        });
+        if (resp.status === 409) {
+          zerothMagicLinkStopPolling();
+          return;
+        }
         if (resp.ok) {
           data = await resp.json();
           if (data && data.status === "complete") {
@@ -3104,13 +3377,33 @@ function zerothBindSectionNav() {
     const links = Array.from(nav.querySelectorAll("a[href^='#']"));
     if (links.length === 0) continue;
     const defaultHash = nav.getAttribute("data-zeroth-default-section") || links[0].getAttribute("href");
+    const tabbed = nav.getAttribute("data-zeroth-tabs") === "true";
+    const panels = links.map((link) => {
+      const hash = link.getAttribute("href");
+      return hash ? document.getElementById(hash.slice(1)) : null;
+    });
+    const relatedPanels = Array.from(document.querySelectorAll("[data-zeroth-panel-for]"));
     const update = () => {
-      const activeHash = window.location.hash || defaultHash;
+      const requestedHash = window.location.hash || defaultHash;
+      const activeHash = links.some((link) => link.getAttribute("href") === requestedHash)
+        ? requestedHash
+        : defaultHash;
       for (const link of links) {
         if (link.getAttribute("href") === activeHash) {
           link.setAttribute("aria-current", "page");
         } else {
           link.removeAttribute("aria-current");
+        }
+      }
+      if (tabbed) {
+        const activeLink = links.find((link) => link.getAttribute("href") === activeHash);
+        const pageTitle = document.getElementById("zeroth-page-title");
+        if (pageTitle && activeLink) pageTitle.textContent = activeLink.textContent.trim();
+        panels.forEach((panel, index) => {
+          if (panel) panel.hidden = links[index].getAttribute("href") !== activeHash;
+        });
+        for (const panel of relatedPanels) {
+          panel.hidden = panel.getAttribute("data-zeroth-panel-for") !== activeHash;
         }
       }
     };
@@ -3270,6 +3563,14 @@ document.addEventListener("click", (event) => {
     window.alert(error instanceof Error ? error.message : "Passkey sign in failed");
   });
 });
+
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", () => {
+    zerothStartConditionalPasskeySignIn();
+  }, { once: true });
+} else {
+  zerothStartConditionalPasskeySignIn();
+}
 "#;
 
 const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
@@ -3327,13 +3628,33 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
       const links = Array.from(nav.querySelectorAll("a[href^='#']"));
       if (links.length === 0) continue;
       const defaultHash = nav.getAttribute("data-zeroth-default-section") || links[0].getAttribute("href");
+      const tabbed = nav.getAttribute("data-zeroth-tabs") === "true";
+      const panels = links.map((link) => {
+        const hash = link.getAttribute("href");
+        return hash ? document.getElementById(hash.slice(1)) : null;
+      });
+      const relatedPanels = Array.from(document.querySelectorAll("[data-zeroth-panel-for]"));
       const update = () => {
-        const activeHash = window.location.hash || defaultHash;
+        const requestedHash = window.location.hash || defaultHash;
+        const activeHash = links.some((link) => link.getAttribute("href") === requestedHash)
+          ? requestedHash
+          : defaultHash;
         for (const link of links) {
           if (link.getAttribute("href") === activeHash) {
             link.setAttribute("aria-current", "page");
           } else {
             link.removeAttribute("aria-current");
+          }
+        }
+        if (tabbed) {
+          const activeLink = links.find((link) => link.getAttribute("href") === activeHash);
+          const pageTitle = document.getElementById("zeroth-page-title");
+          if (pageTitle && activeLink) pageTitle.textContent = activeLink.textContent.trim();
+          panels.forEach((panel, index) => {
+            if (panel) panel.hidden = links[index].getAttribute("href") !== activeHash;
+          });
+          for (const panel of relatedPanels) {
+            panel.hidden = panel.getAttribute("data-zeroth-panel-for") !== activeHash;
           }
         }
       };
@@ -3376,10 +3697,16 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
     publicKey.user = Object.assign({}, publicKey.user, {
       id: base64urlToBuffer(publicKey.user.id)
     });
-    publicKey.excludeCredentials = (publicKey.excludeCredentials || []).map((credential) => ({
-      type: credential.type,
-      id: base64urlToBuffer(credential.id)
-    }));
+    publicKey.excludeCredentials = (publicKey.excludeCredentials || []).map((credential) => {
+      const descriptor = {
+        type: credential.type,
+        id: base64urlToBuffer(credential.id)
+      };
+      if (Array.isArray(credential.transports) && credential.transports.length > 0) {
+        descriptor.transports = credential.transports;
+      }
+      return descriptor;
+    });
     return publicKey;
   }
 
@@ -4408,24 +4735,23 @@ mod tests {
         assert!(html.contains(">Z<"));
         assert!(html.contains("Identity"));
         assert!(!html.contains("zeroth-hero-mark"));
-        assert!(!html.contains("zeroth-login-intro"));
+        assert!(!html.contains("zeroth-login-intro-copy"));
         assert!(!html.contains(">SSO<"));
         assert!(html.contains("Sign in"));
         assert!(provider_index < password_index);
         assert!(html.contains("Continue with Apple"));
         assert!(html.contains("Continue with Google"));
         assert!(html.contains("Email and password"));
-        assert!(html.contains("Create account"));
+        assert!(!html.contains("Create account"));
         assert!(!html.contains("Create password"));
         assert!(html.contains("zeroth-status zeroth-hidden"));
         assert!(html.contains("/password/login"));
-        assert!(html.contains("/password/register"));
         assert!(html.contains("/wallet/challenge"));
         assert!(html.contains("/wallet/verify"));
         assert!(html.contains("zeroth-wallet-login"));
-        assert!(html.contains("Use wallet"));
+        assert!(html.contains("Connect wallet"));
         assert!(!html.contains("/magic-links"));
-        assert!(!html.contains("Magic link"));
+        assert!(!html.contains("Continue with email"));
         assert!(!html.contains("zeroth-account-passkey-login"));
         assert!(!html.contains("Use passkey"));
         assert!(html.contains("zeroth-login-card"));
@@ -4449,10 +4775,12 @@ mod tests {
         let html = render_account_html(state);
 
         assert!(html.contains("/magic-links"));
-        assert!(html.contains("Magic link"));
-        assert!(html.contains("Send link"));
+        assert!(html.contains("Continue with email"));
+        assert!(html.contains("Continue"));
         assert!(html.contains("zeroth-account-passkey-login"));
         assert!(html.contains("Use passkey"));
+        assert!(html.contains("autocomplete=\"username webauthn\""));
+        assert!(html.find("More options").unwrap() < html.find("Email and password").unwrap());
     }
 
     #[test]
@@ -4498,11 +4826,18 @@ mod tests {
         assert!(document.contains("function zerothSignInWithWallet(button)"));
         assert!(document.contains("personal_sign"));
         assert!(document.contains("navigator.credentials.get"));
+        assert!(document.contains("isConditionalMediationAvailable"));
+        assert!(document.contains("mediation: \"conditional\""));
+        assert!(document.contains("zerothConditionalPasskeyAbortController"));
         assert!(document.contains("/passkeys/authenticate/options"));
         assert!(document.contains("function zerothSubmitAction(form, submitter)"));
         assert!(document.contains("submitter.hasAttribute(\"formaction\")"));
         assert!(document.contains("zerothSubmitAction(form, submitter)"));
         assert!(document.contains("function zerothBindSectionNav()"));
+        assert!(document.contains("new URL(\"/magic-links/poll\""));
+        assert!(document.contains("method: \"POST\""));
+        assert!(document.contains("JSON.stringify({ pollToken })"));
+        assert!(!document.contains("url.searchParams.set(\"token\", pollToken)"));
     }
 
     #[test]
@@ -4553,6 +4888,8 @@ mod tests {
         assert!(ZEROTH_UI_CSS.contains("--z-ink-deep: #0b0f19"));
         assert!(ZEROTH_UI_CSS.contains("#2d333b 0%, var(--z-ink)"));
         assert!(ZEROTH_UI_CSS.contains("rgba(31, 35, 40"));
+        assert!(ZEROTH_UI_CSS.contains(":focus-visible"));
+        assert!(ZEROTH_UI_CSS.contains("prefers-reduced-motion: reduce"));
         assert!(!ZEROTH_UI_CSS.contains("#ff7c12 0%, var(--z-orange)"));
         assert!(!ZEROTH_UI_CSS.contains("#0550ae 55%, #1a7f37"));
     }
@@ -4598,6 +4935,13 @@ mod tests {
             created_at: None,
             expires_at: None,
         });
+        state.sessions.push(SessionUi {
+            id: "ses_other&device".to_owned(),
+            client_id: Some("cli-client".to_owned()),
+            current: false,
+            created_at: None,
+            expires_at: None,
+        });
         state.applications.push(ApplicationUi {
             client_id: "browser-client".to_owned(),
             name: "Browser".to_owned(),
@@ -4619,6 +4963,9 @@ mod tests {
         assert!(html.contains("https://id.example.com/admin"));
         assert!(html.contains("data-zeroth-profile-menu"));
         assert!(html.contains("Sign out"));
+        assert!(html.contains("Revoke"));
+        assert!(html.contains("/sessions?session_id=ses_other%26device"));
+        assert!(html.contains("data-zeroth-method=\"DELETE\""));
         assert!(html.contains("id=\"security\""));
         assert!(html.contains("zeroth-auth-group zeroth-hidden"));
         assert!(!html.contains("id=\"login\""));
@@ -4741,6 +5088,9 @@ mod tests {
         assert!(html.contains("Authentication"));
         assert!(html.contains("Monitoring"));
         assert!(html.contains("My account"));
+        assert!(html.contains("data-zeroth-tabs=\"true\""));
+        assert!(html.contains("data-zeroth-panel-for=\"#overview\""));
+        assert!(html.contains("data-zeroth-panel-for=\"#clients\""));
         assert!(html.contains("zeroth-overview-grid"));
         assert!(html.contains("Admin access"));
         assert!(html.contains("Bootstrap token"));
@@ -4811,6 +5161,8 @@ mod tests {
         assert!(document.contains("URLSearchParams"));
         assert!(document.contains("event_type"));
         assert!(document.contains("function bindSectionNav()"));
+        assert!(document.contains("panel.hidden ="));
+        assert!(document.contains("zeroth-page-title"));
     }
 
     #[test]
