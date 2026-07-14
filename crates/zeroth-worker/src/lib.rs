@@ -3140,7 +3140,9 @@ async fn handle_request(request: Request, env: Env) -> worker::Result<Response> 
 
 #[cfg(target_arch = "wasm32")]
 fn with_response_security_headers(response: Response) -> worker::Result<Response> {
-    let headers = response.headers();
+    // Fetch redirect responses have immutable header guards in the Workers
+    // runtime. Build a mutable copy and replace the response headers instead.
+    let headers = response.headers().clone();
     headers.set("X-Content-Type-Options", "nosniff")?;
     headers.set("Referrer-Policy", "no-referrer")?;
     headers.set("X-Frame-Options", "DENY")?;
@@ -3156,7 +3158,7 @@ fn with_response_security_headers(response: Response) -> worker::Result<Response
     if headers.get("Cache-Control")?.is_none() {
         headers.set("Cache-Control", "no-store")?;
     }
-    Ok(response)
+    Ok(response.with_headers(headers))
 }
 
 #[cfg(target_arch = "wasm32")]
