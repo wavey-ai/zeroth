@@ -240,3 +240,7 @@ After the root name is transferred:
 ```sh
 cargo publish -p zeroth
 ```
+
+## License
+
+Zeroth is available under the [MIT License](LICENSE).
