@@ -60,19 +60,18 @@ Implemented so far:
 - Worker `/authorize` flow that stores provider transaction state in D1 before
   redirecting upstream, plus `prompt=none` silent SSO from an active Zeroth
   browser session
-- Worker hosted Leptos `/login` and `/account` pages; `/login` supports
-  browser-session login with client-bounded `return_to`, and `/authorize`
-  renders the provider picker when the OIDC request omits `provider`
+- Worker hosted Leptos `/login` and `/account` pages. `/login` supports browser
+  sessions with client-bounded `return_to`. `/authorize` renders the provider
+  picker when the OIDC request omits `provider`
 - discoverable WebAuthn passkeys with opaque user handles, required user
   verification, conditional-mediation autofill, stored transport/backup
   metadata, and synced-passkey-aware signature-counter handling
 - password and scanner-safe magic-link sign-in with layered D1 rate limits,
   generic public responses, one-time POST confirmation, and one-time
   cross-device polling credentials
-- Worker hosted Leptos `/admin` and `/admin/clients` page for provider
-  readiness, D1 schema status, user list/disable/enable, audit events, and
-  registered-client list/create/update operations through the generic management
-  APIs, including a first-party Zeroth sign-in action for allowlisted admin
+- Worker hosted Leptos `/admin` and `/admin/clients` pages for provider and D1
+  readiness, users, audit events, and registered clients. The pages use the
+  generic management APIs. They include Zeroth sign-in for allowlisted admin
   sessions
 
 - Worker Apple App Site Association endpoint backed by deployment-provided JSON
@@ -88,30 +87,27 @@ Implemented so far:
 - CLI `validate-secret` checks for Zeroth ES256 private keys, Apple PKCS #8
   private keys, and previous public JWKS rotation JSON without printing secret
   material
-- Worker `/clients` management API as the minimal Auth0-management replacement
-  for registered-client create/update/list/disable, protected by either a
-  deployment admin bearer token or an allowlisted Zeroth browser session, and
-  backed by D1
+- Worker `/clients` management API as the minimal Auth0-management replacement.
+  It creates, updates, lists, and disables registered clients in D1. A deployment
+  admin token or allowlisted Zeroth browser session protects it
 - Worker `/tokens` and `/api/tokens` short-lived ES256 bearer-token minting for
   client-configured downstream issuers such as `yl-record-issuer`, with the
   audience and TTL editable through the client admin UI
-- Worker `POST /__zeroth/db/ensure` schema bootstrap endpoint protected by the
-  same admin gate, applying unrecorded generic migrations, persisting migration
-  history in D1, and repairing D1 compatibility columns exported by
-  `zeroth-storage`
-- Worker `GET /__zeroth/db/status` read-only persistence preflight protected by
-  the same admin gate, reporting required D1 tables, migrations, compatibility
+- Worker `POST /__zeroth/db/ensure` schema bootstrap endpoint. The same admin gate
+  protects it. It applies unrecorded generic migrations and stores migration
+  history in D1. It repairs compatibility columns from `zeroth-storage`
+- Worker `GET /__zeroth/db/status` read-only persistence preflight. The same
+  admin gate protects it. It reports D1 tables, migrations, compatibility
   columns, and registered-client count without slowing public `/ready`
 - Worker `/users` and `/providers/status` management APIs for bounded user
-  inspection, reversible user disable/enable with session/refresh-token
-  revocation, and provider configuration readiness without exposing secrets
+  inspection and provider readiness. User disable and enable are reversible.
+  Disable also revokes sessions and refresh tokens. The APIs do not expose secrets
 - Worker `/events` management API, D1 audit persistence, and hosted admin
   filters for bounded Auth0-style event inspection without storing token values
   or provider secrets
-- Worker `/oauth2/callback` parsing for query callbacks and Apple `form_post`,
-  with D1 transaction lookup, browser transaction-cookie binding, conditional
-  one-time transaction consumption before provider token exchange, and replay
-  rejection
+- Worker `/oauth2/callback` parsing for query callbacks and Apple `form_post`.
+  It looks up the D1 transaction and binds the browser transaction cookie. It
+  consumes the transaction before provider token exchange and rejects replays
 - Zeroth-owned upstream OIDC provider nonces for Apple/Google callbacks,
   separate from downstream app nonces that are preserved only for Zeroth-issued
   ID tokens
@@ -125,66 +121,61 @@ Implemented so far:
   as the stable account-linking subject when present, with legacy `id` fallback
 - Google/Apple RS256 ID-token verification against provider JWKS and D1
   user/identity upsert from verified OIDC claims
-- provider callback completion that either creates a D1-backed browser session
-  and returns to the hosted-login `return_to` URL, or issues a hashed Zeroth
-  authorization code and redirects back to the registered OIDC client with the
-  original app state plus Zeroth's `iss` authorization response parameter
-- client-bound authorization error redirects after registered redirect URI
-  validation, so relying apps receive `error`, original app state, and `iss`
-  instead of JSON for OIDC request failures that are safe to redirect
-- Worker `/oauth/token` authorization-code validation for public PKCE clients and
-  confidential clients, including registered-client lookup, client-secret
-  verification, code lookup, expiry/reuse checks, redirect URI matching, S256
-  `code_verifier` validation when the authorization code used PKCE, and
-  conditional one-time D1 code consumption before credentials are minted
-- Worker `/oauth/token` native provider token exchange for Swift/mobile apps:
-  Apple and Google ID tokens are verified against provider JWKS and configured
-  native client-ID allowlists, Spotify access tokens are validated through
-  Spotify's profile endpoint, Spotify profile `account_id` is used as the
-  stable account-linking subject when present, and all three persist the
-  provider identity in D1, apply the registered Zeroth client's email-domain
-  policy, and return Zeroth-owned access/ID tokens
+- provider callback completion for hosted login or registered OIDC clients. It
+  can create a D1-backed browser session and use the hosted-login `return_to` URL.
+  It can issue a hashed Zeroth code and redirect to the registered client. The
+  response includes original app state and Zeroth's `iss` parameter
+- client-bound authorization error redirects after redirect URI validation.
+  Relying apps receive an OIDC error response instead of JSON. It contains
+  `error`, original app state, and `iss` for failures that are safe to redirect.
+- Worker `/oauth/token` authorization-code validation for public PKCE and
+  confidential clients. It verifies the registered client, secret, code,
+  expiry, reuse state, and redirect URI. It validates the S256 `code_verifier`
+  when the code used PKCE. It consumes the D1 code before it mints credentials
+- Worker `/oauth/token` native provider token exchange for Swift and mobile apps.
+  It verifies Apple and Google ID tokens against provider JWKS and native client
+  ID allowlists. It validates Spotify access tokens through the profile endpoint.
+  It uses Spotify `account_id` as the stable linking subject when present. Each
+  provider flow stores the identity in D1 and applies the client's email-domain
+  policy. It returns Zeroth-owned access and ID tokens
 - registered-client CORS/preflight support for browser calls to token,
   revocation, introspection, userinfo, session, sessions, profile, identities,
   validate, and logout
   endpoints
-- ES256 Zeroth-owned access/ID token issuance, standard scoped OIDC ID-token
-  claims for `email`/`profile`, conservative `roles` claims (`user`, plus
-  `admin` for active Zeroth admin memberships), session-bound `sid` claims,
-  refresh-token persistence for `offline_access`, and Worker
-  `/.well-known/jwks.json`
-- `zeroth-oidc` relying-party helpers for sub-10 ms product gating: match
-  multiple exact/prefix protected paths locally, verify the Zeroth access token
-  from cached JWKS, and check role/scope claims without calling Zeroth on every
-  request
-- OIDC discovery metadata for query-mode code responses, rejection of
-  unsupported downstream `response_mode` values, the
-  `authorization_response_iss_parameter_supported` flag, Zeroth-owned
-  issuer/JWKS endpoints for native and browser clients, OAuth Authorization
-  Server metadata at `/.well-known/oauth-authorization-server`, explicit
-  `prompt` parsing for `none`, `login`, `consent`, and `select_account`, and
-  `auth_time` claims for clients that use `max_age`
-- refresh-token grant exchange with rotation and fresh Zeroth token issuance;
-  auth-code-issued refresh tokens are bound to the browser session that created
-  the code, preserve original `auth_time`, require conditional D1 rotation to
-  win before a replacement token is issued, and support `prompt=none` silent SSO
-  with `max_age` freshness checks
+- ES256 Zeroth-owned access and ID token issuance. ID tokens contain standard
+  scoped `email` and `profile` claims. Conservative `roles` claims use `user`
+  and add `admin` for active admin memberships. The tokens support session-bound
+  `sid`, refresh tokens for `offline_access`, and Worker JWKS
+- `zeroth-oidc` relying-party helpers for sub-10 ms product gating. They match
+  exact and prefix protected paths locally. They verify Zeroth access tokens from
+  cached JWKS and check role and scope claims without calling Zeroth each time.
+
+- OIDC discovery metadata for query-mode code responses and rejection of
+  unsupported `response_mode` values. It advertises the response `iss` flag and
+  Zeroth issuer and JWKS endpoints. It includes OAuth Authorization Server
+  metadata and explicit `prompt` values. Clients that use `max_age` receive
+  `auth_time` claims
+- refresh-token grant exchange with rotation and fresh Zeroth token issuance.
+  Authorization-code refresh tokens bind to the browser session that created the
+  code. They preserve original `auth_time`. Conditional D1 rotation must win
+  before replacement. They support `prompt=none` SSO with `max_age` checks
 - refresh-token replay detection that revokes the active session-scoped token
   family when a rotated token is presented again by the same client
 - Worker `/oauth/revoke` refresh-token revocation for registered clients
 - Worker `/oauth/introspect` for RFC7662-style access-token and same-client
   refresh-token introspection by confidential clients, returning inactive
-  responses without exposing token values; session-bound access tokens
+  responses without exposing token values. Session-bound access tokens
   introspect as inactive when their D1 session is missing, revoked, expired, or
-  mismatched
-- Worker `/userinfo` with ES256 bearer access-token verification and D1-backed
-  scoped profile response; disabled users or disabled/missing token clients are
-  rejected from D1 before profile data is returned, and session-bound access
-  tokens require the referenced browser session to still be active
+  mismatched.
+
+- Worker `/userinfo` with ES256 bearer-token verification and a D1-backed scoped
+  profile. It rejects disabled users and disabled or missing token clients before
+  it returns profile data. Session-bound access tokens require an active browser
+  session
 - Worker browser sessions with D1 persistence, secure session cookies,
   optional deployment-controlled parent-domain session cookies for same-site SSO
   across first-party subdomains, `/session`, `/sessions`, `/profile`,
-  `/identities`, and `/logout`; session revocation also revokes that session's
+  `/identities`, and `/logout`. Session revocation also revokes that session's
   refresh-token family
 - Worker OIDC `end_session_endpoint` metadata and bounded post-logout redirects
   through `/logout`
@@ -193,15 +184,14 @@ Implemented so far:
   Google, or Spotify, with client-bounded return URLs and callback completion
 - Worker `DELETE /identities` for guarded linked-identity unlinking without
   allowing removal of the last login method
-- Worker `/validate` for bearer access-token and browser-session validation
-  against active D1 users, registered clients, and active D1 sessions when the
-  access token carries a `sid`
+- Worker `/validate` for bearer-token and browser-session validation. It checks
+  active D1 users and registered clients. When an access token has a `sid`, it
+  also checks the active D1 session
 - Leptos account/login UI for hosted provider choice, profile management,
   linked identities, sessions, and compact OIDC application inventory
-- Worker CPU-budget guardrails for the 10 ms Free-plan target: cached ES256
-  signing material/JWKS, cached Apple/Google provider JWKS, bounded session and
-  identity lists, indexed list queries, bounded request-path cleanup, and
-  bounded CORS origin scans
+- Worker CPU-budget guardrails for the 10 ms Free-plan target. They cache ES256
+  signing material and provider JWKS. They also bound lists, queries,
+  request-path cleanup, and CORS origin scans
 - CLI minting of Sign in with Apple client-secret JWTs from Apple team/key/client
   configuration without mutating Apple Developer records
 - Worker runtime minting and isolate caching of Sign in with Apple
@@ -220,9 +210,10 @@ Still required before Auth0 can be removed:
   seed or `/clients` management upsert
 - relying app cutover to Zeroth issuer, client IDs, redirect URIs, and JWKS
 - crates.io ownership for the root `zeroth` crate name. As of 2026-06-04,
-  crates.io already has `zeroth = 0.0.0` owned by `jason-yau`; the split crate
-  names such as `zeroth-core`, `zeroth-oidc`, and `zeroth-worker` are not claimed
-  by search, but the root name needs transfer or an owner invite before publish.
+  crates.io already has `zeroth = 0.0.0` owned by `jason-yau`. The split crate
+  names are not claimed by search. These include `zeroth-core`, `zeroth-oidc`,
+  and `zeroth-worker`. The root name needs a transfer or owner invitation before
+  publication.
 
 ## Crates.io
 

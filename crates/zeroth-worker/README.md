@@ -2,9 +2,9 @@
 
 Cloudflare Worker deployment surface for Zeroth.
 
-This crate is intentionally separate from `zeroth-server` so Cloudflare-specific
-bindings, Wrangler config, D1 migrations, and Worker runtime APIs do not leak
-into the generic server/domain crates.
+This crate is intentionally separate from `zeroth-server`. Cloudflare bindings,
+Wrangler configuration, D1 migrations, and Worker APIs remain outside the
+generic server and domain crates.
 
 ## Bindings
 
@@ -34,12 +34,12 @@ After the first admin user has logged in through Zeroth, `ADMIN_USER_IDS` and
 `ADMIN_EMAILS` can allow that first-party browser session to call the same admin
 APIs. `ADMIN_EMAILS` only matches verified primary emails.
 
-`POST /__zeroth/db/ensure` creates the generic migration ledger, applies
-embedded migrations that are not yet recorded in `zeroth_schema_migrations`, and
-repairs compatibility columns exported by `zeroth-storage` when the request
-includes `Authorization: Bearer <ADMIN_TOKEN>`. The JSON response reports
+`POST /__zeroth/db/ensure` creates the generic migration ledger. It applies
+embedded migrations not recorded in `zeroth_schema_migrations`. It repairs
+compatibility columns from `zeroth-storage` when the request has
+`Authorization: Bearer <ADMIN_TOKEN>`. The JSON response reports
 `migrationsApplied` and `migrationsSkipped`. Registered clients live in
-`zeroth_clients`; `/authorize` will not redirect to an upstream provider until
+`zeroth_clients`. `/authorize` will not redirect to an upstream provider until
 the `client_id` and `redirect_uri` match a non-disabled row.
 
 The same generic D1 SQL can be inspected or used by deployment scripts through
@@ -121,10 +121,10 @@ INSERT INTO zeroth_clients (
 );
 ```
 
-`allowed_email_domains_json` is optional client policy. Leave it as `[]` for
-public clients that can accept any provider account, or set domains such as
-`["example.com"]` to require a verified provider email whose domain matches the
-client allowlist before Zeroth issues a session or authorization code.
+`allowed_email_domains_json` is an optional client policy. Leave it as `[]` for
+public clients that accept any provider account. To restrict accounts, add
+domains such as `["example.com"]`. Zeroth then requires a verified provider
+email that matches the client allowlist before it issues a session or code.
 
 The client row can also configure a short-lived bearer token for a downstream
 issuer such as `yl-record-issuer`. Set `issuer_token_audience` to the fixed
@@ -132,7 +132,7 @@ audience the client should receive, and `issuer_token_ttl_seconds` to a value
 between 60 and 600 seconds. Zeroth exposes these fields in the admin client UI
 so deployments can update them without editing SQL. The token minting endpoint
 uses the current signed-in browser session, the exact browser origin, and the
-client's configured audience; it does not accept an audience from the request.
+client's configured audience. It does not accept an audience from the request.
 
 For confidential clients, `secret_hash` is the SHA-256 hex digest of the client
 secret, optionally prefixed with `sha256:`. `/oauth/token` accepts
@@ -160,7 +160,7 @@ curl -X DELETE -H "Authorization: Bearer $ADMIN_TOKEN" \
   "https://id.example.com/clients?client_id=old-client"
 ```
 
-`GET /clients?client_id=...` returns one client; `GET /clients` returns at most
+`GET /clients?client_id=...` returns one client.`GET /clients` returns at most
 256 clients. `POST /clients` creates or updates a client. Confidential clients
 may send `clientSecret` to have Zeroth hash it, or `secretHash` when the hash is
 already produced outside the Worker. `allowedEmailDomains` accepts up to 32
@@ -168,8 +168,8 @@ ASCII domains and requires provider emails to be verified before matching.
 `DELETE /clients?client_id=...` disables the client instead of deleting the row.
 
 `GET /ready` is the public deployment preflight endpoint. It returns `200` only
-when the issuer URL is HTTPS, Zeroth signing material is present and parseable,
-and Apple, Google, and Spotify provider credentials are configured. Empty values
+when the issuer URL uses HTTPS and Zeroth signing material is valid. Apple,
+Google, and Spotify provider credentials must also be configured. Empty values
 and scaffold placeholders such as `replace-with-*`, `changeme`, or `<...>` are
 treated as unconfigured so local templates cannot accidentally pass a live
 readiness check. It also reports Apple App Site Association JSON status without
@@ -217,14 +217,16 @@ const { accessToken } = await tokenResponse.json();
 
 `GET /admin` and `GET /admin/clients` serve the Leptos management UI for the
 same APIs. The page can use the current Zeroth session when the user is
-allowlisted by `ADMIN_USER_IDS` or `ADMIN_EMAILS`; it also accepts the bootstrap
+allowlisted by `ADMIN_USER_IDS` or `ADMIN_EMAILS`. It also accepts the bootstrap
 admin bearer token in the browser and stores that token only in `sessionStorage`
 for the current tab session. The admin page includes a first-party sign-in link
-to `/login?return_to=<issuer>/admin`; issuer-origin `/admin` and
+to `/login?return_to=<issuer>/admin`. Issuer-origin `/admin` and
 `/admin/clients` returns are allowed only for the hosted management UI. The UI
-also renders the admin-only D1 schema status from `/__zeroth/db/status` before
-loading D1-backed users, events, and clients, so an incomplete database shows
-actionable missing-table or pending-migration rows. API writes still go through
+also renders the admin-only D1 schema status from `/__zeroth/db/status`.
+
+The UI loads this status before D1-backed users, events, and clients. An
+incomplete database shows actionable missing-table or pending-migration rows.
+API writes still go through
 `/clients`, `/users`, `/events`, and `/providers/status`, so direct JSON and the
 UI share validation and D1 persistence.
 
@@ -266,22 +268,25 @@ curl -H "Authorization: Bearer $ADMIN_TOKEN" \
 
 `GET /users` returns at most 100 users ordered by recent update time.
 `GET /users?user_id=...` returns a single user with linked identities and active
-sessions. `PATCH /users?user_id=...` reversibly disables or enables the user;
-disabling also revokes active browser sessions and active refresh tokens, but it
+sessions. `PATCH /users?user_id=...` reversibly disables or enables the user.
+Disabling also revokes active browser sessions and active refresh tokens, but it
 does not delete the user or identity rows.
 
 `GET /events` returns at most 100 recent audit events. It accepts exact-match
 filters for `event_type`, `user_id`, `client_id`, and `provider_id`. Events
-store event metadata, hashed IP, user agent, and a small details JSON object;
+store event metadata, hashed IP, user agent, and a small details JSON object.
 Zeroth does not write provider secrets, access tokens, refresh tokens, auth
 codes, or session cookie values into audit details. The hosted admin UI exposes
 the same event filters and sends them directly to `/events`.
 
-Browser calls use `allowed_origins_json` for CORS. Zeroth answers preflight for
-`/oauth/token`, `/oauth/revoke`, `/oauth/introspect`, `/userinfo`, `/session`,
-`/sessions`, `/profile`, `/identities/link`, `/identities`, `/validate`, and
-`/logout` only when the `Origin` exactly matches a non-disabled registered
-client's allowed origin.
+Browser calls use `allowed_origins_json` for CORS. Zeroth answers preflight for:
+
+- `/oauth/token`, `/oauth/revoke`, and `/oauth/introspect`
+- `/userinfo`, `/profile`, `/validate`, and `/logout`
+- `/session`, `/sessions`, `/identities/link`, and `/identities`.
+
+The `Origin` must exactly match an allowed origin for a non-disabled registered
+client.
 
 ## Secrets
 
@@ -310,18 +315,19 @@ Non-secret deployment vars include `PUBLIC_BASE_URL`, `SESSION_COOKIE_NAME`,
 `TX_COOKIE_NAME`, `APPLE_NATIVE_CLIENT_IDS`, `GOOGLE_NATIVE_CLIENT_IDS`,
 `SPOTIFY_NATIVE_CLIENT_IDS`, `MAGIC_LINK_FROM`, optional
 `MAGIC_LINK_DELIVERY`, optional `MAGIC_LINK_WEBHOOK_URL`, and optional
-`SESSION_COOKIE_DOMAIN`. Leave
-`SESSION_COOKIE_DOMAIN` unset for a host-only Zeroth session cookie, or set it
-to a parent domain such as `.example.com` when one first-party registrable
-domain owns multiple subdomain apps. This is the Zeroth-native equivalent of
-the useful shared-cookie behavior from a deployment-specific identity broker;
-unrelated domains still need OIDC redirects and app-local sessions.
-`APPLE_NATIVE_CLIENT_IDS` is a comma/space separated allowlist of Apple app
-Bundle IDs whose native Sign in with Apple `identityToken` values Zeroth may
-accept, for example `ai.wavey.id`. `GOOGLE_NATIVE_CLIENT_IDS` allowlists Google
+`SESSION_COOKIE_DOMAIN`.
+
+Leave `SESSION_COOKIE_DOMAIN` unset for a host-only Zeroth session cookie. Set it
+to a parent domain such as `.example.com` when one registrable domain owns
+multiple subdomain apps. This provides shared cookies across its first-party
+subdomains. Unrelated domains still need OIDC redirects and app-local sessions.
+
+`APPLE_NATIVE_CLIENT_IDS` lists Apple app Bundle IDs that Zeroth can accept for
+native Sign in with Apple. For example, use `ai.wavey.id`.
+`GOOGLE_NATIVE_CLIENT_IDS` allowlists Google
 native OAuth client IDs whose ID-token `aud` values Zeroth may accept.
 `SPOTIFY_NATIVE_CLIENT_IDS` records the Spotify native app client IDs allowed to
-request native access-token exchange; Spotify access tokens are validated by
+request native access-token exchange. Spotify access tokens are validated by
 calling Spotify's profile endpoint because Spotify does not expose an OIDC ID
 token for that mobile SDK path. When Spotify returns `account_id`, Zeroth uses
 that immutable profile value for account linking and falls back to legacy `id`
@@ -329,7 +335,7 @@ only for older responses.
 
 Magic-link local auth defaults to `MAGIC_LINK_DELIVERY=cloudflare_email`. That
 requires `MAGIC_LINK_FROM` and a Worker `send_email` binding named `EMAIL`.
-Set `MAGIC_LINK_DELIVERY=webhook` to use a generic HTTPS email sender instead;
+Set `MAGIC_LINK_DELIVERY=webhook` to use a generic HTTPS email sender instead.
 Zeroth will POST JSON containing `kind`, `to`, `from`, `fromName`, `subject`,
 `text`, `html`, `link`, and `productName` to `MAGIC_LINK_WEBHOOK_URL`. If
 `MAGIC_LINK_WEBHOOK_BEARER` or `MAGIC_LINK_WEBHOOK_TOKEN` is configured as a
@@ -351,7 +357,7 @@ Apple can be configured in either of two ways:
 - `APPLE_CLIENT_SECRET`: a pre-minted Sign in with Apple client-secret JWT.
 - `APPLE_TEAM_ID`, `APPLE_KEY_ID`, and `APPLE_PRIVATE_KEY`: Zeroth mints and
   caches the client-secret JWT at runtime. `APPLE_PRIVATE_KEY` is the `.p8` PKCS
-  #8 PEM content; escaped `\n` newlines are accepted. `APPLE_CLIENT_SECRET_TTL_SECONDS`
+  #8 PEM content. Escaped `\n` newlines are accepted. `APPLE_CLIENT_SECRET_TTL_SECONDS`
   optionally sets the JWT TTL and is capped at Apple's 180-day maximum.
 
 A test `APPLE_CLIENT_SECRET` can still be minted locally without changing Apple
@@ -403,13 +409,12 @@ Current guardrails:
 - Token issuance performs a single compact D1 user-claims lookup before signing
   so disabled users are rejected and scoped ID-token claims do not require
   unbounded identity scans.
-- Token introspection verifies Zeroth access tokens locally before D1 checks,
-  requires confidential client authentication, and returns the compact inactive
-  RFC7662 response for invalid, disabled-user, disabled-client, or revoked
-  session-bound tokens.
-- Session-bound access and ID tokens include the standard `sid` claim, and
-  token validation/introspection require the referenced D1 session to still be
-  active before exposing that same session id to relying services.
+- Token introspection verifies Zeroth access tokens locally before D1 checks. It
+  requires confidential client authentication. Invalid tokens and inactive
+  users, clients, or sessions receive the compact inactive RFC7662 response.
+- Session-bound access and ID tokens include the standard `sid` claim. Token
+  validation and introspection require the referenced D1 session to remain
+  active. Only then can relying services receive that session ID.
 - Auth-code consumption and refresh-token rotation use conditional indexed D1
   updates and `changes` metadata, avoiding extra post-write scans on the token
   endpoint.
@@ -417,35 +422,36 @@ Current guardrails:
   check before upstream token exchange, profile upsert, session creation, or
   Zeroth code issuance.
 - Provider callbacks must also match a short-lived HttpOnly transaction cookie
-  scoped to `/oauth2/callback`; it uses `SameSite=None` so Apple's cross-site
+  scoped to `/oauth2/callback`. It uses `SameSite=None` so Apple's cross-site
   `form_post` callback can still carry it.
-- List endpoints are bounded: `/sessions` returns at most 100 active sessions,
-  `/identities` returns at most 16 linked provider identities, `/clients`
-  returns at most 256 registered clients, `/users` returns at most 100 users,
-  and `/events` returns at most 100 audit events.
+- List endpoints are bounded. `/sessions` returns at most 100 active sessions,
+  and `/identities` returns at most 16 linked identities. `/clients` returns at
+  most 256 clients. `/users` and `/events` each return at most 100 rows.
 - List queries use D1 indexes that match the bounded lookup shape so Worker code
   does not sort or scan unbounded rows.
 - Event inspection stays bounded even when filtered because `/events` uses
   exact-match query parameters with indexed lookups and a fixed 100-row limit.
-- Management writes are bounded: `POST /clients` accepts only JSON bodies up to
-  8 KiB, validates at most 32 redirect URIs, 32 allowed origins, and 32 allowed
-  email domains, and uses a single D1 upsert. `PATCH /users` accepts only a 1
-  KiB JSON body for the reversible disabled state.
+- Management writes are bounded. `POST /clients` accepts JSON bodies up to 8 KiB
+  and uses one D1 upsert. It permits at most 32 redirect URIs, allowed origins,
+  and allowed email domains. `PATCH /users` accepts a 1 KiB JSON body for the
+  reversible disabled state.
+
 - Audit details are bounded to 1 KiB and oversized details are replaced with a
   small truncation marker before they are inserted into D1.
 - Profile writes are bounded: `PATCH /profile` accepts only JSON bodies up to 4
   KiB and validates the two mutable local profile fields before writing D1.
 - Identity unlinking is guarded: `DELETE /identities` uses exact provider
   identity keys and will not remove the user's last linked identity.
-- Identity linking is session-bound: `GET /identities/link` requires an active
-  browser session, stores the target user/session on the provider transaction,
-  and refuses callback completion if the identity belongs to another user.
-- Request-path maintenance is bounded: `/authorize` and provider-selected
-  `/login` delete at most 64 expired provider transactions before inserting the
-  next one.
+- Identity linking is session-bound. `GET /identities/link` requires an active
+  browser session. It stores the target user and session on the provider
+  transaction. It rejects callback completion if another user owns the identity.
+- Request-path maintenance is bounded. `/authorize` and provider-selected
+  `/login` delete at most 64 expired provider transactions. They do this before
+  they insert the next transaction.
+
 - Hosted UI rendering is server-side Leptos with inline CSS and a tiny inline
-  form handler. `/login`, `/account`, `/admin`, and `/admin/clients` perform
-  only bounded D1 reads already used by the API paths, and API endpoints do not
+  form handler. `/login`, `/account`, `/admin`, and `/admin/clients` perform only
+  bounded D1 reads. The API paths already use these reads. API endpoints do not
   render the UI.
 - Anonymous CORS preflight scans at most 256 registered clients and skips JSON
   parsing for origin rows that cannot contain the request origin.
@@ -459,25 +465,25 @@ Current guardrails:
   authorization-code request or a browser-session login request such as
   `/login?client_id=wavey-web&return_to=https%3A%2F%2Fapp.example.com%2F`.
   If `client_id` is omitted, the Worker uses `DEFAULT_LOGIN_CLIENT_ID`. Browser
-  login return URLs are validated against the selected client's registered
-  redirect URIs or allowed origins.
+  login URLs must match the selected client's redirect URIs or allowed origins.
+
 - `GET /account` renders the hosted Leptos account UI for the current browser
   session, including local profile edits, linked identities, and active
   sessions. Identity-link returns to `/account` are allowed only on Zeroth's own
   issuer origin.
 - `GET /admin` and `GET /admin/clients` render the hosted Leptos management UI
-  for database status, providers, users, and registered clients. It can SSR
-  bounded rows when the request includes a valid admin bearer token or an
-  allowlisted Zeroth browser session. Without either, the page still loads and
-  lets an operator enter the bootstrap token for the current browser tab or sign
-  in through Zeroth. The client script also retries the same APIs with
-  same-origin credentials so an allowlisted Zeroth session can administer the
-  issuer without a bearer token in browser storage.
+  for database status, providers, users, and registered clients. The UI can
+  server-render bounded rows for an authorized request. Authorization can use an
+  admin bearer token or allowlisted Zeroth browser session. Without either, the
+  page lets an operator enter the bootstrap token or sign in through Zeroth.
+
+  The client script retries the APIs with same-origin credentials. An allowlisted
+  session can then administer the issuer without storing a bearer token.
 - `GET|POST|DELETE /clients` exposes registered-client management. It requires
-  the admin bearer token or an allowlisted Zeroth browser session, returns safe
-  client metadata without secret hashes, creates or updates clients with bounded
-  JSON, hashes `clientSecret` when supplied, preserves an existing confidential
-  secret when omitted, and disables clients instead of deleting rows. Disabled
+  an admin bearer token or allowlisted Zeroth browser session. It returns safe
+  metadata without secret hashes. It creates or updates clients with bounded
+  JSON and hashes a supplied `clientSecret`. It preserves an existing secret when
+  omitted. Delete requests disable clients instead of deleting rows. Disabled
   clients are hidden from authorization, token, resource, validation, and CORS
   checks.
 - `GET|PATCH /users` exposes bounded user inspection and reversible disable or
@@ -491,63 +497,69 @@ Current guardrails:
   registered-client count without mutating the database.
 - `GET /events` exposes recent audit events for admin troubleshooting. It is
   bounded to 100 rows and can filter by event type, user, client, or provider.
-- `GET /authorize` parses an OIDC authorization-code request, requires `openid`
-  scope, supports only query-mode downstream code responses, validates the
-  registered client redirect URI, requires S256 PKCE for public clients, and
-  renders the hosted provider picker when `provider` is omitted. When `provider`
-  is Apple, Google, or Spotify, it stores a provider transaction in D1 and
-  redirects upstream using Zeroth's `/oauth2/callback`.
+- `GET /authorize` parses an OIDC authorization-code request and requires the
+  `openid` scope. It supports only query-mode downstream code responses. It
+  validates the registered client redirect URI and requires S256 PKCE for public
+  clients. When `provider` is omitted, it renders the hosted provider picker.
+  For Apple, Google, or Spotify, it stores a D1 transaction and redirects
+  upstream through Zeroth's `/oauth2/callback`.
+
   When the validated request uses `prompt=none` and no provider selection is
-  required, Zeroth checks the existing browser session directly; an active
-  session that satisfies `max_age` receives a Zeroth authorization code on the
-  registered redirect URI, while a missing or too-old session redirects back
-  with `login_required`, original `state`, and Zeroth's `iss` parameter.
+  required, Zeroth checks the existing browser session. A session that satisfies
+  `max_age` receives a Zeroth code on the registered redirect URI. A missing or
+  old session redirects with `login_required`, original `state`, and Zeroth's
+  `iss` parameter.
+
   `prompt=login` and failed `max_age` checks suppress current-session reuse in
-  the hosted provider picker. After the client and redirect URI are validated,
-  authorization errors such as unsupported or unconfigured providers also
-  redirect to the registered client with `error`, `error_description`, original
-  `state`, and `iss` instead of returning JSON.
-- `GET|POST /oauth2/callback` supports normal query callbacks and Apple's
-  `form_post`, resolves the stored D1 transaction, requires the callback
-  `state` to match the short-lived browser transaction cookie, requires the
-  conditional D1 update that consumes the one-time provider state to report
-  exactly one changed row, exchanges the provider code for upstream tokens,
-  verifies Google/Apple RS256 ID tokens against provider JWKS and a
-  Zeroth-owned provider nonce separate from the downstream app nonce, persists
-  Google/Apple users/identities from verified claims, preserves Apple's
-  first-consent `user` JSON for display-name capture, persists Spotify
-  users/identities from Spotify's profile API, creates a D1-backed browser
-  session, sets the secure session cookie, clears the transaction cookie, and
-  then either redirects to the browser login `return_to` URL or issues a Zeroth
-  authorization code and redirects to the registered OIDC
-  client with query response parameters `code`, `state` when supplied, and
-  `iss` set to Zeroth's issuer. Provider-side authorization errors such as user
-  cancellation are also resolved through the stored D1 transaction, consume the
-  one-time provider state, and redirect back with `error`,
-  `error_description`, original app `state`, and `iss` for OIDC authorization
-  responses instead of returning a generic JSON response.
-- `POST /oauth/token` validates authorization-code exchanges, checks S256 PKCE
-  for codes that were issued with a challenge, authenticates confidential
-  clients with `client_secret_post` or `client_secret_basic`, and requires the
-  conditional D1 update that consumes the Zeroth auth code to report exactly one
-  changed row before credentials are minted. It reloads the D1 user before
-  signing so missing/disabled users are rejected, optionally persists a hashed
-  refresh token bound to the auth code's browser session and original
-  `auth_time` when `offline_access` was requested, and returns ES256 access and
-  ID tokens. ID tokens include standard `email`, `email_verified`, `name`, and
-  `picture` claims only when the authorization scope requested `email` and/or
-  `profile`; access and ID tokens include `sid` when they are tied to a browser
-  session. The same endpoint also accepts
-  `grant_type=refresh_token`, rejects expired/revoked/rotated refresh tokens,
-  and requires the conditional D1 rotation update to report exactly one changed
-  row before it stores and returns a replacement refresh token. If a rotated
-  refresh token is presented again by the same client, or if the conditional
-  rotation loses a race, Zeroth treats it as replay and revokes the active
-  session-scoped refresh-token family before returning `invalid_grant`. Legacy
-  refresh-token rows without a stored session id are still accepted and
-  replay-revoked within their null-session user/client family.
+  the hosted provider picker. After client and redirect validation,
+  authorization errors redirect to the registered client. The response contains
+  `error`, `error_description`, original `state`, and `iss` instead of JSON.
+- `GET|POST /oauth2/callback` supports query callbacks and Apple's `form_post`.
+  It resolves the stored D1 transaction. Callback `state` must match the
+  short-lived browser transaction cookie. A conditional D1 update must consume
+  exactly one provider state before the provider code exchange.
+
+  Zeroth verifies Google and Apple RS256 ID tokens against provider JWKS. It uses
+  a Zeroth provider nonce that is separate from the downstream app nonce. It
+  stores verified Google and Apple users and identities. It preserves Apple's
+  first-consent `user` JSON for display-name capture. It stores Spotify users and
+  identities from the Spotify profile API.
+
+  Zeroth creates a D1-backed browser session and sets the secure cookie. It
+  clears the transaction cookie. It then uses the browser login `return_to` URL
+  or issues a Zeroth authorization code. OIDC query responses contain `code`,
+  supplied `state`, and Zeroth's issuer in `iss`.
+
+  Provider authorization errors also use the stored D1 transaction. They consume
+  the one-time state and redirect instead of returning generic JSON. OIDC error
+  responses contain `error`, `error_description`, original app `state`, and
+  `iss`.
+- `POST /oauth/token` validates authorization-code exchanges. It checks S256
+  PKCE for codes that used a challenge. It authenticates confidential clients
+  through `client_secret_post` or `client_secret_basic`. A conditional D1 update
+  must consume exactly one Zeroth code before credential issuance.
+
+  The endpoint reloads the D1 user before signing and rejects missing or disabled
+  users. For `offline_access`, it can store a hashed refresh token. The token is
+  bound to the code's browser session and original `auth_time`. The endpoint
+  returns ES256 access and ID tokens.
+
+  ID tokens include standard `email`, `email_verified`, `name`, and `picture`
+  claims only for the corresponding scopes. Access and ID tokens include `sid`
+  when they are bound to a browser session.
+
+  The endpoint accepts `grant_type=refresh_token` and rejects inactive refresh
+  tokens. A conditional D1 rotation must change exactly one row. Only then does
+  Zeroth store and return the replacement refresh token.
+
+  Reuse of a rotated token by the same client is a replay. A lost conditional
+  rotation race is also a replay. Zeroth revokes the active session-scoped token
+  family and returns `invalid_grant`. Legacy rows without a session ID remain
+  accepted. Replay revocation applies to their null-session user and client
+  family.
+
   The same endpoint also accepts native provider token exchange for Swift/mobile
-  apps. Apple and Google use provider ID tokens; Spotify uses a provider access
+  apps. Apple and Google use provider ID tokens. Spotify uses a provider access
   token:
 
 ```sh
@@ -565,7 +577,7 @@ curl -X POST "https://id.example.com/oauth/token" \
   `subject_token` is the `identityToken` returned by
   `ASAuthorizationAppleIDProvider`. `identity_token` is accepted as an alias for
   Swift clients that prefer the Apple term. `provider_client_id` must be one of
-  `APPLE_NATIVE_CLIENT_IDS`; it can be omitted when exactly one native Apple
+  `APPLE_NATIVE_CLIENT_IDS`. It can be omitted when exactly one native Apple
   client ID is configured. `nonce` is optional and, when supplied, must match the
   Apple ID-token nonce claim.
 
@@ -598,16 +610,17 @@ curl -X POST "https://id.example.com/oauth/token" \
 ```
 
   Spotify `subject_token` is a bearer access token with profile/email access.
-  Zeroth verifies it by fetching Spotify's current-user profile, persists the
-  Spotify user identity in D1 using `account_id` when present, and issues
+  Zeroth verifies it through Spotify's current-user profile. It stores the
+  Spotify user identity in D1 and uses `account_id` when present. It issues
   Zeroth-owned tokens for the registered client.
 - `GET /.well-known/openid-configuration` advertises the authorization,
   token, revocation, introspection, userinfo, JWKS, and end-session endpoints,
   ES256 token signing, `query` response mode, supported prompt values, and
-  `authorization_response_iss_parameter_supported: true`. `prompt=none`
-  performs silent SSO only with a fresh active session, `prompt=login` and
-  `prompt=select_account` force the hosted picker to ignore the current session,
-  and `prompt=consent` is parsed explicitly while remaining a no-op until
+  `authorization_response_iss_parameter_supported: true`.
+
+  `prompt=none` performs silent SSO only with a fresh active session.
+  `prompt=login` and `prompt=select_account` make the hosted picker ignore the
+  current session. Zeroth parses `prompt=consent`, but it has no effect until
   consent records exist.
 - `GET /.well-known/oauth-authorization-server` serves the same issuer-derived
   endpoint metadata for OAuth-only resource servers and advertises revocation
@@ -617,23 +630,22 @@ curl -X POST "https://id.example.com/oauth/token" \
   tokens owned by another client are treated as successful no-ops.
 - `POST /oauth/introspect` authenticates a confidential registered client and
   returns RFC7662-style metadata for active Zeroth access tokens. Refresh tokens
-  introspect as active only for their owning client; invalid, expired, rotated,
+  introspect as active only for their owning client. Invalid, expired, rotated,
   revoked, disabled-user, disabled-client, or revoked session-bound tokens
   return `{"active":false}`.
 - `OPTIONS /oauth/token|/oauth/revoke|/oauth/introspect|/userinfo|/session|/sessions|/profile|/identities/link|/identities|/validate|/logout`
-  handles browser CORS preflight for exact registered origins. Actual token,
-  revocation, introspection, userinfo, session, sessions, profile, identities,
-  validate, and logout responses include credentialed CORS headers only for
-  origins allowed by the identified client or active session.
+  handles browser CORS preflight for exact registered origins. Actual responses
+  include credentialed CORS headers only for permitted origins. The identified
+  client or active session defines the permitted origins.
 - `GET /.well-known/jwks.json` publishes the active ES256 public signing key
   plus optional previous public keys configured for rotation.
 - `GET /.well-known/apple-app-site-association` serves the configured
   `APPLE_APP_SITE_ASSOCIATION_JSON` payload for deployments that use Apple
   associated domains.
-- `GET /userinfo` verifies a Zeroth ES256 bearer access token, loads the user
-  and active token client from D1, rejects disabled users or disabled/missing
-  clients, rejects session-bound tokens whose D1 session is no longer active,
-  and returns profile fields allowed by the token scope.
+- `GET /userinfo` verifies a Zeroth ES256 bearer access token. It loads the user
+  and active token client from D1. It rejects disabled users and disabled or
+  missing clients. It rejects session-bound tokens without an active D1 session.
+  It returns profile fields that the token scope permits.
 - `GET /session` reads the secure session cookie and returns authenticated
   browser-session state without treating an anonymous request as an error.
 - `GET /sessions` lists the current user's active browser sessions. `DELETE
@@ -644,28 +656,27 @@ curl -X POST "https://id.example.com/oauth/token" \
   profile fields.
 - `PATCH /profile` requires an active browser session and accepts a bounded
   `application/json` body with `name` or `displayName` and `picture` or
-  `pictureUrl`. String values update local profile fields; `null` clears them.
+  `pictureUrl`. String values update local profile fields. `null` clears them.
 - `GET /identities` requires an active browser session and returns the current
   user's linked Apple, Google, and Spotify provider identities without raw
   provider profile JSON.
 - `GET /identities/link?provider=...&return_to=...` requires an active browser
-  session, validates `return_to` against the session client's registered
-  redirect URIs or allowed origins, starts an upstream Apple, Google, or Spotify
-  authorization flow, and completes by linking the provider identity back to the
-  current user.
+  session. It validates `return_to` against the client's redirect URIs or allowed
+  origins. It starts an upstream provider authorization flow. On completion, it
+  links the provider identity to the current user.
 - `DELETE /identities?provider_id=...&provider_subject=...` requires an active
-  browser session and unlinks that provider identity only when it belongs to the
-  current user and at least one other login identity remains.
-- `GET /validate` verifies a Zeroth ES256 bearer access token or active browser
-  session cookie, requires the referenced D1 user and client to still be active,
-  requires session-bound access tokens to reference an active D1 session, and
-  returns the validated subject, client, expiry, session id, and scoped profile
-  payload.
+  browser session. It unlinks the identity only when the current user owns it and
+  has at least one other login identity.
+
+- `GET /validate` verifies a Zeroth ES256 bearer token or active browser session
+  cookie. The referenced D1 user and client must remain active. Session-bound
+  access tokens must reference an active D1 session. The response contains the
+  validated subject, client, expiry, session ID, and scoped profile.
 - `GET|POST /logout` revokes the current browser session row and its
   refresh-token family when present, then clears the session cookie. It is also
-  advertised as the OIDC
-  `end_session_endpoint`: when `post_logout_redirect_uri` or `return_to` is
-  present, Zeroth resolves the client from the active session, `client_id`, or a
-  valid `id_token_hint`, validates the redirect against registered redirect URIs
-  or allowed origins, appends `state` when present, and redirects after clearing
-  the cookie.
+  the OIDC `end_session_endpoint`.
+
+  When a return URL is present, Zeroth resolves the client. It uses the active
+  session, `client_id`, or a valid `id_token_hint`. It validates the return URL
+  against registered redirect URIs or allowed origins. It adds `state` when
+  present and redirects after it clears the cookie.

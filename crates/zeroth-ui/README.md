@@ -30,9 +30,10 @@ management surface. `zeroth-worker` serves these Leptos documents from `/login`,
 `/authorize` provider-selection responses, `/account`, `/admin`, and
 `/admin/clients`.
 
-The rendered document is intentionally SSR-first: CSS is inline, provider
-actions are ordinary links, and the only JavaScript is a small same-origin form
-handler for profile saves, identity unlinking, sign-out, and admin API calls.
+The rendered document is intentionally SSR-first. CSS is inline, and provider
+actions are ordinary links. A small same-origin form handler is the only
+JavaScript. It handles profile saves, identity removal, sign-out, and admin API
+calls.
 
 Preview the default surface with:
 

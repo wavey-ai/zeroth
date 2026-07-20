@@ -15,14 +15,15 @@ use it to:
 - check multiple protected path rules with exact/prefix matching, accepted
   roles, and required scopes after local token verification
 
-Server-side product gates should redirect users to Zeroth, exchange the returned
-code with the original `code_verifier`, validate the returned Zeroth token for
-the product client, then issue a product-local session cookie. The crate does
-not fetch discovery, JWKS, or token endpoints; product Workers decide how to
+Server-side product gates should redirect users to Zeroth. They should exchange
+the returned code with the original `code_verifier`. They should validate the
+returned Zeroth token for the product client. Then, they should issue a
+product-local session cookie. The crate does
+not fetch discovery, JWKS, or token endpoints. Product Workers decide how to
 fetch and cache those HTTP responses.
 
-For the low-latency path, product Workers should match the request path first,
-verify the Zeroth access token locally from cached JWKS, then call
-`authorize_protected_path` to enforce route roles/scopes. Calling Zeroth
+For the low-latency path, product Workers should match the request path first.
+They should verify the Zeroth access token locally from cached JWKS. Then, call
+`authorize_protected_path` to enforce route roles and scopes. Calling Zeroth
 `/validate` on every request gives immediate session-revocation awareness, but
 adds a network and D1 hop, so reserve it for sensitive actions.
