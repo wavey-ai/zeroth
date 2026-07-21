@@ -144,6 +144,8 @@ const RATE_LIMIT_CLEANUP_MODULUS: u8 = 100;
 const RATE_LIMIT_CLEANUP_LIMIT: i32 = 100;
 const RATE_LIMIT_RETENTION_SECONDS: i32 = 48 * 60 * 60;
 const RATE_LIMIT_BLOCK_STEPS_SECONDS: [i32; 4] = [60, 5 * 60, 15 * 60, 60 * 60];
+const OAUTH_TOKEN_RATE_LIMIT_WINDOW_SECONDS: i32 = 5 * 60;
+const OAUTH_TOKEN_RATE_LIMIT_MAX_ATTEMPTS: i32 = 300;
 const RATE_LIMIT_SCOPE_PASSWORD_LOGIN_IP: &str = "password_login:ip";
 const RATE_LIMIT_SCOPE_PASSWORD_LOGIN_EMAIL: &str = "password_login:email";
 const RATE_LIMIT_SCOPE_PASSWORD_LOGIN_IP_EMAIL: &str = "password_login:ip_email";
@@ -3940,24 +3942,24 @@ async fn oauth_token(mut request: Request, env: Env) -> worker::Result<Response>
         rate_limit_subject(
             RateLimitPolicy {
                 scope: RATE_LIMIT_SCOPE_OAUTH_TOKEN_IP,
-                window_seconds: 5 * 60,
-                max_attempts: 30,
+                window_seconds: OAUTH_TOKEN_RATE_LIMIT_WINDOW_SECONDS,
+                max_attempts: OAUTH_TOKEN_RATE_LIMIT_MAX_ATTEMPTS,
             },
             ip.as_str(),
         ),
         rate_limit_subject(
             RateLimitPolicy {
                 scope: RATE_LIMIT_SCOPE_OAUTH_TOKEN_CLIENT,
-                window_seconds: 5 * 60,
-                max_attempts: 30,
+                window_seconds: OAUTH_TOKEN_RATE_LIMIT_WINDOW_SECONDS,
+                max_attempts: OAUTH_TOKEN_RATE_LIMIT_MAX_ATTEMPTS,
             },
             form.client_id.as_str(),
         ),
         rate_limit_subject(
             RateLimitPolicy {
                 scope: RATE_LIMIT_SCOPE_OAUTH_TOKEN_GRANT,
-                window_seconds: 5 * 60,
-                max_attempts: 30,
+                window_seconds: OAUTH_TOKEN_RATE_LIMIT_WINDOW_SECONDS,
+                max_attempts: OAUTH_TOKEN_RATE_LIMIT_MAX_ATTEMPTS,
             },
             grant_subject.as_str(),
         ),
