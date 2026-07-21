@@ -3083,6 +3083,7 @@ async fn handle_request(request: Request, env: Env) -> worker::Result<Response> 
         (Method::Get, "/robots.txt") => robots_txt(),
         (Method::Get, "/login") => hosted_login(request, env).await,
         (Method::Get, "/account") => hosted_account(request, env).await,
+        (Method::Delete, "/account") => delete_account(request, env).await,
         (Method::Get, "/profile-menu.js") => profile_menu_script(),
         (Method::Get, "/profile-panel.js") => profile_panel_script(),
         (Method::Get, "/admin") => hosted_clients_admin(request, env).await,
@@ -7467,6 +7468,87 @@ async fn hosted_session_login(request: Request, env: Env) -> worker::Result<Resp
             AUTH_TRANSACTION_TTL_SECONDS,
         ),
     )
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn delete_account(request: Request, env: Env) -> worker::Result<Response> {
+    let request_url = request.url()?;
+    let config = server_config(&env, &request_url);
+    let origin = request_origin_for_config(&request, &config)?;
+    let db = env.d1(D1_BINDING)?;
+    let now = unix_timestamp_seconds();
+    let current =
+        match current_account_from_request(&request, &env, &db, &config, origin.as_deref(), now)
+            .await?
+        {
+            Ok(current) => current,
+            Err(error) => return oauth_error_json(error.code, error.description, error.status),
+        };
+
+    if let Err(error) = current.require_profile_scope() {
+        return oauth_error_json(error.code, error.description, error.status);
+    }
+
+    if !current.access_token {
+        let csrf_token = csrf_token_from_header(&request)?;
+        if let Err(error) = validate_browser_session_mutation(
+            &request,
+            &env,
+            &db,
+            &config,
+            current.client_id.as_deref(),
+            current.session_id.as_deref().unwrap_or_default(),
+            CSRF_ROUTE_FAMILY_ACCOUNT,
+            csrf_token.as_deref(),
+            now,
+        )
+        .await?
+        {
+            return oauth_error_json("invalid_request", error, 403);
+        }
+    }
+
+    delete_user_account_data(&db, &current.user.id).await?;
+    let response = json(&serde_json::json!({ "ok": true }))?;
+    let response = if current.access_token {
+        response
+    } else {
+        with_set_cookie(
+            response,
+            &clear_session_cookie(&config.cookie_name, config.cookie_domain.as_deref()),
+        )?
+    };
+    with_cors_actual_headers(response, origin.as_deref())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn delete_user_account_data(
+    db: &worker::d1::D1Database,
+    user_id: &str,
+) -> worker::Result<()> {
+    // Remove references without foreign keys before deleting the user row.
+    // The remaining account tables use ON DELETE CASCADE, but explicit deletes
+    // also support older databases created before the FK set was complete.
+    const STATEMENTS: &[&str] = &[
+        "DELETE FROM zeroth_auth_transactions WHERE link_user_id = ?",
+        "DELETE FROM zeroth_auth_codes WHERE user_id = ?",
+        "DELETE FROM zeroth_refresh_tokens WHERE user_id = ?",
+        "DELETE FROM zeroth_sessions WHERE user_id = ?",
+        "DELETE FROM zeroth_passkey_challenges WHERE user_id = ?",
+        "DELETE FROM zeroth_passkey_credentials WHERE user_id = ?",
+        "DELETE FROM zeroth_local_credentials WHERE user_id = ?",
+        "DELETE FROM zeroth_magic_links WHERE user_id = ?",
+        "DELETE FROM zeroth_account_identities WHERE user_id = ?",
+        "DELETE FROM zeroth_identities WHERE user_id = ?",
+        "DELETE FROM zeroth_admin_memberships WHERE user_id = ?",
+        "DELETE FROM zeroth_audit_events WHERE user_id = ?",
+        "DELETE FROM zeroth_users WHERE id = ?",
+    ];
+    for statement in STATEMENTS {
+        let args = [worker::d1::D1Type::Text(user_id)];
+        db.prepare(*statement).bind_refs(&args)?.run().await?;
+    }
+    Ok(())
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -17558,6 +17640,7 @@ fn cors_path(path: &str) -> bool {
             | "/userinfo"
             | "/session"
             | "/sessions"
+            | "/account"
             | "/profile"
             | "/identities/link"
             | "/identities"
@@ -17584,6 +17667,7 @@ fn cors_method_allowed(path: &str, method: &str) -> bool {
     match path {
         "/oauth/token" | "/oauth/revoke" | "/oauth/introspect" | "/tokens" => method == "POST",
         "/client-branding" | "/userinfo" | "/session" | "/validate" => method == "GET",
+        "/account" => method == "DELETE",
         "/profile" => method == "GET" || method == "PATCH",
         "/identities/link" => method == "POST",
         "/identities" => method == "GET" || method == "DELETE",
@@ -24613,6 +24697,7 @@ mod tests {
         assert!(cors_path("/userinfo"));
         assert!(cors_path("/session"));
         assert!(cors_path("/sessions"));
+        assert!(cors_path("/account"));
         assert!(cors_path("/profile"));
         assert!(cors_path("/identities"));
         assert!(cors_path("/passkeys/register/options"));
@@ -24644,6 +24729,8 @@ mod tests {
         assert!(cors_method_allowed("/sessions", "GET"));
         assert!(cors_method_allowed("/sessions", "DELETE"));
         assert!(!cors_method_allowed("/sessions", "POST"));
+        assert!(cors_method_allowed("/account", "DELETE"));
+        assert!(!cors_method_allowed("/account", "GET"));
         assert!(cors_method_allowed("/identities", "GET"));
         assert!(cors_method_allowed("/identities", "DELETE"));
         assert!(!cors_method_allowed("/identities", "POST"));

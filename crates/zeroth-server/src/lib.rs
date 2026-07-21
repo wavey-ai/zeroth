@@ -182,6 +182,10 @@ pub const ROUTES: &[Route] = &[
         path: "/account",
     },
     Route {
+        method: "DELETE",
+        path: "/account",
+    },
+    Route {
         method: "GET",
         path: "/profile-menu.js",
     },
