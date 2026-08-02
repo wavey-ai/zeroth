@@ -9,7 +9,6 @@ use zeroth_providers::well_known;
 
 const TRANSPARENT_PIXEL_DATA_URI: &str =
     "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==";
-const YL_LOGO_SVG: &str = include_str!("yl_logo.svg");
 
 /// Stylesheet for the default Zeroth account UI.
 pub const ZEROTH_UI_CSS: &str = r#"
@@ -38,6 +37,15 @@ pub const ZEROTH_UI_CSS: &str = r#"
   --z-login-header-from: #ffffff;
   --z-login-header-to: #f6f8fa;
   --z-login-header-text: var(--z-ink);
+  --z-login-page-from: #ffffff;
+  --z-login-page-to: #f6f8fa;
+  --z-login-panel: #ffffff;
+  --z-login-panel-border: #d0d7de;
+  --z-login-text: #24292f;
+  --z-login-muted: #57606a;
+  --z-login-accent: #0969da;
+  --z-login-accent-hover: #0550ae;
+  --z-login-accent-text: #ffffff;
 }
 
 * {
@@ -145,73 +153,105 @@ textarea:focus-visible {
     linear-gradient(180deg, #ffffff 0%, #f6f8fa 54%, #eef7f1 100%);
 }
 
-.zeroth-yl-login {
-  --z-yl-pink: #ef035c;
-  --z-yl-red: #d51b14;
-  --z-yl-yellow: #f3b511;
-  --z-yl-blue: #0e7c8c;
+.zeroth-login-minimal {
+  --z-bg: var(--z-login-page-to);
+  --z-panel: var(--z-login-panel);
+  --z-text: var(--z-login-text);
+  --z-muted: var(--z-login-muted);
+  --z-line: var(--z-login-panel-border);
+  --z-line-strong: var(--z-login-panel-border);
+  --z-blue: var(--z-login-accent);
+  min-height: 100dvh;
+  color: var(--z-login-text);
   background:
-    radial-gradient(circle at 12% 8%, rgba(243, 181, 17, 0.22), transparent 28rem),
-    radial-gradient(circle at 88% 92%, rgba(14, 124, 140, 0.16), transparent 30rem),
-    linear-gradient(145deg, #fffaf1 0%, #ffffff 48%, #fff2ee 100%);
+    radial-gradient(34rem 25rem at 50% -8rem, color-mix(in srgb, var(--z-login-accent) 8%, transparent), transparent 76%),
+    linear-gradient(180deg, var(--z-login-page-from) 0%, var(--z-login-page-to) 100%);
 }
 
-.zeroth-yl-login .zeroth-login-card {
-  border-color: rgba(3, 8, 10, 0.2);
-  border-radius: 18px;
-  box-shadow: 0 26px 70px rgba(3, 8, 10, 0.13);
-}
-
-.zeroth-yl-login .zeroth-sidebar {
+.zeroth-login-minimal .zeroth-sidebar {
   display: none;
 }
 
-.zeroth-yl-login .zeroth-main {
-  padding-top: 48px;
+.zeroth-login-mode.zeroth-login-minimal .zeroth-main {
+  width: min(430px, 100%);
+  min-height: 100dvh;
+  padding: max(18px, env(safe-area-inset-top)) 16px 32px;
 }
 
-.zeroth-yl-login .zeroth-panel-header {
-  border-bottom-color: rgba(3, 8, 10, 0.12);
-}
-
-.zeroth-yl-login .zeroth-action.zeroth-primary {
-  background: var(--z-yl-pink);
-  border-color: var(--z-yl-pink);
-}
-
-.zeroth-yl-login .zeroth-action.zeroth-primary:hover {
-  background: var(--z-yl-red);
-  border-color: var(--z-yl-red);
-}
-
-.zeroth-login-intro {
-  width: min(440px, 100%);
-  margin: 0 auto 18px;
-}
-
-.zeroth-yl-logo {
-  display: block;
+.zeroth-login-minimal .zeroth-login-intro {
   width: 92px;
-  height: 46px;
-  margin: 0 auto 22px;
-  color: #03080a;
+  height: 50px;
+  margin: 0 0 30px;
+  overflow: hidden;
+  background: #000000;
 }
 
-.zeroth-login-intro-mark {
-  display: inline-block;
-  color: var(--z-yl-pink, var(--z-blue));
-  font-size: 12px;
-  font-weight: 900;
-  letter-spacing: 0.18em;
+.zeroth-login-minimal .zeroth-login-intro img {
+  display: block;
+  width: 112px;
+  height: 112px;
+  max-width: none;
+  margin: -31px -10px;
 }
 
-.zeroth-login-intro-copy {
-  margin: 7px 0 0;
-  color: var(--z-ink);
-  font-size: clamp(24px, 4vw, 34px);
-  font-weight: 900;
-  letter-spacing: -0.04em;
-  line-height: 1.02;
+.zeroth-login-minimal .zeroth-login-card {
+  width: 100%;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  overflow: visible;
+}
+
+.zeroth-login-minimal .zeroth-login-card .zeroth-panel-header {
+  min-height: 0;
+  padding: 0 0 14px;
+  border-bottom: 1px solid var(--z-login-panel-border);
+}
+
+.zeroth-login-minimal .zeroth-login-card .zeroth-panel-title {
+  color: var(--z-login-muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.zeroth-login-minimal .zeroth-login-card .zeroth-panel-body {
+  padding: 18px 0 0;
+}
+
+.zeroth-login-minimal .zeroth-action {
+  border-color: var(--z-login-panel-border);
+  border-radius: 8px;
+  background: var(--z-login-panel);
+  color: var(--z-login-text);
+}
+
+.zeroth-login-minimal .zeroth-action:hover {
+  border-color: var(--z-login-accent);
+  color: var(--z-login-accent);
+}
+
+.zeroth-login-minimal .zeroth-action.zeroth-primary {
+  border-color: var(--z-login-accent);
+  background: var(--z-login-accent);
+  color: var(--z-login-accent-text);
+}
+
+.zeroth-login-minimal .zeroth-action.zeroth-primary:hover {
+  border-color: var(--z-login-accent-hover);
+  background: var(--z-login-accent-hover);
+  color: var(--z-login-accent-text);
+}
+
+.zeroth-login-minimal .zeroth-field input,
+.zeroth-login-minimal .zeroth-field textarea,
+.zeroth-login-minimal .zeroth-field select {
+  border-color: var(--z-login-panel-border);
+  background: var(--z-login-panel);
+  color: var(--z-login-text);
 }
 
 .zeroth-more-options {
@@ -398,11 +438,11 @@ textarea:focus-visible {
   color: #0969da;
 }
 
-.zeroth-yl-login .zeroth-provider-list {
+.zeroth-login-minimal .zeroth-provider-list {
   gap: 8px;
 }
 
-.zeroth-yl-login .zeroth-provider {
+.zeroth-login-minimal .zeroth-provider {
   grid-template-columns: 1fr;
   gap: 0;
   padding: 0;
@@ -410,41 +450,42 @@ textarea:focus-visible {
   background: transparent;
 }
 
-.zeroth-yl-login .zeroth-provider-badge,
-.zeroth-yl-login .zeroth-provider > div {
+.zeroth-login-minimal .zeroth-provider-badge,
+.zeroth-login-minimal .zeroth-provider > div {
   display: none;
 }
 
-.zeroth-yl-login .zeroth-provider .zeroth-action {
+.zeroth-login-minimal .zeroth-provider .zeroth-action {
   grid-column: 1;
-  min-height: 48px;
-  border-radius: 999px;
+  min-height: 44px;
+  border-radius: 8px;
   font-weight: 800;
 }
 
-.zeroth-yl-login .provider-apple .zeroth-action {
-  border-color: #03080a;
-  background: #03080a;
-  color: #ffffff;
+.zeroth-login-minimal .provider-apple .zeroth-action {
+  border-color: var(--z-login-accent);
+  background: var(--z-login-accent);
+  color: var(--z-login-accent-text);
 }
 
-.zeroth-yl-login .provider-apple .zeroth-action:hover {
-  border-color: #1c2528;
-  background: #1c2528;
+.zeroth-login-minimal .provider-apple .zeroth-action:hover {
+  border-color: var(--z-login-accent-hover);
+  background: var(--z-login-accent-hover);
+  color: var(--z-login-accent-text);
 }
 
-.zeroth-yl-login .provider-google .zeroth-action {
-  border-color: #d0d7de;
-  background: #ffffff;
-  color: #03080a;
+.zeroth-login-minimal .provider-google .zeroth-action {
+  border-color: var(--z-login-panel-border);
+  background: var(--z-login-panel);
+  color: var(--z-login-text);
 }
 
-.zeroth-yl-login .provider-google .zeroth-action:hover {
-  border-color: #5f6368;
-  color: #03080a;
+.zeroth-login-minimal .provider-google .zeroth-action:hover {
+  border-color: var(--z-login-accent);
+  color: var(--z-login-accent);
 }
 
-.zeroth-yl-login .provider-google .zeroth-action[aria-disabled="true"] {
+.zeroth-login-minimal .provider-google .zeroth-action[aria-disabled="true"] {
   cursor: not-allowed;
   opacity: 0.55;
 }
@@ -1059,37 +1100,52 @@ impl ZerothUiConfig {
     }
 }
 
-/// Safe colour customisation for the hosted login header.
+/// Safe visual customization for the hosted login page.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ZerothUiTheme {
+    pub brand_icon: Option<String>,
+    pub login_style: Option<String>,
     pub header_background_from: Option<String>,
     pub header_background_to: Option<String>,
     pub header_text_color: Option<String>,
+    pub page_background_from: Option<String>,
+    pub page_background_to: Option<String>,
+    pub panel_background: Option<String>,
+    pub panel_border_color: Option<String>,
+    pub text_color: Option<String>,
+    pub muted_text_color: Option<String>,
+    pub accent_color: Option<String>,
+    pub accent_hover_color: Option<String>,
+    pub accent_text_color: Option<String>,
 }
 
 impl ZerothUiTheme {
+    fn uses_minimal_login(&self) -> bool {
+        self.login_style
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| value.eq_ignore_ascii_case("minimal"))
+    }
+
     fn css(&self) -> String {
         let mut rules = Vec::new();
-        if let Some(value) = self
-            .header_background_from
-            .as_deref()
-            .and_then(normalized_hex_color)
-        {
-            rules.push(format!("--z-login-header-from: {value};"));
-        }
-        if let Some(value) = self
-            .header_background_to
-            .as_deref()
-            .and_then(normalized_hex_color)
-        {
-            rules.push(format!("--z-login-header-to: {value};"));
-        }
-        if let Some(value) = self
-            .header_text_color
-            .as_deref()
-            .and_then(normalized_hex_color)
-        {
-            rules.push(format!("--z-login-header-text: {value};"));
+        for (property, configured_value) in [
+            ("--z-login-header-from", &self.header_background_from),
+            ("--z-login-header-to", &self.header_background_to),
+            ("--z-login-header-text", &self.header_text_color),
+            ("--z-login-page-from", &self.page_background_from),
+            ("--z-login-page-to", &self.page_background_to),
+            ("--z-login-panel", &self.panel_background),
+            ("--z-login-panel-border", &self.panel_border_color),
+            ("--z-login-text", &self.text_color),
+            ("--z-login-muted", &self.muted_text_color),
+            ("--z-login-accent", &self.accent_color),
+            ("--z-login-accent-hover", &self.accent_hover_color),
+            ("--z-login-accent-text", &self.accent_text_color),
+        ] {
+            if let Some(value) = configured_value.as_deref().and_then(normalized_hex_color) {
+                rules.push(format!("{property}: {value};"));
+            }
         }
 
         if rules.is_empty() {
@@ -1433,7 +1489,7 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
     let ZerothUiState {
         config,
         product_name,
-        theme: _,
+        theme,
         profile,
         providers,
         identities,
@@ -1497,9 +1553,9 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
     let signed_in_account_mode = signed_in && config.link_identities;
     let signed_in_login_flow = signed_in && !config.link_identities;
     let login_mode = !signed_in;
-    let is_yl_brand = product_name.to_ascii_uppercase().contains("YL");
-    let shell_class = if login_mode && is_yl_brand {
-        "zeroth-shell zeroth-login-mode zeroth-yl-login"
+    let uses_minimal_login = login_mode && theme.uses_minimal_login();
+    let shell_class = if uses_minimal_login {
+        "zeroth-shell zeroth-login-mode zeroth-login-minimal"
     } else if login_mode {
         "zeroth-shell zeroth-login-mode"
     } else {
@@ -1540,12 +1596,12 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
     } else {
         "zeroth-auth-group"
     };
-    let login_intro = (login_mode && is_yl_brand).then(|| {
+    let login_intro = uses_minimal_login.then(|| {
+        let icon = theme.brand_icon.clone();
+        let accessible_name = product_name.clone();
         view! {
             <div class="zeroth-login-intro">
-                <div class="zeroth-yl-logo" aria-label="YL.VIN" inner_html=YL_LOGO_SVG></div>
-                <span class="zeroth-login-intro-mark">"YL.VIN"</span>
-                <p class="zeroth-login-intro-copy">"Create and release playable records."</p>
+                {icon.map(|src| view! { <img src=src alt=accessible_name /> })}
             </div>
         }
     });
@@ -4850,9 +4906,20 @@ mod tests {
             ))
             .with_product_name("Acme")
             .with_theme(ZerothUiTheme {
+                brand_icon: Some("https://assets.example.com/acme.avif".to_owned()),
+                login_style: Some("minimal".to_owned()),
                 header_background_from: Some("#101820".to_owned()),
                 header_background_to: Some("#203a43".to_owned()),
                 header_text_color: Some("#f7fafc".to_owned()),
+                page_background_from: Some("#0b0a0f".to_owned()),
+                page_background_to: Some("#000000".to_owned()),
+                panel_background: Some("#15121a".to_owned()),
+                panel_border_color: Some("#2d2635".to_owned()),
+                text_color: Some("#f8f7fb".to_owned()),
+                muted_text_color: Some("#a9a6b4".to_owned()),
+                accent_color: Some("#ff2582".to_owned()),
+                accent_hover_color: Some("#e61d72".to_owned()),
+                accent_text_color: Some("#060609".to_owned()),
             }),
         );
 
@@ -4860,6 +4927,10 @@ mod tests {
         assert!(document.contains("--z-login-header-from: #101820;"));
         assert!(document.contains("--z-login-header-to: #203a43;"));
         assert!(document.contains("--z-login-header-text: #f7fafc;"));
+        assert!(document.contains("--z-login-page-from: #0b0a0f;"));
+        assert!(document.contains("--z-login-accent: #ff2582;"));
+        assert!(document.contains("zeroth-login-minimal"));
+        assert!(document.contains("https://assets.example.com/acme.avif"));
     }
 
     #[test]
@@ -4874,6 +4945,8 @@ mod tests {
                 header_background_from: Some("red;background:url(javascript:alert(1))".to_owned()),
                 header_background_to: Some("#f60".to_owned()),
                 header_text_color: Some("var(--unsafe-login-text)".to_owned()),
+                accent_color: Some("#fff;position:fixed".to_owned()),
+                ..ZerothUiTheme::default()
             }),
         );
 
