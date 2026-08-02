@@ -1453,12 +1453,32 @@ struct LoginThemeOverride {
         alias = "brandIconUrl"
     )]
     icon: Option<String>,
+    #[serde(default, alias = "layout", alias = "loginStyle")]
+    style: Option<String>,
     #[serde(default, alias = "backgroundColor")]
     header_background_from: Option<String>,
     #[serde(default, alias = "backgroundToColor")]
     header_background_to: Option<String>,
-    #[serde(default, alias = "textColor")]
+    #[serde(default)]
     header_text_color: Option<String>,
+    #[serde(default)]
+    page_background_from: Option<String>,
+    #[serde(default)]
+    page_background_to: Option<String>,
+    #[serde(default)]
+    panel_background: Option<String>,
+    #[serde(default)]
+    panel_border_color: Option<String>,
+    #[serde(default)]
+    text_color: Option<String>,
+    #[serde(default)]
+    muted_text_color: Option<String>,
+    #[serde(default)]
+    accent_color: Option<String>,
+    #[serde(default)]
+    accent_hover_color: Option<String>,
+    #[serde(default)]
+    accent_text_color: Option<String>,
 }
 
 impl LoginThemeOverride {
@@ -1468,6 +1488,9 @@ impl LoginThemeOverride {
         }
         if other.icon.is_some() {
             self.icon.clone_from(&other.icon);
+        }
+        if other.style.is_some() {
+            self.style.clone_from(&other.style);
         }
         if other.header_background_from.is_some() {
             self.header_background_from
@@ -1479,6 +1502,37 @@ impl LoginThemeOverride {
         }
         if other.header_text_color.is_some() {
             self.header_text_color.clone_from(&other.header_text_color);
+        }
+        if other.page_background_from.is_some() {
+            self.page_background_from
+                .clone_from(&other.page_background_from);
+        }
+        if other.page_background_to.is_some() {
+            self.page_background_to
+                .clone_from(&other.page_background_to);
+        }
+        if other.panel_background.is_some() {
+            self.panel_background.clone_from(&other.panel_background);
+        }
+        if other.panel_border_color.is_some() {
+            self.panel_border_color
+                .clone_from(&other.panel_border_color);
+        }
+        if other.text_color.is_some() {
+            self.text_color.clone_from(&other.text_color);
+        }
+        if other.muted_text_color.is_some() {
+            self.muted_text_color.clone_from(&other.muted_text_color);
+        }
+        if other.accent_color.is_some() {
+            self.accent_color.clone_from(&other.accent_color);
+        }
+        if other.accent_hover_color.is_some() {
+            self.accent_hover_color
+                .clone_from(&other.accent_hover_color);
+        }
+        if other.accent_text_color.is_some() {
+            self.accent_text_color.clone_from(&other.accent_text_color);
         }
     }
 
@@ -9016,9 +9070,20 @@ fn login_theme_for_client(
     (
         display_name,
         ZerothUiTheme {
+            brand_icon: merged.trimmed_icon(),
+            login_style: merged.style,
             header_background_from: merged.header_background_from,
             header_background_to: merged.header_background_to,
             header_text_color: merged.header_text_color,
+            page_background_from: merged.page_background_from,
+            page_background_to: merged.page_background_to,
+            panel_background: merged.panel_background,
+            panel_border_color: merged.panel_border_color,
+            text_color: merged.text_color,
+            muted_text_color: merged.muted_text_color,
+            accent_color: merged.accent_color,
+            accent_hover_color: merged.accent_hover_color,
+            accent_text_color: merged.accent_text_color,
         },
     )
 }
@@ -9108,13 +9173,23 @@ fn login_theme_catalog_from_env(env: &Env) -> LoginThemeCatalog {
         icon: env_string(env, "LOGIN_BRAND_ICON")
             .or_else(|| env_string(env, "LOGIN_ICON"))
             .or_else(|| env_string(env, "LOGIN_ICON_URL")),
+        style: env_string(env, "LOGIN_STYLE"),
         header_background_from: env_string(env, "LOGIN_HEADER_BACKGROUND_FROM")
             .or_else(|| env_string(env, "LOGIN_HEADER_GRADIENT_FROM"))
             .or_else(|| env_string(env, "LOGIN_BACKGROUND_COLOR")),
         header_background_to: env_string(env, "LOGIN_HEADER_BACKGROUND_TO")
             .or_else(|| env_string(env, "LOGIN_HEADER_GRADIENT_TO")),
         header_text_color: env_string(env, "LOGIN_HEADER_TEXT_COLOR")
-            .or_else(|| env_string(env, "LOGIN_TEXT_COLOR")),
+            .or_else(|| env_string(env, "LOGIN_HEADER_FOREGROUND_COLOR")),
+        page_background_from: env_string(env, "LOGIN_PAGE_BACKGROUND_FROM"),
+        page_background_to: env_string(env, "LOGIN_PAGE_BACKGROUND_TO"),
+        panel_background: env_string(env, "LOGIN_PANEL_BACKGROUND"),
+        panel_border_color: env_string(env, "LOGIN_PANEL_BORDER_COLOR"),
+        text_color: env_string(env, "LOGIN_TEXT_COLOR"),
+        muted_text_color: env_string(env, "LOGIN_MUTED_TEXT_COLOR"),
+        accent_color: env_string(env, "LOGIN_ACCENT_COLOR"),
+        accent_hover_color: env_string(env, "LOGIN_ACCENT_HOVER_COLOR"),
+        accent_text_color: env_string(env, "LOGIN_ACCENT_TEXT_COLOR"),
     });
 
     if let Some(raw) =
@@ -21236,6 +21311,7 @@ mod tests {
                 header_background_from: Some("#111111".to_owned()),
                 header_background_to: Some("#222222".to_owned()),
                 header_text_color: None,
+                ..LoginThemeOverride::default()
             },
         );
         catalog.domains.insert(
@@ -21243,9 +21319,12 @@ mod tests {
             LoginThemeOverride {
                 name: Some("Domain Name".to_owned()),
                 icon: None,
+                style: Some("minimal".to_owned()),
                 header_background_from: Some("#ffffff".to_owned()),
                 header_background_to: Some("#f6f8fa".to_owned()),
                 header_text_color: Some("#101820".to_owned()),
+                accent_color: Some("#ff2582".to_owned()),
+                ..LoginThemeOverride::default()
             },
         );
 
@@ -21261,6 +21340,8 @@ mod tests {
         assert_eq!(theme.header_background_from.as_deref(), Some("#ffffff"));
         assert_eq!(theme.header_background_to.as_deref(), Some("#f6f8fa"));
         assert_eq!(theme.header_text_color.as_deref(), Some("#101820"));
+        assert_eq!(theme.login_style.as_deref(), Some("minimal"));
+        assert_eq!(theme.accent_color.as_deref(), Some("#ff2582"));
     }
 
     #[test]
