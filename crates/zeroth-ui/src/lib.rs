@@ -9,6 +9,7 @@ use zeroth_providers::well_known;
 
 const TRANSPARENT_PIXEL_DATA_URI: &str =
     "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==";
+const YL_APP_ICON_SVG: &str = include_str!("yl_app_icon.svg");
 
 /// Stylesheet for the default Zeroth account UI.
 pub const ZEROTH_UI_CSS: &str = r#"
@@ -254,6 +255,133 @@ textarea:focus-visible {
   color: var(--z-login-text);
 }
 
+.zeroth-yl-login {
+  --z-yl-pink: #ff176d;
+  --z-yl-red: #ff302e;
+  --z-yl-paper: #f6efdf;
+  --z-yl-ink: #070707;
+  min-height: 100svh;
+  background:
+    radial-gradient(circle at 3% 7%, rgba(255, 23, 109, 0.28), transparent 27rem),
+    radial-gradient(circle at 100% 100%, rgba(255, 48, 46, 0.18), transparent 30rem),
+    var(--z-yl-paper);
+}
+
+.zeroth-yl-login::before {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  content: "";
+  opacity: 0.11;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 180 180' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='.7'/%3E%3C/svg%3E");
+}
+
+.zeroth-yl-login .zeroth-sidebar {
+  display: none;
+}
+
+.zeroth-login-mode.zeroth-yl-login .zeroth-main {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  grid-template-columns: minmax(320px, 1fr) minmax(360px, 480px);
+  gap: clamp(44px, 8vw, 132px);
+  align-items: center;
+  width: min(1240px, 100%);
+  min-height: 100svh;
+  margin: 0 auto;
+  padding: clamp(32px, 6vw, 84px);
+}
+
+.zeroth-login-mode.zeroth-yl-login .zeroth-grid {
+  width: 100%;
+  min-width: 0;
+}
+
+.zeroth-yl-login .zeroth-login-card {
+  width: 100%;
+  overflow: hidden;
+  border: 1px solid rgba(7, 7, 7, 0.2);
+  border-radius: 28px;
+  background: rgba(255, 253, 248, 0.88);
+  box-shadow: 0 28px 80px rgba(62, 18, 28, 0.2);
+  backdrop-filter: blur(22px);
+}
+
+.zeroth-yl-login .zeroth-login-card .zeroth-panel-header {
+  display: block;
+  border-bottom: 0;
+  padding: 30px 30px 4px;
+}
+
+.zeroth-yl-login .zeroth-login-card .zeroth-panel-title {
+  color: var(--z-yl-ink);
+  font-size: clamp(30px, 4vw, 44px);
+  font-weight: 900;
+  letter-spacing: -0.055em;
+  line-height: 0.96;
+}
+
+.zeroth-yl-login .zeroth-login-card .zeroth-panel-body {
+  gap: 20px;
+  padding: 24px 30px 30px;
+}
+
+.zeroth-login-intro {
+  width: min(620px, 100%);
+  margin: 0;
+}
+
+.zeroth-yl-app-icon {
+  display: block;
+  width: clamp(154px, 18vw, 248px);
+  aspect-ratio: 1;
+  margin-bottom: clamp(28px, 5vw, 54px);
+  overflow: hidden;
+  border: 1px solid rgba(7, 7, 7, 0.14);
+  border-radius: 26%;
+  box-shadow:
+    0 4px 0 rgba(7, 7, 7, 0.92),
+    0 28px 64px rgba(106, 0, 40, 0.24);
+  transform: rotate(-2.5deg);
+}
+
+.zeroth-yl-app-icon svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.zeroth-login-intro-mark {
+  display: block;
+  color: var(--z-yl-ink);
+  font-size: clamp(28px, 5vw, 68px);
+  font-weight: 900;
+  letter-spacing: -0.075em;
+  line-height: 0.86;
+}
+
+.zeroth-login-intro-copy {
+  max-width: 20ch;
+  margin: 18px 0 0;
+  color: rgba(7, 7, 7, 0.62);
+  font-size: clamp(18px, 2vw, 25px);
+  font-weight: 650;
+  letter-spacing: -0.025em;
+  line-height: 1.18;
+}
+
+.zeroth-yl-login .zeroth-action.zeroth-primary {
+  background: var(--z-yl-pink);
+  border-color: var(--z-yl-pink);
+}
+
+.zeroth-yl-login .zeroth-action.zeroth-primary:hover {
+  background: var(--z-yl-red);
+  border-color: var(--z-yl-red);
+}
+
 .zeroth-more-options {
   border-top: 1px solid var(--z-line);
   padding-top: 12px;
@@ -472,6 +600,40 @@ textarea:focus-visible {
   border-color: var(--z-login-accent-hover);
   background: var(--z-login-accent-hover);
   color: var(--z-login-accent-text);
+}
+
+.zeroth-yl-login .provider-apple .zeroth-action {
+  min-height: 48px;
+  padding: 0;
+  overflow: hidden;
+  border: 0;
+  background: transparent;
+}
+
+.zeroth-yl-login .provider-apple .zeroth-action:hover {
+  border: 0;
+  background: transparent;
+}
+
+.zeroth-apple-button-image {
+  display: block;
+  width: 100%;
+  max-width: 375px;
+  height: auto;
+  margin: 0 auto;
+}
+
+.zeroth-yl-login .zeroth-more-options {
+  border-top-color: rgba(7, 7, 7, 0.13);
+  padding-top: 16px;
+}
+
+.zeroth-yl-login .zeroth-more-options > summary {
+  color: rgba(7, 7, 7, 0.55);
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-align: center;
+  text-transform: uppercase;
 }
 
 .zeroth-login-minimal .provider-google .zeroth-action {
@@ -1000,6 +1162,12 @@ textarea:focus-visible {
     grid-template-columns: 1fr;
   }
 
+  .zeroth-yl-login .zeroth-main {
+    grid-template-columns: minmax(260px, 0.8fr) minmax(340px, 1fr);
+    gap: clamp(30px, 5vw, 58px);
+    padding: clamp(30px, 5vw, 56px);
+  }
+
   .zeroth-filter-grid {
     grid-template-columns: repeat(2, minmax(130px, 1fr));
   }
@@ -1039,6 +1207,50 @@ textarea:focus-visible {
 
   .zeroth-login-actions {
     grid-template-columns: 1fr;
+  }
+
+  .zeroth-yl-login .zeroth-main {
+    display: block;
+    min-height: 100svh;
+    padding: 24px 16px 28px;
+  }
+
+  .zeroth-yl-login .zeroth-login-intro {
+    display: grid;
+    grid-template-columns: 76px minmax(0, 1fr);
+    column-gap: 18px;
+    align-items: center;
+    margin: 0 0 24px;
+  }
+
+  .zeroth-yl-login .zeroth-yl-app-icon {
+    grid-row: 1 / span 2;
+    width: 76px;
+    margin: 0;
+    box-shadow:
+      0 3px 0 rgba(7, 7, 7, 0.9),
+      0 16px 32px rgba(106, 0, 40, 0.2);
+  }
+
+  .zeroth-yl-login .zeroth-login-intro-mark {
+    font-size: 40px;
+  }
+
+  .zeroth-yl-login .zeroth-login-intro-copy {
+    margin: 7px 0 0;
+    font-size: 16px;
+  }
+
+  .zeroth-yl-login .zeroth-login-card {
+    border-radius: 22px;
+  }
+
+  .zeroth-yl-login .zeroth-login-card .zeroth-panel-header {
+    padding: 24px 22px 2px;
+  }
+
+  .zeroth-yl-login .zeroth-login-card .zeroth-panel-body {
+    padding: 20px 22px 24px;
   }
 }
 
@@ -1553,8 +1765,11 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
     let signed_in_account_mode = signed_in && config.link_identities;
     let signed_in_login_flow = signed_in && !config.link_identities;
     let login_mode = !signed_in;
+    let is_yl_brand = product_name.to_ascii_uppercase().contains("YL");
     let uses_minimal_login = login_mode && theme.uses_minimal_login();
-    let shell_class = if uses_minimal_login {
+    let shell_class = if login_mode && is_yl_brand {
+        "zeroth-shell zeroth-login-mode zeroth-yl-login"
+    } else if uses_minimal_login {
         "zeroth-shell zeroth-login-mode zeroth-login-minimal"
     } else if login_mode {
         "zeroth-shell zeroth-login-mode"
@@ -1596,15 +1811,38 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
     } else {
         "zeroth-auth-group"
     };
-    let login_intro = uses_minimal_login.then(|| {
+    let login_intro_copy = config
+        .return_to
+        .as_deref()
+        .and_then(|return_to| Url::parse(return_to).ok())
+        .is_some_and(|return_to| return_to.path().starts_with("/admin"))
+        .then_some("Continue to the release dashboard.")
+        .unwrap_or("Continue to YL.VIN.");
+    let login_intro = if login_mode && is_yl_brand {
+        Some(
+            view! {
+                <div class="zeroth-login-intro">
+                    <div class="zeroth-yl-app-icon" inner_html=YL_APP_ICON_SVG></div>
+                    <span class="zeroth-login-intro-mark">"yl.vin"</span>
+                    <p class="zeroth-login-intro-copy">{login_intro_copy}</p>
+                </div>
+            }
+            .into_any(),
+        )
+    } else if uses_minimal_login {
         let icon = theme.brand_icon.clone();
         let accessible_name = product_name.clone();
-        view! {
-            <div class="zeroth-login-intro">
-                {icon.map(|src| view! { <img src=src alt=accessible_name /> })}
-            </div>
-        }
-    });
+        Some(
+            view! {
+                <div class="zeroth-login-intro">
+                    {icon.map(|src| view! { <img src=src alt=accessible_name /> })}
+                </div>
+            }
+            .into_any(),
+        )
+    } else {
+        None
+    };
     let provider_list_class = if signed_in_login_flow {
         "zeroth-provider-list zeroth-hidden"
     } else {
@@ -1647,7 +1885,7 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
     let wallet_verify_action = endpoint_url(&config, "/wallet/verify");
     let provider_rows = providers
         .into_iter()
-        .map(|provider| provider_row(&config, provider, signed_in))
+        .map(|provider| provider_row(&config, provider, signed_in, is_yl_brand))
         .collect_view();
     let identity_rows = identities
         .into_iter()
@@ -2345,7 +2583,12 @@ pub fn ClientsAdminApp(state: ClientsAdminUiState) -> impl IntoView {
     }
 }
 
-fn provider_row(config: &ZerothUiConfig, provider: ProviderUi, signed_in: bool) -> impl IntoView {
+fn provider_row(
+    config: &ZerothUiConfig,
+    provider: ProviderUi,
+    signed_in: bool,
+    is_yl_brand: bool,
+) -> impl IntoView {
     let linking = signed_in && config.link_identities;
     let login_mode = !signed_in && !config.link_identities;
     let action = if provider.connected && linking {
@@ -2369,6 +2612,8 @@ fn provider_row(config: &ZerothUiConfig, provider: ProviderUi, signed_in: bool) 
         provider_kind_class(&provider.kind, provider.connected)
     );
     let initial = provider_initial(&provider);
+    let uses_apple_button =
+        login_mode && matches!(provider.kind, ProviderKind::Apple) && is_yl_brand;
     let disabled = !provider.enabled || (provider.connected && linking);
     let csrf_token = config.csrf_token.clone().unwrap_or_default();
     let link_action = provider_link_url(config, &provider.id);
@@ -2389,6 +2634,19 @@ fn provider_row(config: &ZerothUiConfig, provider: ProviderUi, signed_in: bool) 
     } else if disabled {
         view! {
             <span class="zeroth-action" aria-disabled="true">{action}</span>
+        }
+        .into_any()
+    } else if uses_apple_button {
+        view! {
+            <a class="zeroth-action" href=href>
+                <img
+                    class="zeroth-apple-button-image"
+                    src="https://appleid.cdn-apple.com/appleid/button?height=48&width=375&color=black&border=false&type=continue&border_radius=24&scale=2&locale=en_US"
+                    alt=action
+                    width="375"
+                    height="48"
+                />
+            </a>
         }
         .into_any()
     } else {
@@ -4813,6 +5071,31 @@ mod tests {
         assert!(html.contains("zeroth-login-card"));
         assert!(html.contains("zeroth-panel zeroth-hidden"));
         assert!(html.contains("provider=apple"));
+        assert!(!html.contains("appleid.cdn-apple.com/appleid/button"));
+    }
+
+    #[test]
+    fn yl_login_uses_apple_generated_continue_button() {
+        let mut state = ZerothUiState::new(ZerothUiConfig::new(
+            "https://id.yl.vin",
+            "yl-web",
+            "https://yl.vin/auth/callback",
+        ))
+        .with_product_name("YL.VIN");
+        state.config.link_identities = false;
+        state.config.return_to = Some("https://yl.vin/admin/".to_owned());
+        state.providers = vec![ProviderUi::apple(false)];
+
+        let html = render_account_html(state);
+
+        assert!(html.contains("zeroth-yl-login"));
+        assert!(html.contains("zeroth-yl-app-icon"));
+        assert!(html.contains("YL.VIN</title>"));
+        assert!(html.contains("Continue to the release dashboard."));
+        assert!(html.contains("zeroth-apple-button-image"));
+        assert!(html.contains("appleid.cdn-apple.com/appleid/button"));
+        assert!(html.contains("type=continue"));
+        assert!(html.contains("alt=\"Continue with Apple\""));
     }
 
     #[test]
