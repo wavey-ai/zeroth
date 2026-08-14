@@ -10,6 +10,234 @@ use zeroth_providers::well_known;
 const TRANSPARENT_PIXEL_DATA_URI: &str =
     "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==";
 
+const YL_VIN_LOGIN_CSS: &str = r#"
+:root {
+  color-scheme: light;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: #f5f5f7;
+  color: #1d1d1f;
+}
+
+.yl-login {
+  display: grid;
+  place-items: center;
+  min-height: 100svh;
+  padding: max(32px, env(safe-area-inset-top)) 20px max(32px, env(safe-area-inset-bottom));
+}
+
+.yl-login-inner {
+  display: grid;
+  width: min(375px, 100%);
+  gap: 28px;
+}
+
+.yl-login-icon {
+  display: block;
+  width: 120px;
+  height: 120px;
+  margin: 0 auto 8px;
+  border-radius: 26.5%;
+  object-fit: cover;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.12);
+}
+
+.yl-login-apple {
+  display: block;
+  overflow: hidden;
+  width: 100%;
+  aspect-ratio: 375 / 48;
+  border-radius: 8px;
+  background: #000000;
+}
+
+.yl-login-apple img {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.yl-login-email {
+  display: grid;
+  gap: 12px;
+}
+
+.yl-login-email label {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.yl-login-email input,
+.yl-login-email button,
+.yl-login-reset {
+  min-height: 48px;
+  border-radius: 8px;
+  font: inherit;
+  font-size: 17px;
+}
+
+.yl-login-email input {
+  width: 100%;
+  border: 1px solid #86868b;
+  background: #ffffff;
+  color: #1d1d1f;
+  padding: 0 15px;
+}
+
+.yl-login-email input::placeholder {
+  color: #6e6e73;
+}
+
+.yl-login-email button,
+.yl-login-reset {
+  border: 1px solid #1d1d1f;
+  background: #ffffff;
+  color: #1d1d1f;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.yl-login-email button:hover,
+.yl-login-reset:hover {
+  background: #e8e8ed;
+}
+
+.yl-login-apple:focus-visible,
+.yl-login-email input:focus-visible,
+.yl-login-email button:focus-visible,
+.yl-login-reset:focus-visible {
+  outline: 3px solid #0071e3;
+  outline-offset: 3px;
+}
+
+.yl-login-waiting {
+  display: grid;
+  gap: 14px;
+  text-align: center;
+}
+
+.yl-login-waiting p {
+  margin: 0;
+  color: #6e6e73;
+  font-size: 15px;
+  line-height: 1.4;
+}
+
+.yl-login-reset {
+  min-height: 44px;
+}
+
+@media (max-width: 420px) {
+  .yl-login-inner {
+    gap: 24px;
+  }
+
+  .yl-login-icon {
+    width: 104px;
+    height: 104px;
+  }
+}
+"#;
+
+const YL_VIN_LOGIN_SCRIPT: &str = r#"
+(() => {
+  const form = document.getElementById("zeroth-magic-link-form");
+  const waiting = document.getElementById("zeroth-magic-link-waiting");
+  const reset = document.getElementById("zeroth-magic-link-reset");
+  let pollTimer = null;
+
+  const stopPolling = () => {
+    if (pollTimer !== null) window.clearTimeout(pollTimer);
+    pollTimer = null;
+  };
+
+  const startPolling = (returnTo, pollToken) => {
+    stopPolling();
+    const poll = async () => {
+      try {
+        const response = await fetch("/magic-links/poll", {
+          method: "POST",
+          credentials: "include",
+          headers: { Accept: "application/json", "Content-Type": "application/json" },
+          body: JSON.stringify({ pollToken })
+        });
+        const body = await response.json();
+        if (response.ok && body.status === "complete") {
+          stopPolling();
+          window.location.assign(body.returnTo || returnTo);
+          return;
+        }
+        if (response.status === 409 || body.status === "expired" || body.status === "not_found") {
+          stopPolling();
+          return;
+        }
+      } catch (_) {}
+      pollTimer = window.setTimeout(poll, 3000);
+    };
+    pollTimer = window.setTimeout(poll, 3000);
+  };
+
+  if (form) {
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const data = new FormData(form);
+      const payload = {
+        email: String(data.get("email") || "").trim(),
+        clientId: String(data.get("clientId") || "").trim(),
+        returnTo: String(data.get("returnTo") || "").trim()
+      };
+      const button = form.querySelector("button[type='submit']");
+      if (button) button.disabled = true;
+      try {
+        const response = await fetch(form.action, {
+          method: "POST",
+          credentials: "include",
+          headers: { Accept: "application/json", "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(body.error || body.message || "Sign in failed");
+        if (body.returnTo) {
+          window.location.assign(body.returnTo);
+          return;
+        }
+        form.hidden = true;
+        if (waiting) waiting.hidden = false;
+        startPolling(payload.returnTo || window.location.href, body.pollToken);
+      } catch (error) {
+        window.alert(error instanceof Error ? error.message : "Sign in failed");
+      } finally {
+        if (button) button.disabled = false;
+      }
+    });
+  }
+
+  if (reset) {
+    reset.addEventListener("click", () => {
+      stopPolling();
+      if (waiting) waiting.hidden = true;
+      if (form) {
+        form.hidden = false;
+        const email = form.querySelector("input[type='email']");
+        if (email) email.focus();
+      }
+    });
+  }
+})();
+"#;
+
 /// Stylesheet for the default Zeroth account UI.
 pub const ZEROTH_UI_CSS: &str = r#"
 :root {
@@ -1719,11 +1947,36 @@ pub fn provider_link_url(config: &ZerothUiConfig, provider_id: &str) -> String {
 
 /// Renders the default Zeroth UI body as server-side HTML.
 pub fn render_account_html(state: ZerothUiState) -> String {
+    if state.profile.is_none() && state.theme.uses_yl_vin_login() {
+        return render_yl_vin_login_html(&state);
+    }
     view! { <AccountApp state=state /> }.to_html()
 }
 
 /// Renders a complete HTML document with the default Zeroth stylesheet.
 pub fn render_account_document(state: ZerothUiState) -> String {
+    if state.profile.is_none() && state.theme.uses_yl_vin_login() {
+        let favicon = state
+            .theme
+            .brand_icon
+            .as_deref()
+            .map(escape_text)
+            .unwrap_or_else(|| "/favicon.svg".to_owned());
+        return format!(
+            concat!(
+                "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">",
+                "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">",
+                "<meta name=\"theme-color\" content=\"#f5f5f7\">",
+                "<link rel=\"icon\" href=\"{}\">",
+                "<title>Sign in</title><style>{}</style></head><body>{}<script>{}</script></body></html>"
+            ),
+            favicon,
+            YL_VIN_LOGIN_CSS,
+            render_yl_vin_login_html(&state),
+            YL_VIN_LOGIN_SCRIPT
+        );
+    }
+
     let title = escape_text(&state.product_name);
     let favicon = state
         .theme
@@ -1741,6 +1994,69 @@ pub fn render_account_document(state: ZerothUiState) -> String {
             "<title>{}</title><style>{}{}</style></head><body>{}<script src=\"/profile-menu.js\" defer></script><script>{}</script></body></html>"
         ),
         favicon, title, ZEROTH_UI_CSS, theme_css, html, ZEROTH_UI_SCRIPT
+    )
+}
+
+fn render_yl_vin_login_html(state: &ZerothUiState) -> String {
+    let config = &state.config;
+    let icon = state
+        .theme
+        .brand_icon
+        .as_deref()
+        .map(|src| {
+            format!(
+                "<img class=\"yl-login-icon\" src=\"{}\" alt=\"\">",
+                escape_text(src)
+            )
+        })
+        .unwrap_or_default();
+
+    let apple = state
+        .providers
+        .iter()
+        .find(|provider| provider.id == well_known::APPLE && provider.enabled)
+        .map(|provider| {
+            let href = provider_authorize_url(config, &provider.id);
+            format!(
+                concat!(
+                    "<a class=\"yl-login-apple\" href=\"{}\" aria-label=\"Sign in with Apple\">",
+                    "<img src=\"https://appleid.cdn-apple.com/appleid/button?height=48&amp;width=375&amp;color=black&amp;border=false&amp;type=sign-in&amp;border_radius=8&amp;scale=2&amp;locale=en_GB\" ",
+                    "width=\"375\" height=\"48\" alt=\"\"></a>"
+                ),
+                escape_text(&href)
+            )
+        })
+        .unwrap_or_default();
+
+    let email = config
+        .show_magic_link_login
+        .then(|| {
+            let action = endpoint_url(config, "/magic-links");
+            let return_to = config
+                .return_to
+                .as_deref()
+                .unwrap_or(&config.redirect_uri);
+            format!(
+                concat!(
+                    "<form id=\"zeroth-magic-link-form\" class=\"yl-login-email\" method=\"post\" action=\"{}\">",
+                    "<input type=\"hidden\" name=\"clientId\" value=\"{}\">",
+                    "<input type=\"hidden\" name=\"returnTo\" value=\"{}\">",
+                    "<label for=\"zeroth-magic-email\">Email</label>",
+                    "<input id=\"zeroth-magic-email\" name=\"email\" type=\"email\" autocomplete=\"email\" inputmode=\"email\" placeholder=\"Email\" required>",
+                    "<button type=\"submit\">Continue with email</button></form>",
+                    "<div id=\"zeroth-magic-link-waiting\" class=\"yl-login-waiting\" hidden>",
+                    "<p>Check your email to finish signing in.</p>",
+                    "<button id=\"zeroth-magic-link-reset\" class=\"yl-login-reset\" type=\"button\">Use a different email</button></div>"
+                ),
+                escape_text(&action),
+                escape_text(&config.client_id),
+                escape_text(return_to)
+            )
+        })
+        .unwrap_or_default();
+
+    format!(
+        "<main class=\"yl-login\" aria-label=\"Sign in\"><div class=\"yl-login-inner\">{icon}{apple}{email}</div></main>"
     )
 }
 
@@ -5129,7 +5445,7 @@ mod tests {
     }
 
     #[test]
-    fn yl_vin_login_uses_explicit_theme_and_configured_app_icon() {
+    fn yl_vin_login_is_a_dedicated_icon_apple_and_email_surface() {
         let mut state = ZerothUiState::new(ZerothUiConfig::new(
             "https://id.yl.vin",
             "yl-web",
@@ -5143,21 +5459,31 @@ mod tests {
         });
         state.config.link_identities = false;
         state.config.return_to = Some("https://yl.vin/admin/".to_owned());
+        state.config.show_magic_link_login = true;
         state.providers = vec![ProviderUi::apple(false)];
 
         let html = render_account_document(state);
 
-        assert!(html.contains("zeroth-yl-login"));
-        assert!(html.contains("zeroth-yl-app-icon"));
+        assert!(html.contains("class=\"yl-login\""));
+        assert!(html.contains("class=\"yl-login-icon\""));
         assert!(html.contains("src=\"https://yl.vin/appicon.png\""));
         assert!(html.contains("rel=\"icon\" href=\"https://yl.vin/appicon.png\""));
-        assert!(html.contains("YL.VIN</title>"));
-        assert!(html.contains("Continue to the release dashboard."));
-        assert!(html.contains("Continue with Apple"));
-        assert!(!html.contains("appleid.cdn-apple.com"));
-        assert!(
-            !html.contains("<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 1024 1024\"")
-        );
+        assert!(html.contains("<title>Sign in</title>"));
+        assert!(html.contains("aria-label=\"Sign in with Apple\""));
+        assert!(html.contains("appleid.cdn-apple.com/appleid/button"));
+        assert!(html.contains("placeholder=\"Email\""));
+        assert!(html.contains("Continue with email"));
+        assert!(!html.contains("zeroth-shell"));
+        assert!(!html.contains("zeroth-sidebar"));
+        assert!(!html.contains("zeroth-topbar"));
+        assert!(!html.contains("YL.VIN</title>"));
+        assert!(!html.contains(">yl.vin<"));
+        assert!(!html.contains("Continue with Google"));
+        assert!(!html.contains("More options"));
+        assert!(!html.contains("Email and password"));
+        assert!(!html.contains("Use passkey"));
+        assert!(!html.contains("Connect wallet"));
+        assert!(!html.contains("profile-menu.js"));
     }
 
     #[test]
