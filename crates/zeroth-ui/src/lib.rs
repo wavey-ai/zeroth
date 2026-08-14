@@ -9,7 +9,6 @@ use zeroth_providers::well_known;
 
 const TRANSPARENT_PIXEL_DATA_URI: &str =
     "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==";
-const YL_APP_ICON_SVG: &str = include_str!("yl_app_icon.svg");
 
 /// Stylesheet for the default Zeroth account UI.
 pub const ZEROTH_UI_CSS: &str = r#"
@@ -256,15 +255,28 @@ textarea:focus-visible {
 }
 
 .zeroth-yl-login {
-  --z-yl-pink: #ff176d;
-  --z-yl-red: #ff302e;
-  --z-yl-paper: #f6efdf;
-  --z-yl-ink: #070707;
+  --z-bg: #060609;
+  --z-panel: #15121a;
+  --z-text: #f8f7fb;
+  --z-muted: #a9a6b4;
+  --z-line: #1d1823;
+  --z-line-strong: #3d3448;
+  --z-blue: #ff2582;
+  --z-yl-background: #060609;
+  --z-yl-surface: #15121a;
+  --z-yl-surface-raised: #1d1823;
+  --z-yl-text: #f8f7fb;
+  --z-yl-muted: #a9a6b4;
+  --z-yl-dim: #74717e;
+  --z-yl-pink: #ff2582;
+  --z-yl-pink-soft: #ff6bb8;
+  --z-yl-red: #ff0d1a;
   min-height: 100svh;
+  color: var(--z-yl-text);
   background:
-    radial-gradient(circle at 3% 7%, rgba(255, 23, 109, 0.28), transparent 27rem),
-    radial-gradient(circle at 100% 100%, rgba(255, 48, 46, 0.18), transparent 30rem),
-    var(--z-yl-paper);
+    radial-gradient(circle at 2% 2%, rgba(255, 37, 130, 0.24), transparent 30rem),
+    radial-gradient(circle at 98% 96%, rgba(113, 60, 255, 0.16), transparent 34rem),
+    linear-gradient(145deg, #0d0c12 0%, var(--z-yl-background) 54%, #10050a 100%);
 }
 
 .zeroth-yl-login::before {
@@ -273,7 +285,8 @@ textarea:focus-visible {
   z-index: 0;
   pointer-events: none;
   content: "";
-  opacity: 0.11;
+  opacity: 0.08;
+  mix-blend-mode: screen;
   background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 180 180' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='.7'/%3E%3C/svg%3E");
 }
 
@@ -302,10 +315,12 @@ textarea:focus-visible {
 .zeroth-yl-login .zeroth-login-card {
   width: 100%;
   overflow: hidden;
-  border: 1px solid rgba(7, 7, 7, 0.2);
+  border: 1px solid rgba(255, 107, 184, 0.24);
   border-radius: 28px;
-  background: rgba(255, 253, 248, 0.88);
-  box-shadow: 0 28px 80px rgba(62, 18, 28, 0.2);
+  background: rgba(21, 18, 26, 0.9);
+  box-shadow:
+    0 0 0 1px rgba(255, 37, 130, 0.04),
+    0 28px 80px rgba(0, 0, 0, 0.5);
   backdrop-filter: blur(22px);
 }
 
@@ -316,7 +331,7 @@ textarea:focus-visible {
 }
 
 .zeroth-yl-login .zeroth-login-card .zeroth-panel-title {
-  color: var(--z-yl-ink);
+  color: var(--z-yl-text);
   font-size: clamp(30px, 4vw, 44px);
   font-weight: 900;
   letter-spacing: -0.055em;
@@ -326,6 +341,49 @@ textarea:focus-visible {
 .zeroth-yl-login .zeroth-login-card .zeroth-panel-body {
   gap: 20px;
   padding: 24px 30px 30px;
+}
+
+.zeroth-yl-login .zeroth-provider {
+  grid-template-columns: 1fr;
+  border-color: rgba(248, 247, 251, 0.12);
+  background: var(--z-yl-surface-raised);
+}
+
+.zeroth-yl-login .zeroth-provider-badge {
+  display: none;
+}
+
+.zeroth-yl-login .zeroth-provider .zeroth-action {
+  grid-column: 1;
+}
+
+.zeroth-yl-login .zeroth-action {
+  border-color: rgba(248, 247, 251, 0.18);
+  background: var(--z-yl-surface-raised);
+  color: var(--z-yl-text);
+}
+
+.zeroth-yl-login .zeroth-action:hover {
+  border-color: var(--z-yl-pink-soft);
+  color: var(--z-yl-pink-soft);
+}
+
+.zeroth-yl-login .zeroth-field input,
+.zeroth-yl-login .zeroth-field textarea,
+.zeroth-yl-login .zeroth-field select {
+  border-color: rgba(248, 247, 251, 0.18);
+  background: var(--z-yl-surface-raised);
+  color: var(--z-yl-text);
+}
+
+.zeroth-yl-login .zeroth-divider,
+.zeroth-yl-login .zeroth-row-meta {
+  color: var(--z-yl-muted);
+}
+
+.zeroth-yl-login .zeroth-divider::before,
+.zeroth-yl-login .zeroth-divider::after {
+  background: rgba(248, 247, 251, 0.13);
 }
 
 .zeroth-login-intro {
@@ -339,23 +397,19 @@ textarea:focus-visible {
   aspect-ratio: 1;
   margin-bottom: clamp(28px, 5vw, 54px);
   overflow: hidden;
-  border: 1px solid rgba(7, 7, 7, 0.14);
+  object-fit: cover;
+  border: 1px solid rgba(255, 255, 255, 0.16);
   border-radius: 26%;
   box-shadow:
-    0 4px 0 rgba(7, 7, 7, 0.92),
-    0 28px 64px rgba(106, 0, 40, 0.24);
+    0 4px 0 rgba(0, 0, 0, 0.92),
+    0 0 42px rgba(255, 37, 130, 0.24),
+    0 28px 64px rgba(0, 0, 0, 0.48);
   transform: rotate(-2.5deg);
-}
-
-.zeroth-yl-app-icon svg {
-  display: block;
-  width: 100%;
-  height: 100%;
 }
 
 .zeroth-login-intro-mark {
   display: block;
-  color: var(--z-yl-ink);
+  color: var(--z-yl-text);
   font-size: clamp(28px, 5vw, 68px);
   font-weight: 900;
   letter-spacing: -0.075em;
@@ -365,7 +419,7 @@ textarea:focus-visible {
 .zeroth-login-intro-copy {
   max-width: 20ch;
   margin: 18px 0 0;
-  color: rgba(7, 7, 7, 0.62);
+  color: var(--z-yl-muted);
   font-size: clamp(18px, 2vw, 25px);
   font-weight: 650;
   letter-spacing: -0.025em;
@@ -380,6 +434,12 @@ textarea:focus-visible {
 .zeroth-yl-login .zeroth-action.zeroth-primary:hover {
   background: var(--z-yl-red);
   border-color: var(--z-yl-red);
+}
+
+.zeroth-yl-login .zeroth-action:focus-visible,
+.zeroth-yl-login input:focus-visible,
+.zeroth-yl-login summary:focus-visible {
+  outline-color: rgba(255, 37, 130, 0.58);
 }
 
 .zeroth-more-options {
@@ -604,36 +664,33 @@ textarea:focus-visible {
 
 .zeroth-yl-login .provider-apple .zeroth-action {
   min-height: 48px;
-  padding: 0;
-  overflow: hidden;
-  border: 0;
-  background: transparent;
+  border-color: #f8f7fb;
+  border-radius: 24px;
+  background: #f8f7fb;
+  color: #060609;
 }
 
 .zeroth-yl-login .provider-apple .zeroth-action:hover {
-  border: 0;
-  background: transparent;
-}
-
-.zeroth-apple-button-image {
-  display: block;
-  width: 100%;
-  max-width: 375px;
-  height: auto;
-  margin: 0 auto;
+  border-color: var(--z-yl-pink-soft);
+  background: var(--z-yl-pink-soft);
+  color: #060609;
 }
 
 .zeroth-yl-login .zeroth-more-options {
-  border-top-color: rgba(7, 7, 7, 0.13);
+  border-top-color: rgba(248, 247, 251, 0.13);
   padding-top: 16px;
 }
 
 .zeroth-yl-login .zeroth-more-options > summary {
-  color: rgba(7, 7, 7, 0.55);
+  color: var(--z-yl-dim);
   font-size: 12px;
   letter-spacing: 0.08em;
   text-align: center;
   text-transform: uppercase;
+}
+
+.zeroth-yl-login .zeroth-more-options[open] > summary {
+  color: var(--z-yl-muted);
 }
 
 .zeroth-login-minimal .provider-google .zeroth-action {
@@ -1339,6 +1396,13 @@ impl ZerothUiTheme {
             .is_some_and(|value| value.eq_ignore_ascii_case("minimal"))
     }
 
+    fn uses_yl_vin_login(&self) -> bool {
+        self.login_style
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| value.eq_ignore_ascii_case("yl-vin"))
+    }
+
     fn css(&self) -> String {
         let mut rules = Vec::new();
         for (property, configured_value) in [
@@ -1661,16 +1725,22 @@ pub fn render_account_html(state: ZerothUiState) -> String {
 /// Renders a complete HTML document with the default Zeroth stylesheet.
 pub fn render_account_document(state: ZerothUiState) -> String {
     let title = escape_text(&state.product_name);
+    let favicon = state
+        .theme
+        .brand_icon
+        .as_deref()
+        .map(escape_text)
+        .unwrap_or_else(|| "/favicon.svg".to_owned());
     let theme_css = state.theme.css();
     let html = render_account_html(state);
     format!(
         concat!(
             "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">",
             "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">",
-            "<link rel=\"icon\" href=\"/favicon.svg\" type=\"image/svg+xml\">",
+            "<link rel=\"icon\" href=\"{}\">",
             "<title>{}</title><style>{}{}</style></head><body>{}<script src=\"/profile-menu.js\" defer></script><script>{}</script></body></html>"
         ),
-        title, ZEROTH_UI_CSS, theme_css, html, ZEROTH_UI_SCRIPT
+        favicon, title, ZEROTH_UI_CSS, theme_css, html, ZEROTH_UI_SCRIPT
     )
 }
 
@@ -1765,9 +1835,9 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
     let signed_in_account_mode = signed_in && config.link_identities;
     let signed_in_login_flow = signed_in && !config.link_identities;
     let login_mode = !signed_in;
-    let is_yl_brand = product_name.to_ascii_uppercase().contains("YL");
+    let uses_yl_vin_login = login_mode && theme.uses_yl_vin_login();
     let uses_minimal_login = login_mode && theme.uses_minimal_login();
-    let shell_class = if login_mode && is_yl_brand {
+    let shell_class = if uses_yl_vin_login {
         "zeroth-shell zeroth-login-mode zeroth-yl-login"
     } else if uses_minimal_login {
         "zeroth-shell zeroth-login-mode zeroth-login-minimal"
@@ -1817,12 +1887,16 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
         .and_then(|return_to| Url::parse(return_to).ok())
         .is_some_and(|return_to| return_to.path().starts_with("/admin"))
         .then_some("Continue to the release dashboard.")
-        .unwrap_or("Continue to YL.VIN.");
-    let login_intro = if login_mode && is_yl_brand {
+        .unwrap_or("Sign in to cut, drop, and play records.");
+    let login_intro = if uses_yl_vin_login {
+        let icon = theme.brand_icon.clone();
+        let accessible_name = product_name.clone();
         Some(
             view! {
                 <div class="zeroth-login-intro">
-                    <div class="zeroth-yl-app-icon" inner_html=YL_APP_ICON_SVG></div>
+                    {icon.map(|src| view! {
+                        <img class="zeroth-yl-app-icon" src=src alt=accessible_name />
+                    })}
                     <span class="zeroth-login-intro-mark">"yl.vin"</span>
                     <p class="zeroth-login-intro-copy">{login_intro_copy}</p>
                 </div>
@@ -1885,7 +1959,7 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
     let wallet_verify_action = endpoint_url(&config, "/wallet/verify");
     let provider_rows = providers
         .into_iter()
-        .map(|provider| provider_row(&config, provider, signed_in, is_yl_brand))
+        .map(|provider| provider_row(&config, provider, signed_in))
         .collect_view();
     let identity_rows = identities
         .into_iter()
@@ -2583,12 +2657,7 @@ pub fn ClientsAdminApp(state: ClientsAdminUiState) -> impl IntoView {
     }
 }
 
-fn provider_row(
-    config: &ZerothUiConfig,
-    provider: ProviderUi,
-    signed_in: bool,
-    is_yl_brand: bool,
-) -> impl IntoView {
+fn provider_row(config: &ZerothUiConfig, provider: ProviderUi, signed_in: bool) -> impl IntoView {
     let linking = signed_in && config.link_identities;
     let login_mode = !signed_in && !config.link_identities;
     let action = if provider.connected && linking {
@@ -2612,8 +2681,6 @@ fn provider_row(
         provider_kind_class(&provider.kind, provider.connected)
     );
     let initial = provider_initial(&provider);
-    let uses_apple_button =
-        login_mode && matches!(provider.kind, ProviderKind::Apple) && is_yl_brand;
     let disabled = !provider.enabled || (provider.connected && linking);
     let csrf_token = config.csrf_token.clone().unwrap_or_default();
     let link_action = provider_link_url(config, &provider.id);
@@ -2634,19 +2701,6 @@ fn provider_row(
     } else if disabled {
         view! {
             <span class="zeroth-action" aria-disabled="true">{action}</span>
-        }
-        .into_any()
-    } else if uses_apple_button {
-        view! {
-            <a class="zeroth-action" href=href>
-                <img
-                    class="zeroth-apple-button-image"
-                    src="https://appleid.cdn-apple.com/appleid/button?height=48&width=375&color=black&border=false&type=continue&border_radius=24&scale=2&locale=en_US"
-                    alt=action
-                    width="375"
-                    height="48"
-                />
-            </a>
         }
         .into_any()
     } else {
@@ -5075,7 +5129,39 @@ mod tests {
     }
 
     #[test]
-    fn yl_login_uses_apple_generated_continue_button() {
+    fn yl_vin_login_uses_explicit_theme_and_configured_app_icon() {
+        let mut state = ZerothUiState::new(ZerothUiConfig::new(
+            "https://id.yl.vin",
+            "yl-web",
+            "https://yl.vin/auth/callback",
+        ))
+        .with_product_name("YL.VIN")
+        .with_theme(ZerothUiTheme {
+            brand_icon: Some("https://yl.vin/appicon.png".to_owned()),
+            login_style: Some("yl-vin".to_owned()),
+            ..ZerothUiTheme::default()
+        });
+        state.config.link_identities = false;
+        state.config.return_to = Some("https://yl.vin/admin/".to_owned());
+        state.providers = vec![ProviderUi::apple(false)];
+
+        let html = render_account_document(state);
+
+        assert!(html.contains("zeroth-yl-login"));
+        assert!(html.contains("zeroth-yl-app-icon"));
+        assert!(html.contains("src=\"https://yl.vin/appicon.png\""));
+        assert!(html.contains("rel=\"icon\" href=\"https://yl.vin/appicon.png\""));
+        assert!(html.contains("YL.VIN</title>"));
+        assert!(html.contains("Continue to the release dashboard."));
+        assert!(html.contains("Continue with Apple"));
+        assert!(!html.contains("appleid.cdn-apple.com"));
+        assert!(
+            !html.contains("<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 1024 1024\"")
+        );
+    }
+
+    #[test]
+    fn product_name_does_not_implicitly_enable_yl_vin_layout() {
         let mut state = ZerothUiState::new(ZerothUiConfig::new(
             "https://id.yl.vin",
             "yl-web",
@@ -5083,19 +5169,13 @@ mod tests {
         ))
         .with_product_name("YL.VIN");
         state.config.link_identities = false;
-        state.config.return_to = Some("https://yl.vin/admin/".to_owned());
         state.providers = vec![ProviderUi::apple(false)];
 
         let html = render_account_html(state);
 
-        assert!(html.contains("zeroth-yl-login"));
-        assert!(html.contains("zeroth-yl-app-icon"));
-        assert!(html.contains("YL.VIN</title>"));
-        assert!(html.contains("Continue to the release dashboard."));
-        assert!(html.contains("zeroth-apple-button-image"));
-        assert!(html.contains("appleid.cdn-apple.com/appleid/button"));
-        assert!(html.contains("type=continue"));
-        assert!(html.contains("alt=\"Continue with Apple\""));
+        assert!(html.contains("zeroth-login-mode"));
+        assert!(!html.contains("zeroth-yl-login"));
+        assert!(!html.contains("zeroth-yl-app-icon"));
     }
 
     #[test]
