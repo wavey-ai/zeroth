@@ -130,10 +130,6 @@ pub const ROUTES: &[Route] = &[
         path: "/authorize",
     },
     Route {
-        method: "GET",
-        path: "/providers/{provider}/authorize",
-    },
-    Route {
         method: "POST",
         path: "/oauth/token",
     },
