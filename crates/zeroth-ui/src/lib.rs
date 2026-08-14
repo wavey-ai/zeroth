@@ -128,6 +128,10 @@ body {
   text-align: center;
 }
 
+.yl-login-waiting[hidden] {
+  display: none;
+}
+
 .yl-login-waiting p {
   margin: 0;
   color: #6e6e73;
