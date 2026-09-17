@@ -174,7 +174,9 @@ const CSRF_ROUTE_FAMILY_ACCOUNT: &str = "account";
 const CSRF_ROUTE_FAMILY_ADMIN: &str = "admin";
 const CSRF_ROUTE_FAMILY_LOGOUT: &str = "logout";
 const CSRF_ROUTE_FAMILY_MAGIC_LINK_CONFIRM: &str = "magic-link-confirm";
+const CSRF_ROUTE_FAMILY_MAGIC_LINK_POLL: &str = "magic-link-poll";
 const MAGIC_LINK_CONFIRM_TOKEN_FIELD: &str = "confirm";
+const MAGIC_LINK_POLL_COOKIE: &str = "zeroth_magic_poll";
 const PUBLIC_LOCAL_AUTH_RESPONSE_MESSAGE: &str =
     "If this account can use this method, the next step has been initiated.";
 const ADMIN_BOOTSTRAP_EMERGENCY_ENV: &str = "ADMIN_BOOTSTRAP_EMERGENCY";
@@ -4573,16 +4575,16 @@ async fn client_issuer_access_token(request: Request, env: Env) -> worker::Resul
             None,
         );
     };
-    if validate_session_cors_origin(&db, Some(origin), &current.session)
-        .await
-        .is_err()
-    {
-        return token_issuer_error_json(
-            "origin_not_allowed",
-            "this origin is not permitted to request an issuer token",
-            403,
-            Some(origin),
-        );
+    match validate_session_cors_origin(&db, Some(origin), &current.session).await? {
+        Ok(()) => {}
+        Err(_) => {
+            return token_issuer_error_json(
+                "origin_not_allowed",
+                "this origin is not permitted to request an issuer token",
+                403,
+                Some(origin),
+            );
+        }
     }
     let Some(client_id) = current.session.client_id.as_deref() else {
         return token_issuer_error_json(
@@ -5271,6 +5273,7 @@ async fn passkey_register_verify(mut request: Request, env: Env) -> worker::Resu
         }
         return oauth_error_json("invalid_request", "passkey challenge did not match", 400);
     }
+    let mut session_user_id: Option<String> = None;
     if admin_authorization.is_none() {
         let Some(current) = current_session_from_request(&request, &db, &config, now).await? else {
             return oauth_error_json(
@@ -5279,6 +5282,7 @@ async fn passkey_register_verify(mut request: Request, env: Env) -> worker::Resu
                 401,
             );
         };
+        session_user_id = Some(current.user.id.clone());
         let csrf_token = csrf_token_from_header(&request)?;
         if let Err(error) = validate_browser_session_mutation(
             &request,
@@ -5294,6 +5298,17 @@ async fn passkey_register_verify(mut request: Request, env: Env) -> worker::Resu
         .await?
         {
             return oauth_error_json("invalid_request", error, 403);
+        }
+    }
+    if let (Some(session_user_id), Some(challenge_user_id)) =
+        (session_user_id.as_deref(), challenge.user_id.as_deref())
+    {
+        if session_user_id != challenge_user_id {
+            return oauth_error_json(
+                "invalid_request",
+                "passkey challenge does not belong to the signed-in user",
+                403,
+            );
         }
     }
     if !consume_passkey_challenge(&db, &challenge.challenge_hash, now).await? {
@@ -5744,46 +5759,6 @@ async fn password_register(mut request: Request, env: Env) -> worker::Result<Res
 
     let current = current_session_from_request(&request, &db, &config, now).await?;
     let existing_user = get_user_by_primary_email(&db, &email).await?;
-    let registration_target = match current.as_ref() {
-        Some(current) => {
-            if current.user.disabled_at.is_some() {
-                return oauth_error_json("invalid_request", "user is disabled", 403);
-            }
-            if let Some(primary_email) = current.user.primary_email.as_deref() {
-                if !primary_email.eq_ignore_ascii_case(&email) {
-                    return oauth_error_json(
-                        "invalid_request",
-                        "password email must match the signed-in user",
-                        403,
-                    );
-                }
-            }
-            if let Some(existing_user) = existing_user.as_ref() {
-                if existing_user.id != current.user.id {
-                    return oauth_error_json(
-                        "invalid_request",
-                        "email is already attached to another user",
-                        409,
-                    );
-                }
-            }
-            Some(current.user.id.clone())
-        }
-        None if existing_user.is_some() => None,
-        None => {
-            let user_id = format!("usr_{}", random_token()?);
-            insert_passkey_user(&db, &user_id, &email, display_name.as_deref(), None, now).await?;
-            Some(user_id)
-        }
-    };
-
-    if let Some(user_id) = registration_target.as_deref() {
-        if let Some(user) = get_user(&db, user_id).await? {
-            if user.disabled_at.is_some() {
-                return oauth_error_json("invalid_request", "user is disabled", 403);
-            }
-        }
-    }
 
     let peppers = password_pepper_from_env(&env).map_err(worker_error)?;
     let salt = random_token()?;
@@ -5835,6 +5810,49 @@ async fn password_register(mut request: Request, env: Env) -> worker::Result<Res
             return public_response();
         }
         return oauth_error_json(&error.code, &error.description, 403);
+    }
+
+    // Create the account only after the client email-domain policy allows it, so a denied
+    // registration cannot leave an orphaned user row behind.
+    let registration_target = match current.as_ref() {
+        Some(current) => {
+            if current.user.disabled_at.is_some() {
+                return oauth_error_json("invalid_request", "user is disabled", 403);
+            }
+            if let Some(primary_email) = current.user.primary_email.as_deref() {
+                if !primary_email.eq_ignore_ascii_case(&email) {
+                    return oauth_error_json(
+                        "invalid_request",
+                        "password email must match the signed-in user",
+                        403,
+                    );
+                }
+            }
+            if let Some(existing_user) = existing_user.as_ref() {
+                if existing_user.id != current.user.id {
+                    return oauth_error_json(
+                        "invalid_request",
+                        "email is already attached to another user",
+                        409,
+                    );
+                }
+            }
+            Some(current.user.id.clone())
+        }
+        None if existing_user.is_some() => None,
+        None => {
+            let user_id = format!("usr_{}", random_token()?);
+            insert_passkey_user(&db, &user_id, &email, display_name.as_deref(), None, now).await?;
+            Some(user_id)
+        }
+    };
+
+    if let Some(user_id) = registration_target.as_deref() {
+        if let Some(user) = get_user(&db, user_id).await? {
+            if user.disabled_at.is_some() {
+                return oauth_error_json("invalid_request", "user is disabled", 403);
+            }
+        }
     }
 
     let Some(user_id) = registration_target else {
@@ -5906,6 +5924,9 @@ async fn password_login(mut request: Request, env: Env) -> worker::Result<Respon
     if let Err(error) = validate_local_auth_origin(&request, &db, &client, &config).await? {
         return oauth_error_json("invalid_request", error, 403);
     }
+    if validate_local_auth_client_email_policy(&client, &email).is_err() {
+        return oauth_error_json("invalid_grant", "invalid email or password", 401);
+    }
     let ip = rate_limit_request_ip(&request)?.unwrap_or_else(|| "missing".to_owned());
     let ip_email = format!("{ip}:{email}");
     let failure_rate_limit_subjects = [
@@ -5936,6 +5957,13 @@ async fn password_login(mut request: Request, env: Env) -> worker::Result<Respon
     ];
     if let Some(blocked) =
         rate_limit_check_subjects(&db, &rate_limit_key, now, &failure_rate_limit_subjects).await?
+    {
+        return rate_limit_error_json(blocked.retry_after_seconds);
+    }
+    // Increment before expensive work so concurrent attempts cannot race past the check.
+    if let Some(blocked) =
+        rate_limit_increment_subjects(&db, &rate_limit_key, now, &failure_rate_limit_subjects)
+            .await?
     {
         return rate_limit_error_json(blocked.retry_after_seconds);
     }
@@ -5996,12 +6024,6 @@ async fn password_login(mut request: Request, env: Env) -> worker::Result<Respon
         }
         let peppers = password_pepper_from_env(&env).map_err(worker_error)?;
         password_dummy_verify_with_config(&peppers, &body.password).await?;
-        if let Some(blocked) =
-            rate_limit_increment_subjects(&db, &rate_limit_key, now, &failure_rate_limit_subjects)
-                .await?
-        {
-            return rate_limit_error_json(blocked.retry_after_seconds);
-        }
         return oauth_error_json("invalid_grant", "invalid email or password", 401);
     }
     let Some(credential) = credential_opt else {
@@ -6010,30 +6032,12 @@ async fn password_login(mut request: Request, env: Env) -> worker::Result<Respon
     let password_verification =
         local_auth_password_matches(&env, &credential, &body.password).await?;
     if credential.disabled_at.is_some() || !password_verification.valid {
-        if let Some(blocked) =
-            rate_limit_increment_subjects(&db, &rate_limit_key, now, &failure_rate_limit_subjects)
-                .await?
-        {
-            return rate_limit_error_json(blocked.retry_after_seconds);
-        }
         return oauth_error_json("invalid_grant", "invalid email or password", 401);
     }
     let Some(user) = get_user(&db, &credential.user_id).await? else {
-        if let Some(blocked) =
-            rate_limit_increment_subjects(&db, &rate_limit_key, now, &failure_rate_limit_subjects)
-                .await?
-        {
-            return rate_limit_error_json(blocked.retry_after_seconds);
-        }
         return oauth_error_json("invalid_grant", "invalid email or password", 401);
     };
     if user.disabled_at.is_some() {
-        if let Some(blocked) =
-            rate_limit_increment_subjects(&db, &rate_limit_key, now, &failure_rate_limit_subjects)
-                .await?
-        {
-            return rate_limit_error_json(blocked.retry_after_seconds);
-        }
         return oauth_error_json("invalid_grant", "invalid email or password", 401);
     }
     if password_verification.needs_rehash {
@@ -6056,6 +6060,14 @@ async fn password_login(mut request: Request, env: Env) -> worker::Result<Respon
     }
     mark_local_credential_used(&db, &credential.email, now).await?;
     let success_rate_limit_subjects = [
+        rate_limit_subject(
+            RateLimitPolicy {
+                scope: RATE_LIMIT_SCOPE_PASSWORD_LOGIN_IP,
+                window_seconds: 15 * 60,
+                max_attempts: 20,
+            },
+            ip.as_str(),
+        ),
         rate_limit_subject(
             RateLimitPolicy {
                 scope: RATE_LIMIT_SCOPE_PASSWORD_LOGIN_EMAIL,
@@ -6240,6 +6252,9 @@ async fn evm_wallet_verify(mut request: Request, env: Env) -> worker::Result<Res
     };
     if !wallet_nonce_valid(&body.nonce) {
         return oauth_error_json("invalid_grant", "invalid wallet challenge", 401);
+    }
+    if let Err(error) = validate_any_client_or_public_origin(&request, &db, &config).await? {
+        return oauth_error_json("invalid_request", error, 403);
     }
     let challenge_hash = hash_secret(&body.nonce);
     let ip = rate_limit_request_ip(&request)?.unwrap_or_else(|| "missing".to_owned());
@@ -6466,26 +6481,45 @@ async fn magic_link_request(mut request: Request, env: Env) -> worker::Result<Re
     }
 
     cleanup_expired_magic_links(&db, now).await?;
-    let user = get_user_by_primary_email(&db, &email).await?;
-    let policy_ok = validate_local_auth_client_email_policy(&client, &email).is_ok();
     let allow_signup = binding_value_from_env(&env, "MAGIC_LINK_ALLOW_SIGNUP")
         .map(|v| v.trim().to_lowercase() == "true")
         .unwrap_or(false);
+    let policy_ok = validate_local_auth_client_email_policy(&client, &email).is_ok();
+    let mut user = get_user_by_primary_email(&db, &email).await?;
+    // Pin the account at request time so a later-created account for the same email
+    // cannot capture the link (magic-link pre-hijack).
+    if user.is_none() && allow_signup && policy_ok {
+        let new_user_id = format!("usr_{}", random_token()?);
+        insert_passkey_user(&db, &new_user_id, &email, None, None, now).await?;
+        user = get_user(&db, &new_user_id).await?;
+    }
     let user_id = user.as_ref().map(|user| user.id.clone());
     let token = random_token()?;
     let token_hash = hash_secret(&token);
     let poll_token = random_token()?;
     let poll_token_hash = hash_secret(&poll_token);
     let audit_context = audit_request_context(&request).unwrap_or_default();
+    // Bind the poll credential to this browser so a leaked pollToken is not enough to
+    // redeem the session from elsewhere.
+    let poll_binding = {
+        let secret = csrf_secret_from_env(&env).map_err(worker_error)?;
+        csrf_token(
+            &secret,
+            &poll_token_hash,
+            CSRF_ROUTE_FAMILY_MAGIC_LINK_POLL,
+            now,
+        )
+    };
     let public_response = || {
-        json_status(
+        let response = json_status(
             &serde_json::json!({
                 "ok": true,
                 "message": PUBLIC_LOCAL_AUTH_RESPONSE_MESSAGE,
                 "pollToken": poll_token,
             }),
             202,
-        )
+        )?;
+        with_set_cookie(response, &magic_link_poll_binding_cookie(&poll_binding))
     };
 
     let account_allowed = user.as_ref().is_some_and(|user| user.disabled_at.is_none())
@@ -6550,14 +6584,15 @@ async fn magic_link_request(mut request: Request, env: Env) -> worker::Result<Re
         now,
     )
     .await;
-    json_status(
+    let response = json_status(
         &serde_json::json!({
             "ok": true,
             "message": PUBLIC_LOCAL_AUTH_RESPONSE_MESSAGE,
             "pollToken": poll_token,
         }),
         202,
-    )
+    )?;
+    with_set_cookie(response, &magic_link_poll_binding_cookie(&poll_binding))
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -6611,11 +6646,8 @@ async fn magic_link_consume(mut request: Request, env: Env) -> worker::Result<Re
     let db = env.d1(D1_BINDING)?;
     let now = unix_timestamp_seconds();
     let rate_limit_key = rate_limit_key_from_env(&env).map_err(worker_error)?;
-    let origin = request_origin_for_config(&request, &config)?;
-    if let Some(ref origin) = origin {
-        // "null" origin means the browser is hiding the real origin (e.g. after a cross-site
-        // redirect chain). The CSRF token already provides replay protection here.
-        if origin != "null" && !origin_matches_public_base_url(origin, &config.public_base_url) {
+    if let Some(ref origin) = request_origin(&request)? {
+        if !origin_matches_public_base_url(origin, &config.public_base_url) {
             return oauth_error_json("invalid_request", cors_disallowed_origin(origin), 403);
         }
     }
@@ -6762,6 +6794,29 @@ async fn magic_link_poll(mut request: Request, env: Env) -> worker::Result<Respo
         return oauth_error_json("invalid_request", "missing poll token", 400);
     };
     let poll_token_hash = hash_secret(poll_token.trim());
+    let binding = cookie_value(
+        request_header(&request, "Cookie")?.as_deref(),
+        MAGIC_LINK_POLL_COOKIE,
+    );
+    let Some(binding) = binding else {
+        return oauth_error_json("invalid_request", "missing magic link poll binding", 403);
+    };
+    let secret = csrf_secret_from_env(&env).map_err(worker_error)?;
+    if validate_csrf_token(
+        &secret,
+        &poll_token_hash,
+        CSRF_ROUTE_FAMILY_MAGIC_LINK_POLL,
+        binding.trim(),
+        now,
+    )
+    .is_err()
+    {
+        return oauth_error_json(
+            "invalid_request",
+            "magic link poll binding did not match",
+            403,
+        );
+    }
     let args = [worker::d1::D1Type::Text(&poll_token_hash)];
     let row = db
         .prepare(
@@ -6785,6 +6840,12 @@ async fn magic_link_poll(mut request: Request, env: Env) -> worker::Result<Respo
     let Some(user_id) = row.user_id else {
         return json_status(&serde_json::json!({"status": "pending"}), 200);
     };
+    let Some(user) = get_user(&db, &user_id).await? else {
+        return json_status(&serde_json::json!({"status": "not_found"}), 404);
+    };
+    if user.disabled_at.is_some() {
+        return oauth_error_json("invalid_request", "user is disabled", 403);
+    }
     if !consume_magic_link_poll_token(&db, &poll_token_hash, now).await? {
         return json_status(&serde_json::json!({"status": "consumed"}), 409);
     }
@@ -6813,7 +6874,7 @@ async fn magic_link_poll(mut request: Request, env: Env) -> worker::Result<Respo
             config.cookie_domain.as_deref(),
         ),
     )?;
-    Ok(response)
+    with_set_cookie(response, &clear_magic_link_poll_binding_cookie())
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -7651,7 +7712,16 @@ async fn hosted_account(request: Request, env: Env) -> worker::Result<Response> 
     } else {
         ZerothUiConfig::new(config.issuer().issuer.clone(), "", account_url.clone())
     };
-    ui_config.return_to = Some(query_param(&url, "return_to").unwrap_or(account_url));
+    ui_config.return_to = Some(
+        query_param(&url, "return_to")
+            .filter(|return_to| {
+                client.as_ref().is_some_and(|client| {
+                    validate_client_return_to(return_to, client, Some(&config.issuer().issuer))
+                        .is_ok()
+                })
+            })
+            .unwrap_or_else(|| account_url.clone()),
+    );
     ui_config.code_challenge = None;
     ui_config.code_challenge_method = None;
     ui_config.link_identities = true;
@@ -9236,7 +9306,7 @@ fn with_confirmation_document_headers(response: Response) -> worker::Result<Resp
     response.headers().set("X-Frame-Options", "DENY")?;
     response.headers().set(
         "Content-Security-Policy",
-        "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+        "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
     )?;
     Ok(response)
 }
@@ -10106,7 +10176,7 @@ async fn upsert_local_credential(
     let password_iterations = i32::try_from(password_iterations)
         .map_err(|_| worker_error("password iteration count is too large".to_owned()))?;
     let password_scheme = PasswordScheme::Pbkdf2Sha256.as_str();
-    let password_params_json = password_params_json(pepper_id);
+    let password_params_json = password_params_json(pepper_id, password_iterations);
     let args = [
         worker::d1::D1Type::Text(email),
         worker::d1::D1Type::Text(user_id),
@@ -10410,7 +10480,7 @@ async fn cleanup_expired_magic_links(db: &worker::d1::D1Database, now: i32) -> w
         "DELETE FROM zeroth_magic_links
          WHERE token_hash IN (
              SELECT token_hash FROM zeroth_magic_links
-             WHERE expires_at <= ? OR consumed_at IS NOT NULL
+             WHERE expires_at <= ?
              ORDER BY expires_at
              LIMIT ?
          )",
@@ -10430,9 +10500,8 @@ async fn ensure_magic_link_user(
     if let Some(user_id) = row.user_id.as_deref() {
         return Ok((user_id.to_owned(), false));
     }
-    if let Some(user) = get_user_by_primary_email(db, &row.email).await? {
-        return Ok((user.id, false));
-    }
+    // A NULL user_id means the account was not pinned at request time. Create a fresh
+    // user instead of attaching the login to whichever account now owns the email.
     let user_id = format!("usr_{}", random_token()?);
     insert_passkey_user(db, &user_id, &row.email, None, None, now).await?;
     Ok((user_id, true))
@@ -13779,7 +13848,8 @@ fn validate_authorization_code_exchange(
                 ));
             };
 
-            if pkce_s256_challenge(code_verifier) != *code_challenge {
+            let expected_challenge = pkce_s256_challenge(code_verifier);
+            if !constant_time_eq(&expected_challenge, code_challenge) {
                 return Err(TokenExchangeError::invalid_grant(
                     "code_verifier did not match code_challenge",
                 ));
@@ -15111,6 +15181,23 @@ fn identities_response(identities: &[IdentityRow]) -> IdentitiesResponse {
 }
 
 #[cfg(target_arch = "wasm32")]
+fn reject_oversized_content_length(request: &Request, limit: usize) -> Result<(), String> {
+    let content_length = request_header(request, "Content-Length")
+        .map_err(|error| format!("could not read Content-Length header: {error}"))?;
+    if let Some(length) = content_length {
+        if length
+            .trim()
+            .parse::<usize>()
+            .map(|length| length > limit)
+            .unwrap_or(false)
+        {
+            return Err("request body is too large".to_owned());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
 async fn passkey_json_from_request<T: serde::de::DeserializeOwned>(
     request: &mut Request,
 ) -> Result<T, String> {
@@ -15121,6 +15208,7 @@ async fn passkey_json_from_request<T: serde::de::DeserializeOwned>(
     if !content_type_is_json(content_type.as_deref()) {
         return Err("Content-Type must be application/json".to_owned());
     }
+    reject_oversized_content_length(request, PASSKEY_BODY_LIMIT)?;
     let body = request
         .bytes()
         .await
@@ -15142,6 +15230,7 @@ async fn wallet_json_from_request<T: serde::de::DeserializeOwned>(
     if !content_type_is_json(content_type.as_deref()) {
         return Err("Content-Type must be application/json".to_owned());
     }
+    reject_oversized_content_length(request, EVM_WALLET_BODY_LIMIT)?;
     let body = request
         .bytes()
         .await
@@ -15158,6 +15247,7 @@ async fn local_auth_body_from_request<T: serde::de::DeserializeOwned>(
 ) -> Result<T, String> {
     let content_type = request_header(request, "Content-Type")
         .map_err(|error| format!("could not read Content-Type header: {error}"))?;
+    reject_oversized_content_length(request, LOCAL_AUTH_BODY_LIMIT)?;
     let body = request
         .bytes()
         .await
@@ -15389,6 +15479,24 @@ async fn validate_local_auth_origin(
         origin.as_deref(),
         &client.allowed_origins,
     ))
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn validate_any_client_or_public_origin(
+    request: &Request,
+    db: &worker::d1::D1Database,
+    config: &ZerothServerConfig,
+) -> worker::Result<Result<(), String>> {
+    let Some(origin) = request_origin(request)? else {
+        return Ok(Ok(()));
+    };
+    if origin == "null" {
+        return Ok(Err(cors_disallowed_origin(&origin)));
+    }
+    if origin_matches_public_base_url(&origin, &config.public_base_url) {
+        return Ok(Ok(()));
+    }
+    validate_any_client_cors_origin(db, Some(&origin)).await
 }
 
 fn validate_local_auth_client_email_policy(
@@ -16008,9 +16116,9 @@ async fn rate_limit_clear_subjects<'a>(
     Ok(())
 }
 
-fn password_params_json(pepper_id: &str) -> String {
+fn password_params_json(pepper_id: &str, iterations: i32) -> String {
     serde_json::json!({
-        "iterations": PASSWORD_PBKDF2_ITERATIONS,
+        "iterations": iterations,
         "prehash": "hmac-sha256",
         "pepper_id": pepper_id,
     })
@@ -17430,6 +17538,8 @@ fn cbor_int(value: &CborValue) -> Option<i64> {
     }
 }
 
+const CBOR_MAX_NESTING_DEPTH: usize = 32;
+
 struct CborReader<'a> {
     bytes: &'a [u8],
     offset: usize,
@@ -17438,6 +17548,10 @@ struct CborReader<'a> {
 impl<'a> CborReader<'a> {
     fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, offset: 0 }
+    }
+
+    fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.offset)
     }
 
     fn read_single(mut self) -> Result<CborValue, String> {
@@ -17454,6 +17568,13 @@ impl<'a> CborReader<'a> {
     }
 
     fn read_value(&mut self) -> Result<CborValue, String> {
+        self.read_value_at_depth(0)
+    }
+
+    fn read_value_at_depth(&mut self, depth: usize) -> Result<CborValue, String> {
+        if depth > CBOR_MAX_NESTING_DEPTH {
+            return Err("CBOR value is nested too deeply".to_owned());
+        }
         let initial = self.read_u8()?;
         let major = initial >> 5;
         let additional = initial & 0x1f;
@@ -17478,18 +17599,24 @@ impl<'a> CborReader<'a> {
             }
             4 => {
                 let len = self.read_len_usize(additional)?;
+                if len > self.remaining() {
+                    return Err("CBOR array length exceeds remaining data".to_owned());
+                }
                 let mut values = Vec::with_capacity(len);
                 for _ in 0..len {
-                    values.push(self.read_value()?);
+                    values.push(self.read_value_at_depth(depth + 1)?);
                 }
                 Ok(CborValue::Array(values))
             }
             5 => {
                 let len = self.read_len_usize(additional)?;
+                if len > self.remaining() {
+                    return Err("CBOR map length exceeds remaining data".to_owned());
+                }
                 let mut entries = Vec::with_capacity(len);
                 for _ in 0..len {
-                    let key = self.read_value()?;
-                    let value = self.read_value()?;
+                    let key = self.read_value_at_depth(depth + 1)?;
+                    let value = self.read_value_at_depth(depth + 1)?;
                     entries.push((key, value));
                 }
                 Ok(CborValue::Map(entries))
@@ -17644,7 +17771,7 @@ async fn validate_any_client_cors_origin(
         return Ok(Ok(()));
     };
     if origin == "null" {
-        return Ok(Ok(()));
+        return Ok(Err(cors_disallowed_origin(origin)));
     }
     if origin_allowed_by_any_client(db, origin).await? {
         Ok(Ok(()))
@@ -17657,10 +17784,10 @@ fn validate_cors_origin(origin: Option<&str>, allowed_origins: &[String]) -> Res
     let Some(origin) = origin else {
         return Ok(());
     };
-    // "null" means the browser is protecting the actual origin (sandboxed iframe, privacy
-    // restrictions, cross-origin redirect). Treat it as opaque/unknown — allow through.
+    // "null" is an opaque origin (sandboxed iframe, data:/file: URL). Reflecting it with
+    // credentials would let any opaque-origin frame read authenticated responses.
     if origin == "null" {
-        return Ok(());
+        return Err(cors_disallowed_origin(origin));
     }
     if origin_allowed(allowed_origins, origin) {
         Ok(())
@@ -17816,6 +17943,16 @@ fn transaction_cookie(name: &str, value: &str, max_age_seconds: i32) -> String {
 
 fn clear_transaction_cookie(name: &str) -> String {
     format!("{name}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=None")
+}
+
+fn magic_link_poll_binding_cookie(value: &str) -> String {
+    format!(
+        "{MAGIC_LINK_POLL_COOKIE}={value}; Path=/; Max-Age={MAGIC_LINK_TTL_SECONDS}; HttpOnly; Secure; SameSite=None"
+    )
+}
+
+fn clear_magic_link_poll_binding_cookie() -> String {
+    format!("{MAGIC_LINK_POLL_COOKIE}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=None")
 }
 
 fn cookie_domain_attribute(domain: Option<&str>) -> String {
@@ -18723,6 +18860,11 @@ async fn authorize_admin_request(
     now: i32,
 ) -> Result<AdminAuthorization, ClientManagementError> {
     if validate_admin_bearer_request(request, env).is_ok() {
+        if !admin_bootstrap_allowed(request, env, db, now, "admin_read", true).await? {
+            return Err(ClientManagementError::unauthorized(
+                "admin bootstrap token is not allowed",
+            ));
+        }
         return Ok(AdminAuthorization::BootstrapToken);
     }
 
@@ -24864,6 +25006,46 @@ mod tests {
             error,
             "Origin is not allowed for this client: https://evil.example.com"
         );
+    }
+
+    #[test]
+    fn validate_cors_origin_rejects_opaque_null_origin() {
+        let allowed_origins = vec!["null".to_owned(), "https://app.example.com".to_owned()];
+
+        let error = validate_cors_origin(Some("null"), &allowed_origins).unwrap_err();
+
+        assert_eq!(error, "Origin is not allowed for this client: null");
+        assert!(validate_cors_origin(None, &allowed_origins).is_ok());
+    }
+
+    #[test]
+    fn password_params_json_records_requested_iterations() {
+        let params = password_params_json("pepper-1", 123_456);
+        let parsed: serde_json::Value = serde_json::from_str(&params).unwrap();
+
+        assert_eq!(parsed["iterations"], 123_456);
+        assert_eq!(parsed["pepper_id"], "pepper-1");
+        assert_eq!(parsed["prehash"], "hmac-sha256");
+    }
+
+    #[test]
+    fn cbor_reader_rejects_oversized_array_length() {
+        // 0x9a 0xff 0xff 0xff 0xff: array of ~4 billion elements with no payload.
+        let error = CborReader::new(&[0x9a, 0xff, 0xff, 0xff, 0xff])
+            .read_single()
+            .unwrap_err();
+
+        assert!(error.contains("exceeds remaining data"), "{error}");
+    }
+
+    #[test]
+    fn cbor_reader_rejects_deep_nesting() {
+        let mut bytes = vec![0x81u8; CBOR_MAX_NESTING_DEPTH + 8];
+        *bytes.last_mut().unwrap() = 0x00;
+
+        let error = CborReader::new(&bytes).read_single().unwrap_err();
+
+        assert!(error.contains("nested too deeply"), "{error}");
     }
 
     #[test]
