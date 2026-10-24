@@ -1221,7 +1221,7 @@ fn parse_prompt(raw: &str) -> Result<AuthorizationPrompt, AuthorizationRequestEr
             "prompt none cannot be combined with other values",
         ));
     }
-    if values.iter().any(|value| *value == "login") {
+    if values.contains(&"login") {
         return Ok(AuthorizationPrompt::Login);
     }
     if !values
@@ -1232,7 +1232,7 @@ fn parse_prompt(raw: &str) -> Result<AuthorizationPrompt, AuthorizationRequestEr
             "prompt must be none, login, consent, or select_account",
         ));
     }
-    if values.iter().any(|value| *value == "select_account") {
+    if values.contains(&"select_account") {
         return Ok(AuthorizationPrompt::SelectAccount);
     }
     Ok(AuthorizationPrompt::Consent)
