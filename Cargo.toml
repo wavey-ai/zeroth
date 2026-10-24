@@ -8,6 +8,7 @@ homepage.workspace = true
 
 [workspace]
 members = [
+    "crates/zeroth-aws-authorizer",
     "crates/zeroth-cli",
     "crates/zeroth-core",
     "crates/zeroth-oidc",

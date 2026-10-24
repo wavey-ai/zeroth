@@ -1,0 +1,61 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Reusable Zeroth ES256 token authorizer for an AWS HTTP API
+
+Parameters:
+  CodeBucket:
+    Type: String
+  CodeKey:
+    Type: String
+  FunctionName:
+    Type: String
+  Issuer:
+    Type: String
+  JwksUrl:
+    Type: String
+  Audience:
+    Type: String
+  ClientId:
+    Type: String
+
+Resources:
+  AuthorizerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  AuthorizerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref FunctionName
+      Runtime: provided.al2023
+      Architectures: [arm64]
+      Handler: bootstrap
+      Code:
+        S3Bucket: !Ref CodeBucket
+        S3Key: !Ref CodeKey
+      Role: !GetAtt AuthorizerRole.Arn
+      Timeout: 8
+      MemorySize: 128
+      Environment:
+        Variables:
+          ZEROTH_ISSUER: !Ref Issuer
+          ZEROTH_JWKS_URL: !Ref JwksUrl
+          ZEROTH_AUDIENCE: !Ref Audience
+          ZEROTH_CLIENT_ID: !Ref ClientId
+
+  AuthorizerLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AuthorizerFunction}
+      RetentionInDays: 14
+
+Outputs:
+  AuthorizerArn:
+    Value: !GetAtt AuthorizerFunction.Arn

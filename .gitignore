@@ -1,4 +1,5 @@
 /target
+/build
 /crates/zeroth-worker/build/
 /crates/zeroth-worker/wrangler.generated.jsonc
 /.wrangler/

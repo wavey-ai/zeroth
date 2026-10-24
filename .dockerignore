@@ -1,0 +1,8 @@
+.git
+target
+build
+.wrangler
+.env*
+.dev.vars
+*.log
+*.p8
