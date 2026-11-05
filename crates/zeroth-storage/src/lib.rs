@@ -149,6 +149,12 @@ pub mod migrations {
         sql: include_str!("../migrations/0011_passkey_metadata.sql"),
     };
 
+    pub const ENTERPRISE_AUTH_POLICY: Migration = Migration {
+        version: 12,
+        name: "enterprise_auth_policy",
+        sql: include_str!("../migrations/0012_enterprise_auth_policy.sql"),
+    };
+
     pub const ALL: &[Migration] = &[
         INIT,
         PASSKEYS,
@@ -161,6 +167,7 @@ pub mod migrations {
         RATE_LIMITS,
         MAGIC_LINK_POLL_TOKEN,
         PASSKEY_METADATA,
+        ENTERPRISE_AUTH_POLICY,
     ];
 }
 
@@ -208,6 +215,16 @@ pub mod compatibility {
         name: "provider_nonce",
         definition: "TEXT",
     };
+    pub const AUTH_TRANSACTION_PROVIDER_POLICY_HASH: CompatibilityColumn = CompatibilityColumn {
+        table: "zeroth_auth_transactions",
+        name: "provider_policy_hash",
+        definition: "TEXT",
+    };
+    pub const AUTH_TRANSACTION_PROVIDER_CODE_VERIFIER: CompatibilityColumn = CompatibilityColumn {
+        table: "zeroth_auth_transactions",
+        name: "provider_code_verifier",
+        definition: "TEXT",
+    };
     pub const AUTH_CODE_SESSION_ID: CompatibilityColumn = CompatibilityColumn {
         table: "zeroth_auth_codes",
         name: "session_id",
@@ -218,10 +235,40 @@ pub mod compatibility {
         name: "auth_time",
         definition: "INTEGER",
     };
+    pub const AUTH_CODE_AUTH_PROVIDER: CompatibilityColumn = CompatibilityColumn {
+        table: "zeroth_auth_codes",
+        name: "auth_provider",
+        definition: "TEXT",
+    };
+    pub const AUTH_CODE_AUTH_POLICY_HASH: CompatibilityColumn = CompatibilityColumn {
+        table: "zeroth_auth_codes",
+        name: "auth_policy_hash",
+        definition: "TEXT",
+    };
     pub const REFRESH_TOKEN_AUTH_TIME: CompatibilityColumn = CompatibilityColumn {
         table: "zeroth_refresh_tokens",
         name: "auth_time",
         definition: "INTEGER",
+    };
+    pub const REFRESH_TOKEN_AUTH_PROVIDER: CompatibilityColumn = CompatibilityColumn {
+        table: "zeroth_refresh_tokens",
+        name: "auth_provider",
+        definition: "TEXT",
+    };
+    pub const REFRESH_TOKEN_AUTH_POLICY_HASH: CompatibilityColumn = CompatibilityColumn {
+        table: "zeroth_refresh_tokens",
+        name: "auth_policy_hash",
+        definition: "TEXT",
+    };
+    pub const SESSION_AUTH_PROVIDER: CompatibilityColumn = CompatibilityColumn {
+        table: "zeroth_sessions",
+        name: "auth_provider",
+        definition: "TEXT",
+    };
+    pub const SESSION_AUTH_POLICY_HASH: CompatibilityColumn = CompatibilityColumn {
+        table: "zeroth_sessions",
+        name: "auth_policy_hash",
+        definition: "TEXT",
     };
     pub const CLIENT_ALLOWED_EMAIL_DOMAINS: CompatibilityColumn = CompatibilityColumn {
         table: "zeroth_clients",
@@ -253,12 +300,18 @@ pub mod compatibility {
         name: "visible_login_methods_json",
         definition: "TEXT NOT NULL DEFAULT '[]'",
     };
+    pub const CLIENT_ENTERPRISE_PROVIDER: CompatibilityColumn = CompatibilityColumn {
+        table: "zeroth_clients",
+        name: "enterprise_provider",
+        definition: "TEXT",
+    };
 
     pub const TABLES: &[&str] = &[
         "zeroth_clients",
         "zeroth_auth_transactions",
         "zeroth_auth_codes",
         "zeroth_refresh_tokens",
+        "zeroth_sessions",
     ];
 
     pub const ALL: &[CompatibilityColumn] = &[
@@ -268,19 +321,29 @@ pub mod compatibility {
         CLIENT_ACCOUNT_SHARING_MODE,
         CLIENT_ACCOUNT_TENANT_ID,
         CLIENT_VISIBLE_LOGIN_METHODS,
+        CLIENT_ENTERPRISE_PROVIDER,
         AUTH_TRANSACTION_PROVIDER_NONCE,
+        AUTH_TRANSACTION_PROVIDER_POLICY_HASH,
+        AUTH_TRANSACTION_PROVIDER_CODE_VERIFIER,
         AUTH_TRANSACTION_LINK_USER_ID,
         AUTH_TRANSACTION_LINK_SESSION_ID,
         AUTH_TRANSACTION_SESSION_RETURN_TO,
         AUTH_CODE_SESSION_ID,
         AUTH_CODE_AUTH_TIME,
+        AUTH_CODE_AUTH_PROVIDER,
+        AUTH_CODE_AUTH_POLICY_HASH,
         REFRESH_TOKEN_AUTH_TIME,
+        REFRESH_TOKEN_AUTH_PROVIDER,
+        REFRESH_TOKEN_AUTH_POLICY_HASH,
+        SESSION_AUTH_PROVIDER,
+        SESSION_AUTH_POLICY_HASH,
     ];
 }
 
 #[cfg(test)]
 mod tests {
     use super::{compatibility, migrations};
+    use rusqlite::{params, Connection};
 
     #[test]
     fn init_migration_contains_auth_tables() {
@@ -305,7 +368,7 @@ mod tests {
         for table in ["zeroth_passkey_credentials", "zeroth_passkey_challenges"] {
             assert!(sql.contains(table), "missing table {table}");
         }
-        assert_eq!(migrations::ALL.len(), 11);
+        assert_eq!(migrations::ALL.len(), 12);
         assert_eq!(migrations::ALL[1].version, 2);
     }
 
@@ -338,7 +401,7 @@ mod tests {
         assert!(sql.contains("account_sharing_mode TEXT NOT NULL DEFAULT 'global'"));
         assert!(sql.contains("account_tenant_id TEXT NOT NULL DEFAULT 'global'"));
         assert!(sql.contains("INSERT OR IGNORE INTO zeroth_account_identities"));
-        assert_eq!(migrations::ALL.len(), 11);
+        assert_eq!(migrations::ALL.len(), 12);
         assert_eq!(migrations::ALL[4].version, 5);
     }
 
@@ -349,7 +412,7 @@ mod tests {
         assert!(sql.contains("zeroth_wallet_challenges"));
         assert!(sql.contains("challenge_hash TEXT PRIMARY KEY"));
         assert!(sql.contains("account_namespace TEXT NOT NULL"));
-        assert_eq!(migrations::ALL.len(), 11);
+        assert_eq!(migrations::ALL.len(), 12);
         assert_eq!(migrations::ALL[5].version, 6);
     }
 
@@ -358,7 +421,7 @@ mod tests {
         let sql = migrations::CLIENT_LOGIN_METHODS.sql;
 
         assert!(sql.contains("visible_login_methods_json TEXT NOT NULL DEFAULT '[]'"));
-        assert_eq!(migrations::ALL.len(), 11);
+        assert_eq!(migrations::ALL.len(), 12);
         assert_eq!(migrations::ALL[6].version, 7);
     }
 
@@ -458,6 +521,7 @@ mod tests {
         assert!(compatibility::TABLES.contains(&"zeroth_auth_codes"));
         assert!(compatibility::TABLES.contains(&"zeroth_refresh_tokens"));
         assert!(compatibility::TABLES.contains(&"zeroth_clients"));
+        assert!(compatibility::TABLES.contains(&"zeroth_sessions"));
 
         for column in [
             "allowed_email_domains_json",
@@ -470,6 +534,11 @@ mod tests {
             "session_return_to",
             "session_id",
             "auth_time",
+            "enterprise_provider",
+            "auth_provider",
+            "auth_policy_hash",
+            "provider_policy_hash",
+            "provider_code_verifier",
         ] {
             assert!(
                 compatibility::ALL
@@ -482,5 +551,165 @@ mod tests {
             compatibility::AUTH_CODE_AUTH_TIME.alter_table_sql(),
             "ALTER TABLE zeroth_auth_codes ADD COLUMN auth_time INTEGER"
         );
+    }
+
+    const ENTERPRISE_COLUMNS: &[(&str, &str)] = &[
+        ("zeroth_clients", "enterprise_provider"),
+        ("zeroth_sessions", "auth_provider"),
+        ("zeroth_sessions", "auth_policy_hash"),
+        ("zeroth_auth_codes", "auth_provider"),
+        ("zeroth_auth_codes", "auth_policy_hash"),
+        ("zeroth_refresh_tokens", "auth_provider"),
+        ("zeroth_refresh_tokens", "auth_policy_hash"),
+        ("zeroth_auth_transactions", "provider_policy_hash"),
+        ("zeroth_auth_transactions", "provider_code_verifier"),
+    ];
+
+    fn database_before_enterprise_migration() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        for migration in migrations::ALL
+            .iter()
+            .filter(|migration| migration.version < 12)
+        {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        conn
+    }
+
+    fn assert_enterprise_columns_are_nullable_text(conn: &Connection) {
+        for &(table, column) in ENTERPRISE_COLUMNS {
+            let (column_type, not_null, default_value): (String, i32, Option<String>) = conn
+                .query_row(
+                    "SELECT type, [notnull], dflt_value FROM pragma_table_info(?) WHERE name = ?",
+                    params![table, column],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(column_type, "TEXT", "{table}.{column}");
+            assert_eq!(not_null, 0, "{table}.{column}");
+            assert!(
+                default_value.is_none(),
+                "{table}.{column} must not infer old authentication proof"
+            );
+        }
+    }
+
+    #[test]
+    fn enterprise_migration_upgrades_legacy_credentials_without_inventing_proof() {
+        let conn = database_before_enterprise_migration();
+        conn.execute_batch(
+            "INSERT INTO zeroth_users (id, primary_email, created_at, updated_at)
+             VALUES ('user', 'user@example.com', 100, 100);
+             INSERT INTO zeroth_clients (id, name, redirect_uris_json, created_at, updated_at)
+             VALUES ('client', 'Client', '[\"https://app.example.com/callback\"]', 100, 100);
+             INSERT INTO zeroth_sessions (id, user_id, client_id, created_at, expires_at)
+             VALUES ('session', 'user', 'client', 100, 200);
+             INSERT INTO zeroth_auth_codes (code_hash, client_id, redirect_uri, user_id, scope, created_at, expires_at)
+             VALUES ('code', 'client', 'https://app.example.com/callback', 'user', 'openid', 100, 200);
+             INSERT INTO zeroth_refresh_tokens (token_hash, client_id, user_id, scope, created_at, expires_at)
+             VALUES ('refresh', 'client', 'user', 'openid offline_access', 100, 200);
+             INSERT INTO zeroth_auth_transactions (provider_state, client_id, provider_id, redirect_uri, provider_redirect_uri, scope, created_at, expires_at)
+             VALUES ('state', 'client', 'google', 'https://app.example.com/callback', 'https://id.example.com/oauth2/callback', 'openid', 100, 200);"
+        ).unwrap();
+
+        for statement in migrations::ENTERPRISE_AUTH_POLICY.statements() {
+            conn.execute(statement, []).unwrap();
+        }
+        assert_enterprise_columns_are_nullable_text(&conn);
+        for &(table, column) in ENTERPRISE_COLUMNS {
+            let value: Option<String> = conn
+                .query_row(&format!("SELECT {column} FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert!(
+                value.is_none(),
+                "existing {table}.{column} must stay unverified"
+            );
+        }
+        let provider: String = conn
+            .query_row(
+                "SELECT provider_id FROM zeroth_auth_transactions WHERE provider_state = 'state'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(provider, "google");
+
+        conn.execute(
+            "UPDATE zeroth_clients SET enterprise_provider = 'entra' WHERE id = 'client'",
+            [],
+        )
+        .unwrap();
+        for table in [
+            "zeroth_sessions",
+            "zeroth_auth_codes",
+            "zeroth_refresh_tokens",
+        ] {
+            conn.execute(
+                &format!("UPDATE {table} SET auth_provider = ?, auth_policy_hash = ?"),
+                params!["entra", "sha256:provider-policy"],
+            )
+            .unwrap();
+            let proof: (String, String) = conn
+                .query_row(
+                    &format!("SELECT auth_provider, auth_policy_hash FROM {table}"),
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                proof,
+                ("entra".to_owned(), "sha256:provider-policy".to_owned())
+            );
+        }
+        conn.execute("UPDATE zeroth_auth_transactions SET provider_policy_hash = ?, provider_code_verifier = ? WHERE provider_state = 'state'",
+            params!["sha256:provider-policy", "transaction-specific-pkce-verifier"],
+        ).unwrap();
+        let transaction_proof: (String, String) = conn.query_row(
+            "SELECT provider_policy_hash, provider_code_verifier FROM zeroth_auth_transactions WHERE provider_state = 'state'", [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(
+            transaction_proof,
+            (
+                "sha256:provider-policy".to_owned(),
+                "transaction-specific-pkce-verifier".to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn complete_migration_chain_contains_enterprise_provenance() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        for migration in migrations::ALL {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        assert_eq!(migrations::ALL.last().unwrap().version, 12);
+        assert_enterprise_columns_are_nullable_text(&conn);
+        for &(table, name) in ENTERPRISE_COLUMNS {
+            assert!(compatibility::TABLES.contains(&table));
+            assert!(
+                compatibility::ALL
+                    .iter()
+                    .any(|column| column.table == table && column.name == name),
+                "schema inspection/repair must cover {table}.{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn compatibility_repair_adds_missing_enterprise_columns() {
+        let conn = database_before_enterprise_migration();
+        for &(table, name) in ENTERPRISE_COLUMNS {
+            let column = compatibility::ALL
+                .iter()
+                .find(|column| column.table == table && column.name == name)
+                .unwrap();
+            conn.execute(&column.alter_table_sql(), []).unwrap();
+        }
+        assert_enterprise_columns_are_nullable_text(&conn);
     }
 }

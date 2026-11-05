@@ -3671,6 +3671,7 @@ dependencies = [
 name = "zeroth-storage"
 version = "0.2.0"
 dependencies = [
+ "rusqlite",
  "zeroth-core",
 ]
 

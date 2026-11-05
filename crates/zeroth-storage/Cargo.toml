@@ -8,3 +8,6 @@ homepage.workspace = true
 
 [dependencies]
 zeroth-core.workspace = true
+
+[dev-dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
