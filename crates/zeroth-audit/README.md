@@ -42,3 +42,12 @@ separate authorized deletion job. The sink deduplicates by event ID and compares
 the entire JSON payload on a conflict; it never overwrites an event. It is an
 optional delivery destination, not the Worker's transactional outbox or a claim of
 cryptographic immutability, exactly-once transport or permanent retention.
+
+The ignored `postgres_live` integration test requires an isolated TLS-only test
+database and a private CA not trusted by the OS. Set
+`ZEROTH_AUDIT_POSTGRES_TEST_URL` to a libpq key-value connection string and
+`ZEROTH_AUDIT_POSTGRES_TEST_CA_DER` to that CA's DER certificate, then run
+`cargo test -p zeroth-audit --features postgres --test postgres_live -- --ignored`.
+It exercises real insert/duplicate/collision handling and races two independent
+connections. It creates test audit records and never discovers credentials or
+starts a database automatically.

@@ -16,6 +16,9 @@ It is intended to cover the Auth0-shaped role for owned products:
 
 ```text
 zeroth
+crates/zeroth-audit
+crates/zeroth-audit-aws
+crates/zeroth-audit-collector
 crates/zeroth-core
 crates/zeroth-oidc
 crates/zeroth-providers
@@ -56,9 +59,11 @@ Implemented so far:
 - per-client `enterpriseProvider` requirements, upstream PKCE and nonce binding,
   and persisted provider/policy context across browser sessions, authorization
   codes, refresh rotation, and silent SSO. Local or consumer-provider sessions
-  cannot satisfy an enterprise-required client. The initial configuration supports
-  one Entra tenant and one Workspace domain policy per deployment; see the
-  [enterprise setup guide](docs/enterprise-sso-setup.html)
+  cannot satisfy an enterprise-required client. Deployment defaults support one
+  Entra tenant and one Workspace policy; `/admin/tenants` adds independent
+  customer-owned connections, tenant account isolation, application bindings and
+  audit-reader permissions. Credentials remain in dedicated deployment secret
+  bindings. See the [enterprise administration guide](docs/enterprise-admin-setup.html)
 - OIDC authorization request parsing and registered-client validation
 - native loopback redirect validation for Swift clients that use an ephemeral
   localhost callback port
@@ -112,6 +117,14 @@ Implemented so far:
 - Worker `/events` management API, D1 audit persistence, and hosted admin
   filters for bounded Auth0-style event inspection without storing token values
   or provider secrets
+- versioned audit envelopes, atomic capture/outbox for administrative and corporate
+  credential transitions, preserved history on account deletion, organization-scoped
+  customer history, stable cursors and bounded CSV export. `/audit/stream` uses a
+  separate delivery credential and persistent consumer checkpoints; `tracing` is
+  only a redacted diagnostic mirror
+- optional native PostgreSQL, DynamoDB and SQS audit adapters, with a replaying
+  collector and an AWS infrastructure template. Queue acknowledgement is separate
+  from permanent archival; consumers must deduplicate stable event IDs
 - Worker `/oauth2/callback` parsing for query callbacks and Apple `form_post`.
   It looks up the D1 transaction and binds the browser transaction cookie. It
   consumes the transaction before provider token exchange and rejects replays

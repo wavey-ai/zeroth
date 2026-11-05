@@ -1,0 +1,89 @@
+.zeroth-admin .zeroth-main { padding: 30px clamp(18px, 3vw, 48px) 48px; }
+.zeroth-admin .zeroth-topbar { margin-bottom: 20px; padding-bottom: 20px; border-bottom: 1px solid var(--z-line); }
+.zeroth-admin .zeroth-title { font-size: 28px; letter-spacing: -0.7px; }
+.zeroth-admin .zeroth-brand { margin-bottom: 26px; }
+.zeroth-admin .zeroth-brand-subtitle { font-size: 11px; }
+.zeroth-admin .zeroth-topbar .zeroth-status-row > .zeroth-status { display: none; }
+.zeroth-admin .zeroth-panel { border-radius: 9px; box-shadow: 0 1px 2px #1f232808; }
+.zeroth-admin .zeroth-panel-header { padding: 18px 20px; }
+.zeroth-admin .zeroth-panel-body { padding: 20px; }
+.zeroth-admin .zeroth-panel-title { font-size: 16px; letter-spacing: -0.2px; }
+.zeroth-section-description { margin: 5px 0 0; color: var(--z-muted); font-size: 13px; line-height: 1.6; max-width: 70ch; }
+.zeroth-admin .zeroth-overview-grid { gap: 0; background: white; border: 1px solid var(--z-line); border-radius: 9px; grid-template-columns: repeat(3, 1fr); overflow: hidden; }
+.zeroth-admin .zeroth-metric { min-height: auto; border: 0; border-radius: 0; padding: 18px 20px; box-shadow: none; }
+.zeroth-admin .zeroth-metric-value { font-size: 25px; }
+.zeroth-admin .zeroth-metric-meta { font-size: 12px; }
+.zeroth-admin .zeroth-table th { padding: 12px 16px; background: #f8fafc; text-transform: none; white-space: nowrap; }
+.zeroth-admin .zeroth-table td { padding: 16px; vertical-align: top; }
+.zeroth-admin .zeroth-table tbody tr:hover { background: #f8fafc; }
+.zeroth-admin .zeroth-table-scroll { width: 100%; overflow-x: auto; overscroll-behavior-x: contain; }
+.zeroth-admin .zeroth-row-title { font-weight: 650; }
+.zeroth-admin .zeroth-row-meta { margin-top: 4px; line-height: 1.5; }
+.zeroth-admin .zeroth-action { min-height: 34px; border-radius: 6px; padding: 6px 11px; font-weight: 600; font-size: 12px; }
+.zeroth-admin .zeroth-action:disabled { opacity: 0.5; cursor: not-allowed; }
+.zeroth-admin .zeroth-actions, .zeroth-row-actions { display: flex; flex-wrap: wrap; gap: 7px; align-items: center; }
+.zeroth-admin .zeroth-row-actions { min-width: 180px; }
+.zeroth-admin .zeroth-filter-grid { grid-template-columns: repeat(4, minmax(120px, 1fr)); gap: 14px; }
+.zeroth-admin .zeroth-field { min-width: 0; gap: 7px; }
+.zeroth-admin .zeroth-field input, .zeroth-admin .zeroth-field select { min-height: 38px; }
+.zeroth-admin .zeroth-field small, .zeroth-help { color: var(--z-muted); font-size: 12px; line-height: 1.6; }
+.zeroth-help { margin: 0 0 14px; }
+.zeroth-list-summary { padding: 12px 20px; color: var(--z-muted); font-size: 12px; border-top: 1px solid var(--z-line); }
+.zeroth-admin-notice { position: sticky; top: 12px; z-index: 4; min-height: 0; margin: 0; }
+.zeroth-admin-notice:not(:empty) { margin-bottom: 18px; padding: 12px 16px; border: 1px solid #b6d7ff; border-left: 3px solid var(--z-blue); border-radius: 6px; background: #eef6ff; color: #174576; }
+.zeroth-admin-notice[aria-invalid="true"]:not(:empty) { color: #8b1a1f; border-color: #f0bdc0; border-left-color: var(--z-red); background: #fff3f3; }
+.zeroth-form-footer, .zeroth-pagination { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 14px; }
+.zeroth-pagination { padding: 16px 20px; border-top: 1px solid var(--z-line); font-size: 12px; color: var(--z-muted); }
+.zeroth-audit-filter { display: grid; gap: 18px; }
+.zeroth-advanced { border-top: 1px solid var(--z-line); padding-top: 13px; }
+.zeroth-advanced summary { cursor: pointer; color: var(--z-muted); font-size: 12px; font-weight: 600; }
+.zeroth-advanced[open] summary { margin-bottom: 16px; }
+.zeroth-advanced .zeroth-help { margin: 12px 0 0; }
+.zeroth-page-size { max-width: 140px; }
+.zeroth-audit-evidence { max-width: 360px; }
+.zeroth-audit-evidence summary { cursor: pointer; color: var(--z-blue); font-size: 12px; white-space: nowrap; }
+.zeroth-audit-evidence pre { max-width: 360px; max-height: 320px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 11px; }
+.zeroth-text-success { color: var(--z-green); }
+.zeroth-text-warning { color: var(--z-orange); }
+.zeroth-tenant-editor { border-top: 2px solid var(--z-line); }
+.zeroth-settings-form { display: grid; gap: 26px; }
+.zeroth-settings-form fieldset { border: 0; border-bottom: 1px solid var(--z-line); margin: 0; padding: 0 0 24px; min-width: 0; }
+.zeroth-settings-form legend { font-size: 14px; font-weight: 700; margin-bottom: 16px; padding: 0; }
+.zeroth-settings-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; }
+.zeroth-connection-note { border-left: 3px solid #d4a72c; background: #fff8e5; color: #6e5416; font-size: 12px; padding: 12px; margin: 18px 0 10px; }
+.zeroth-dialog { border: 1px solid var(--z-line); border-radius: 10px; width: min(700px, calc(100vw - 28px)); padding: 0; max-height: 85vh; overflow: auto; color: var(--z-text); box-shadow: 0 20px 70px #0003; }
+.zeroth-dialog::backdrop { background: #11182780; }
+.zeroth-dialog .zeroth-detail-section { border-top: 1px solid var(--z-line); margin-top: 20px; padding-top: 18px; }
+.zeroth-dialog h3 { font-size: 14px; margin: 0 0 12px; }
+.zeroth-dialog .zeroth-detail-line { padding: 10px 0; border-bottom: 1px solid #eaeef2; }
+.zeroth-empty { padding: 28px 20px !important; text-align: center; }
+@media (max-width: 1120px) {
+  .zeroth-admin .zeroth-main { padding: 22px 18px 32px; }
+  .zeroth-admin .zeroth-sidebar { padding: 16px 18px; }
+  .zeroth-admin .zeroth-brand { margin-bottom: 12px; }
+  .zeroth-admin .zeroth-sidebar-footer { display: none; }
+  .zeroth-admin .zeroth-nav-section { display: none; }
+  .zeroth-admin .zeroth-nav { display: flex; flex-wrap: wrap; gap: 4px; }
+  .zeroth-admin .zeroth-nav a { font-size: 12px; padding: 7px 10px; }
+  .zeroth-admin .zeroth-filter-grid { grid-template-columns: repeat(2, minmax(120px, 1fr)); }
+}
+@media (max-width: 600px) {
+  .zeroth-admin .zeroth-main { padding: 18px 12px 30px; }
+  .zeroth-admin .zeroth-panel-header, .zeroth-admin .zeroth-panel-body { padding: 16px; }
+  .zeroth-admin .zeroth-title { font-size: 24px; }
+  .zeroth-admin .zeroth-filter-grid, .zeroth-settings-fields { grid-template-columns: minmax(0, 1fr); }
+  .zeroth-admin .zeroth-overview-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .zeroth-admin .zeroth-table { display: table; min-width: 660px; }
+  .zeroth-admin .zeroth-table td { padding: 13px; }
+  .zeroth-admin .zeroth-topbar { flex-direction: row; align-items: center; }
+  .zeroth-admin .zeroth-subtitle { max-width: 220px; overflow-wrap: anywhere; }
+  .zeroth-admin .zeroth-form-footer { align-items: stretch; flex-direction: column; }
+  .zeroth-admin .zeroth-pagination { align-items: flex-start; flex-direction: column; }
+}
+.zeroth-admin #tenants .zeroth-table { min-width: 850px; }
+.zeroth-admin #tenants .zeroth-table th:first-child { min-width: 180px; }
+.zeroth-admin #tenants .zeroth-table th:nth-child(2) { min-width: 190px; }
+.zeroth-admin #events .zeroth-table { min-width: 900px; }
+.zeroth-admin #events .zeroth-table th:first-child { min-width: 190px; }
+.zeroth-admin #users .zeroth-table { min-width: 980px; }
+.zeroth-binding-picker { margin-bottom: 16px; }

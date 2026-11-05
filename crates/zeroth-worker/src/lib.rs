@@ -1,10 +1,22 @@
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 
+mod audit_capture;
+mod audit_stream;
+mod audit_trace;
+#[cfg(target_arch = "wasm32")]
+pub use audit_capture::D1AuditCapture;
+#[cfg(test)]
+mod audit_identity_tests;
+#[cfg(test)]
+mod audit_query_tests;
+#[cfg(test)]
+mod audit_transition_tests;
 mod enterprise;
 #[cfg(test)]
 mod enterprise_persistence_tests;
 #[cfg(test)]
 mod enterprise_signed_tests;
+mod tenants;
 #[cfg(any(test, target_arch = "wasm32"))]
 use enterprise::provider_policy_hash;
 use enterprise::{is_enterprise_provider, AuthContext};
@@ -63,7 +75,9 @@ use zeroth_server::ZerothServerConfig;
 #[cfg(target_arch = "wasm32")]
 use zeroth_ui::{render_account_document, ZerothUiState};
 #[cfg(target_arch = "wasm32")]
-use zeroth_ui::{render_clients_admin_document, ClientsAdminUiState};
+use zeroth_ui::{
+    render_clients_admin_document, render_tenants_admin_document, ClientsAdminUiState,
+};
 use zeroth_ui::{
     ApplicationUi, ClientAdminUi, EventAdminUi, IdentityUi, ProfileUi, ProviderKind, ProviderUi,
     SessionUi, UserAdminUi, ZerothUiConfig, ZerothUiTheme,
@@ -103,6 +117,43 @@ const INSERT_ROTATED_REFRESH_TOKEN_SQL: &str = "INSERT INTO zeroth_refresh_token
      SELECT ?, client_id, user_id, session_id, auth_time, scope, ?, ?, auth_provider, auth_policy_hash
      FROM zeroth_refresh_tokens
      WHERE token_hash = ? AND rotated_at = ? AND revoked_at IS NULL AND expires_at > ?";
+const CONSUME_AUTHORIZATION_CODE_SQL: &str = "UPDATE zeroth_auth_codes
+    SET consumed_at = ? WHERE code_hash = ? AND consumed_at IS NULL";
+const ROTATE_REFRESH_TOKEN_SQL: &str = "UPDATE zeroth_refresh_tokens SET rotated_at = ?
+    WHERE token_hash = ? AND rotated_at IS NULL AND revoked_at IS NULL";
+const AUTH_CODE_ISSUE_GUARD_SQL: &str = "INSERT INTO zeroth_audit_write_guards (id, valid)
+    SELECT ?, CASE WHEN EXISTS (
+        SELECT 1 FROM zeroth_auth_codes code
+        JOIN zeroth_users user ON user.id=code.user_id
+        JOIN zeroth_clients client ON client.id=code.client_id
+        WHERE code.code_hash=? AND code.consumed_at IS NULL AND code.expires_at>?
+          AND user.disabled_at IS NULL AND client.disabled_at IS NULL
+          AND (code.session_id IS NULL OR EXISTS (
+              SELECT 1 FROM zeroth_sessions session WHERE session.id=code.session_id
+                AND session.user_id=code.user_id AND session.client_id=code.client_id
+                AND session.revoked_at IS NULL AND session.expires_at>?
+          ))
+    ) THEN 1 ELSE 0 END";
+const REFRESH_ISSUE_GUARD_SQL: &str = "INSERT INTO zeroth_audit_write_guards (id, valid)
+    SELECT ?, CASE WHEN EXISTS (
+        SELECT 1 FROM zeroth_refresh_tokens token
+        JOIN zeroth_users user ON user.id=token.user_id
+        JOIN zeroth_clients client ON client.id=token.client_id
+        WHERE token.token_hash=? AND token.rotated_at IS NULL AND token.revoked_at IS NULL
+          AND token.expires_at>? AND user.disabled_at IS NULL AND client.disabled_at IS NULL
+          AND (token.session_id IS NULL OR EXISTS (
+              SELECT 1 FROM zeroth_sessions session WHERE session.id=token.session_id
+                AND session.user_id=token.user_id AND session.client_id=token.client_id
+                AND session.revoked_at IS NULL AND session.expires_at>?
+          ))
+    ) THEN 1 ELSE 0 END";
+const DELETE_AUDIT_WRITE_GUARD_SQL: &str = "DELETE FROM zeroth_audit_write_guards WHERE id=?";
+const REVOKE_SINGLE_REFRESH_TOKEN_SQL: &str = "UPDATE zeroth_refresh_tokens
+    SET revoked_at=? WHERE token_hash=? AND revoked_at IS NULL";
+const REVOKE_OWNED_SESSION_SQL: &str = "UPDATE zeroth_sessions
+    SET revoked_at=? WHERE id=? AND user_id=? AND revoked_at IS NULL";
+const REVOKE_OWNED_SESSION_REFRESH_SQL: &str = "UPDATE zeroth_refresh_tokens
+    SET revoked_at=? WHERE session_id=? AND user_id=? AND revoked_at IS NULL";
 const REVOKE_USER_REFRESH_TOKENS_SQL: &str = "UPDATE zeroth_refresh_tokens
      SET revoked_at = ?
      WHERE user_id = ? AND revoked_at IS NULL";
@@ -1752,6 +1803,63 @@ struct ValidatedClientUpsert {
     disabled: bool,
 }
 
+fn client_audit_policy_details(
+    previous: Option<&ClientRow>,
+    next: &ValidatedClientUpsert,
+) -> serde_json::Value {
+    let parse = |value: &str| serde_json::from_str::<serde_json::Value>(value).unwrap_or_default();
+    let before = previous.map(|row| serde_json::json!({
+        "name":row.name,"redirectUris":parse(&row.redirect_uris_json),"allowedOrigins":parse(&row.allowed_origins_json),
+        "allowedEmailDomains":parse(&row.allowed_email_domains_json),"enterpriseProvider":row.enterprise_provider,
+        "accountSharingMode":row.account_sharing_mode.as_deref().unwrap_or(ACCOUNT_SHARING_MODE_GLOBAL),
+        "accountTenantId":row.account_tenant_id.as_deref().unwrap_or(""),"confidential":row.confidential!=0,"disabled":row.disabled_at.is_some(),
+        "issuerTokenAudience":row.issuer_token_audience,"issuerTokenTtlSeconds":row.issuer_token_ttl_seconds,
+        "visibleLoginMethods":row.visible_login_methods_json.as_deref().map(parse).unwrap_or(serde_json::json!([])),
+    }));
+    let after = serde_json::json!({
+        "name":next.name,"redirectUris":next.redirect_uris,"allowedOrigins":next.allowed_origins,
+        "allowedEmailDomains":next.allowed_email_domains,"enterpriseProvider":next.enterprise_provider,
+        "accountSharingMode":account_sharing_mode_label(next.account_sharing_mode),"accountTenantId":next.account_tenant_id,
+        "confidential":next.confidential,"disabled":next.disabled,"issuerTokenAudience":next.issuer_token_audience,
+        "issuerTokenTtlSeconds":next.issuer_token_ttl_seconds,"visibleLoginMethods":next.visible_login_methods,
+    });
+    let changed = |keys: &[&str]| {
+        before
+            .as_ref()
+            .is_none_or(|old| keys.iter().any(|key| old.get(*key) != after.get(*key)))
+    };
+    let mut fields = Vec::new();
+    for (category, keys) in [
+        ("display_settings", &["name"][..]),
+        ("redirect_uris", &["redirectUris", "allowedOrigins"][..]),
+        ("allowed_email_domains", &["allowedEmailDomains"][..]),
+        ("enterprise_provider", &["enterpriseProvider"][..]),
+        (
+            "account_namespace",
+            &["accountSharingMode", "accountTenantId"][..],
+        ),
+        ("login_methods", &["visibleLoginMethods"][..]),
+        (
+            "token_policy",
+            &["issuerTokenAudience", "issuerTokenTtlSeconds"][..],
+        ),
+        ("disabled", &["disabled"][..]),
+    ] {
+        if changed(keys) {
+            fields.push(category);
+        }
+    }
+    if changed(&["confidential"]) || next.secret_hash.is_some() {
+        fields.push("credentials");
+    }
+    serde_json::json!({
+        "previousPolicyHash":before.as_ref().map(|v| hash_secret(&v.to_string())),"policyHash":hash_secret(&after.to_string()),
+        "beforeProvider":previous.and_then(|v|v.enterprise_provider.as_deref()).unwrap_or("none"),
+        "afterProvider":next.enterprise_provider.as_deref().unwrap_or("none"),
+        "secretUpdated":next.secret_hash.is_some(),"confidential":next.confidential,"disabled":next.disabled,"changedFields":fields,
+    })
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct AdminUserRow {
     id: String,
@@ -1838,6 +1946,28 @@ struct AuditEventRow {
     #[serde(default)]
     user_agent: Option<String>,
     details_json: String,
+    #[serde(default)]
+    schema_version: i32,
+    #[serde(default)]
+    organization_id: Option<String>,
+    #[serde(default)]
+    actor_type: Option<String>,
+    #[serde(default)]
+    actor_id: Option<String>,
+    #[serde(default)]
+    target_type: Option<String>,
+    #[serde(default)]
+    target_id: Option<String>,
+    #[serde(default = "legacy_audit_outcome")]
+    outcome: String,
+    #[serde(default)]
+    reason_code: Option<String>,
+    #[serde(default)]
+    request_id: Option<String>,
+    #[serde(default)]
+    recorded_at: Option<i64>,
+    #[serde(default)]
+    event_json: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Eq, PartialEq)]
@@ -1872,12 +2002,34 @@ struct AuditEventResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     user_agent: Option<String>,
     details: serde_json::Value,
+    schema_version: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    organization_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    actor_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    actor_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_id: Option<String>,
+    outcome: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_id: Option<String>,
+    recorded_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    event: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AuditEventsResponse {
     events: Vec<AuditEventResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_cursor: Option<String>,
+    has_more: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1920,6 +2072,30 @@ struct AuditEventFilter {
     user_id: Option<String>,
     client_id: Option<String>,
     provider_id: Option<String>,
+    organization_id: Option<String>,
+    actor_type: Option<String>,
+    actor_id: Option<String>,
+    target_type: Option<String>,
+    target_id: Option<String>,
+    outcome: Option<String>,
+    from: Option<i64>,
+    until: Option<i64>,
+    limit: Option<u16>,
+    cursor: Option<AuditCursor>,
+    csv: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuditCursor {
+    version: u8,
+    recorded_at: i64,
+    id: String,
+    filters: String,
+}
+
+fn legacy_audit_outcome() -> String {
+    "unknown".to_owned()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -3150,7 +3326,7 @@ async fn validate_grant_authentication(
     context: &AuthContext,
     now: i32,
 ) -> worker::Result<Result<(), String>> {
-    if let Err(error) = validate_auth_context_for_client(env, client, context) {
+    if let Err(error) = validate_auth_context_for_client(db, env, client, context).await {
         return Ok(Err(error));
     }
     let session = match session_id {
@@ -3204,20 +3380,31 @@ fn validate_client_login_provider(client: &Client, provider_id: &str) -> Result<
 }
 
 #[cfg(target_arch = "wasm32")]
-fn validate_auth_context_for_client(
+async fn validate_auth_context_for_client(
+    db: &worker::d1::D1Database,
     env: &Env,
     client: &Client,
     context: &AuthContext,
 ) -> Result<(), String> {
+    if let Some(tenant) = tenants::tenant_for_client(db, &client.id.0)
+        .await
+        .map_err(|_| "could not validate tenant")?
+    {
+        if tenant.is_disabled() {
+            return Err("tenant is disabled".into());
+        }
+    }
     let active_hash = match context
         .auth_provider
         .as_deref()
         .filter(|id| is_enterprise_provider(id))
     {
-        Some(id) if provider_configured_for_login(env, id) => provider_policy_hash(
-            &provider_from_env(env, id)
-                .map_err(|_| "enterprise provider configuration is invalid")?,
-        )?,
+        Some(id) => {
+            let provider = tenants::provider_for_client(db, env, &client.id.0, id)
+                .await
+                .map_err(|_| "enterprise provider configuration is unavailable")?;
+            provider_policy_hash(&provider)?
+        }
         _ => None,
     };
     context.validate(
@@ -3353,6 +3540,11 @@ use worker::*;
 #[event(fetch)]
 pub async fn main(request: Request, env: Env, _ctx: worker::Context) -> worker::Result<Response> {
     console_error_panic_hook::set_once();
+    audit_trace::init();
+    let mut request = request.clone_mut()?;
+    request
+        .headers_mut()?
+        .set("X-Zeroth-Request-ID", &format!("req_{}", random_token()?))?;
     handle_request(request, env).await
 }
 
@@ -3376,7 +3568,12 @@ async fn handle_request(request: Request, env: Env) -> worker::Result<Response> 
         (Method::Get, "/local-auth/status") => local_auth_status(request, env).await,
         (Method::Get | Method::Post | Method::Delete, "/clients") => clients(request, env).await,
         (Method::Get | Method::Patch, "/users") => users(request, env).await,
-        (Method::Get, "/events") => events(request, env).await,
+        (Method::Get, "/events" | "/audit/events" | "/audit") => events(request, env).await,
+        (Method::Get | Method::Post, "/tenants") => tenants::tenants(request, env).await,
+        (Method::Get, "/admin/setup") => hosted_admin_setup(request, env).await,
+        (Method::Get, "/audit/stream") | (Method::Post, "/audit/stream/ack") => {
+            audit_stream::stream(request, env).await
+        }
         (Method::Get, "/routes") => json(&RoutesResponse {
             routes: ROUTES
                 .iter()
@@ -3405,7 +3602,9 @@ async fn handle_request(request: Request, env: Env) -> worker::Result<Response> 
         (Method::Get, "/profile-menu.js") => profile_menu_script(),
         (Method::Get, "/profile-panel.js") => profile_panel_script(),
         (Method::Get, "/admin") => hosted_clients_admin(request, env).await,
-        (Method::Get, "/admin/clients") => hosted_clients_admin(request, env).await,
+        (Method::Get, "/admin/clients" | "/admin/tenants") => {
+            hosted_clients_admin(request, env).await
+        }
         (Method::Get, "/authorize") => authorize(request, env).await,
         (Method::Get, "/__zeroth/db/status") => d1_schema_status(request, env).await,
         (Method::Post, "/__zeroth/db/ensure") => ensure_d1_schema(request, env).await,
@@ -3537,7 +3736,7 @@ async fn provider_callback(mut request: Request, env: Env) -> worker::Result<Res
             }),
             now,
         )
-        .await;
+        .await?;
         let response = redirect_to_provider_callback_error(
             &record.transaction,
             &config.issuer().issuer,
@@ -3561,17 +3760,41 @@ async fn provider_callback(mut request: Request, env: Env) -> worker::Result<Res
         );
     };
 
-    if !provider_configured_for_login(&env, &record.transaction.provider_id.0) {
+    if !tenants::configured_for_client(
+        &db,
+        &env,
+        &record.transaction.client_id.0,
+        &record.transaction.provider_id.0,
+    )
+    .await?
+    {
         return provider_callback_error_json(
             &ProviderCallbackError::access_denied("provider is disabled or not configured"),
             403,
         );
     }
-    let provider = provider_from_env(&env, &record.transaction.provider_id.0)?;
+    let provider = tenants::provider_for_client(
+        &db,
+        &env,
+        &record.transaction.client_id.0,
+        &record.transaction.provider_id.0,
+    )
+    .await?;
     let auth_context = match validate_provider_transaction_policy(&record.transaction, &provider) {
         Ok(context) => context,
         Err(error) => {
-            return provider_callback_error_json(&ProviderCallbackError::access_denied(error), 403)
+            record_audit_event(
+                &db,
+                &request,
+                "client.login.denied",
+                None,
+                Some(&record.transaction.client_id.0),
+                Some(&record.transaction.provider_id.0),
+                serde_json::json!({"errorCode":"enterprise_policy_changed"}),
+                now,
+            )
+            .await?;
+            return provider_callback_error_json(&ProviderCallbackError::access_denied(error), 403);
         }
     };
     let Some(callback_client) = get_client(&db, &record.transaction.client_id.0).await? else {
@@ -3581,10 +3804,27 @@ async fn provider_callback(mut request: Request, env: Env) -> worker::Result<Res
         );
     };
     if let Err(error) = validate_client_login_provider(&callback_client, &provider.id().0) {
+        record_audit_event(
+            &db,
+            &request,
+            "client.login.denied",
+            None,
+            Some(&record.transaction.client_id.0),
+            Some(&record.transaction.provider_id.0),
+            serde_json::json!({"errorCode":"required_provider_mismatch"}),
+            now,
+        )
+        .await?;
         return provider_callback_error_json(&ProviderCallbackError::access_denied(error), 403);
     }
 
-    let client_secret = provider_client_secret_from_env(&env, &record.transaction.provider_id.0)?;
+    let client_secret = tenants::secret_for_client(
+        &db,
+        &env,
+        &record.transaction.client_id.0,
+        &record.transaction.provider_id.0,
+    )
+    .await?;
     let token_request = provider
         .token_exchange_request(
             provider_code,
@@ -3609,7 +3849,7 @@ async fn provider_callback(mut request: Request, env: Env) -> worker::Result<Res
                 }),
                 now,
             )
-            .await;
+            .await?;
             let callback_error = provider_callback_error_from_token_exchange_error(&error);
             let response = redirect_to_provider_callback_error(
                 &record.transaction,
@@ -3640,7 +3880,7 @@ async fn provider_callback(mut request: Request, env: Env) -> worker::Result<Res
                     }),
                     now,
                 )
-                .await;
+                .await?;
                 let callback_error = provider_callback_error_from_profile_error(&error);
                 let response = redirect_to_provider_callback_error(
                     &record.transaction,
@@ -3657,8 +3897,11 @@ async fn provider_callback(mut request: Request, env: Env) -> worker::Result<Res
     if let Some(link_user_id) = record.transaction.link_user_id.as_ref() {
         let link_result = complete_provider_identity_link(
             &db,
+            &env,
+            &request,
             link_user_id,
             record.transaction.link_session_id.as_deref(),
+            &record.transaction.client_id.0,
             &resolved_profile.profile,
             resolved_profile.raw_profile_json.as_deref(),
             now,
@@ -3667,17 +3910,6 @@ async fn provider_callback(mut request: Request, env: Env) -> worker::Result<Res
 
         let response = match link_result {
             Ok(()) => {
-                record_audit_event(
-                    &db,
-                    &request,
-                    "identity.link",
-                    Some(&link_user_id.0),
-                    Some(&record.transaction.client_id.0),
-                    Some(&resolved_profile.profile.provider_id.0),
-                    serde_json::json!({}),
-                    now,
-                )
-                .await;
                 redirect_to_identity_link_return(&record.transaction, &resolved_profile.profile)
             }
             Err(error) => {
@@ -3694,7 +3926,7 @@ async fn provider_callback(mut request: Request, env: Env) -> worker::Result<Res
                     }),
                     now,
                 )
-                .await;
+                .await?;
                 redirect_to_identity_link_error(&record.transaction, &error)
             }
         }?;
@@ -3718,7 +3950,7 @@ async fn provider_callback(mut request: Request, env: Env) -> worker::Result<Res
             serde_json::json!({ "reason": "client_inactive" }),
             now,
         )
-        .await;
+        .await?;
         let response = redirect_to_provider_callback_error(
             &record.transaction,
             &config.issuer().issuer,
@@ -3749,7 +3981,7 @@ async fn provider_callback(mut request: Request, env: Env) -> worker::Result<Res
             }),
             now,
         )
-        .await;
+        .await?;
         let response = redirect_to_provider_callback_error(
             &record.transaction,
             &config.issuer().issuer,
@@ -3764,9 +3996,10 @@ async fn provider_callback(mut request: Request, env: Env) -> worker::Result<Res
     if record.transaction.session_return_to.is_some() {
         let user_id = upsert_provider_profile(
             &db,
-            &registered_client.account_scope.namespace,
+            &registered_client,
             &resolved_profile.profile,
             resolved_profile.raw_profile_json.as_deref(),
+            Some(&request),
             now,
         )
         .await?;
@@ -3785,18 +4018,6 @@ async fn provider_callback(mut request: Request, env: Env) -> worker::Result<Res
             now + SESSION_TTL_SECONDS,
         )
         .await?;
-        record_audit_event(
-            &db,
-            &request,
-            "session.login",
-            Some(&user_id),
-            Some(&record.transaction.client_id.0),
-            Some(&resolved_profile.profile.provider_id.0),
-            serde_json::json!({ "mode": "hosted" }),
-            now,
-        )
-        .await;
-
         let response = redirect_to_session_login_return(&record.transaction)?;
         let response = with_set_cookie(
             response,
@@ -3815,9 +4036,10 @@ async fn provider_callback(mut request: Request, env: Env) -> worker::Result<Res
 
     let user_id = upsert_provider_profile(
         &db,
-        &registered_client.account_scope.namespace,
+        &registered_client,
         &resolved_profile.profile,
         resolved_profile.raw_profile_json.as_deref(),
+        Some(&request),
         now,
     )
     .await?;
@@ -3847,20 +4069,6 @@ async fn provider_callback(mut request: Request, env: Env) -> worker::Result<Res
         now + SESSION_TTL_SECONDS,
     )
     .await?;
-    record_audit_event(
-        &db,
-        &request,
-        "authorization.code.issue",
-        Some(&user_id),
-        Some(&record.transaction.client_id.0),
-        Some(&resolved_profile.profile.provider_id.0),
-        serde_json::json!({
-            "scope": record.transaction.scope.as_slice().join(" ")
-        }),
-        now,
-    )
-    .await;
-
     let response = redirect_to_client(&record.transaction, &config.issuer().issuer, &zeroth_code)?;
     let response = with_set_cookie(
         response,
@@ -3883,7 +4091,7 @@ async fn clients(mut request: Request, env: Env) -> worker::Result<Response> {
     let db = env.d1(D1_BINDING)?;
     let config = server_config(&env, &request_url);
     let now = unix_timestamp_seconds();
-    if !matches!(request.method(), Method::Get) {
+    let admin_authorization = if !matches!(request.method(), Method::Get) {
         match maybe_authorize_admin_write_request(
             &mut request,
             &env,
@@ -3896,17 +4104,20 @@ async fn clients(mut request: Request, env: Env) -> worker::Result<Response> {
         )
         .await
         {
-            Ok(Some(_)) => {}
+            Ok(Some(authorization)) => authorization,
             Ok(None) => {
                 return client_management_error_json(&ClientManagementError::unauthorized(
                     "admin bearer token or allowed Zeroth session is required",
                 ))
             }
             Err(error) => return client_management_error_json(&error),
-        };
-    } else if let Err(error) = validate_admin_request(&request, &env, &db, &config, now).await {
-        return client_management_error_json(&error);
-    }
+        }
+    } else {
+        match authorize_admin_request(&request, &env, &db, &config, now).await {
+            Ok(authorization) => authorization,
+            Err(error) => return client_management_error_json(&error),
+        }
+    };
 
     match request.method() {
         Method::Get => {
@@ -3948,6 +4159,11 @@ async fn clients(mut request: Request, env: Env) -> worker::Result<Response> {
                 Ok(upsert) => upsert,
                 Err(error) => return client_management_error_json(&error),
             };
+            if let Err(message) = tenants::validate_client_update(&db, &upsert).await? {
+                return client_management_error_json(&ClientManagementError::invalid_request(
+                    message,
+                ));
+            }
             if upsert.confidential && upsert.secret_hash.is_none() {
                 let existing = get_client_row_for_admin(&db, &upsert.id).await?;
                 if existing.and_then(|row| row.secret_hash).is_none() {
@@ -3957,30 +4173,35 @@ async fn clients(mut request: Request, env: Env) -> worker::Result<Response> {
                 }
             }
 
-            upsert_client(&db, &upsert, now).await?;
-            let row = get_client_row_for_admin(&db, &upsert.id)
-                .await?
-                .ok_or_else(|| {
-                    worker::Error::RustError("client upsert did not return a row".to_owned())
-                })?;
-            record_audit_event(
+            let previous = get_client_row_for_admin(&db, &upsert.id).await?;
+            let details = client_audit_policy_details(previous.as_ref(), &upsert);
+            let event = prepare_audit_event(
                 &db,
-                &request,
+                Some(&request),
+                Some(audit_capture::admin_actor(&admin_authorization).map_err(worker_error)?),
                 "client.upsert",
                 None,
                 Some(&upsert.id),
                 None,
-                serde_json::json!({
-                    "confidential": upsert.confidential,
-                    "disabled": upsert.disabled,
-                    "redirectUriCount": upsert.redirect_uris.len(),
-                    "allowedOriginCount": upsert.allowed_origins.len(),
-                    "visibleLoginMethodCount": upsert.visible_login_methods.len(),
-                    "secretUpdated": upsert.secret_hash.is_some()
-                }),
+                details,
                 now,
             )
-            .await;
+            .await?;
+            let guard_id = &event.0.event_id;
+            let guard =
+                audit_capture::client_policy_guard(&db, previous.as_ref(), &upsert.id, guard_id)?;
+            let cleanup = db
+                .prepare("DELETE FROM zeroth_audit_write_guards WHERE id=?")
+                .bind_refs(&[worker::d1::D1Type::Text(guard_id)])?;
+            audit_capture::commit(
+                &db,
+                vec![guard, upsert_client_statement(&db, &upsert, now)?, cleanup],
+                &[event],
+            )
+            .await?;
+            let row = get_client_row_for_admin(&db, &upsert.id)
+                .await?
+                .ok_or_else(|| worker_error("client upsert did not return a row".into()))?;
             match client_response_from_row(row) {
                 Ok(client) => json(&client),
                 Err(error) => {
@@ -4003,18 +4224,24 @@ async fn clients(mut request: Request, env: Env) -> worker::Result<Response> {
                     "client was not found",
                 ));
             }
-            disable_client(&db, &client_id, now).await?;
-            record_audit_event(
+            let event = prepare_audit_event(
                 &db,
-                &request,
+                Some(&request),
+                Some(audit_capture::admin_actor(&admin_authorization).map_err(worker_error)?),
                 "client.disable",
                 None,
                 Some(&client_id),
                 None,
-                serde_json::json!({}),
+                serde_json::json!({"disabled":true,"changedFields":["disabled"]}),
                 now,
             )
-            .await;
+            .await?;
+            audit_capture::commit(
+                &db,
+                vec![disable_client_statement(&db, &client_id, now)?],
+                &[event],
+            )
+            .await?;
             json(&serde_json::json!({ "ok": true }))
         }
         _ => json_status(&serde_json::json!({ "error": "method_not_allowed" }), 405),
@@ -4070,7 +4297,8 @@ async fn users(mut request: Request, env: Env) -> worker::Result<Response> {
                 return json(&response);
             }
 
-            let rows = list_admin_user_rows(&db, now).await?;
+            let tenant_id = query_param(&request_url, "tenant_id");
+            let rows = list_admin_user_rows_for_tenant(&db, now, tenant_id.as_deref()).await?;
             let users = rows.into_iter().map(admin_user_response_from_row).collect();
             json(&AdminUsersResponse { users })
         }
@@ -4108,58 +4336,71 @@ async fn users(mut request: Request, env: Env) -> worker::Result<Response> {
                 ));
             }
 
+            let actor = audit_capture::admin_actor(&admin_authorization).map_err(worker_error)?;
+            let mut changes = Vec::new();
+            let mut audit = Vec::new();
             if let Some(disabled) = patch.disabled {
-                set_admin_user_disabled(&db, &user_id, disabled, now).await?;
+                changes.push(set_admin_user_disabled_statement(
+                    &db, &user_id, disabled, now,
+                )?);
                 if disabled {
-                    revoke_active_sessions_for_user(&db, &user_id, now).await?;
-                    revoke_active_refresh_tokens_for_user(&db, &user_id, now).await?;
+                    changes.push(revoke_active_sessions_for_user_statement(
+                        &db, &user_id, now,
+                    )?);
+                    changes.push(revoke_active_refresh_tokens_for_user_statement(
+                        &db, &user_id, now,
+                    )?);
                 }
-                record_audit_event(
-                    &db,
-                    &request,
-                    if disabled {
-                        "user.disable"
-                    } else {
-                        "user.enable"
-                    },
-                    Some(&user_id),
-                    None,
-                    None,
-                    serde_json::json!({}),
-                    now,
-                )
-                .await;
+                audit.push(
+                    prepare_audit_event(
+                        &db,
+                        Some(&request),
+                        Some(actor.clone()),
+                        if disabled {
+                            "user.disable"
+                        } else {
+                            "user.enable"
+                        },
+                        Some(&user_id),
+                        None,
+                        None,
+                        serde_json::json!({"disabled":disabled,"changedFields":["disabled"]}),
+                        now,
+                    )
+                    .await?,
+                );
             }
             if let Some(admin) = patch.admin {
                 if admin {
-                    let granted_by = admin_authorization_granted_by(&admin_authorization);
-                    upsert_admin_membership(&db, &user_id, &granted_by, now).await?;
-                    record_audit_event(
+                    changes.push(upsert_admin_membership_statement(
                         &db,
-                        &request,
-                        "admin.membership.grant",
-                        Some(&user_id),
-                        None,
-                        None,
-                        serde_json::json!({ "grantedBy": granted_by, "mode": "admin_ui" }),
+                        &user_id,
+                        &admin_authorization_granted_by(&admin_authorization),
                         now,
-                    )
-                    .await;
+                    )?);
                 } else {
-                    disable_admin_membership(&db, &user_id, now).await?;
-                    record_audit_event(
+                    changes.push(disable_admin_membership_statement(&db, &user_id, now)?);
+                }
+                audit.push(
+                    prepare_audit_event(
                         &db,
-                        &request,
-                        "admin.membership.revoke",
+                        Some(&request),
+                        Some(actor),
+                        if admin {
+                            "admin.membership.grant"
+                        } else {
+                            "admin.membership.revoke"
+                        },
                         Some(&user_id),
                         None,
                         None,
-                        serde_json::json!({ "mode": "admin_ui" }),
+                        serde_json::json!({"changedFields":["admin"]}),
                         now,
                     )
-                    .await;
-                }
+                    .await?,
+                );
             }
+            audit_capture::commit(&db, changes, &audit).await?;
 
             let response = admin_user_detail_response(&db, &user_id, now)
                 .await?
@@ -4253,22 +4494,98 @@ async fn events(request: Request, env: Env) -> worker::Result<Response> {
     let url = request.url()?;
     let db = env.d1(D1_BINDING)?;
     let config = server_config(&env, &url);
-    if let Err(error) =
-        validate_admin_request(&request, &env, &db, &config, unix_timestamp_seconds()).await
-    {
-        return client_management_error_json(&error);
-    }
-
     let filter = match audit_event_filter_from_url(&url) {
         Ok(filter) => filter,
         Err(error) => return client_management_error_json(&error),
     };
-    let rows = list_audit_event_rows(&db, &filter).await?;
-    let events = rows
-        .into_iter()
-        .map(audit_event_response_from_row)
-        .collect();
-    json(&AuditEventsResponse { events })
+    let now = unix_timestamp_seconds();
+    let admin = authorize_admin_request(&request, &env, &db, &config, now).await;
+    let customer_view = canonical_route_path(url.path()) != "/events";
+    if customer_view {
+        let Some(organization_id) = filter.organization_id.as_deref() else {
+            return oauth_error_json("invalid_request", "organization_id is required", 400);
+        };
+        if admin.is_err() {
+            if let Err(error) = tenants::require_audit_read(
+                &request,
+                &env,
+                &db,
+                &config,
+                organization_id,
+                filter.csv,
+                now,
+            )
+            .await
+            {
+                return client_management_error_json(&error);
+            }
+        }
+    } else if let Err(error) = &admin {
+        return client_management_error_json(error);
+    }
+    let actor = match &admin {
+        Ok(authorization) => audit_capture::admin_actor(authorization).map_err(worker_error)?,
+        Err(_) => {
+            let current = current_session_from_request(&request, &env, &db, &config, now)
+                .await?
+                .ok_or_else(|| worker_error("audit reader session is missing".into()))?;
+            zeroth_audit::AuditActor::new("user", current.user.id)
+                .map_err(|e| worker_error(e.to_string()))?
+        }
+    };
+    let page = audit_event_page(fetch_audit_event_page_rows(&db, &filter).await?, &filter)
+        .map_err(|error| worker_error(error.description))?;
+    let mut access = prepare_audit_event(
+        &db,
+        Some(&request),
+        Some(actor),
+        if filter.csv {
+            "audit.export"
+        } else {
+            "audit.read"
+        },
+        None,
+        None,
+        None,
+        serde_json::json!({"count":page.events.len()}),
+        now,
+    )
+    .await?;
+    access.0.organization_id = filter.organization_id.clone();
+    audit_capture::commit(&db, Vec::new(), &[access]).await?;
+    let response = if canonical_route_path(url.path()) == "/audit" && !filter.csv {
+        let can_export = match filter.organization_id.as_deref() {
+            Some(id) => {
+                admin.is_ok()
+                    || tenants::require_audit_read(&request, &env, &db, &config, id, true, now)
+                        .await
+                        .is_ok()
+            }
+            None => false,
+        };
+        html(audit_history_document(&page, &url, can_export))?
+    } else if filter.csv {
+        let response = Response::ok(audit_events_csv(&page.events))?;
+        response
+            .headers()
+            .set("Content-Type", "text/csv; charset=utf-8")?;
+        response.headers().set(
+            "Content-Disposition",
+            "attachment; filename=\"zeroth-audit-events.csv\"",
+        )?;
+        response
+    } else {
+        json(&page)?
+    };
+    response.headers().set("Cache-Control", "no-store")?;
+    response.headers().set(
+        "X-Audit-Has-More",
+        if page.has_more { "true" } else { "false" },
+    )?;
+    if let Some(cursor) = page.next_cursor.as_deref() {
+        response.headers().set("X-Audit-Next-Cursor", cursor)?;
+    }
+    Ok(response)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -4370,6 +4687,7 @@ async fn oauth_token(mut request: Request, env: Env) -> worker::Result<Response>
         "authorization_code" => {
             authorization_code_token(
                 &db,
+                &request,
                 &env,
                 &config,
                 &signing_key,
@@ -4382,6 +4700,7 @@ async fn oauth_token(mut request: Request, env: Env) -> worker::Result<Response>
         "refresh_token" => {
             refresh_token_token(
                 &db,
+                &request,
                 &env,
                 &config,
                 &signing_key,
@@ -4394,6 +4713,7 @@ async fn oauth_token(mut request: Request, env: Env) -> worker::Result<Response>
         TOKEN_EXCHANGE_GRANT_TYPE => {
             native_provider_token(
                 &db,
+                &request,
                 &env,
                 &config,
                 &signing_key,
@@ -4417,24 +4737,22 @@ async fn oauth_token(mut request: Request, env: Env) -> worker::Result<Response>
             return rate_limit_oauth_error_json(blocked.retry_after_seconds, origin.as_deref());
         }
     }
-    record_audit_event(
-        &db,
-        &request,
-        "token.issue",
-        None,
-        Some(&form.client_id),
-        None,
-        serde_json::json!({ "grantType": form.grant_type }),
-        now,
-    )
-    .await;
-
-    with_cors_actual_headers(response, origin.as_deref())
+    if response.status_code() >= 400 {
+        record_audit_event(
+            &db, &request, "token.issue.failed", None, Some(&form.client_id), None,
+            serde_json::json!({ "grantType": form.grant_type, "httpStatus": response.status_code() }), now,
+        ).await?;
+        return with_cors_actual_headers(response, origin.as_deref());
+    }
+    // Successful issuance and its evidence already committed atomically below.
+    // A secondary audit write must not turn that committed response into a 500.
+    Ok(response)
 }
 
 #[cfg(target_arch = "wasm32")]
 async fn authorization_code_token(
     db: &worker::d1::D1Database,
+    request: &Request,
     env: &Env,
     config: &ZerothServerConfig,
     signing_key: &Es256SigningKey,
@@ -4442,10 +4760,11 @@ async fn authorization_code_token(
     form: &TokenExchangeForm,
     now: i32,
 ) -> worker::Result<Response> {
+    use worker::d1::D1Type as V;
     let fields =
         authorization_code_fields(form).map_err(|error| worker_error(error.description))?;
     let auth_code = match get_authorization_code(db, fields.code).await? {
-        Some(auth_code) => auth_code,
+        Some(code) => code,
         None => {
             return token_exchange_error_json(
                 &TokenExchangeError::invalid_grant("authorization code was not found"),
@@ -4453,7 +4772,6 @@ async fn authorization_code_token(
             )
         }
     };
-
     if let Err(error) = validate_authorization_code_exchange(&auth_code, &fields, now) {
         return token_exchange_error_json(&error, 400);
     }
@@ -4476,55 +4794,78 @@ async fn authorization_code_token(
             400,
         );
     }
-    if !consume_authorization_code(db, &auth_code.code_hash, now).await? {
-        return token_exchange_error_json(
-            &TokenExchangeError::invalid_grant("authorization code has already been consumed"),
-            400,
-        );
-    }
-
     let user_claims = match get_user_token_claims(db, &auth_code.user_id).await? {
-        Some(user_claims) => user_claims,
-        None => {
+        Some(user) if user.disabled_at.is_none() => user,
+        _ => {
             return token_exchange_error_json(
-                &TokenExchangeError::invalid_grant("authorization code user was not found"),
+                &TokenExchangeError::invalid_grant(
+                    "authorization code user is missing or disabled",
+                ),
                 400,
             )
         }
     };
-    if user_claims.disabled_at.is_some() {
-        return token_exchange_error_json(
-            &TokenExchangeError::invalid_grant("authorization code user is disabled"),
-            400,
-        );
-    }
-
-    let refresh_token = if auth_code
-        .scope
-        .split_whitespace()
-        .any(|scope| scope == "offline_access")
-    {
-        let token = random_token()?;
-        put_refresh_token(&db, &token, &auth_code, now).await?;
-        Some(token)
+    let issue = TokenIssue::from_auth_code(&auth_code).with_user_claims(&user_claims);
+    let refresh_token = if scope_contains(Some(&auth_code.scope), "offline_access") {
+        Some(random_token()?)
     } else {
         None
     };
-
-    let response = token_response(
-        config,
-        signing_key,
-        &TokenIssue::from_auth_code(&auth_code).with_user_claims(&user_claims),
-        refresh_token,
-        now,
-    )
-    .map_err(worker_error)?;
-    json(&response)
+    let refresh_hash = refresh_token.as_deref().map(hash_secret);
+    // Signing, JSON serialization and response headers can fail; finish them
+    // before consuming a one-use credential or creating its refresh token.
+    let response =
+        token_response(config, signing_key, &issue, refresh_token, now).map_err(worker_error)?;
+    let response = with_cors_actual_headers(json(&response)?, request_origin(request)?.as_deref())?;
+    let event = prepare_token_issue_event(db, request, &issue, "authorization_code", now).await?;
+    let guard_id = format!("guard_{}", event.0.event_id);
+    let scope_guard_id = format!("scope_{}", event.0.event_id);
+    let mut changes = vec![
+        db.prepare(AUTH_CODE_ISSUE_GUARD_SQL).bind_refs(&[
+            V::Text(&guard_id),
+            V::Text(&auth_code.code_hash),
+            V::Integer(now),
+            V::Integer(now),
+        ])?,
+        audit_capture::client_user_scope_guard(
+            db,
+            &issue.user_id,
+            &issue.client_id,
+            &scope_guard_id,
+            issue.auth_context.auth_provider.as_deref(),
+        )?,
+        db.prepare(CONSUME_AUTHORIZATION_CODE_SQL)
+            .bind_refs(&[V::Integer(now), V::Text(&auth_code.code_hash)])?,
+    ];
+    if let Some(hash) = &refresh_hash {
+        changes.push(refresh_token_statement(db, hash, &issue, now)?);
+    }
+    changes.push(audit_capture::clear_guard(db, &scope_guard_id)?);
+    changes.push(
+        db.prepare(DELETE_AUDIT_WRITE_GUARD_SQL)
+            .bind_refs(&[V::Text(&guard_id)])?,
+    );
+    if let Err(error) = commit_credential_transition(db, changes, &event).await {
+        if get_authorization_code(db, fields.code)
+            .await?
+            .is_none_or(|row| row.consumed_at.is_some() || row.expires_at <= now)
+        {
+            return token_exchange_error_json(
+                &TokenExchangeError::invalid_grant(
+                    "authorization code has already been consumed or expired",
+                ),
+                400,
+            );
+        }
+        return Err(error);
+    }
+    Ok(response)
 }
 
 #[cfg(target_arch = "wasm32")]
 async fn refresh_token_token(
     db: &worker::d1::D1Database,
+    request: &Request,
     env: &Env,
     config: &ZerothServerConfig,
     signing_key: &Es256SigningKey,
@@ -4532,10 +4873,11 @@ async fn refresh_token_token(
     form: &TokenExchangeForm,
     now: i32,
 ) -> worker::Result<Response> {
+    use worker::d1::D1Type as V;
     let refresh_token =
         refresh_token_field(form).map_err(|error| worker_error(error.description))?;
-    let refresh_token_row = match get_refresh_token(db, refresh_token).await? {
-        Some(refresh_token_row) => refresh_token_row,
+    let row = match get_refresh_token(db, refresh_token).await? {
+        Some(row) => row,
         None => {
             return token_exchange_error_json(
                 &TokenExchangeError::invalid_grant("refresh token was not found"),
@@ -4543,10 +4885,16 @@ async fn refresh_token_token(
             )
         }
     };
-
-    if let Err(error) = validate_refresh_token_exchange(&refresh_token_row, &form.client_id, now) {
-        if refresh_token_replay_detected(&refresh_token_row, &form.client_id) {
-            revoke_refresh_token_family(db, &refresh_token_row, now).await?;
+    if let Err(error) = validate_refresh_token_exchange(&row, &form.client_id, now) {
+        if refresh_token_replay_detected(&row, &form.client_id) {
+            revoke_refresh_token_family(
+                db,
+                &row,
+                now,
+                "refresh_token.replay",
+                "refresh_token_replay",
+            )
+            .await?;
         }
         return token_exchange_error_json(&error, 400);
     }
@@ -4554,69 +4902,112 @@ async fn refresh_token_token(
         db,
         env,
         &client.client,
-        &refresh_token_row.user_id,
-        refresh_token_row.session_id.as_deref(),
-        &refresh_token_row.auth_context,
+        &row.user_id,
+        row.session_id.as_deref(),
+        &row.auth_context,
         now,
     )
     .await?
     {
         return token_exchange_error_json(&TokenExchangeError::invalid_grant(error), 400);
     }
-    if let Err(error) =
-        validate_user_client_admission(db, client, &refresh_token_row.user_id).await?
-    {
-        revoke_refresh_token_family(db, &refresh_token_row, now).await?;
+    if let Err(error) = validate_user_client_admission(db, client, &row.user_id).await? {
+        revoke_refresh_token_family(
+            db,
+            &row,
+            now,
+            "refresh_token.revoke",
+            "client_admission_denied",
+        )
+        .await?;
         return token_exchange_error_json(
             &TokenExchangeError::invalid_grant(error.description),
             400,
         );
     }
-    let user_claims = match get_user_token_claims(db, &refresh_token_row.user_id).await? {
-        Some(user_claims) => user_claims,
-        None => {
+    let user_claims = match get_user_token_claims(db, &row.user_id).await? {
+        Some(user) if user.disabled_at.is_none() => user,
+        _ => {
             return token_exchange_error_json(
-                &TokenExchangeError::invalid_grant("refresh token user was not found"),
+                &TokenExchangeError::invalid_grant("refresh token user is missing or disabled"),
                 400,
             )
         }
     };
-    if user_claims.disabled_at.is_some() {
-        return token_exchange_error_json(
-            &TokenExchangeError::invalid_grant("refresh token user is disabled"),
-            400,
-        );
+    let issue = TokenIssue::from_refresh_token(&row).with_user_claims(&user_claims);
+    let replacement = random_token()?;
+    let replacement_hash = hash_secret(&replacement);
+    let response = token_response(config, signing_key, &issue, Some(replacement), now)
+        .map_err(worker_error)?;
+    let response = with_cors_actual_headers(json(&response)?, request_origin(request)?.as_deref())?;
+    let event = prepare_token_issue_event(db, request, &issue, "refresh_token", now).await?;
+    let guard_id = format!("guard_{}", event.0.event_id);
+    let scope_guard_id = format!("scope_{}", event.0.event_id);
+    let changes = vec![
+        db.prepare(REFRESH_ISSUE_GUARD_SQL).bind_refs(&[
+            V::Text(&guard_id),
+            V::Text(&row.token_hash),
+            V::Integer(now),
+            V::Integer(now),
+        ])?,
+        audit_capture::client_user_scope_guard(
+            db,
+            &issue.user_id,
+            &issue.client_id,
+            &scope_guard_id,
+            issue.auth_context.auth_provider.as_deref(),
+        )?,
+        db.prepare(ROTATE_REFRESH_TOKEN_SQL)
+            .bind_refs(&[V::Integer(now), V::Text(&row.token_hash)])?,
+        db.prepare(INSERT_ROTATED_REFRESH_TOKEN_SQL).bind_refs(&[
+            V::Text(&replacement_hash),
+            V::Integer(now),
+            V::Integer(now + REFRESH_TOKEN_TTL_SECONDS),
+            V::Text(&row.token_hash),
+            V::Integer(now),
+            V::Integer(now),
+        ])?,
+        audit_capture::clear_guard(db, &scope_guard_id)?,
+        db.prepare(DELETE_AUDIT_WRITE_GUARD_SQL)
+            .bind_refs(&[V::Text(&guard_id)])?,
+    ];
+    if let Err(error) = commit_credential_transition(db, changes, &event).await {
+        let latest = get_refresh_token(db, refresh_token).await?;
+        if let Some(latest) = latest {
+            if latest.rotated_at.is_some() && latest.revoked_at.is_none() {
+                // Another transaction won the CAS. Its entire family, including
+                // the committed replacement, must be revoked for actual replay.
+                revoke_refresh_token_family(
+                    db,
+                    &latest,
+                    now,
+                    "refresh_token.replay",
+                    "refresh_token_replay",
+                )
+                .await?;
+                return token_exchange_error_json(
+                    &TokenExchangeError::invalid_grant("refresh token has already been rotated"),
+                    400,
+                );
+            }
+            if latest.revoked_at.is_some() || latest.expires_at <= now {
+                return token_exchange_error_json(
+                    &TokenExchangeError::invalid_grant("refresh token is revoked or expired"),
+                    400,
+                );
+            }
+        }
+        // The parent remains unused after an audit/outbox failure. Returning a
+        // server error permits the legitimate caller to retry the same token.
+        return Err(error);
     }
-
-    if !rotate_refresh_token(db, &refresh_token_row.token_hash, now).await? {
-        revoke_refresh_token_family(db, &refresh_token_row, now).await?;
-        return token_exchange_error_json(
-            &TokenExchangeError::invalid_grant("refresh token has already been rotated"),
-            400,
-        );
-    }
-    let new_refresh_token = random_token()?;
-    if !put_rotated_refresh_token(db, &new_refresh_token, &refresh_token_row, now).await? {
-        return token_exchange_error_json(
-            &TokenExchangeError::invalid_grant("refresh token was revoked during rotation"),
-            400,
-        );
-    }
-
-    let response = token_response(
-        config,
-        signing_key,
-        &TokenIssue::from_refresh_token(&refresh_token_row).with_user_claims(&user_claims),
-        Some(new_refresh_token),
-        now,
-    )
-    .map_err(worker_error)?;
-    json(&response)
+    Ok(response)
 }
 
 #[cfg(target_arch = "wasm32")]
 async fn native_provider_token(
     db: &worker::d1::D1Database,
+    request: &Request,
     env: &Env,
     config: &ZerothServerConfig,
     signing_key: &Es256SigningKey,
@@ -4656,9 +5047,10 @@ async fn native_provider_token(
 
     let user_id = upsert_provider_profile(
         db,
-        &client.account_scope.namespace,
+        client,
         &resolved.profile,
         resolved.raw_profile_json.as_deref(),
+        Some(request),
         now,
     )
     .await?;
@@ -4681,15 +5073,30 @@ async fn native_provider_token(
     let issue = TokenIssue::from_native_provider(&form.client_id, &user_id, &scope, now)
         .with_user_claims(&user_claims);
     let refresh_token = if scope_contains(Some(&scope), "offline_access") {
-        let token = random_token()?;
-        put_refresh_token_row(db, &hash_secret(&token), &issue, now).await?;
-        Some(token)
+        Some(random_token()?)
     } else {
         None
     };
+    let refresh_hash = refresh_token.as_deref().map(hash_secret);
     let response =
         token_response(config, signing_key, &issue, refresh_token, now).map_err(worker_error)?;
-    json(&response)
+    let response = with_cors_actual_headers(json(&response)?, request_origin(request)?.as_deref())?;
+    let mut event = prepare_token_issue_event(db, request, &issue, "token_exchange", now).await?;
+    event.0.provider_id = Some(resolved.profile.provider_id.0.clone());
+    let scope_guard_id = format!("scope_{}", event.0.event_id);
+    let mut changes = vec![audit_capture::client_user_scope_guard(
+        db,
+        &issue.user_id,
+        &issue.client_id,
+        &scope_guard_id,
+        issue.auth_context.auth_provider.as_deref(),
+    )?];
+    if let Some(hash) = &refresh_hash {
+        changes.push(refresh_token_statement(db, hash, &issue, now)?);
+    }
+    changes.push(audit_capture::clear_guard(db, &scope_guard_id)?);
+    commit_credential_transition(db, changes, &event).await?;
+    Ok(response)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -4751,6 +5158,7 @@ async fn resolve_native_oidc_provider_profile(
 
 #[cfg(target_arch = "wasm32")]
 async fn oauth_revoke(mut request: Request, env: Env) -> worker::Result<Response> {
+    use worker::d1::D1Type as V;
     let origin = request_origin(&request)?;
     let form = match token_revocation_form_from_request(&mut request).await {
         Ok(form) => form,
@@ -4759,7 +5167,6 @@ async fn oauth_revoke(mut request: Request, env: Env) -> worker::Result<Response
     if let Err(error) = validate_token_revocation_form(&form) {
         return token_exchange_error_json(&error, 400);
     }
-
     let db = env.d1(D1_BINDING)?;
     let registered_client = match get_registered_client(&db, &form.client_id).await? {
         Some(client) => client,
@@ -4780,31 +5187,47 @@ async fn oauth_revoke(mut request: Request, env: Env) -> worker::Result<Response
     {
         return oauth_error_json("invalid_request", error, 403);
     }
-
-    if should_attempt_refresh_token_revocation(form.token_type_hint.as_deref()) {
-        if let Some(refresh_token) = get_refresh_token(&db, &form.token).await? {
-            if refresh_token.client_id == form.client_id {
-                revoke_refresh_token(&db, &refresh_token.token_hash, unix_timestamp_seconds())
-                    .await?;
-            }
-        }
-    }
-    record_audit_event(
+    let now = unix_timestamp_seconds();
+    let token = if should_attempt_refresh_token_revocation(form.token_type_hint.as_deref()) {
+        get_refresh_token(&db, &form.token)
+            .await?
+            .filter(|row| row.client_id == form.client_id)
+    } else {
+        None
+    };
+    let actor = if registered_client.client.confidential {
+        zeroth_audit::AuditActor::new("service", &form.client_id)
+            .map_err(|e| worker_error(e.to_string()))?
+    } else {
+        zeroth_audit::AuditActor::anonymous()
+    };
+    let mut event = prepare_audit_event(
         &db,
-        &request,
+        Some(&request),
+        Some(actor),
         "token.revoke",
-        None,
+        token.as_ref().map(|row| row.user_id.as_str()),
         Some(&form.client_id),
         None,
-        serde_json::json!({
-            "tokenTypeHint": form.token_type_hint.as_deref().unwrap_or("")
-        }),
-        unix_timestamp_seconds(),
+        serde_json::json!({}),
+        now,
     )
-    .await;
-
-    let response = Response::empty()?;
-    with_cors_actual_headers(response, origin.as_deref())
+    .await?;
+    if token.is_none() {
+        // RFC revocation accepts missing/foreign/unsupported tokens without
+        // disclosing them. That acceptance does not prove a token was revoked.
+        event.0.outcome = zeroth_audit::AuditOutcome::Unknown;
+    }
+    let response = with_cors_actual_headers(Response::empty()?, origin.as_deref())?;
+    let mut changes = Vec::new();
+    if let Some(row) = &token {
+        changes.push(
+            db.prepare(REVOKE_SINGLE_REFRESH_TOKEN_SQL)
+                .bind_refs(&[V::Integer(now), V::Text(&row.token_hash)])?,
+        );
+    }
+    commit_credential_transition(&db, changes, &event).await?;
+    Ok(response)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -5140,23 +5563,6 @@ async fn sessions(request: Request, env: Env) -> worker::Result<Response> {
                 return oauth_error_json("invalid_request", "missing session_id", 400);
             };
             let now = unix_timestamp_seconds();
-            revoke_user_session(&db, &session_id, &current.user.id, now).await?;
-            revoke_refresh_token_family_for_session(&db, &session_id, &current.user.id, now)
-                .await?;
-            record_audit_event(
-                &db,
-                &request,
-                "session.revoke",
-                Some(&current.user.id),
-                current.client_id.as_deref(),
-                None,
-                serde_json::json!({
-                    "current": current.session_id.as_deref() == Some(session_id.as_str())
-                }),
-                now,
-            )
-            .await;
-
             let response = json(&serde_json::json!({ "ok": true }))?;
             let response = if current.session_id.as_deref() == Some(session_id.as_str()) {
                 with_set_cookie(
@@ -5166,7 +5572,18 @@ async fn sessions(request: Request, env: Env) -> worker::Result<Response> {
             } else {
                 response
             };
-            with_cors_actual_headers(response, origin.as_deref())
+            let response = with_cors_actual_headers(response, origin.as_deref())?;
+            revoke_session_with_audit(
+                &db,
+                &request,
+                &session_id,
+                &current.user.id,
+                current.client_id.as_deref(),
+                "session.revoke",
+                now,
+            )
+            .await?;
+            Ok(response)
         }
         _ => json_status(&serde_json::json!({ "error": "method_not_allowed" }), 405),
     }
@@ -5224,21 +5641,30 @@ async fn profile(mut request: Request, env: Env) -> worker::Result<Response> {
                 }
             };
             let now = unix_timestamp_seconds();
-            update_user_profile_patch(&db, &current.user.id, &patch, now).await?;
-            record_audit_event(
+            let event = prepare_audit_event(
                 &db,
-                &request,
+                Some(&request),
+                Some(audit_capture::actor_from_user(Some(&current.user.id)).map_err(worker_error)?),
                 "user.profile.update",
                 Some(&current.user.id),
                 current.client_id.as_deref(),
                 None,
                 serde_json::json!({
-                    "displayName": patch.display_name.is_some(),
-                    "pictureUrl": patch.picture_url.is_some()
+                    "changedFields": profile_patch_changed_fields(&patch)
                 }),
                 now,
             )
-            .await;
+            .await?;
+            audit_capture::commit(
+                &db,
+                vec![
+                    identity_account_auth_guard_statement(&db, &current, &event.0.event_id, now)?,
+                    update_user_profile_patch_statement(&db, &current.user.id, &patch, now)?,
+                    identity_cleanup_guard_statement(&db, &event.0.event_id)?,
+                ],
+                &[event],
+            )
+            .await?;
             let updated_user = user_with_profile_patch(&current.user, &patch);
             let response = json(&userinfo_response(
                 &updated_user,
@@ -5316,35 +5742,41 @@ async fn identities(request: Request, env: Env) -> worker::Result<Response> {
                 return oauth_error_json("invalid_request", "cannot unlink the last identity", 400);
             }
 
-            if !delete_user_identity(
+            let event = prepare_audit_event(
                 &db,
-                &current.user.id,
-                &identity.provider_id,
-                &identity.provider_subject,
-            )
-            .await?
-            {
-                return oauth_error_json("invalid_request", "identity could not be unlinked", 409);
-            }
-            if identity.provider_id == "passkey" {
-                disable_passkey_credential(
-                    &db,
-                    &identity.provider_subject,
-                    unix_timestamp_seconds(),
-                )
-                .await?;
-            }
-            record_audit_event(
-                &db,
-                &request,
+                Some(&request),
+                Some(audit_capture::actor_from_user(Some(&current.user.id)).map_err(worker_error)?),
                 "identity.unlink",
                 Some(&current.user.id),
                 current.client_id.as_deref(),
                 Some(&identity.provider_id),
                 serde_json::json!({}),
-                unix_timestamp_seconds(),
+                now,
             )
-            .await;
+            .await?;
+            let mut changes = delete_user_identity_statements(
+                &db,
+                &current.user.id,
+                &identity.provider_id,
+                &identity.provider_subject,
+                &event.0.event_id,
+            )?;
+            let account_guard = format!("account_{}", event.0.event_id);
+            changes.insert(
+                0,
+                identity_account_auth_guard_statement(&db, &current, &account_guard, now)?,
+            );
+            if identity.provider_id == "passkey" {
+                changes.push(disable_passkey_credential_statement(
+                    &db,
+                    &current.user.id,
+                    &identity.provider_subject,
+                    now,
+                )?);
+            }
+            changes.push(identity_cleanup_guard_statement(&db, &event.0.event_id)?);
+            changes.push(identity_cleanup_guard_statement(&db, &account_guard)?);
+            audit_capture::commit(&db, changes, &[event]).await?;
             let response = json(&serde_json::json!({ "ok": true }))?;
             with_cors_actual_headers(response, origin.as_deref())
         }
@@ -5698,21 +6130,29 @@ async fn passkey_register_verify(mut request: Request, env: Env) -> worker::Resu
     .await?;
     if let Some(admin_authorization) = admin_authorization {
         let granted_by = admin_authorization_granted_by(&admin_authorization);
-        upsert_admin_membership(&db, &user_id, &granted_by, now).await?;
-        record_audit_event(
+        let event = prepare_audit_event(
             &db,
-            &request,
+            Some(&request),
+            Some(audit_capture::admin_actor(&admin_authorization).map_err(worker_error)?),
             "admin.membership.grant",
             Some(&user_id),
             challenge.client_id.as_deref(),
             Some("passkey"),
-            serde_json::json!({
-                "grantedBy": granted_by,
-                "mode": "passkey_registration"
-            }),
+            serde_json::json!({"changedFields":["admin"]}),
             now,
         )
-        .await;
+        .await?;
+        audit_capture::commit(
+            &db,
+            vec![upsert_admin_membership_statement(
+                &db,
+                &user_id,
+                &granted_by,
+                now,
+            )?],
+            &[event],
+        )
+        .await?;
     }
     record_audit_event(
         &db,
@@ -5727,7 +6167,7 @@ async fn passkey_register_verify(mut request: Request, env: Env) -> worker::Resu
         }),
         now,
     )
-    .await;
+    .await?;
 
     let Some(user) = get_user(&db, &user_id).await? else {
         return oauth_error_json("invalid_request", "passkey user was not found", 400);
@@ -6012,7 +6452,7 @@ async fn passkey_authenticate_verify(mut request: Request, env: Env) -> worker::
         }),
         now,
     )
-    .await;
+    .await?;
 
     let return_to = challenge
         .return_to
@@ -6156,7 +6596,7 @@ async fn password_register(mut request: Request, env: Env) -> worker::Result<Res
             }),
             now,
         )
-        .await;
+        .await?;
         return public_response();
     }
 
@@ -6179,7 +6619,7 @@ async fn password_register(mut request: Request, env: Env) -> worker::Result<Res
                 }),
                 now,
             )
-            .await;
+            .await?;
             return public_response();
         }
         return oauth_error_json(&error.code, &error.description, 403);
@@ -6606,7 +7046,7 @@ async fn evm_wallet_challenge(mut request: Request, env: Env) -> worker::Result<
         }),
         now,
     )
-    .await;
+    .await?;
     json(&WalletChallengeResponse {
         ok: true,
         provider: EVM_WALLET_PROVIDER_ID,
@@ -6775,9 +7215,10 @@ async fn evm_wallet_verify(mut request: Request, env: Env) -> worker::Result<Res
     .to_string();
     let user_id = upsert_provider_profile(
         &db,
-        &challenge.account_namespace,
+        &registered_client,
         &profile,
         Some(&raw_profile_json),
+        Some(&request),
         now,
     )
     .await?;
@@ -6948,7 +7389,7 @@ async fn magic_link_request(mut request: Request, env: Env) -> worker::Result<Re
             }),
             now,
         )
-        .await;
+        .await?;
         return public_response();
     }
 
@@ -6980,7 +7421,7 @@ async fn magic_link_request(mut request: Request, env: Env) -> worker::Result<Re
                 magic_link_email_failed_details(error_class, &error),
                 now,
             )
-            .await;
+            .await?;
             false
         }
     };
@@ -6994,7 +7435,7 @@ async fn magic_link_request(mut request: Request, env: Env) -> worker::Result<Re
         serde_json::json!({ "sent": sent }),
         now,
     )
-    .await;
+    .await?;
     let response = json_status(
         &serde_json::json!({
             "ok": true,
@@ -7153,7 +7594,7 @@ async fn magic_link_consume(mut request: Request, env: Env) -> worker::Result<Re
             serde_json::json!({}),
             now,
         )
-        .await;
+        .await?;
     }
     upsert_local_auth_identity(&db, &user_id, &row.email, None, "magic_link", now).await?;
     let issue = issue_local_auth_session(
@@ -7352,7 +7793,7 @@ async fn identity_link(request: Request, env: Env) -> worker::Result<Response> {
         Ok(return_to) => return_to,
         Err(error) => return oauth_error_json("invalid_request", error, 400),
     };
-    if !provider_configured_for_login(&env, &provider_id) {
+    if !tenants::configured_for_client(&db, &env, &client.id.0, &provider_id).await? {
         return oauth_error_json(
             "invalid_request",
             format!("provider is not fully configured: {provider_id}"),
@@ -7360,7 +7801,7 @@ async fn identity_link(request: Request, env: Env) -> worker::Result<Response> {
         );
     }
 
-    let provider = provider_from_env(&env, &provider_id)?;
+    let provider = tenants::provider_for_client(&db, &env, &client.id.0, &provider_id).await?;
     let provider_redirect_uri = config.issuer().provider_callback_endpoint();
     let provider_state = random_token()?;
     let provider_nonce = random_token()?;
@@ -7546,25 +7987,6 @@ async fn logout(request: Request, env: Env) -> worker::Result<Response> {
                         return oauth_error_json("invalid_request", error, 403);
                     }
                 }
-                revoke_session(&db, &current.session.id, now).await?;
-                revoke_refresh_token_family_for_session(
-                    &db,
-                    &current.session.id,
-                    &current.user.id,
-                    now,
-                )
-                .await?;
-                record_audit_event(
-                    &db,
-                    &request,
-                    "session.logout",
-                    Some(&current.user.id),
-                    current.session.client_id.as_deref(),
-                    None,
-                    serde_json::json!({}),
-                    now,
-                )
-                .await;
             } else if let Err(error) =
                 validate_any_client_cors_origin(&db, origin.as_deref()).await?
             {
@@ -7585,20 +8007,29 @@ async fn logout(request: Request, env: Env) -> worker::Result<Response> {
                 Err(error) => return oauth_error_json("invalid_request", error, 400),
             };
 
-            if let Some(target) = redirect_target {
-                let response = Response::redirect(target)?;
-                return with_set_cookie(
-                    response,
-                    &clear_session_cookie(&config.cookie_name, config.cookie_domain.as_deref()),
-                );
-            }
-
-            let response = json(&serde_json::json!({ "ok": true }))?;
+            let response = if let Some(target) = redirect_target {
+                Response::redirect(target)?
+            } else {
+                json(&serde_json::json!({ "ok": true }))?
+            };
             let response = with_set_cookie(
                 response,
                 &clear_session_cookie(&config.cookie_name, config.cookie_domain.as_deref()),
             )?;
-            with_cors_actual_headers(response, origin.as_deref())
+            let response = with_cors_actual_headers(response, origin.as_deref())?;
+            if let Some(current) = &current {
+                revoke_session_with_audit(
+                    &db,
+                    &request,
+                    &current.session.id,
+                    &current.user.id,
+                    current.session.client_id.as_deref(),
+                    "session.logout",
+                    now,
+                )
+                .await?;
+            }
+            Ok(response)
         }
         _ => json_status(&serde_json::json!({ "error": "method_not_allowed" }), 405),
     }
@@ -7961,7 +8392,7 @@ async fn hosted_session_login(request: Request, env: Env) -> worker::Result<Resp
     if let Err(error) = validate_client_login_provider(client, &provider_id) {
         return oauth_error_json("access_denied", error, 403);
     }
-    if !provider_configured_for_login(&env, &provider_id) {
+    if !tenants::configured_for_client(&db, &env, &client.id.0, &provider_id).await? {
         return auth_error_json(
             &AuthorizationRequestError::invalid_request(format!(
                 "provider is not fully configured: {provider_id}"
@@ -7970,7 +8401,7 @@ async fn hosted_session_login(request: Request, env: Env) -> worker::Result<Resp
         );
     }
 
-    let provider = provider_from_env(&env, &provider_id)?;
+    let provider = tenants::provider_for_client(&db, &env, &client.id.0, &provider_id).await?;
     let provider_redirect_uri = config.issuer().provider_callback_endpoint();
     let provider_state = random_token()?;
     let provider_nonce = random_token()?;
@@ -8052,7 +8483,19 @@ async fn delete_account(request: Request, env: Env) -> worker::Result<Response> 
         return oauth_error_json("invalid_request", error, 403);
     }
 
-    delete_user_account_data(&db, &current.user.id).await?;
+    let event = prepare_audit_event(
+        &db,
+        Some(&request),
+        None,
+        "account.delete",
+        Some(&current.user.id),
+        current.client_id.as_deref(),
+        None,
+        serde_json::json!({}),
+        now,
+    )
+    .await?;
+    delete_user_account_data(&db, &current.user.id, event).await?;
     let response = json(&serde_json::json!({ "ok": true }))?;
     let response = with_set_cookie(
         response,
@@ -8061,34 +8504,36 @@ async fn delete_account(request: Request, env: Env) -> worker::Result<Response> 
     with_cors_actual_headers(response, origin.as_deref())
 }
 
+// Opaque audit references and delivery history deliberately survive deletion.
+const DELETE_ACCOUNT_DATA_SQL: &[&str] = &[
+    "DELETE FROM zeroth_auth_transactions WHERE link_user_id = ?",
+    "DELETE FROM zeroth_auth_codes WHERE user_id = ?",
+    "DELETE FROM zeroth_refresh_tokens WHERE user_id = ?",
+    "DELETE FROM zeroth_sessions WHERE user_id = ?",
+    "DELETE FROM zeroth_passkey_challenges WHERE user_id = ?",
+    "DELETE FROM zeroth_passkey_credentials WHERE user_id = ?",
+    "DELETE FROM zeroth_local_credentials WHERE user_id = ?",
+    "DELETE FROM zeroth_magic_links WHERE user_id = ?",
+    "DELETE FROM zeroth_account_identities WHERE user_id = ?",
+    "DELETE FROM zeroth_identities WHERE user_id = ?",
+    "DELETE FROM zeroth_admin_memberships WHERE user_id = ?",
+    "DELETE FROM zeroth_users WHERE id = ?",
+];
+
 #[cfg(target_arch = "wasm32")]
 async fn delete_user_account_data(
     db: &worker::d1::D1Database,
     user_id: &str,
+    event: (zeroth_audit::AuditEvent, Option<String>),
 ) -> worker::Result<()> {
-    // Remove references without foreign keys before deleting the user row.
-    // The remaining account tables use ON DELETE CASCADE, but explicit deletes
-    // also support older databases created before the FK set was complete.
-    const STATEMENTS: &[&str] = &[
-        "DELETE FROM zeroth_auth_transactions WHERE link_user_id = ?",
-        "DELETE FROM zeroth_auth_codes WHERE user_id = ?",
-        "DELETE FROM zeroth_refresh_tokens WHERE user_id = ?",
-        "DELETE FROM zeroth_sessions WHERE user_id = ?",
-        "DELETE FROM zeroth_passkey_challenges WHERE user_id = ?",
-        "DELETE FROM zeroth_passkey_credentials WHERE user_id = ?",
-        "DELETE FROM zeroth_local_credentials WHERE user_id = ?",
-        "DELETE FROM zeroth_magic_links WHERE user_id = ?",
-        "DELETE FROM zeroth_account_identities WHERE user_id = ?",
-        "DELETE FROM zeroth_identities WHERE user_id = ?",
-        "DELETE FROM zeroth_admin_memberships WHERE user_id = ?",
-        "DELETE FROM zeroth_audit_events WHERE user_id = ?",
-        "DELETE FROM zeroth_users WHERE id = ?",
-    ];
-    for statement in STATEMENTS {
-        let args = [worker::d1::D1Type::Text(user_id)];
-        db.prepare(*statement).bind_refs(&args)?.run().await?;
+    let mut changes = Vec::new();
+    for statement in DELETE_ACCOUNT_DATA_SQL {
+        changes.push(
+            db.prepare(*statement)
+                .bind_refs(&[worker::d1::D1Type::Text(user_id)])?,
+        );
     }
-    Ok(())
+    audit_capture::commit(db, changes, &[event]).await
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -8163,7 +8608,9 @@ async fn hosted_account(request: Request, env: Env) -> worker::Result<Response> 
     }
 
     let mut state = ZerothUiState::new(ui_config).with_product_name(product_name_from_env(&env));
-    state.providers = provider_ui_rows(&env, &identities, client.is_some());
+    state.providers =
+        provider_ui_rows_for_client(&db, &env, &identities, client.is_some(), client.as_ref())
+            .await?;
     state.profile = current
         .as_ref()
         .map(|current| profile_ui_from_user(&current.user, &identities));
@@ -8197,13 +8644,14 @@ async fn hosted_clients_admin(request: Request, env: Env) -> worker::Result<Resp
             let current = current_session_from_request(&request, &env, &db, &config, now).await?;
             state = state.with_csrf_token(current.as_ref().and_then(|current| {
                 csrf_secret_from_env(&env).ok().map(|secret| {
-                    csrf_token(&secret, &current.session.id, CSRF_ROUTE_FAMILY_ACCOUNT, now)
+                    csrf_token(&secret, &current.session.id, CSRF_ROUTE_FAMILY_ADMIN, now)
                 })
             }));
             let provider_failures = provider_failure_statuses(&db).await?;
             state.providers = provider_admin_ui_rows(&env, &config, &provider_failures);
             state.local_auth =
                 local_auth_admin_ui_rows(&env, magic_link_delivery_status(&db).await?);
+            state.tenants = tenants::list_ui(&db, &env).await?;
             let rows = list_client_rows_for_admin(&db).await?;
             state.clients = rows
                 .into_iter()
@@ -8225,7 +8673,7 @@ async fn hosted_clients_admin(request: Request, env: Env) -> worker::Result<Resp
             let current = current_session_from_request(&request, &env, &db, &config, now).await?;
             if current.is_none()
                 && error.status == 401
-                && provider_configured_for_login(&env, well_known::APPLE)
+                && env_string(&env, "DEFAULT_LOGIN_CLIENT_ID").is_some()
             {
                 return redirect_to_hosted_admin_login(&config, url.path());
             }
@@ -8234,7 +8682,95 @@ async fn hosted_clients_admin(request: Request, env: Env) -> worker::Result<Resp
         }
     }
 
-    html(render_clients_admin_document(state))
+    if canonical_route_path(url.path()) == "/admin/tenants" {
+        html(render_tenants_admin_document(state))
+    } else {
+        html(render_clients_admin_document(state))
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn hosted_admin_setup(request: Request, env: Env) -> worker::Result<Response> {
+    let url = request.url()?;
+    let db = env.d1(D1_BINDING)?;
+    let config = server_config(&env, &url);
+    if let Err(error) =
+        validate_admin_request(&request, &env, &db, &config, unix_timestamp_seconds()).await
+    {
+        return client_management_error_json(&error);
+    }
+    html(include_str!("../../../docs/enterprise-admin-setup.html").to_owned())
+}
+
+fn audit_history_document(page: &AuditEventsResponse, url: &url::Url, can_export: bool) -> String {
+    let organization = query_param(url, "organization_id").unwrap_or_default();
+    let escaped = html_escape(&organization);
+    let mut rows = String::new();
+    for event in &page.events {
+        let actor = format!(
+            "{} / {}",
+            event.actor_type.as_deref().unwrap_or("unknown"),
+            event.actor_id.as_deref().unwrap_or("unavailable")
+        );
+        let target = format!(
+            "{} / {}",
+            event.target_type.as_deref().unwrap_or("unknown"),
+            event.target_id.as_deref().unwrap_or("unavailable")
+        );
+        rows.push_str(&format!(r#"<tr><td><time data-audit-time="{}">{}</time><small><code>{}</code></small></td><td><strong>{}</strong><small>{}</small></td><td><code>{}</code></td><td><code>{}</code></td></tr>"#,
+            event.recorded_at, event.recorded_at, html_escape(&event.id), html_escape(&event.event_type), html_escape(&event.outcome), html_escape(&actor), html_escape(&target)));
+    }
+    if rows.is_empty() {
+        rows.push_str(
+            "<tr><td colspan=\"4\" class=\"empty\">No events match these filters.</td></tr>",
+        );
+    }
+    let controls = [
+        ("event_type", "Action"),
+        ("actor_id", "Actor ID"),
+        ("outcome", "Outcome"),
+        ("from", "From (Unix seconds)"),
+        ("until", "Until (Unix seconds)"),
+    ]
+    .into_iter()
+    .map(|(name, label)| {
+        format!(
+            r#"<label>{label}<input name="{name}" value="{}"></label>"#,
+            html_escape(&query_param(url, name).unwrap_or_default())
+        )
+    })
+    .collect::<String>();
+    let link = |key: &str, value: &str| {
+        let mut next = url.clone();
+        next.set_fragment(None);
+        next.set_query(None);
+        next.query_pairs_mut()
+            .extend_pairs(url.query_pairs().filter(|(k, _)| k != key));
+        next.query_pairs_mut().append_pair(key, value);
+        html_escape(next.as_str())
+    };
+    let next = page
+        .next_cursor
+        .as_deref()
+        .map(|cursor| {
+            format!(
+                r#"<a class="button" href="{}">Older events →</a>"#,
+                link("cursor", cursor)
+            )
+        })
+        .unwrap_or_else(|| "<span class=\"muted\">End of history</span>".into());
+    let export = if can_export {
+        format!(
+            r#"<a href="{}">Download this page as CSV</a>"#,
+            link("format", "csv")
+        )
+    } else {
+        "<span class=\"muted\">Read access · export permission required for CSV</span>".into()
+    };
+    format!(
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Audit history · {escaped}</title><style>{}</style></head><body><header><p>Zeroth / Corporate audit history</p></header><main><h1>Audit history</h1><p class="muted">Organization <code>{escaped}</code> · This view includes only authorized organization events.</p><form method="get"><input type="hidden" name="organization_id" value="{escaped}">{controls}<button type="submit">Apply filters</button></form><div class="history"><table><thead><tr><th>Recorded time / event ID</th><th>Action / outcome</th><th>Actor</th><th>Target</th></tr></thead><tbody>{rows}</tbody></table></div><nav aria-label="Audit pagination">{export}{next}</nav><p class="muted">Up to 100 events per page. Times use UTC. Legacy history with unknown organization ownership is available only to deployment operators.</p></main><script>for(const el of document.querySelectorAll('[data-audit-time]')){{const date=new Date(Number(el.dataset.auditTime)*1000);if(!Number.isNaN(date.getTime())){{el.textContent=date.toISOString().replace('T',' ').replace('.000Z',' UTC');}}}}</script></body></html>"#,
+        include_str!("audit_view.css")
+    )
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -8331,20 +8867,6 @@ async fn authorize(request: Request, env: Env) -> worker::Result<Response> {
                 now,
             )
             .await?;
-            record_audit_event(
-                &db,
-                &request,
-                "authorization.code.issue",
-                Some(&current.user.id),
-                Some(&authorization_request.client_id.0),
-                None,
-                serde_json::json!({
-                    "scope": authorization_request.scope.as_slice().join(" "),
-                    "mode": "session_reuse"
-                }),
-                now,
-            )
-            .await;
 
             let response = redirect_to_authorization_request_client(
                 &authorization_request,
@@ -8418,7 +8940,7 @@ async fn authorize(request: Request, env: Env) -> worker::Result<Response> {
             }),
             now,
         )
-        .await;
+        .await?;
 
         let response = redirect_to_authorization_request_client(
             &authorization_request,
@@ -8454,7 +8976,7 @@ async fn authorize(request: Request, env: Env) -> worker::Result<Response> {
             &error,
         );
     }
-    if !provider_configured_for_login(&env, &provider_id) {
+    if !tenants::configured_for_client(&db, &env, &client.id.0, &provider_id).await? {
         return redirect_to_authorization_request_error(
             &authorization_request,
             &config.issuer().issuer,
@@ -8463,7 +8985,7 @@ async fn authorize(request: Request, env: Env) -> worker::Result<Response> {
         );
     }
 
-    let provider = provider_from_env(&env, &provider_id)?;
+    let provider = tenants::provider_for_client(&db, &env, &client.id.0, &provider_id).await?;
     let provider_redirect_uri = config.issuer().provider_callback_endpoint();
     let provider_state = random_token()?;
     let provider_nonce = random_token()?;
@@ -8568,7 +9090,7 @@ async fn hosted_session_login_document(
         &issuer_base_url,
         target_url.as_deref(),
     );
-    state.providers = provider_ui_rows(env, &identities, true);
+    state.providers = provider_ui_rows_for_client(db, env, &identities, true, Some(client)).await?;
     restrict_enterprise_login_ui(&mut state, client);
     state.profile = current
         .as_ref()
@@ -8633,7 +9155,7 @@ async fn hosted_authorization_document(
         &config.issuer().issuer,
         Some(&target_url),
     );
-    state.providers = provider_ui_rows(env, &identities, true);
+    state.providers = provider_ui_rows_for_client(db, env, &identities, true, Some(client)).await?;
     restrict_enterprise_login_ui(&mut state, client);
     state.profile = current
         .as_ref()
@@ -8671,6 +9193,30 @@ fn apply_client_login_method_visibility(ui_config: &mut ZerothUiConfig, methods:
     ui_config.show_passkey_login = token_list_slice_contains(methods, LOGIN_METHOD_PASSKEY, false);
     ui_config.show_magic_link_login =
         token_list_slice_contains(methods, LOGIN_METHOD_MAGIC_LINK, false);
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn provider_ui_rows_for_client(
+    db: &worker::d1::D1Database,
+    env: &Env,
+    identities: &[IdentityRow],
+    actions_enabled: bool,
+    client: Option<&Client>,
+) -> worker::Result<Vec<ProviderUi>> {
+    if let Some(client) = client {
+        if let Some(required) = client.enterprise_provider.as_deref() {
+            let (label, kind) = match required {
+                well_known::ENTRA => ("Microsoft Entra", ProviderKind::Entra),
+                well_known::GOOGLE_WORKSPACE => ("Google Workspace", ProviderKind::Google),
+                _ => return Ok(Vec::new()),
+            };
+            let mut provider = provider_ui(required, label, kind, identities);
+            provider.enabled = actions_enabled
+                && tenants::configured_for_client(db, env, &client.id.0, required).await?;
+            return Ok(vec![provider]);
+        }
+    }
+    Ok(provider_ui_rows(env, identities, actions_enabled))
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -9920,7 +10466,6 @@ fn render_confirmation_document(
     )
 }
 
-#[cfg(target_arch = "wasm32")]
 fn html_escape(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -10116,11 +10661,11 @@ const CLIENT_UPSERT_SQL: &str = "INSERT INTO zeroth_clients (
              disabled_at = excluded.disabled_at";
 
 #[cfg(target_arch = "wasm32")]
-async fn upsert_client(
+fn upsert_client_statement(
     db: &worker::d1::D1Database,
     client: &ValidatedClientUpsert,
     now: i32,
-) -> worker::Result<()> {
+) -> worker::Result<worker::d1::D1PreparedStatement> {
     let redirect_uris_json = serde_json::to_string(&client.redirect_uris).map_err(|error| {
         worker::Error::RustError(format!("could not serialize redirect URIs: {error}"))
     })?;
@@ -10170,19 +10715,15 @@ async fn upsert_client(
         disabled_at,
     ];
 
-    db.prepare(CLIENT_UPSERT_SQL)
-        .bind_refs(&args)?
-        .run()
-        .await?;
-    Ok(())
+    db.prepare(CLIENT_UPSERT_SQL).bind_refs(&args)
 }
 
 #[cfg(target_arch = "wasm32")]
-async fn disable_client(
+fn disable_client_statement(
     db: &worker::d1::D1Database,
     client_id: &str,
     disabled_at: i32,
-) -> worker::Result<()> {
+) -> worker::Result<worker::d1::D1PreparedStatement> {
     let args = [
         worker::d1::D1Type::Integer(disabled_at),
         worker::d1::D1Type::Integer(disabled_at),
@@ -10193,10 +10734,7 @@ async fn disable_client(
          SET disabled_at = ?, updated_at = ?
          WHERE id = ?",
     )
-    .bind_refs(&args)?
-    .run()
-    .await?;
-    Ok(())
+    .bind_refs(&args)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -10306,8 +10844,11 @@ async fn get_identity_user_id(
 #[cfg(target_arch = "wasm32")]
 async fn complete_provider_identity_link(
     db: &worker::d1::D1Database,
+    env: &Env,
+    request: &Request,
     link_user_id: &UserId,
     link_session_id: Option<&str>,
+    expected_client_id: &str,
     profile: &ProviderProfile,
     raw_profile_json: Option<&str>,
     now: i32,
@@ -10322,7 +10863,10 @@ async fn complete_provider_identity_link(
             "identity link session was not found",
         )));
     };
-    if session.user_id != link_user_id.0 || !session_row_is_active(&session, now) {
+    if session.user_id != link_user_id.0
+        || !session_row_is_active(&session, now)
+        || session.client_id.as_deref() != Some(expected_client_id)
+    {
         return Ok(Err(IdentityLinkError::invalid_request(
             "identity link session is no longer active",
         )));
@@ -10339,18 +10883,23 @@ async fn complete_provider_identity_link(
         )));
     }
 
-    let account_namespace = if let Some(client_id) = session.client_id.as_deref() {
-        let Some(registered_client) = get_registered_client(db, client_id).await? else {
-            return Ok(Err(IdentityLinkError::invalid_request(
-                "identity link client is disabled or not found",
-            )));
-        };
-        registered_client.account_scope.namespace
-    } else {
-        ACCOUNT_NAMESPACE_GLOBAL.to_owned()
+    let Some(client) = get_registered_client(db, expected_client_id).await? else {
+        return Ok(Err(IdentityLinkError::invalid_request(
+            "identity link client is disabled or not found",
+        )));
     };
-
-    if let Some(existing_user_id) = get_identity_user_id(db, &account_namespace, profile).await? {
+    if validate_auth_context_for_client(db, env, &client.client, &session.auth_context)
+        .await
+        .is_err()
+    {
+        return Ok(Err(IdentityLinkError::invalid_request(
+            "identity link session requires a fresh login",
+        )));
+    }
+    let account_namespace = &client.account_scope.namespace;
+    let existing = get_identity_user_id(db, account_namespace, profile).await?;
+    let is_new = existing.is_none();
+    if let Some(existing_user_id) = existing {
         if existing_user_id != link_user_id.0 {
             return Ok(Err(IdentityLinkError::conflict(
                 "identity is already linked to another user",
@@ -10362,26 +10911,53 @@ async fn complete_provider_identity_link(
         )));
     }
 
-    update_user_from_profile(db, &link_user_id.0, profile, now).await?;
-    upsert_account_identity_from_profile(
+    let event = prepare_audit_event(
         db,
-        &account_namespace,
-        &link_user_id.0,
-        profile,
-        raw_profile_json,
+        Some(request),
+        Some(audit_capture::actor_from_user(Some(&link_user_id.0)).map_err(worker_error)?),
+        "identity.link",
+        Some(&link_user_id.0),
+        Some(expected_client_id),
+        Some(&profile.provider_id.0),
+        serde_json::json!({}),
         now,
     )
     .await?;
-
-    match get_identity_user_id(db, &account_namespace, profile).await? {
-        Some(user_id) if user_id == link_user_id.0 => Ok(Ok(())),
-        Some(_) => Ok(Err(IdentityLinkError::conflict(
-            "identity is already linked to another user",
-        ))),
-        None => Ok(Err(IdentityLinkError::invalid_request(
-            "identity could not be linked",
-        ))),
-    }
+    let scope_guard = format!("scope_{}", event.0.event_id);
+    let session_guard = format!("session_{}", event.0.event_id);
+    let session_check = db.prepare(IDENTITY_LINK_SESSION_GUARD_SQL).bind_refs(&[
+        worker::d1::D1Type::Text(&session_guard),
+        worker::d1::D1Type::Text(link_session_id),
+        worker::d1::D1Type::Text(&link_user_id.0),
+        worker::d1::D1Type::Text(expected_client_id),
+        worker::d1::D1Type::Integer(now),
+    ])?;
+    let changes = vec![
+        identity_client_scope_guard_statement(db, &client, &scope_guard)?,
+        session_check,
+        update_user_from_profile_statement(db, &link_user_id.0, profile, now)?,
+        upsert_account_identity_statement(
+            db,
+            account_namespace,
+            &link_user_id.0,
+            profile,
+            raw_profile_json,
+            now,
+        )?,
+        identity_owner_guard_statement(
+            db,
+            account_namespace,
+            profile,
+            &link_user_id.0,
+            if is_new { IDENTITY_LIST_LIMIT } else { 0 },
+            &event.0.event_id,
+        )?,
+        identity_cleanup_guard_statement(db, &scope_guard)?,
+        identity_cleanup_guard_statement(db, &session_guard)?,
+        identity_cleanup_guard_statement(db, &event.0.event_id)?,
+    ];
+    audit_capture::commit(db, changes, &[event]).await?;
+    Ok(Ok(()))
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -10490,38 +11066,85 @@ async fn count_identities_for_user(
     Ok(row.map(|row| row.count).unwrap_or(0))
 }
 
+const IDENTITY_DELETE_GUARD_SQL: &str = "INSERT INTO zeroth_audit_write_guards(id,valid)
+    SELECT ?1, CASE WHEN EXISTS (SELECT 1 FROM zeroth_users WHERE id=?2 AND disabled_at IS NULL)
+      AND EXISTS (SELECT 1 FROM (
+          SELECT user_id FROM zeroth_account_identities WHERE user_id=?2 AND provider_id=?3 AND provider_subject=?4
+          UNION ALL SELECT user_id FROM zeroth_identities WHERE user_id=?2 AND provider_id=?3 AND provider_subject=?4))
+      AND (SELECT COUNT(*) FROM (
+          SELECT provider_id,provider_subject FROM zeroth_account_identities WHERE user_id=?2
+          UNION SELECT provider_id,provider_subject FROM zeroth_identities WHERE user_id=?2)) > 1
+    THEN 1 ELSE 0 END";
+const DELETE_ACCOUNT_IDENTITY_SQL: &str = "DELETE FROM zeroth_account_identities WHERE user_id=?1 AND provider_id=?2 AND provider_subject=?3";
+const DELETE_LEGACY_IDENTITY_SQL: &str =
+    "DELETE FROM zeroth_identities WHERE user_id=?1 AND provider_id=?2 AND provider_subject=?3";
+const DISABLE_OWN_PASSKEY_SQL: &str = "UPDATE zeroth_passkey_credentials
+    SET disabled_at=COALESCE(disabled_at,?1),updated_at=?1 WHERE credential_id=?2 AND user_id=?3";
+const IDENTITY_ACTIVE_USER_GUARD_SQL: &str = "INSERT INTO zeroth_audit_write_guards(id,valid)
+    SELECT ?1, CASE WHEN EXISTS (SELECT 1 FROM zeroth_users WHERE id=?2 AND disabled_at IS NULL) THEN 1 ELSE 0 END";
+const IDENTITY_ACCOUNT_AUTH_GUARD_SQL: &str = "INSERT INTO zeroth_audit_write_guards(id,valid)
+    SELECT ?1,CASE WHEN EXISTS (SELECT 1 FROM zeroth_users WHERE id=?2 AND disabled_at IS NULL)
+      AND (?3 IS NULL OR EXISTS (SELECT 1 FROM zeroth_sessions WHERE id=?3 AND user_id=?2
+          AND client_id IS ?4 AND revoked_at IS NULL AND expires_at>?5))
+      AND (?4 IS NULL OR EXISTS (SELECT 1 FROM zeroth_clients c WHERE c.id=?4 AND c.disabled_at IS NULL
+          AND (NOT EXISTS (SELECT 1 FROM zeroth_tenant_clients tc WHERE tc.client_id=c.id)
+            OR EXISTS (SELECT 1 FROM zeroth_tenant_clients tc JOIN zeroth_tenants t ON t.id=tc.tenant_id
+                JOIN zeroth_account_identities ai ON ai.account_namespace='tenant:'||t.id
+                WHERE tc.client_id=c.id AND t.disabled=0 AND ai.user_id=?2
+                  AND ai.provider_id=t.enterprise_provider AND c.account_sharing_mode='tenant'
+                  AND c.account_tenant_id=t.id AND c.enterprise_provider=t.enterprise_provider))))
+    THEN 1 ELSE 0 END";
+const IDENTITY_CLEANUP_GUARD_SQL: &str = "DELETE FROM zeroth_audit_write_guards WHERE id=?1";
+
 #[cfg(target_arch = "wasm32")]
-async fn delete_user_identity(
+fn identity_account_auth_guard_statement(
+    db: &worker::d1::D1Database,
+    current: &CurrentAccount,
+    guard_id: &str,
+    now: i32,
+) -> worker::Result<worker::d1::D1PreparedStatement> {
+    db.prepare(IDENTITY_ACCOUNT_AUTH_GUARD_SQL).bind_refs(&[
+        worker::d1::D1Type::Text(guard_id),
+        worker::d1::D1Type::Text(&current.user.id),
+        d1_optional_text(current.session_id.as_deref()),
+        d1_optional_text(current.client_id.as_deref()),
+        worker::d1::D1Type::Integer(now),
+    ])
+}
+
+#[cfg(target_arch = "wasm32")]
+fn identity_cleanup_guard_statement(
+    db: &worker::d1::D1Database,
+    guard_id: &str,
+) -> worker::Result<worker::d1::D1PreparedStatement> {
+    db.prepare(IDENTITY_CLEANUP_GUARD_SQL)
+        .bind_refs(&[worker::d1::D1Type::Text(guard_id)])
+}
+
+#[cfg(target_arch = "wasm32")]
+fn delete_user_identity_statements(
     db: &worker::d1::D1Database,
     user_id: &str,
     provider_id: &str,
     provider_subject: &str,
-) -> worker::Result<bool> {
-    if count_identities_for_user(db, user_id).await? <= 1 {
-        return Ok(false);
-    }
+    guard_id: &str,
+) -> worker::Result<Vec<worker::d1::D1PreparedStatement>> {
+    let guard = db.prepare(IDENTITY_DELETE_GUARD_SQL).bind_refs(&[
+        worker::d1::D1Type::Text(guard_id),
+        worker::d1::D1Type::Text(user_id),
+        worker::d1::D1Type::Text(provider_id),
+        worker::d1::D1Type::Text(provider_subject),
+    ])?;
     let args = [
         worker::d1::D1Type::Text(user_id),
         worker::d1::D1Type::Text(provider_id),
         worker::d1::D1Type::Text(provider_subject),
     ];
-    let account_result = db
-        .prepare(
-            "DELETE FROM zeroth_account_identities
-             WHERE user_id = ? AND provider_id = ? AND provider_subject = ?",
-        )
-        .bind_refs(&args)?
-        .run()
-        .await?;
-    let legacy_result = db
-        .prepare(
-            "DELETE FROM zeroth_identities
-             WHERE user_id = ? AND provider_id = ? AND provider_subject = ?",
-        )
-        .bind_refs(&args)?
-        .run()
-        .await?;
-    Ok(d1_result_changed_any(account_result)? || d1_result_changed_any(legacy_result)?)
+    Ok(vec![
+        guard,
+        db.prepare(DELETE_ACCOUNT_IDENTITY_SQL).bind_refs(&args)?,
+        db.prepare(DELETE_LEGACY_IDENTITY_SQL).bind_refs(&args)?,
+    ])
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -11368,26 +11991,18 @@ async fn update_passkey_credential_use(
 }
 
 #[cfg(target_arch = "wasm32")]
-async fn disable_passkey_credential(
+fn disable_passkey_credential_statement(
     db: &worker::d1::D1Database,
+    user_id: &str,
     credential_id: &str,
     disabled_at: i32,
-) -> worker::Result<()> {
+) -> worker::Result<worker::d1::D1PreparedStatement> {
     let args = [
         worker::d1::D1Type::Integer(disabled_at),
-        worker::d1::D1Type::Integer(disabled_at),
         worker::d1::D1Type::Text(credential_id),
+        worker::d1::D1Type::Text(user_id),
     ];
-    db.prepare(
-        "UPDATE zeroth_passkey_credentials
-         SET disabled_at = COALESCE(disabled_at, ?),
-             updated_at = ?
-         WHERE credential_id = ?",
-    )
-    .bind_refs(&args)?
-    .run()
-    .await?;
-    Ok(())
+    db.prepare(DISABLE_OWN_PASSKEY_SQL).bind_refs(&args)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -11521,8 +12136,20 @@ async fn list_admin_user_rows(
     db: &worker::d1::D1Database,
     now: i32,
 ) -> worker::Result<Vec<AdminUserRow>> {
+    list_admin_user_rows_for_tenant(db, now, None).await
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn list_admin_user_rows_for_tenant(
+    db: &worker::d1::D1Database,
+    now: i32,
+    tenant_id: Option<&str>,
+) -> worker::Result<Vec<AdminUserRow>> {
+    let namespace = tenant_id.map(|id| format!("tenant:{id}"));
     let args = [
         worker::d1::D1Type::Integer(now),
+        d1_optional_text(namespace.as_deref()),
+        d1_optional_text(namespace.as_deref()),
         worker::d1::D1Type::Integer(USER_LIST_LIMIT),
     ];
     db.prepare(
@@ -11573,6 +12200,10 @@ async fn list_admin_user_rows(
                     LIMIT 1
                 ) AS admin_membership_active
            FROM zeroth_users u
+          WHERE (? IS NULL OR EXISTS (
+              SELECT 1 FROM zeroth_account_identities ai
+              WHERE ai.user_id = u.id AND ai.account_namespace = ?
+          ))
           ORDER BY u.updated_at DESC, u.id
           LIMIT ?",
     )
@@ -11602,12 +12233,12 @@ async fn user_has_active_admin_membership(
 }
 
 #[cfg(target_arch = "wasm32")]
-async fn upsert_admin_membership(
+fn upsert_admin_membership_statement(
     db: &worker::d1::D1Database,
     user_id: &str,
     granted_by: &str,
     now: i32,
-) -> worker::Result<()> {
+) -> worker::Result<worker::d1::D1PreparedStatement> {
     let args = [
         worker::d1::D1Type::Text(user_id),
         worker::d1::D1Type::Text("admin"),
@@ -11625,18 +12256,15 @@ async fn upsert_admin_membership(
              updated_at = excluded.updated_at,
              disabled_at = NULL",
     )
-    .bind_refs(&args)?
-    .run()
-    .await?;
-    Ok(())
+    .bind_refs(&args)
 }
 
 #[cfg(target_arch = "wasm32")]
-async fn disable_admin_membership(
+fn disable_admin_membership_statement(
     db: &worker::d1::D1Database,
     user_id: &str,
     now: i32,
-) -> worker::Result<()> {
+) -> worker::Result<worker::d1::D1PreparedStatement> {
     let args = [
         worker::d1::D1Type::Integer(now),
         worker::d1::D1Type::Integer(now),
@@ -11648,10 +12276,7 @@ async fn disable_admin_membership(
              updated_at = ?
          WHERE user_id = ?",
     )
-    .bind_refs(&args)?
-    .run()
-    .await?;
-    Ok(())
+    .bind_refs(&args)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -11674,12 +12299,12 @@ async fn admin_user_detail_response(
 }
 
 #[cfg(target_arch = "wasm32")]
-async fn set_admin_user_disabled(
+fn set_admin_user_disabled_statement(
     db: &worker::d1::D1Database,
     user_id: &str,
     disabled: bool,
     now: i32,
-) -> worker::Result<()> {
+) -> worker::Result<worker::d1::D1PreparedStatement> {
     let disabled_at = if disabled {
         worker::d1::D1Type::Integer(now)
     } else {
@@ -11695,18 +12320,15 @@ async fn set_admin_user_disabled(
             SET disabled_at = ?, updated_at = ?
           WHERE id = ?",
     )
-    .bind_refs(&args)?
-    .run()
-    .await?;
-    Ok(())
+    .bind_refs(&args)
 }
 
 #[cfg(target_arch = "wasm32")]
-async fn revoke_active_sessions_for_user(
+fn revoke_active_sessions_for_user_statement(
     db: &worker::d1::D1Database,
     user_id: &str,
     revoked_at: i32,
-) -> worker::Result<()> {
+) -> worker::Result<worker::d1::D1PreparedStatement> {
     let args = [
         worker::d1::D1Type::Integer(revoked_at),
         worker::d1::D1Type::Text(user_id),
@@ -11717,27 +12339,20 @@ async fn revoke_active_sessions_for_user(
           WHERE user_id = ?
             AND revoked_at IS NULL",
     )
-    .bind_refs(&args)?
-    .run()
-    .await?;
-    Ok(())
+    .bind_refs(&args)
 }
 
 #[cfg(target_arch = "wasm32")]
-async fn revoke_active_refresh_tokens_for_user(
+fn revoke_active_refresh_tokens_for_user_statement(
     db: &worker::d1::D1Database,
     user_id: &str,
     revoked_at: i32,
-) -> worker::Result<()> {
+) -> worker::Result<worker::d1::D1PreparedStatement> {
     let args = [
         worker::d1::D1Type::Integer(revoked_at),
         worker::d1::D1Type::Text(user_id),
     ];
-    db.prepare(REVOKE_USER_REFRESH_TOKENS_SQL)
-        .bind_refs(&args)?
-        .run()
-        .await?;
-    Ok(())
+    db.prepare(REVOKE_USER_REFRESH_TOKENS_SQL).bind_refs(&args)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -11745,44 +12360,218 @@ async fn list_audit_event_rows(
     db: &worker::d1::D1Database,
     filter: &AuditEventFilter,
 ) -> worker::Result<Vec<AuditEventRow>> {
-    let mut conditions = Vec::new();
-    let mut args = Vec::new();
-    if let Some(event_type) = &filter.event_type {
-        conditions.push("event_type = ?");
-        args.push(worker::d1::D1Type::Text(event_type));
-    }
-    if let Some(user_id) = &filter.user_id {
-        conditions.push("user_id = ?");
-        args.push(worker::d1::D1Type::Text(user_id));
-    }
-    if let Some(client_id) = &filter.client_id {
-        conditions.push("client_id = ?");
-        args.push(worker::d1::D1Type::Text(client_id));
-    }
-    if let Some(provider_id) = &filter.provider_id {
-        conditions.push("provider_id = ?");
-        args.push(worker::d1::D1Type::Text(provider_id));
-    }
-    args.push(worker::d1::D1Type::Integer(AUDIT_EVENT_LIST_LIMIT));
+    let mut rows = fetch_audit_event_page_rows(db, filter).await?;
+    rows.truncate(audit_page_limit(filter));
+    Ok(rows)
+}
 
+#[cfg(target_arch = "wasm32")]
+async fn fetch_audit_event_page_rows(
+    db: &worker::d1::D1Database,
+    filter: &AuditEventFilter,
+) -> worker::Result<Vec<AuditEventRow>> {
+    let query = audit_event_query(filter).map_err(|error| worker_error(error.description))?;
+    // Bind integer bounds as text and CAST in SQL: workers-rs D1Type::Integer
+    // is i32, whereas the audit contract uses i64 timestamps.
+    let args = query
+        .parameters
+        .iter()
+        .map(|value| worker::d1::D1Type::Text(value))
+        .collect::<Vec<_>>();
+    db.prepare(query.sql)
+        .bind_refs(&args)?
+        .all()
+        .await?
+        .results::<AuditEventRow>()
+}
+
+struct AuditEventQuery {
+    sql: String,
+    parameters: Vec<String>,
+}
+
+fn audit_page_limit(filter: &AuditEventFilter) -> usize {
+    usize::from(filter.limit.unwrap_or(AUDIT_EVENT_LIST_LIMIT as u16))
+}
+
+fn audit_filter_fingerprint(filter: &AuditEventFilter) -> String {
+    let serialized = serde_json::to_string(&(
+        &filter.event_type,
+        &filter.user_id,
+        &filter.client_id,
+        &filter.provider_id,
+        &filter.organization_id,
+        &filter.actor_type,
+        &filter.actor_id,
+        &filter.target_type,
+        &filter.target_id,
+        &filter.outcome,
+        filter.from,
+        filter.until,
+    ))
+    .expect("audit filter consists of serializable strings and integers");
+    hash_secret(&serialized)
+}
+
+fn audit_event_query(filter: &AuditEventFilter) -> Result<AuditEventQuery, ClientManagementError> {
+    let limit = audit_page_limit(filter);
+    if limit == 0 || limit > AUDIT_EVENT_LIST_LIMIT as usize {
+        return Err(ClientManagementError::invalid_request(
+            "audit limit must be between 1 and 100",
+        ));
+    }
+    let mut conditions = Vec::new();
+    let mut parameters = Vec::new();
+    for (column, value) in [
+        ("event_type", &filter.event_type),
+        ("user_id", &filter.user_id),
+        ("client_id", &filter.client_id),
+        ("provider_id", &filter.provider_id),
+        ("organization_id", &filter.organization_id),
+        ("actor_type", &filter.actor_type),
+        ("actor_id", &filter.actor_id),
+        ("target_type", &filter.target_type),
+        ("target_id", &filter.target_id),
+        ("outcome", &filter.outcome),
+    ] {
+        if let Some(value) = value {
+            conditions.push(format!("{column} = ?"));
+            parameters.push(value.clone());
+        }
+    }
+    if let Some(from) = filter.from {
+        conditions.push("COALESCE(recorded_at, created_at) >= CAST(? AS INTEGER)".to_owned());
+        parameters.push(from.to_string());
+    }
+    if let Some(until) = filter.until {
+        conditions.push("COALESCE(recorded_at, created_at) < CAST(? AS INTEGER)".to_owned());
+        parameters.push(until.to_string());
+    }
+    if let Some(cursor) = filter.cursor.as_ref() {
+        validate_audit_cursor(cursor, filter)?;
+        conditions.push("(COALESCE(recorded_at, created_at) < CAST(? AS INTEGER) OR (COALESCE(recorded_at, created_at) = CAST(? AS INTEGER) AND id < ?))".to_owned());
+        parameters.extend([
+            cursor.recorded_at.to_string(),
+            cursor.recorded_at.to_string(),
+            cursor.id.clone(),
+        ]);
+    }
     let where_clause = if conditions.is_empty() {
         String::new()
     } else {
         format!(" WHERE {}", conditions.join(" AND "))
     };
-    let sql = format!(
-        "SELECT id, event_type, user_id, client_id, provider_id, created_at,
-                ip_hash, user_agent, details_json
-           FROM zeroth_audit_events
-          {where_clause}
-          ORDER BY created_at DESC, id DESC
-          LIMIT ?"
-    );
-    db.prepare(sql)
-        .bind_refs(&args)?
-        .all()
-        .await?
-        .results::<AuditEventRow>()
+    parameters.push((limit + 1).to_string());
+    Ok(AuditEventQuery {
+        sql: format!("SELECT id, event_type, user_id, client_id, provider_id, created_at, ip_hash, user_agent, details_json, schema_version, organization_id, actor_type, actor_id, target_type, target_id, outcome, reason_code, request_id, COALESCE(recorded_at, created_at) AS recorded_at, event_json FROM zeroth_audit_events{where_clause} ORDER BY COALESCE(recorded_at, created_at) DESC, id DESC LIMIT CAST(? AS INTEGER)"),
+        parameters,
+    })
+}
+
+fn validate_audit_cursor(
+    cursor: &AuditCursor,
+    filter: &AuditEventFilter,
+) -> Result<(), ClientManagementError> {
+    if cursor.version != 1
+        || cursor.recorded_at < 0
+        || validate_audit_query_token(&cursor.id, "cursor event id").is_err()
+        || cursor.filters != audit_filter_fingerprint(filter)
+    {
+        return Err(ClientManagementError::invalid_request(
+            "invalid audit cursor or cursor filters changed",
+        ));
+    }
+    Ok(())
+}
+
+fn audit_event_page(
+    mut rows: Vec<AuditEventRow>,
+    filter: &AuditEventFilter,
+) -> Result<AuditEventsResponse, ClientManagementError> {
+    let limit = audit_page_limit(filter);
+    let has_more = rows.len() > limit;
+    rows.truncate(limit);
+    let next_cursor = if has_more {
+        rows.last()
+            .map(|row| {
+                let cursor = AuditCursor {
+                    version: 1,
+                    recorded_at: row.recorded_at.unwrap_or(i64::from(row.created_at)),
+                    id: row.id.clone(),
+                    filters: audit_filter_fingerprint(filter),
+                };
+                serde_json::to_vec(&cursor)
+                    .map(|value| URL_SAFE_NO_PAD.encode(value))
+                    .map_err(|_| {
+                        ClientManagementError::invalid_request("could not encode audit cursor")
+                    })
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    Ok(AuditEventsResponse {
+        events: rows
+            .into_iter()
+            .map(audit_event_response_from_row)
+            .collect(),
+        next_cursor,
+        has_more,
+    })
+}
+
+fn audit_csv_cell(value: &str) -> String {
+    let probe = value.trim_start_matches(|ch: char| ch.is_whitespace() || ch == '\u{feff}');
+    let dangerous = probe.starts_with(['=', '+', '-', '@'])
+        || value.chars().next().is_some_and(char::is_control);
+    let text = if dangerous {
+        format!("'{value}")
+    } else {
+        value.to_owned()
+    };
+    format!("\"{}\"", text.replace('"', "\"\""))
+}
+
+fn audit_events_csv(events: &[AuditEventResponse]) -> String {
+    let mut output = "id,recorded_at,event_type,schema_version,organization_id,actor_type,actor_id,target_type,target_id,outcome,reason_code,request_id,user_id,client_id,provider_id,details,event\r\n".to_owned();
+    for event in events {
+        let recorded_at = event.recorded_at.to_string();
+        let schema_version = event.schema_version.to_string();
+        let details = event.details.to_string();
+        let canonical = event
+            .event
+            .as_ref()
+            .map(serde_json::Value::to_string)
+            .unwrap_or_default();
+        let fields = [
+            event.id.as_str(),
+            &recorded_at,
+            &event.event_type,
+            &schema_version,
+            event.organization_id.as_deref().unwrap_or_default(),
+            event.actor_type.as_deref().unwrap_or_default(),
+            event.actor_id.as_deref().unwrap_or_default(),
+            event.target_type.as_deref().unwrap_or_default(),
+            event.target_id.as_deref().unwrap_or_default(),
+            &event.outcome,
+            event.reason_code.as_deref().unwrap_or_default(),
+            event.request_id.as_deref().unwrap_or_default(),
+            event.user_id.as_deref().unwrap_or_default(),
+            event.client_id.as_deref().unwrap_or_default(),
+            event.provider_id.as_deref().unwrap_or_default(),
+            &details,
+            &canonical,
+        ];
+        output.push_str(
+            &fields
+                .iter()
+                .map(|field| audit_csv_cell(field))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        output.push_str("\r\n");
+    }
+    output
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -12077,45 +12866,53 @@ fn matching_magic_link_email_error_class(error: &str) -> &'static str {
 }
 
 #[cfg(target_arch = "wasm32")]
-async fn put_audit_event(
+async fn prepare_audit_event(
     db: &worker::d1::D1Database,
-    context: &AuditRequestContext,
+    request: Option<&Request>,
+    actor: Option<zeroth_audit::AuditActor>,
     event_type: &str,
     user_id: Option<&str>,
     client_id: Option<&str>,
     provider_id: Option<&str>,
     details: serde_json::Value,
     now: i32,
-) -> worker::Result<()> {
-    let id = format!("evt_{}", random_token()?);
-    let details_json = audit_details_json(details).map_err(worker_error)?;
-    let user_id = d1_optional_text(user_id);
-    let client_id = d1_optional_text(client_id);
-    let provider_id = d1_optional_text(provider_id);
-    let ip_hash = d1_optional_text(context.ip_hash.as_deref());
-    let user_agent = d1_optional_text(context.user_agent.as_deref());
-    let args = [
-        worker::d1::D1Type::Text(&id),
-        worker::d1::D1Type::Text(event_type),
+) -> worker::Result<(zeroth_audit::AuditEvent, Option<String>)> {
+    let actor = match actor {
+        Some(actor) => actor,
+        None => audit_capture::actor_for_event(event_type, user_id).map_err(worker_error)?,
+    };
+    let mut event = audit_capture::event(
+        format!("evt_{}", random_token()?),
+        event_type,
+        actor,
         user_id,
         client_id,
         provider_id,
-        worker::d1::D1Type::Integer(now),
-        ip_hash,
-        user_agent,
-        worker::d1::D1Type::Text(&details_json),
-    ];
-
-    db.prepare(
-        "INSERT INTO zeroth_audit_events (
-             id, event_type, user_id, client_id, provider_id, created_at,
-             ip_hash, user_agent, details_json
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        &details,
+        now,
     )
-    .bind_refs(&args)?
-    .run()
-    .await?;
-    Ok(())
+    .map_err(worker_error)?;
+    if let Some(request) = request {
+        event.correlation_id = request_header(request, "X-Zeroth-Request-ID")?;
+    }
+    // Organization ownership is captured here, never inferred when reading
+    // historical events. Unbound clients remain platform-only.
+    if matches!(
+        event_type,
+        "user.disable" | "user.enable" | "account.delete"
+    ) {
+        // These affect the whole user. The capture transaction projects the
+        // event into each explicitly owned tenant before destructive changes.
+        event.client_id = None;
+        event.organization_id = None;
+    } else {
+        event.organization_id = tenants::organization_for_client(db, client_id).await?;
+    }
+    if let Some(policy) = details.get("policyHash").and_then(|v| v.as_str()) {
+        event.policy_reference = Some(policy.to_owned());
+    }
+    event.validate().map_err(|e| worker_error(e.to_string()))?;
+    Ok((event, user_id.map(str::to_owned)))
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -12128,11 +12925,11 @@ async fn record_audit_event(
     provider_id: Option<&str>,
     details: serde_json::Value,
     now: i32,
-) {
-    let context = audit_request_context(request).unwrap_or_default();
-    let _ = put_audit_event(
+) -> worker::Result<()> {
+    let event = prepare_audit_event(
         db,
-        &context,
+        Some(request),
+        None,
         event_type,
         user_id,
         client_id,
@@ -12140,41 +12937,126 @@ async fn record_audit_event(
         details,
         now,
     )
-    .await;
+    .await?;
+    audit_capture::commit(db, Vec::new(), &[event]).await
+}
+
+const IDENTITY_OWNER_GUARD_SQL: &str = "INSERT INTO zeroth_audit_write_guards(id,valid)
+    SELECT ?1,CASE WHEN EXISTS (SELECT 1 FROM zeroth_account_identities
+        WHERE account_namespace=?2 AND provider_id=?3 AND provider_subject=?4 AND user_id=?5)
+      AND EXISTS (SELECT 1 FROM zeroth_users WHERE id=?5 AND disabled_at IS NULL)
+      AND (?6=0 OR (SELECT COUNT(*) FROM (
+          SELECT provider_id,provider_subject FROM zeroth_account_identities WHERE user_id=?5
+          UNION SELECT provider_id,provider_subject FROM zeroth_identities WHERE user_id=?5))<=?6)
+    THEN 1 ELSE 0 END";
+const IDENTITY_CLIENT_SCOPE_GUARD_SQL: &str = "INSERT INTO zeroth_audit_write_guards(id,valid)
+    SELECT ?1,CASE WHEN EXISTS (SELECT 1 FROM zeroth_clients
+        WHERE id=?2 AND disabled_at IS NULL AND account_sharing_mode=?3
+          AND account_tenant_id=?4 AND enterprise_provider IS ?5)
+      AND NOT EXISTS (SELECT 1 FROM zeroth_tenant_clients tc LEFT JOIN zeroth_tenants t ON t.id=tc.tenant_id
+          WHERE tc.client_id=?2 AND (t.id IS NULL OR t.disabled<>0))
+    THEN 1 ELSE 0 END";
+const IDENTITY_LINK_SESSION_GUARD_SQL: &str = "INSERT INTO zeroth_audit_write_guards(id,valid)
+    SELECT ?1,CASE WHEN EXISTS (SELECT 1 FROM zeroth_sessions
+        WHERE id=?2 AND user_id=?3 AND client_id=?4 AND revoked_at IS NULL AND expires_at>?5)
+    THEN 1 ELSE 0 END";
+
+#[cfg(target_arch = "wasm32")]
+fn identity_client_scope_guard_statement(
+    db: &worker::d1::D1Database,
+    client: &RegisteredClient,
+    guard_id: &str,
+) -> worker::Result<worker::d1::D1PreparedStatement> {
+    db.prepare(IDENTITY_CLIENT_SCOPE_GUARD_SQL).bind_refs(&[
+        worker::d1::D1Type::Text(guard_id),
+        worker::d1::D1Type::Text(&client.client.id.0),
+        worker::d1::D1Type::Text(account_sharing_mode_label(
+            client.account_scope.sharing_mode,
+        )),
+        worker::d1::D1Type::Text(&client.account_scope.tenant_id),
+        d1_optional_text(client.client.enterprise_provider.as_deref()),
+    ])
+}
+
+#[cfg(target_arch = "wasm32")]
+fn identity_owner_guard_statement(
+    db: &worker::d1::D1Database,
+    namespace: &str,
+    profile: &ProviderProfile,
+    user_id: &str,
+    limit: i32,
+    guard_id: &str,
+) -> worker::Result<worker::d1::D1PreparedStatement> {
+    db.prepare(IDENTITY_OWNER_GUARD_SQL).bind_refs(&[
+        worker::d1::D1Type::Text(guard_id),
+        worker::d1::D1Type::Text(namespace),
+        worker::d1::D1Type::Text(&profile.provider_id.0),
+        worker::d1::D1Type::Text(&profile.subject.0),
+        worker::d1::D1Type::Text(user_id),
+        worker::d1::D1Type::Integer(limit),
+    ])
 }
 
 #[cfg(target_arch = "wasm32")]
 async fn upsert_provider_profile(
     db: &worker::d1::D1Database,
-    account_namespace: &str,
+    client: &RegisteredClient,
     profile: &ProviderProfile,
     raw_profile_json: Option<&str>,
+    request: Option<&Request>,
     now: i32,
 ) -> worker::Result<String> {
-    let user_id = match get_identity_user_id(db, account_namespace, profile).await? {
-        Some(user_id) => {
-            update_user_from_profile(db, &user_id, profile, now).await?;
-            user_id
-        }
-        None => {
-            let user_id = format!("usr_{}", random_token()?);
-            insert_user_from_profile(db, &user_id, profile, now).await?;
-            user_id
-        }
+    let account_namespace = &client.account_scope.namespace;
+    let existing = get_identity_user_id(db, account_namespace, profile).await?;
+    let is_new = existing.is_none();
+    let user_id = match existing {
+        Some(user_id) => user_id,
+        None => format!("usr_{}", random_token()?),
     };
-
-    upsert_account_identity_from_profile(
+    let event = prepare_audit_event(
         db,
-        account_namespace,
-        &user_id,
-        profile,
-        raw_profile_json,
+        request,
+        Some(audit_capture::actor_from_user(Some(&user_id)).map_err(worker_error)?),
+        if is_new {
+            "user.create"
+        } else {
+            "identity.profile.update"
+        },
+        Some(&user_id),
+        Some(&client.client.id.0),
+        Some(&profile.provider_id.0),
+        serde_json::json!({"source":"verified_provider","changedFields":["provider_profile"]}),
         now,
     )
     .await?;
-    let identity_user_id = get_identity_user_id(db, account_namespace, profile).await?;
-    validate_provider_identity_attached_to_user(identity_user_id.as_deref(), &user_id)
-        .map_err(worker_error)?;
+    let scope_guard = format!("scope_{}", event.0.event_id);
+    let changes = vec![
+        identity_client_scope_guard_statement(db, client, &scope_guard)?,
+        if is_new {
+            insert_user_from_profile_statement(db, &user_id, profile, now)?
+        } else {
+            update_user_from_profile_statement(db, &user_id, profile, now)?
+        },
+        upsert_account_identity_statement(
+            db,
+            account_namespace,
+            &user_id,
+            profile,
+            raw_profile_json,
+            now,
+        )?,
+        identity_owner_guard_statement(
+            db,
+            account_namespace,
+            profile,
+            &user_id,
+            0,
+            &event.0.event_id,
+        )?,
+        identity_cleanup_guard_statement(db, &scope_guard)?,
+        identity_cleanup_guard_statement(db, &event.0.event_id)?,
+    ];
+    audit_capture::commit(db, changes, &[event]).await?;
     Ok(user_id)
 }
 
@@ -12190,13 +13072,43 @@ fn validate_provider_identity_attached_to_user(
     }
 }
 
+const INSERT_PROVIDER_USER_SQL: &str = "INSERT INTO zeroth_users (
+    id,primary_email,display_name,picture_url,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?5)";
+const UPDATE_PROVIDER_USER_SQL: &str = "UPDATE zeroth_users
+    SET primary_email=COALESCE(?1,primary_email),display_name=COALESCE(display_name,?2),
+        picture_url=COALESCE(picture_url,?3),updated_at=?4 WHERE id=?5 AND disabled_at IS NULL";
+const UPDATE_PROFILE_PATCH_SQL: &str = "UPDATE zeroth_users
+    SET display_name=CASE WHEN ?1 THEN ?2 ELSE display_name END,
+        picture_url=CASE WHEN ?3 THEN ?4 ELSE picture_url END,updated_at=?5
+    WHERE id=?6 AND disabled_at IS NULL";
+const UPSERT_ACCOUNT_PROVIDER_IDENTITY_SQL: &str = "INSERT INTO zeroth_account_identities (
+    account_namespace,provider_id,provider_subject,user_id,email,email_verified,
+    display_name,picture_url,raw_profile_json,created_at,updated_at)
+    VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?10)
+    ON CONFLICT(account_namespace,provider_id,provider_subject) DO UPDATE SET
+        email=excluded.email,email_verified=excluded.email_verified,
+        display_name=excluded.display_name,picture_url=excluded.picture_url,
+        raw_profile_json=excluded.raw_profile_json,updated_at=excluded.updated_at
+    WHERE zeroth_account_identities.user_id=excluded.user_id";
+
+fn profile_patch_changed_fields(patch: &ProfilePatch) -> Vec<&'static str> {
+    let mut fields = Vec::new();
+    if patch.display_name.is_some() {
+        fields.push("display_name");
+    }
+    if patch.picture_url.is_some() {
+        fields.push("picture_url");
+    }
+    fields
+}
+
 #[cfg(target_arch = "wasm32")]
-async fn insert_user_from_profile(
+fn insert_user_from_profile_statement(
     db: &worker::d1::D1Database,
     user_id: &str,
     profile: &ProviderProfile,
     now: i32,
-) -> worker::Result<()> {
+) -> worker::Result<worker::d1::D1PreparedStatement> {
     let primary_email = d1_optional_text(profile.email.as_deref());
     let display_name = d1_optional_text(profile.display_name.as_deref());
     let picture_url = d1_optional_text(profile.picture_url.as_deref());
@@ -12206,27 +13118,17 @@ async fn insert_user_from_profile(
         display_name,
         picture_url,
         worker::d1::D1Type::Integer(now),
-        worker::d1::D1Type::Integer(now),
     ];
-
-    db.prepare(
-        "INSERT INTO zeroth_users (
-             id, primary_email, display_name, picture_url, created_at, updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?)",
-    )
-    .bind_refs(&args)?
-    .run()
-    .await?;
-    Ok(())
+    db.prepare(INSERT_PROVIDER_USER_SQL).bind_refs(&args)
 }
 
 #[cfg(target_arch = "wasm32")]
-async fn update_user_from_profile(
+fn update_user_from_profile_statement(
     db: &worker::d1::D1Database,
     user_id: &str,
     profile: &ProviderProfile,
     now: i32,
-) -> worker::Result<()> {
+) -> worker::Result<worker::d1::D1PreparedStatement> {
     let primary_email = d1_optional_text(profile.email.as_deref());
     let display_name = d1_optional_text(profile.display_name.as_deref());
     let picture_url = d1_optional_text(profile.picture_url.as_deref());
@@ -12238,27 +13140,16 @@ async fn update_user_from_profile(
         worker::d1::D1Type::Text(user_id),
     ];
 
-    db.prepare(
-        "UPDATE zeroth_users
-         SET primary_email = COALESCE(?, primary_email),
-             display_name = COALESCE(display_name, ?),
-             picture_url = COALESCE(picture_url, ?),
-             updated_at = ?
-         WHERE id = ?",
-    )
-    .bind_refs(&args)?
-    .run()
-    .await?;
-    Ok(())
+    db.prepare(UPDATE_PROVIDER_USER_SQL).bind_refs(&args)
 }
 
 #[cfg(target_arch = "wasm32")]
-async fn update_user_profile_patch(
+fn update_user_profile_patch_statement(
     db: &worker::d1::D1Database,
     user_id: &str,
     patch: &ProfilePatch,
     now: i32,
-) -> worker::Result<()> {
+) -> worker::Result<worker::d1::D1PreparedStatement> {
     let display_name_present = i32::from(patch.display_name.is_some());
     let picture_url_present = i32::from(patch.picture_url.is_some());
     let display_name = d1_optional_text(patch.display_name.as_ref().and_then(|value| {
@@ -12282,17 +13173,7 @@ async fn update_user_profile_patch(
         worker::d1::D1Type::Text(user_id),
     ];
 
-    db.prepare(
-        "UPDATE zeroth_users
-         SET display_name = CASE WHEN ? THEN ? ELSE display_name END,
-             picture_url = CASE WHEN ? THEN ? ELSE picture_url END,
-             updated_at = ?
-         WHERE id = ?",
-    )
-    .bind_refs(&args)?
-    .run()
-    .await?;
-    Ok(())
+    db.prepare(UPDATE_PROFILE_PATCH_SQL).bind_refs(&args)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -12304,6 +13185,28 @@ async fn upsert_account_identity_from_profile(
     raw_profile_json: Option<&str>,
     now: i32,
 ) -> worker::Result<()> {
+    upsert_account_identity_statement(
+        db,
+        account_namespace,
+        user_id,
+        profile,
+        raw_profile_json,
+        now,
+    )?
+    .run()
+    .await?;
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn upsert_account_identity_statement(
+    db: &worker::d1::D1Database,
+    account_namespace: &str,
+    user_id: &str,
+    profile: &ProviderProfile,
+    raw_profile_json: Option<&str>,
+    now: i32,
+) -> worker::Result<worker::d1::D1PreparedStatement> {
     let email = d1_optional_text(profile.email.as_deref());
     let display_name = d1_optional_text(profile.display_name.as_deref());
     let picture_url = d1_optional_text(profile.picture_url.as_deref());
@@ -12320,28 +13223,9 @@ async fn upsert_account_identity_from_profile(
         picture_url,
         raw_profile_json,
         worker::d1::D1Type::Integer(now),
-        worker::d1::D1Type::Integer(now),
     ];
-
-    db.prepare(
-        "INSERT INTO zeroth_account_identities (
-             account_namespace, provider_id, provider_subject, user_id, email,
-             email_verified, display_name, picture_url, raw_profile_json, created_at,
-             updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(account_namespace, provider_id, provider_subject) DO UPDATE SET
-             email = excluded.email,
-             email_verified = excluded.email_verified,
-             display_name = excluded.display_name,
-             picture_url = excluded.picture_url,
-             raw_profile_json = excluded.raw_profile_json,
-             updated_at = excluded.updated_at
-         WHERE zeroth_account_identities.user_id = excluded.user_id",
-    )
-    .bind_refs(&args)?
-    .run()
-    .await?;
-    Ok(())
+    db.prepare(UPSERT_ACCOUNT_PROVIDER_IDENTITY_SQL)
+        .bind_refs(&args)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -12500,11 +13384,35 @@ async fn put_authorization_code_values(
         d1_optional_text(auth_context.auth_policy_hash.as_deref()),
     ];
 
-    db.prepare(INSERT_AUTH_CODE_SQL)
-        .bind_refs(&args)?
-        .run()
-        .await?;
-    Ok(())
+    let event = prepare_audit_event(
+        db,
+        None,
+        None,
+        "authorization.code.create",
+        Some(user_id),
+        Some(client_id),
+        auth_context.auth_provider.as_deref(),
+        serde_json::json!({"policyHash": auth_context.auth_policy_hash}),
+        now,
+    )
+    .await?;
+    let guard_id = format!("scope_{}", event.0.event_id);
+    audit_capture::commit(
+        db,
+        vec![
+            audit_capture::client_user_scope_guard(
+                db,
+                user_id,
+                client_id,
+                &guard_id,
+                auth_context.auth_provider.as_deref(),
+            )?,
+            db.prepare(INSERT_AUTH_CODE_SQL).bind_refs(&args)?,
+            audit_capture::clear_guard(db, &guard_id)?,
+        ],
+        &[event],
+    )
+    .await
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -12527,91 +13435,74 @@ async fn get_authorization_code(
 }
 
 #[cfg(target_arch = "wasm32")]
-async fn consume_authorization_code(
-    db: &worker::d1::D1Database,
-    code_hash: &str,
-    consumed_at: i32,
-) -> worker::Result<bool> {
-    let args = [
-        worker::d1::D1Type::Integer(consumed_at),
-        worker::d1::D1Type::Text(code_hash),
-    ];
-    let result = db
-        .prepare(
-            "UPDATE zeroth_auth_codes
-         SET consumed_at = ?
-         WHERE code_hash = ? AND consumed_at IS NULL",
-        )
-        .bind_refs(&args)?
-        .run()
-        .await?;
-    d1_result_changed_one(result)
-}
-
-#[cfg(target_arch = "wasm32")]
-async fn put_refresh_token(
-    db: &worker::d1::D1Database,
-    refresh_token: &str,
-    code: &AuthCodeRow,
-    now: i32,
-) -> worker::Result<()> {
-    let token_hash = hash_secret(refresh_token);
-    put_refresh_token_row(db, &token_hash, &TokenIssue::from_auth_code(code), now).await
-}
-
-#[cfg(target_arch = "wasm32")]
-async fn put_rotated_refresh_token(
-    db: &worker::d1::D1Database,
-    refresh_token: &str,
-    row: &RefreshTokenRow,
-    now: i32,
-) -> worker::Result<bool> {
-    let token_hash = hash_secret(refresh_token);
-    let args = [
-        worker::d1::D1Type::Text(&token_hash),
-        worker::d1::D1Type::Integer(now),
-        worker::d1::D1Type::Integer(now + REFRESH_TOKEN_TTL_SECONDS),
-        worker::d1::D1Type::Text(&row.token_hash),
-        worker::d1::D1Type::Integer(now),
-        worker::d1::D1Type::Integer(now),
-    ];
-    // A concurrent replay, logout, or user disable may have revoked the parent
-    // after rotation won. Check it in the same statement that inserts the child
-    // so a replacement cannot appear after the family has been revoked.
-    let result = db
-        .prepare(INSERT_ROTATED_REFRESH_TOKEN_SQL)
-        .bind_refs(&args)?
-        .run()
-        .await?;
-    d1_result_changed_one(result)
-}
-
-#[cfg(target_arch = "wasm32")]
-async fn put_refresh_token_row(
+fn refresh_token_statement(
     db: &worker::d1::D1Database,
     token_hash: &str,
     issue: &TokenIssue,
     now: i32,
-) -> worker::Result<()> {
-    let session_id = d1_optional_text(issue.session_id.as_deref());
-    let auth_time = d1_optional_integer(issue.auth_time);
-    let args = [
-        worker::d1::D1Type::Text(token_hash),
-        worker::d1::D1Type::Text(&issue.client_id),
-        worker::d1::D1Type::Text(&issue.user_id),
-        session_id,
-        auth_time,
-        worker::d1::D1Type::Text(&issue.scope),
-        worker::d1::D1Type::Integer(now),
-        worker::d1::D1Type::Integer(now + REFRESH_TOKEN_TTL_SECONDS),
+) -> worker::Result<worker::d1::D1PreparedStatement> {
+    use worker::d1::D1Type as V;
+    db.prepare(INSERT_REFRESH_TOKEN_SQL).bind_refs(&[
+        V::Text(token_hash),
+        V::Text(&issue.client_id),
+        V::Text(&issue.user_id),
+        d1_optional_text(issue.session_id.as_deref()),
+        d1_optional_integer(issue.auth_time),
+        V::Text(&issue.scope),
+        V::Integer(now),
+        V::Integer(now + REFRESH_TOKEN_TTL_SECONDS),
         d1_optional_text(issue.auth_context.auth_provider.as_deref()),
         d1_optional_text(issue.auth_context.auth_policy_hash.as_deref()),
-    ];
-    db.prepare(INSERT_REFRESH_TOKEN_SQL)
-        .bind_refs(&args)?
-        .run()
-        .await?;
-    Ok(())
+    ])
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn commit_credential_transition(
+    db: &worker::d1::D1Database,
+    changes: Vec<worker::d1::D1PreparedStatement>,
+    event: &(zeroth_audit::AuditEvent, Option<String>),
+) -> worker::Result<()> {
+    let canonical = event
+        .0
+        .canonical_json()
+        .map_err(|e| worker_error(e.to_string()))?;
+    match audit_capture::commit(db, changes, std::slice::from_ref(event)).await {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            // A successful transaction may lose its network acknowledgement.
+            // Its exact immutable event proves all credential changes committed
+            // atomically. Return the prepared response instead of classifying
+            // our own successful refresh rotation as somebody else's replay.
+            #[derive(Deserialize)]
+            struct Stored {
+                event_json: Option<String>,
+            }
+            let stored = db
+                .prepare("SELECT event_json FROM zeroth_audit_events WHERE id=?")
+                .bind_refs(&[worker::d1::D1Type::Text(&event.0.event_id)])?
+                .first::<Stored>(None)
+                .await;
+            if matches!(stored, Ok(Some(row)) if row.event_json.as_deref() == Some(canonical.as_str()))
+            {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn prepare_token_issue_event(
+    db: &worker::d1::D1Database,
+    request: &Request,
+    issue: &TokenIssue,
+    grant_type: &str,
+    now: i32,
+) -> worker::Result<(zeroth_audit::AuditEvent, Option<String>)> {
+    prepare_audit_event(db, Some(request), Some(audit_capture::actor_from_user(Some(&issue.user_id)).map_err(worker_error)?),
+        "token.issue", Some(&issue.user_id), Some(&issue.client_id), issue.auth_context.auth_provider.as_deref(),
+        serde_json::json!({"grantType":grant_type,"httpStatus":200,"policyHash":issue.auth_context.auth_policy_hash}), now).await
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -12634,78 +13525,45 @@ async fn get_refresh_token(
 }
 
 #[cfg(target_arch = "wasm32")]
-async fn rotate_refresh_token(
-    db: &worker::d1::D1Database,
-    token_hash: &str,
-    rotated_at: i32,
-) -> worker::Result<bool> {
-    let args = [
-        worker::d1::D1Type::Integer(rotated_at),
-        worker::d1::D1Type::Text(token_hash),
-    ];
-    let result = db
-        .prepare(
-            "UPDATE zeroth_refresh_tokens
-         SET rotated_at = ?
-         WHERE token_hash = ? AND rotated_at IS NULL AND revoked_at IS NULL",
-        )
-        .bind_refs(&args)?
-        .run()
-        .await?;
-    d1_result_changed_one(result)
-}
-
-#[cfg(target_arch = "wasm32")]
-async fn revoke_refresh_token(
-    db: &worker::d1::D1Database,
-    token_hash: &str,
-    revoked_at: i32,
-) -> worker::Result<()> {
-    let args = [
-        worker::d1::D1Type::Integer(revoked_at),
-        worker::d1::D1Type::Text(token_hash),
-    ];
-    db.prepare(
-        "UPDATE zeroth_refresh_tokens
-         SET revoked_at = ?
-         WHERE token_hash = ? AND revoked_at IS NULL",
-    )
-    .bind_refs(&args)?
-    .run()
-    .await?;
-    Ok(())
-}
-
-#[cfg(target_arch = "wasm32")]
 async fn revoke_refresh_token_family(
     db: &worker::d1::D1Database,
     row: &RefreshTokenRow,
     revoked_at: i32,
+    event_type: &str,
+    reason: &str,
 ) -> worker::Result<()> {
-    if let Some(session_id) = row.session_id.as_deref() {
-        let args = [
-            worker::d1::D1Type::Integer(revoked_at),
-            worker::d1::D1Type::Text(&row.client_id),
-            worker::d1::D1Type::Text(&row.user_id),
-            worker::d1::D1Type::Text(session_id),
-        ];
+    let event = prepare_audit_event(
+        db,
+        None,
+        Some(
+            zeroth_audit::AuditActor::new("system", "zeroth")
+                .map_err(|e| worker_error(e.to_string()))?,
+        ),
+        event_type,
+        Some(&row.user_id),
+        Some(&row.client_id),
+        row.auth_context.auth_provider.as_deref(),
+        serde_json::json!({"errorCode":reason}),
+        revoked_at,
+    )
+    .await?;
+    let change = if let Some(session_id) = row.session_id.as_deref() {
         db.prepare(REVOKE_SESSION_REFRESH_TOKEN_FAMILY_SQL)
-            .bind_refs(&args)?
-            .run()
-            .await?;
-        return Ok(());
-    }
-
-    let args = [
-        worker::d1::D1Type::Integer(revoked_at),
-        worker::d1::D1Type::Text(&row.client_id),
-        worker::d1::D1Type::Text(&row.user_id),
-    ];
-    db.prepare(REVOKE_NATIVE_REFRESH_TOKEN_FAMILY_SQL)
-        .bind_refs(&args)?
-        .run()
-        .await?;
-    Ok(())
+            .bind_refs(&[
+                worker::d1::D1Type::Integer(revoked_at),
+                worker::d1::D1Type::Text(&row.client_id),
+                worker::d1::D1Type::Text(&row.user_id),
+                worker::d1::D1Type::Text(session_id),
+            ])?
+    } else {
+        db.prepare(REVOKE_NATIVE_REFRESH_TOKEN_FAMILY_SQL)
+            .bind_refs(&[
+                worker::d1::D1Type::Integer(revoked_at),
+                worker::d1::D1Type::Text(&row.client_id),
+                worker::d1::D1Type::Text(&row.user_id),
+            ])?
+    };
+    commit_credential_transition(db, vec![change], &event).await
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -12765,11 +13623,35 @@ async fn put_session_with_auth_context(
         d1_optional_text(auth_context.auth_provider.as_deref()),
         d1_optional_text(auth_context.auth_policy_hash.as_deref()),
     ];
-    db.prepare(INSERT_SESSION_SQL)
-        .bind_refs(&args)?
-        .run()
-        .await?;
-    Ok(())
+    let event = prepare_audit_event(
+        db,
+        None,
+        None,
+        "session.create",
+        Some(user_id),
+        Some(client_id),
+        auth_context.auth_provider.as_deref(),
+        serde_json::json!({"policyHash": auth_context.auth_policy_hash}),
+        unix_timestamp_seconds(),
+    )
+    .await?;
+    let guard_id = format!("scope_{}", event.0.event_id);
+    audit_capture::commit(
+        db,
+        vec![
+            audit_capture::client_user_scope_guard(
+                db,
+                user_id,
+                client_id,
+                &guard_id,
+                auth_context.auth_provider.as_deref(),
+            )?,
+            db.prepare(INSERT_SESSION_SQL).bind_refs(&args)?,
+            audit_capture::clear_guard(db, &guard_id)?,
+        ],
+        &[event],
+    )
+    .await
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -12814,70 +13696,60 @@ async fn list_active_sessions_for_user(
 }
 
 #[cfg(target_arch = "wasm32")]
-async fn revoke_session(
+async fn revoke_session_with_audit(
     db: &worker::d1::D1Database,
-    session_id: &str,
-    revoked_at: i32,
-) -> worker::Result<()> {
-    let args = [
-        worker::d1::D1Type::Integer(revoked_at),
-        worker::d1::D1Type::Text(session_id),
-    ];
-    db.prepare(
-        "UPDATE zeroth_sessions
-         SET revoked_at = ?
-         WHERE id = ? AND revoked_at IS NULL",
-    )
-    .bind_refs(&args)?
-    .run()
-    .await?;
-    Ok(())
-}
-
-#[cfg(target_arch = "wasm32")]
-async fn revoke_user_session(
-    db: &worker::d1::D1Database,
+    request: &Request,
     session_id: &str,
     user_id: &str,
-    revoked_at: i32,
+    fallback_client_id: Option<&str>,
+    event_type: &str,
+    now: i32,
 ) -> worker::Result<()> {
-    let args = [
-        worker::d1::D1Type::Integer(revoked_at),
-        worker::d1::D1Type::Text(session_id),
-        worker::d1::D1Type::Text(user_id),
-    ];
-    db.prepare(
-        "UPDATE zeroth_sessions
-         SET revoked_at = ?
-         WHERE id = ? AND user_id = ? AND revoked_at IS NULL",
+    use worker::d1::D1Type as V;
+    let owned = get_session(db, session_id)
+        .await?
+        .filter(|row| row.user_id == user_id);
+    let client_id = owned
+        .as_ref()
+        .and_then(|row| row.client_id.as_deref())
+        .or(fallback_client_id);
+    let actor = audit_capture::actor_from_user(Some(user_id)).map_err(worker_error)?;
+    let mut event = prepare_audit_event(
+        db,
+        Some(request),
+        Some(actor),
+        event_type,
+        Some(user_id),
+        client_id,
+        None,
+        serde_json::json!({}),
+        now,
     )
-    .bind_refs(&args)?
-    .run()
     .await?;
-    Ok(())
-}
-
-#[cfg(target_arch = "wasm32")]
-async fn revoke_refresh_token_family_for_session(
-    db: &worker::d1::D1Database,
-    session_id: &str,
-    user_id: &str,
-    revoked_at: i32,
-) -> worker::Result<()> {
-    let args = [
-        worker::d1::D1Type::Integer(revoked_at),
-        worker::d1::D1Type::Text(session_id),
-        worker::d1::D1Type::Text(user_id),
-    ];
-    db.prepare(
-        "UPDATE zeroth_refresh_tokens
-         SET revoked_at = ?
-         WHERE session_id = ? AND user_id = ? AND revoked_at IS NULL",
-    )
-    .bind_refs(&args)?
-    .run()
-    .await?;
-    Ok(())
+    let mut changes = Vec::new();
+    if owned.is_some() {
+        // A session ID is a cookie bearer credential, not an audit reference.
+        event.0.targets.insert(
+            0,
+            zeroth_audit::AuditTarget::new("session", hash_secret(session_id))
+                .map_err(|e| worker_error(e.to_string()))?,
+        );
+        changes.push(db.prepare(REVOKE_OWNED_SESSION_SQL).bind_refs(&[
+            V::Integer(now),
+            V::Text(session_id),
+            V::Text(user_id),
+        ])?);
+        changes.push(db.prepare(REVOKE_OWNED_SESSION_REFRESH_SQL).bind_refs(&[
+            V::Integer(now),
+            V::Text(session_id),
+            V::Text(user_id),
+        ])?);
+    } else {
+        // Keep idempotent endpoint behavior without claiming an unknown or
+        // another user's session was revoked.
+        event.0.outcome = zeroth_audit::AuditOutcome::Unknown;
+    }
+    commit_credential_transition(db, changes, &event).await
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -12909,7 +13781,10 @@ async fn current_session_from_request(
         let Some(client) = get_client(db, client_id).await? else {
             return Ok(None);
         };
-        if validate_auth_context_for_client(env, &client, &session.auth_context).is_err() {
+        if validate_auth_context_for_client(db, env, &client, &session.auth_context)
+            .await
+            .is_err()
+        {
             return Ok(None);
         }
     } else if session
@@ -13104,10 +13979,15 @@ async fn ensure_d1_schema(request: Request, env: Env) -> worker::Result<Response
             migrations_skipped.push(migration.name);
             continue;
         }
-        for statement in migration.statements() {
-            db.prepare(statement.to_owned()).run().await?;
+        let mut statements = migration
+            .statements()
+            .map(|sql| db.prepare(sql))
+            .collect::<Vec<_>>();
+        statements.push(schema_migration_statement(&db, migration, now)?);
+        let results = db.batch(statements).await?;
+        if results.iter().any(|r| !r.success()) {
+            return Err(worker_error("schema migration failed".into()));
         }
-        record_schema_migration(&db, migration, now).await?;
         migrations_applied.push(migration.name);
     }
     ensure_compat_columns(&db).await?;
@@ -13124,7 +14004,7 @@ async fn ensure_d1_schema(request: Request, env: Env) -> worker::Result<Response
         }),
         now,
     )
-    .await;
+    .await?;
 
     json(&MigrationResponse {
         ok: true,
@@ -13315,11 +14195,11 @@ async fn schema_migration_applied(
 }
 
 #[cfg(target_arch = "wasm32")]
-async fn record_schema_migration(
+fn schema_migration_statement(
     db: &worker::d1::D1Database,
     migration: &zeroth_storage::Migration,
     applied_at: i32,
-) -> worker::Result<()> {
+) -> worker::Result<worker::d1::D1PreparedStatement> {
     let args = [
         worker::d1::D1Type::Integer(migration.version),
         worker::d1::D1Type::Text(migration.name),
@@ -13329,10 +14209,7 @@ async fn record_schema_migration(
         "INSERT OR IGNORE INTO zeroth_schema_migrations (version, name, applied_at)
          VALUES (?, ?, ?)",
     )
-    .bind_refs(&args)?
-    .run()
-    .await?;
-    Ok(())
+    .bind_refs(&args)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -13851,7 +14728,13 @@ fn return_to_is_hosted_url(url: &url::Url, issuer_base_url: Option<&str>) -> boo
         && url.origin() == issuer_url.origin()
         && matches!(
             url.path(),
-            "/" | "/account" | "/admin" | "/admin/clients" | "/authorize"
+            "/" | "/account"
+                | "/admin"
+                | "/admin/clients"
+                | "/admin/tenants"
+                | "/admin/setup"
+                | "/audit"
+                | "/authorize"
         )
 }
 
@@ -15061,30 +15944,155 @@ fn validate_audit_event_type(raw: &str) -> Result<String, ClientManagementError>
     Ok(value.to_owned())
 }
 
+fn validate_audit_query_token(raw: &str, field: &str) -> Result<String, ClientManagementError> {
+    let value = raw.trim();
+    if value.is_empty()
+        || value.len() > 256
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':'))
+    {
+        return Err(ClientManagementError::invalid_request(format!(
+            "invalid {field}"
+        )));
+    }
+    Ok(value.to_owned())
+}
+
 fn audit_event_filter_from_url(url: &url::Url) -> Result<AuditEventFilter, ClientManagementError> {
-    let event_type = query_param(url, "event_type")
-        .map(|value| validate_audit_event_type(&value))
-        .transpose()?;
-    let user_id = query_param(url, "user_id")
-        .map(|value| validate_admin_user_id(&value))
-        .transpose()?;
-    let client_id = query_param(url, "client_id")
-        .map(|value| validate_client_id(&value))
-        .transpose()?;
-    let provider_id = query_param(url, "provider_id")
+    let parameter = |name: &str| query_param(url, name).filter(|value| !value.trim().is_empty());
+    let keys = [
+        "event_type",
+        "user_id",
+        "client_id",
+        "provider_id",
+        "organization_id",
+        "actor_type",
+        "actor_id",
+        "target_type",
+        "target_id",
+        "outcome",
+        "from",
+        "until",
+        "limit",
+        "cursor",
+        "format",
+    ];
+    for key in keys {
+        if url.query_pairs().filter(|(name, _)| name == key).count() > 1 {
+            return Err(ClientManagementError::invalid_request(format!(
+                "duplicate audit parameter: {key}"
+            )));
+        }
+    }
+    let token = |name: &str| -> Result<Option<String>, ClientManagementError> {
+        parameter(name)
+            .map(|value| validate_audit_query_token(&value, name))
+            .transpose()
+    };
+    let timestamp = |name: &str| -> Result<Option<i64>, ClientManagementError> {
+        parameter(name)
+            .map(|value| {
+                value
+                    .trim()
+                    .parse::<i64>()
+                    .ok()
+                    .filter(|value| *value >= 0)
+                    .ok_or_else(|| {
+                        ClientManagementError::invalid_request(format!(
+                            "{name} must be nonnegative Unix seconds"
+                        ))
+                    })
+            })
+            .transpose()
+    };
+    let mut filter = AuditEventFilter {
+        event_type: parameter("event_type")
+            .map(|value| validate_audit_event_type(&value))
+            .transpose()?,
+        user_id: parameter("user_id")
+            .map(|value| validate_admin_user_id(&value))
+            .transpose()?,
+        client_id: parameter("client_id")
+            .map(|value| validate_client_id(&value))
+            .transpose()?,
+        provider_id: parameter("provider_id")
+            .map(|value| {
+                validate_identity_provider_id(&value)
+                    .map_err(ClientManagementError::invalid_request)?;
+                Ok::<_, ClientManagementError>(value)
+            })
+            .transpose()?,
+        organization_id: token("organization_id")?,
+        actor_type: token("actor_type")?,
+        actor_id: token("actor_id")?,
+        target_type: token("target_type")?,
+        target_id: token("target_id")?,
+        outcome: token("outcome")?,
+        from: timestamp("from")?,
+        until: timestamp("until")?,
+        ..AuditEventFilter::default()
+    };
+    if filter
+        .from
+        .zip(filter.until)
+        .is_some_and(|(from, until)| from > until)
+    {
+        return Err(ClientManagementError::invalid_request(
+            "from must not be after until",
+        ));
+    }
+    if filter.outcome.as_deref().is_some_and(|value| {
+        !matches!(
+            value,
+            "success" | "failure" | "denied" | "error" | "unknown"
+        )
+    }) {
+        return Err(ClientManagementError::invalid_request(
+            "invalid audit outcome",
+        ));
+    }
+    filter.limit = parameter("limit")
         .map(|value| {
-            validate_identity_provider_id(&value)
-                .map_err(ClientManagementError::invalid_request)?;
-            Ok::<_, ClientManagementError>(value)
+            value
+                .trim()
+                .parse::<u16>()
+                .ok()
+                .filter(|value| *value >= 1 && i32::from(*value) <= AUDIT_EVENT_LIST_LIMIT)
+                .ok_or_else(|| {
+                    ClientManagementError::invalid_request("audit limit must be between 1 and 100")
+                })
         })
         .transpose()?;
-
-    Ok(AuditEventFilter {
-        event_type,
-        user_id,
-        client_id,
-        provider_id,
-    })
+    filter.csv = match parameter("format").as_deref().map(str::trim) {
+        None | Some("json") => false,
+        Some("csv") => true,
+        _ => {
+            return Err(ClientManagementError::invalid_request(
+                "audit format must be json or csv",
+            ))
+        }
+    };
+    if let Some(encoded) = parameter("cursor") {
+        if encoded.len() > 2048 {
+            return Err(ClientManagementError::invalid_request(
+                "audit cursor is too large",
+            ));
+        }
+        let bytes = URL_SAFE_NO_PAD
+            .decode(encoded)
+            .map_err(|_| ClientManagementError::invalid_request("invalid audit cursor"))?;
+        if bytes.len() > 1024 {
+            return Err(ClientManagementError::invalid_request(
+                "audit cursor is too large",
+            ));
+        }
+        let cursor: AuditCursor = serde_json::from_slice(&bytes)
+            .map_err(|_| ClientManagementError::invalid_request("invalid audit cursor"))?;
+        validate_audit_cursor(&cursor, &filter)?;
+        filter.cursor = Some(cursor);
+    }
+    Ok(filter)
 }
 
 fn validate_client_name(raw: &str) -> Result<String, ClientManagementError> {
@@ -15479,7 +16487,8 @@ async fn validate_session_client_admission(
     current: &CurrentSession,
 ) -> worker::Result<Result<(), ProviderCallbackError>> {
     if let Err(error) =
-        validate_auth_context_for_client(env, &client.client, &current.session.auth_context)
+        validate_auth_context_for_client(db, env, &client.client, &current.session.auth_context)
+            .await
     {
         return Ok(Err(ProviderCallbackError::access_denied(error)));
     }
@@ -15878,6 +16887,10 @@ fn admin_user_response_from_row(row: AdminUserRow) -> AdminUserResponse {
 fn audit_event_response_from_row(row: AuditEventRow) -> AuditEventResponse {
     let details = serde_json::from_str(&row.details_json)
         .unwrap_or_else(|_| serde_json::json!({ "invalidDetailsJson": true }));
+    let event = row.event_json.as_deref().map(|value| {
+        serde_json::from_str(value)
+            .unwrap_or_else(|_| serde_json::json!({ "invalidEventJson": true }))
+    });
     AuditEventResponse {
         id: row.id,
         event_type: row.event_type,
@@ -15888,6 +16901,17 @@ fn audit_event_response_from_row(row: AuditEventRow) -> AuditEventResponse {
         ip_hash: row.ip_hash,
         user_agent: row.user_agent,
         details,
+        schema_version: row.schema_version,
+        organization_id: row.organization_id,
+        actor_type: row.actor_type,
+        actor_id: row.actor_id,
+        target_type: row.target_type,
+        target_id: row.target_id,
+        outcome: row.outcome,
+        reason_code: row.reason_code,
+        request_id: row.request_id,
+        recorded_at: row.recorded_at.unwrap_or(i64::from(row.created_at)),
+        event,
     }
 }
 
@@ -16848,11 +17872,22 @@ async fn admin_bootstrap_allowed(
     bootstrap_reason: &str,
     allow_first_admin: bool,
 ) -> Result<bool, ClientManagementError> {
-    let active_admin_exists = active_admin_membership_exists(db).await.map_err(|error| {
-        ClientManagementError::server_error(format!(
-            "could not check active admin membership: {error}"
-        ))
-    })?;
+    // Only the explicitly authorized schema bootstrap may precede this table.
+    // Other routes and all database errors remain fail closed.
+    let membership_table_exists = if bootstrap_reason == "schema_bootstrap" {
+        db_table_exists(db, "zeroth_admin_memberships")
+            .await
+            .map_err(|_| ClientManagementError::server_error("could not inspect schema"))?
+    } else {
+        true
+    };
+    let active_admin_exists = if membership_table_exists {
+        active_admin_membership_exists(db).await.map_err(|_| {
+            ClientManagementError::server_error("could not check active admin membership")
+        })?
+    } else {
+        false
+    };
     let emergency_enabled = binding_value_from_env(env, ADMIN_BOOTSTRAP_EMERGENCY_ENV)
         .is_some_and(|value| value.trim().eq_ignore_ascii_case("true") || value.trim() == "1");
     if active_admin_exists && !emergency_enabled {
@@ -16882,21 +17917,26 @@ async fn admin_bootstrap_allowed(
     if !allow_first_admin && !emergency_enabled {
         return Ok(false);
     }
-    record_audit_event(
-        db,
-        request,
-        "admin.bootstrap.use",
-        None,
-        None,
-        None,
-        serde_json::json!({
-            "reason": bootstrap_reason,
-            "emergency": emergency_enabled,
-            "expiresAt": emergency_expires_at,
-        }),
-        now,
-    )
-    .await;
+    if bootstrap_reason != "schema_bootstrap" {
+        record_audit_event(
+            db,
+            request,
+            "admin.bootstrap.use",
+            None,
+            None,
+            None,
+            serde_json::json!({
+                "reason": bootstrap_reason,
+                "emergency": emergency_enabled,
+                "expiresAt": emergency_expires_at,
+            }),
+            now,
+        )
+        .await
+        .map_err(|_| {
+            ClientManagementError::server_error("could not persist bootstrap audit event")
+        })?;
+    }
     Ok(true)
 }
 
@@ -17529,7 +18569,7 @@ async fn issue_local_auth_session(
         serde_json::json!({ "mode": mode }),
         now,
     )
-    .await;
+    .await?;
     Ok(LocalAuthSessionIssue {
         session_id,
         return_to: return_to.to_owned(),
@@ -17607,7 +18647,7 @@ async fn issue_wallet_session_response(
         }),
         now,
     )
-    .await;
+    .await?;
     let response = json(&LocalAuthResponse {
         ok: true,
         return_to: return_to.to_owned(),
@@ -18758,7 +19798,7 @@ async fn validate_access_token_session(
         .as_ref()
         .map(|row| row.auth_context.clone())
         .unwrap_or_default();
-    if let Err(error) = validate_auth_context_for_client(env, &client.client, &context) {
+    if let Err(error) = validate_auth_context_for_client(db, env, &client.client, &context).await {
         return Ok(Err(error));
     }
     Ok(Ok(()))
@@ -23610,6 +24650,17 @@ mod tests {
             ip_hash: Some("ip-hash".to_owned()),
             user_agent: Some("agent".to_owned()),
             details_json: r#"{"mode":"hosted"}"#.to_owned(),
+            schema_version: 0,
+            organization_id: None,
+            actor_type: None,
+            actor_id: None,
+            target_type: None,
+            target_id: None,
+            outcome: "unknown".to_owned(),
+            reason_code: None,
+            request_id: None,
+            recorded_at: None,
+            event_json: None,
         });
 
         assert_eq!(response.event_type, "session.login");
@@ -24487,7 +25538,7 @@ mod tests {
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        assert_eq!(migration_versions, (1..=12).collect::<Vec<_>>());
+        assert_eq!(migration_versions, (1..=14).collect::<Vec<_>>());
     }
 
     #[test]

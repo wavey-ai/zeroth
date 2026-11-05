@@ -22,13 +22,22 @@ Zeroth now:
 - `/admin` and `/admin/clients` provider readiness, user lifecycle, filtered
   audit event inspection, and registered-client management backed by Zeroth's
   management APIs
+- `/admin/tenants` organization settings, Entra or Google Workspace connection
+  drafts, application bindings, and separate audit read/export grants
+- audit filters, cursor navigation, and CSV export of the displayed page
 
 It is server-renderable today with `render_account_html` or
 `render_account_document` for login/account surfaces, and
 `render_clients_admin_html` or `render_clients_admin_document` for the admin
 management surface. `zeroth-worker` serves these Leptos documents from `/login`,
 `/authorize` provider-selection responses, `/account`, `/admin`, and
-`/admin/clients`.
+`/admin/clients`. `render_tenants_admin_document` selects tenant management in
+the same shell at `/admin/tenants`.
+
+Tenant forms accept a deployment secret **binding name**, never the provider
+secret value. Configuration presence is distinct from a successful provider
+sign-in. Retention days currently record policy metadata; they do not schedule
+automatic deletion.
 
 The rendered document is intentionally SSR-first. CSS is inline, and provider
 actions are ordinary links. A small same-origin form handler is the only
@@ -40,3 +49,16 @@ Preview the default surface with:
 ```sh
 cargo run -p zeroth-ui --example preview > target/zeroth-ui-preview.html
 ```
+
+Preview the administration surface with non-production fixture data:
+
+```sh
+cargo run -p zeroth-ui --example admin_preview -- tenants > /tmp/zeroth-polished-admin.html
+node crates/zeroth-ui/tests/admin_browser.cjs /tmp/zeroth-polished-admin.html
+```
+
+The browser check uses an installed Playwright package and local HTTP fixtures.
+Set `PLAYWRIGHT_MODULE` or `CHROMIUM_EXECUTABLE` when those are outside the
+default installation. Set `SCREENSHOT_DIR` to choose where desktop and mobile
+screenshots are saved. It verifies UI/API contracts, CSRF headers, confirmations,
+filtering, paging, and exports; it does not exercise a live identity provider.

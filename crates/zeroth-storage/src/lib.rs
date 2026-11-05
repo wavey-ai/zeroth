@@ -155,6 +155,18 @@ pub mod migrations {
         sql: include_str!("../migrations/0012_enterprise_auth_policy.sql"),
     };
 
+    pub const AUDIT_HISTORY: Migration = Migration {
+        version: 13,
+        name: "audit_history",
+        sql: include_str!("../migrations/0013_audit_history.sql"),
+    };
+
+    pub const TENANTS: Migration = Migration {
+        version: 14,
+        name: "tenants",
+        sql: include_str!("../migrations/0014_tenants.sql"),
+    };
+
     pub const ALL: &[Migration] = &[
         INIT,
         PASSKEYS,
@@ -168,6 +180,8 @@ pub mod migrations {
         MAGIC_LINK_POLL_TOKEN,
         PASSKEY_METADATA,
         ENTERPRISE_AUTH_POLICY,
+        AUDIT_HISTORY,
+        TENANTS,
     ];
 }
 
@@ -190,6 +204,12 @@ pub const REQUIRED_TABLES: &[&str] = &[
     "zeroth_rate_limits",
     "zeroth_signing_keys",
     "zeroth_audit_events",
+    "zeroth_audit_outbox",
+    "zeroth_audit_consumers",
+    "zeroth_tenants",
+    "zeroth_tenant_clients",
+    "zeroth_tenant_audit_readers",
+    "zeroth_audit_write_guards",
 ];
 
 pub mod compatibility {
@@ -306,12 +326,69 @@ pub mod compatibility {
         definition: "TEXT",
     };
 
+    pub const AUDIT_SCHEMA_VERSION: CompatibilityColumn = CompatibilityColumn {
+        table: "zeroth_audit_events",
+        name: "schema_version",
+        definition: "INTEGER NOT NULL DEFAULT 0",
+    };
+    pub const AUDIT_ORGANIZATION_ID: CompatibilityColumn = CompatibilityColumn {
+        table: "zeroth_audit_events",
+        name: "organization_id",
+        definition: "TEXT",
+    };
+    pub const AUDIT_ACTOR_TYPE: CompatibilityColumn = CompatibilityColumn {
+        table: "zeroth_audit_events",
+        name: "actor_type",
+        definition: "TEXT",
+    };
+    pub const AUDIT_ACTOR_ID: CompatibilityColumn = CompatibilityColumn {
+        table: "zeroth_audit_events",
+        name: "actor_id",
+        definition: "TEXT",
+    };
+    pub const AUDIT_TARGET_TYPE: CompatibilityColumn = CompatibilityColumn {
+        table: "zeroth_audit_events",
+        name: "target_type",
+        definition: "TEXT",
+    };
+    pub const AUDIT_TARGET_ID: CompatibilityColumn = CompatibilityColumn {
+        table: "zeroth_audit_events",
+        name: "target_id",
+        definition: "TEXT",
+    };
+    pub const AUDIT_OUTCOME: CompatibilityColumn = CompatibilityColumn {
+        table: "zeroth_audit_events",
+        name: "outcome",
+        definition: "TEXT NOT NULL DEFAULT 'unknown'",
+    };
+    pub const AUDIT_REASON_CODE: CompatibilityColumn = CompatibilityColumn {
+        table: "zeroth_audit_events",
+        name: "reason_code",
+        definition: "TEXT",
+    };
+    pub const AUDIT_REQUEST_ID: CompatibilityColumn = CompatibilityColumn {
+        table: "zeroth_audit_events",
+        name: "request_id",
+        definition: "TEXT",
+    };
+    pub const AUDIT_RECORDED_AT: CompatibilityColumn = CompatibilityColumn {
+        table: "zeroth_audit_events",
+        name: "recorded_at",
+        definition: "INTEGER",
+    };
+    pub const AUDIT_EVENT_JSON: CompatibilityColumn = CompatibilityColumn {
+        table: "zeroth_audit_events",
+        name: "event_json",
+        definition: "TEXT",
+    };
+
     pub const TABLES: &[&str] = &[
         "zeroth_clients",
         "zeroth_auth_transactions",
         "zeroth_auth_codes",
         "zeroth_refresh_tokens",
         "zeroth_sessions",
+        "zeroth_audit_events",
     ];
 
     pub const ALL: &[CompatibilityColumn] = &[
@@ -337,6 +414,17 @@ pub mod compatibility {
         REFRESH_TOKEN_AUTH_POLICY_HASH,
         SESSION_AUTH_PROVIDER,
         SESSION_AUTH_POLICY_HASH,
+        AUDIT_SCHEMA_VERSION,
+        AUDIT_ORGANIZATION_ID,
+        AUDIT_ACTOR_TYPE,
+        AUDIT_ACTOR_ID,
+        AUDIT_TARGET_TYPE,
+        AUDIT_TARGET_ID,
+        AUDIT_OUTCOME,
+        AUDIT_REASON_CODE,
+        AUDIT_REQUEST_ID,
+        AUDIT_RECORDED_AT,
+        AUDIT_EVENT_JSON,
     ];
 }
 
@@ -356,6 +444,12 @@ mod tests {
                 && *table != "zeroth_wallet_challenges"
                 && *table != "zeroth_rate_limits"
                 && *table != "zeroth_account_identities"
+                && *table != "zeroth_audit_outbox"
+                && *table != "zeroth_audit_consumers"
+                && *table != "zeroth_tenants"
+                && *table != "zeroth_tenant_clients"
+                && *table != "zeroth_tenant_audit_readers"
+                && *table != "zeroth_audit_write_guards"
         }) {
             assert!(sql.contains(table), "missing table {table}");
         }
@@ -368,7 +462,7 @@ mod tests {
         for table in ["zeroth_passkey_credentials", "zeroth_passkey_challenges"] {
             assert!(sql.contains(table), "missing table {table}");
         }
-        assert_eq!(migrations::ALL.len(), 12);
+        assert_eq!(migrations::ALL.len(), 14);
         assert_eq!(migrations::ALL[1].version, 2);
     }
 
@@ -401,7 +495,7 @@ mod tests {
         assert!(sql.contains("account_sharing_mode TEXT NOT NULL DEFAULT 'global'"));
         assert!(sql.contains("account_tenant_id TEXT NOT NULL DEFAULT 'global'"));
         assert!(sql.contains("INSERT OR IGNORE INTO zeroth_account_identities"));
-        assert_eq!(migrations::ALL.len(), 12);
+        assert_eq!(migrations::ALL.len(), 14);
         assert_eq!(migrations::ALL[4].version, 5);
     }
 
@@ -412,7 +506,7 @@ mod tests {
         assert!(sql.contains("zeroth_wallet_challenges"));
         assert!(sql.contains("challenge_hash TEXT PRIMARY KEY"));
         assert!(sql.contains("account_namespace TEXT NOT NULL"));
-        assert_eq!(migrations::ALL.len(), 12);
+        assert_eq!(migrations::ALL.len(), 14);
         assert_eq!(migrations::ALL[5].version, 6);
     }
 
@@ -421,7 +515,7 @@ mod tests {
         let sql = migrations::CLIENT_LOGIN_METHODS.sql;
 
         assert!(sql.contains("visible_login_methods_json TEXT NOT NULL DEFAULT '[]'"));
-        assert_eq!(migrations::ALL.len(), 12);
+        assert_eq!(migrations::ALL.len(), 14);
         assert_eq!(migrations::ALL[6].version, 7);
     }
 
@@ -687,7 +781,7 @@ mod tests {
         for migration in migrations::ALL {
             conn.execute_batch(migration.sql).unwrap();
         }
-        assert_eq!(migrations::ALL.last().unwrap().version, 12);
+        assert_eq!(migrations::ALL.last().unwrap().version, 14);
         assert_enterprise_columns_are_nullable_text(&conn);
         for &(table, name) in ENTERPRISE_COLUMNS {
             assert!(compatibility::TABLES.contains(&table));
@@ -711,5 +805,126 @@ mod tests {
             conn.execute(&column.alter_table_sql(), []).unwrap();
         }
         assert_enterprise_columns_are_nullable_text(&conn);
+    }
+
+    #[test]
+    fn audit_history_upgrade_preserves_legacy_uncertainty() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        for migration in migrations::ALL
+            .iter()
+            .filter(|migration| migration.version < 13)
+        {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        conn.execute("INSERT INTO zeroth_audit_events (id, event_type, user_id, client_id, created_at, details_json) VALUES ('legacy', 'session.login', 'user', 'client', 100, '{}')", []).unwrap();
+        for statement in migrations::AUDIT_HISTORY.statements() {
+            conn.execute(statement, []).unwrap();
+        }
+        let legacy: (i32, String, Option<String>, Option<String>, Option<String>, Option<i64>, Option<String>) = conn.query_row(
+            "SELECT schema_version, outcome, organization_id, actor_id, target_id, recorded_at, event_json FROM zeroth_audit_events WHERE id = 'legacy'", [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
+        ).unwrap();
+        assert_eq!(
+            legacy,
+            (0, "unknown".to_owned(), None, None, None, None, None)
+        );
+        let outbox_count: i32 = conn
+            .query_row("SELECT COUNT(*) FROM zeroth_audit_outbox", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(outbox_count, 0);
+        for name in [
+            "schema_version",
+            "organization_id",
+            "actor_type",
+            "actor_id",
+            "target_type",
+            "target_id",
+            "outcome",
+            "reason_code",
+            "request_id",
+            "recorded_at",
+            "event_json",
+        ] {
+            assert!(compatibility::ALL
+                .iter()
+                .any(|column| column.table == "zeroth_audit_events" && column.name == name));
+        }
+        assert!(super::REQUIRED_TABLES.contains(&"zeroth_audit_outbox"));
+        assert!(super::REQUIRED_TABLES.contains(&"zeroth_audit_consumers"));
+    }
+
+    #[test]
+    fn audit_schema_retains_history_and_outbox_when_subject_user_is_deleted() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        for migration in migrations::ALL {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        conn.execute(
+            "INSERT INTO zeroth_users (id, created_at, updated_at) VALUES ('user', 1, 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO zeroth_audit_events (id, event_type, user_id, actor_type, actor_id, target_type, target_id, created_at, details_json) VALUES ('event', 'account.delete', 'user', 'user', 'user', 'user', 'user', 100, '{}')", []).unwrap();
+        conn.execute("INSERT INTO zeroth_audit_outbox (event_id, event_json, created_at) VALUES ('event', '{}', 100)", []).unwrap();
+        conn.execute("DELETE FROM zeroth_users WHERE id = 'user'", [])
+            .unwrap();
+        let retained: (String, String) = conn
+            .query_row(
+                "SELECT actor_id, target_id FROM zeroth_audit_events WHERE id = 'event'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(retained, ("user".to_owned(), "user".to_owned()));
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM zeroth_audit_outbox WHERE event_id = 'event'",
+                [],
+                |row| row.get::<_, i32>(0)
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn audit_outbox_deduplicates_event_ids_and_does_not_reuse_delivery_sequences() {
+        let conn = Connection::open_in_memory().unwrap();
+        for migration in migrations::ALL {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        conn.execute("INSERT INTO zeroth_audit_outbox (event_id, event_json, created_at) VALUES ('event', '{}', 1)", []).unwrap();
+        assert!(conn.execute("INSERT INTO zeroth_audit_outbox (event_id, event_json, created_at) VALUES ('event', '{}', 1)", []).is_err());
+        let first: i64 = conn
+            .query_row("SELECT sequence FROM zeroth_audit_outbox", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        conn.execute("DELETE FROM zeroth_audit_outbox", []).unwrap();
+        conn.execute("INSERT INTO zeroth_audit_outbox (event_id, event_json, created_at) VALUES ('next', '{}', 2)", []).unwrap();
+        let next: i64 = conn
+            .query_row("SELECT sequence FROM zeroth_audit_outbox", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(next > first);
+        conn.execute(
+            "INSERT INTO zeroth_audit_consumers (id, updated_at) VALUES ('collector', 2)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT last_sequence FROM zeroth_audit_consumers",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
     }
 }

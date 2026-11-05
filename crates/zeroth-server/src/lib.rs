@@ -63,6 +63,38 @@ pub const ROUTES: &[Route] = &[
     },
     Route {
         method: "GET",
+        path: "/tenants",
+    },
+    Route {
+        method: "POST",
+        path: "/tenants",
+    },
+    Route {
+        method: "GET",
+        path: "/audit",
+    },
+    Route {
+        method: "GET",
+        path: "/audit/events",
+    },
+    Route {
+        method: "GET",
+        path: "/audit/stream",
+    },
+    Route {
+        method: "POST",
+        path: "/audit/stream/ack",
+    },
+    Route {
+        method: "GET",
+        path: "/admin/tenants",
+    },
+    Route {
+        method: "GET",
+        path: "/admin/setup",
+    },
+    Route {
+        method: "GET",
         path: "/routes",
     },
     Route {

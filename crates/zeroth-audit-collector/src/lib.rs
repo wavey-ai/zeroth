@@ -108,7 +108,7 @@ impl HttpStream {
             .map_err(|_| CollectorError::Configuration)?;
         authorization.set_sensitive(true);
         let mut ack_endpoint = endpoint.clone();
-        ack_endpoint.set_path("/audit/stream/ack");
+        ack_endpoint.set_path(&format!("{}/ack", endpoint.path()));
         let client = Client::builder()
             .redirect(Policy::none())
             .connect_timeout(Duration::from_secs(10))
@@ -183,7 +183,7 @@ fn validate_endpoint(endpoint: &str) -> Result<Url, CollectorError> {
         || url.password().is_some()
         || url.query().is_some()
         || url.fragment().is_some()
-        || url.path() != "/audit/stream"
+        || !url.path().ends_with("/audit/stream")
     {
         return Err(CollectorError::Configuration);
     }
@@ -622,6 +622,12 @@ mod tests {
             assert!(validate_endpoint(endpoint).is_err());
         }
         assert!(validate_endpoint("https://id.example/audit/stream").is_ok());
+        let prefixed =
+            HttpStream::new("https://id.example/id/audit/stream", &"x".repeat(32), "pg").unwrap();
+        assert_eq!(
+            prefixed.ack_endpoint.as_str(),
+            "https://id.example/id/audit/stream/ack"
+        );
         assert!(validate_endpoint("http://[::1]/audit/stream").is_ok());
         assert_eq!(CollectorError::Transport.to_string(), "transport_failed");
     }
