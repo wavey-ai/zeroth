@@ -4128,13 +4128,18 @@ document.addEventListener("submit", async (event) => {
       if (confirmPassword) payload.confirmPassword = confirmPassword;
     }
     const action = zerothSubmitAction(form, submitter);
+    const headers = {
+      "Accept": "application/json",
+      "Content-Type": "application/json"
+    };
+    const csrf = zerothCsrfToken(form);
+    if (csrf) {
+      headers["X-Zeroth-CSRF"] = csrf;
+    }
     const response = await fetch(action, {
       method: "POST",
       credentials: "include",
-      headers: {
-        "Accept": "application/json",
-        "Content-Type": "application/json"
-      },
+      headers,
       body: JSON.stringify(payload)
     });
     let body = {};
