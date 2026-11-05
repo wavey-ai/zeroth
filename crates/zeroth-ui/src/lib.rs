@@ -1669,6 +1669,7 @@ impl ZerothUiTheme {
 pub enum ProviderKind {
     Apple,
     Google,
+    Entra,
     Spotify,
     Custom,
 }
@@ -1698,6 +1699,26 @@ impl ProviderUi {
         Self {
             id: well_known::GOOGLE.to_owned(),
             label: "Google".to_owned(),
+            kind: ProviderKind::Google,
+            connected,
+            enabled: true,
+        }
+    }
+
+    pub fn entra(connected: bool) -> Self {
+        Self {
+            id: well_known::ENTRA.to_owned(),
+            label: "Microsoft Entra".to_owned(),
+            kind: ProviderKind::Entra,
+            connected,
+            enabled: true,
+        }
+    }
+
+    pub fn google_workspace(connected: bool) -> Self {
+        Self {
+            id: well_known::GOOGLE_WORKSPACE.to_owned(),
+            label: "Google Workspace".to_owned(),
             kind: ProviderKind::Google,
             connected,
             enabled: true,
@@ -1765,6 +1786,7 @@ pub struct ClientAdminUi {
     pub redirect_uris: Vec<String>,
     pub allowed_origins: Vec<String>,
     pub allowed_email_domains: Vec<String>,
+    pub enterprise_provider: Option<String>,
     pub issuer_token_audience: Option<String>,
     pub issuer_token_ttl_seconds: Option<i32>,
     pub account_sharing_mode: String,
@@ -2548,6 +2570,7 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
                                         <th>"Redirect URIs"</th>
                                         <th>"Origins"</th>
                                         <th>"Email domains"</th>
+                                        <th>"Enterprise sign-in"</th>
                                     </tr>
                                 </thead>
                                 <tbody>{application_rows}</tbody>
@@ -2929,6 +2952,14 @@ pub fn ClientsAdminApp(state: ClientsAdminUiState) -> impl IntoView {
                                             <option value="global">"Global"</option>
                                             <option value="tenant">"Tenant"</option>
                                             <option value="client">"Client"</option>
+                                        </select>
+                                    </div>
+                                    <div class="zeroth-field">
+                                        <label for="zeroth-client-enterprise-provider">"Required enterprise sign-in"</label>
+                                        <select id="zeroth-client-enterprise-provider" name="enterpriseProvider">
+                                            <option value="">"None"</option>
+                                            <option value="entra">"Microsoft Entra"</option>
+                                            <option value="google_workspace">"Google Workspace"</option>
                                         </select>
                                     </div>
                                     <div class="zeroth-field">
@@ -3446,6 +3477,12 @@ fn client_admin_row(client: ClientAdminUi) -> impl IntoView {
     let redirects = join_or_dash(client.redirect_uris.clone());
     let origins = join_or_dash(client.allowed_origins.clone());
     let email_domains = join_or_dash(client.allowed_email_domains.clone());
+    let enterprise_provider = client.enterprise_provider.clone().unwrap_or_default();
+    let enterprise_label = match enterprise_provider.as_str() {
+        "entra" => "Microsoft Entra",
+        "google_workspace" => "Google Workspace",
+        _ => "None",
+    };
     let account = format!(
         "{} / {}",
         client.account_sharing_mode, client.account_namespace
@@ -3487,6 +3524,7 @@ fn client_admin_row(client: ClientAdminUi) -> impl IntoView {
             data-client-redirects=redirect_lines
             data-client-origins=origin_lines
             data-client-email-domains=email_domain_lines
+            data-client-enterprise-provider=enterprise_provider
             data-client-account-sharing-mode=account_sharing_mode
             data-client-account-tenant-id=account_tenant_id
             data-client-account-namespace=account_namespace
@@ -3506,6 +3544,7 @@ fn client_admin_row(client: ClientAdminUi) -> impl IntoView {
             <td>{redirects}</td>
             <td>{origins}</td>
             <td>{email_domains}</td>
+            <td>{enterprise_label}</td>
             <td>{account}</td>
             <td>{visible_login_methods}</td>
             <td>{issuer_token}</td>
@@ -3619,6 +3658,7 @@ fn provider_kind_class(kind: &ProviderKind, connected: bool) -> &'static str {
     match kind {
         ProviderKind::Apple => "provider-apple",
         ProviderKind::Google => "provider-google",
+        ProviderKind::Entra => "provider-custom",
         ProviderKind::Spotify => "provider-spotify",
         ProviderKind::Custom => "provider-custom",
     }
@@ -3632,6 +3672,8 @@ fn provider_initial_by_id(provider_id: &str) -> String {
     match provider_id {
         well_known::APPLE => "A".to_owned(),
         well_known::GOOGLE => "G".to_owned(),
+        well_known::ENTRA => "E".to_owned(),
+        well_known::GOOGLE_WORKSPACE => "G".to_owned(),
         well_known::SPOTIFY => "S".to_owned(),
         _ => provider_id
             .chars()
@@ -4501,6 +4543,7 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
       redirectUris: splitLines(row.dataset.clientRedirects || ""),
       allowedOrigins: splitLines(row.dataset.clientOrigins || ""),
       allowedEmailDomains: splitLines(row.dataset.clientEmailDomains || ""),
+      enterpriseProvider: row.dataset.clientEnterpriseProvider || "",
       accountSharingMode: row.dataset.clientAccountSharingMode || "global",
       accountTenantId: row.dataset.clientAccountTenantId || "global",
       accountNamespace: row.dataset.clientAccountNamespace || "global",
@@ -4552,6 +4595,7 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
       redirectUris: (client.redirectUris || client.redirect_uris || []).map((value) => rewriteUrlSubdomain(value, suffix)),
       allowedOrigins: (client.allowedOrigins || client.allowed_origins || []).map((value) => rewriteUrlSubdomain(value, suffix)),
       allowedEmailDomains: client.allowedEmailDomains || client.allowed_email_domains || [],
+      enterpriseProvider: client.enterpriseProvider || client.enterprise_provider || "",
       accountSharingMode: client.accountSharingMode || client.account_sharing_mode || "global",
       accountTenantId: client.accountTenantId || client.account_tenant_id || "",
       visibleLoginMethods: visibleLoginMethodsForClient(client),
@@ -4582,6 +4626,7 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
     form.elements.redirectUris.value = (client.redirectUris || client.redirect_uris || []).join("\n");
     form.elements.allowedOrigins.value = (client.allowedOrigins || client.allowed_origins || []).join("\n");
     form.elements.allowedEmailDomains.value = (client.allowedEmailDomains || client.allowed_email_domains || []).join("\n");
+    form.elements.enterpriseProvider.value = client.enterpriseProvider || client.enterprise_provider || "";
     form.elements.accountSharingMode.value = client.accountSharingMode || client.account_sharing_mode || "global";
     form.elements.accountTenantId.value = client.accountTenantId || client.account_tenant_id || "";
     const visibleMethods = new Set(visibleLoginMethodsForClient(client));
@@ -4615,7 +4660,7 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
     rows.replaceChildren();
     setCountLabel(count, clients.length, "clients");
     if (clients.length === 0) {
-      renderEmptyRows(rows, 10);
+      renderEmptyRows(rows, 11);
       return;
     }
 
@@ -4628,6 +4673,7 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
       row.dataset.clientRedirects = (client.redirectUris || client.redirect_uris || []).join("\n");
       row.dataset.clientOrigins = (client.allowedOrigins || client.allowed_origins || []).join("\n");
       row.dataset.clientEmailDomains = (client.allowedEmailDomains || client.allowed_email_domains || []).join("\n");
+      row.dataset.clientEnterpriseProvider = client.enterpriseProvider || client.enterprise_provider || "";
       row.dataset.clientAccountSharingMode = client.accountSharingMode || client.account_sharing_mode || "global";
       row.dataset.clientAccountTenantId = client.accountTenantId || client.account_tenant_id || "global";
       row.dataset.clientAccountNamespace = client.accountNamespace || client.account_namespace || "global";
@@ -4657,6 +4703,10 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
 
       const emailDomains = document.createElement("td");
       emailDomains.textContent = (client.allowedEmailDomains || client.allowed_email_domains || []).join(", ") || "-";
+
+      const enterprise = document.createElement("td");
+      const enterpriseProvider = client.enterpriseProvider || client.enterprise_provider || "";
+      enterprise.textContent = enterpriseProvider === "entra" ? "Microsoft Entra" : enterpriseProvider === "google_workspace" ? "Google Workspace" : "None";
 
       const account = document.createElement("td");
       setText(account, client.accountSharingMode || client.account_sharing_mode || "global");
@@ -4694,7 +4744,7 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
         actions.appendChild(disable);
       }
 
-      row.append(name, type, state, redirects, origins, emailDomains, account, login, issuerToken, actions);
+      row.append(name, type, state, redirects, origins, emailDomains, enterprise, account, login, issuerToken, actions);
       rows.appendChild(row);
     }
   }
@@ -5053,6 +5103,7 @@ const ZEROTH_CLIENTS_ADMIN_SCRIPT: &str = r#"
       redirectUris: splitLines(data.get("redirectUris") || ""),
       allowedOrigins: splitLines(data.get("allowedOrigins") || ""),
       allowedEmailDomains: splitLines(data.get("allowedEmailDomains") || ""),
+      enterpriseProvider: String(data.get("enterpriseProvider") || ""),
       accountSharingMode: String(data.get("accountSharingMode") || "global"),
       accountTenantId: String(data.get("accountTenantId") || "").trim() || undefined,
       visibleLoginMethods: data.getAll("visibleLoginMethods").map((value) => String(value)),
@@ -5385,6 +5436,29 @@ mod tests {
         );
         assert_eq!(query(&url, "state"), Some("state-1".to_owned()));
         assert_eq!(query(&url, "code_challenge"), None);
+    }
+
+    #[test]
+    fn enterprise_provider_choices_keep_distinct_oauth_routing() {
+        let config = ZerothUiConfig::new(
+            "https://id.example.com",
+            "enterprise-app",
+            "https://app.example.com/callback",
+        );
+        for (provider, id, label) in [
+            (ProviderUi::entra(false), "entra", "Microsoft Entra"),
+            (
+                ProviderUi::google_workspace(false),
+                "google_workspace",
+                "Google Workspace",
+            ),
+        ] {
+            assert_eq!(provider.label, label);
+            let url = Url::parse(&provider_authorize_url(&config, &provider.id)).unwrap();
+            assert_eq!(query(&url, "provider").as_deref(), Some(id));
+            assert_eq!(query(&url, "client_id").as_deref(), Some("enterprise-app"));
+            assert_ne!(provider.id, ProviderUi::google(false).id);
+        }
     }
 
     #[test]
@@ -5759,6 +5833,7 @@ mod tests {
             redirect_uris: vec!["wavey://auth/callback".to_owned()],
             allowed_origins: Vec::new(),
             allowed_email_domains: Vec::new(),
+            enterprise_provider: Some("entra".to_owned()),
             issuer_token_audience: Some("yl-record-issuer".to_owned()),
             issuer_token_ttl_seconds: Some(300),
             account_sharing_mode: "global".to_owned(),
@@ -5890,6 +5965,10 @@ mod tests {
         assert!(html.contains("Provider ID"));
         assert!(html.contains("Applications"));
         assert!(html.contains("Client editor"));
+        assert!(html.contains("Required enterprise sign-in"));
+        assert!(html.contains("name=\"enterpriseProvider\""));
+        assert!(html.contains("data-client-enterprise-provider=\"entra\""));
+        assert!(html.contains("Google Workspace"));
         assert!(html.contains("Visible login methods"));
         assert!(html.contains("Issuer token audience"));
         assert!(html.contains("Issuer token TTL (seconds)"));
