@@ -354,6 +354,21 @@ Deleting an account requires its hosted browser session and account CSRF token.
 Ordinary OAuth access tokens, including tokens with `profile` scope or a `sid`
 claim, cannot delete the account.
 
+Magic-link account selection uses verified global identity evidence, rather than
+an account's self-declared `primary_email`. A new mailbox signup gets a fresh
+account even when an unverified password account already claims that address.
+Confirmed mailbox identities use the separate `magic_link` provider ID, so they
+cannot upgrade or reserve a password identity belonging to another account.
+Multiple verified owners of the same address are refused; use the original
+provider to sign in. Canonical identity records override stale legacy email
+verification. Old links pinned to unverified accounts with existing credentials
+or sessions must be requested again. Without `MAGIC_LINK_ALLOW_SIGNUP=true`,
+mailbox login requires an existing verified identity.
+
+Passkey bootstrap also creates a fresh account; it does not attach an admin's
+new passkey or membership to an account selected by email. Adding a passkey to
+an existing account requires that account's authenticated browser session.
+
 Magic-link local auth defaults to `MAGIC_LINK_DELIVERY=cloudflare_email`. That
 requires `MAGIC_LINK_FROM` and a Worker `send_email` binding named `EMAIL`.
 Set `MAGIC_LINK_DELIVERY=webhook` to use a generic HTTPS email sender instead.

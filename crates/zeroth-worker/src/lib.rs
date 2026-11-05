@@ -117,6 +117,7 @@ const EVM_WALLET_MESSAGE_MAX_BYTES: usize = 2048;
 const EVM_WALLET_SIGNATURE_HEX_BYTES: usize = 65;
 const LOCAL_AUTH_BODY_LIMIT: usize = 8 * 1024;
 const LOCAL_AUTH_PROVIDER_ID: &str = "zeroth";
+const MAGIC_LINK_PROVIDER_ID: &str = "magic_link";
 const PASSWORD_MIN_CHARS: usize = 15;
 const PASSWORD_MAX_BYTES: usize = 1024;
 const PASSWORD_PEPPER_ENV: &str = "PASSWORD_PEPPER";
@@ -5045,16 +5046,14 @@ async fn passkey_register_options(mut request: Request, env: Env) -> worker::Res
             return oauth_error_json("invalid_request", error, 403);
         }
     }
-    let (mut user_id, email, display_name) =
-        match passkey_registration_subject(current.as_ref(), &body) {
-            Ok(subject) => subject,
-            Err(error) => return oauth_error_json("invalid_request", error, 400),
-        };
-    if user_id.is_none() {
-        user_id = get_user_by_primary_email(&db, &email)
-            .await?
-            .map(|user| user.id);
-    }
+    let (user_id, email, display_name) = match passkey_registration_subject(current.as_ref(), &body)
+    {
+        Ok(subject) => subject,
+        Err(error) => return oauth_error_json("invalid_request", error, 400),
+    };
+    // Only an authenticated session may select an existing account. A supplied
+    // email during bootstrap must never attach an admin's new passkey to an
+    // attacker's previously registered password account.
     let user_handle = match user_id.as_deref() {
         Some(user_id) => ensure_passkey_user_handle(&db, user_id).await?,
         None => random_token()?,
@@ -5301,16 +5300,16 @@ async fn passkey_register_verify(mut request: Request, env: Env) -> worker::Resu
             return oauth_error_json("invalid_request", error, 403);
         }
     }
-    if let (Some(session_user_id), Some(challenge_user_id)) =
-        (session_user_id.as_deref(), challenge.user_id.as_deref())
-    {
-        if session_user_id != challenge_user_id {
-            return oauth_error_json(
-                "invalid_request",
-                "passkey challenge does not belong to the signed-in user",
-                403,
-            );
-        }
+    let authenticated_user_id = match admin_authorization.as_ref() {
+        Some(AdminAuthorization::Session { user_id }) => Some(user_id.as_str()),
+        Some(AdminAuthorization::BootstrapToken) => None,
+        None => session_user_id.as_deref(),
+    };
+    if let Err(error) = validate_passkey_registration_account_binding(
+        challenge.user_id.as_deref(),
+        authenticated_user_id,
+    ) {
+        return oauth_error_json("invalid_request", error, 403);
     }
     let client_id = challenge.client_id.as_deref().unwrap_or_default();
     if let Err(error) = global_local_auth_client(&db, client_id).await? {
@@ -6538,10 +6537,13 @@ async fn magic_link_request(mut request: Request, env: Env) -> worker::Result<Re
         .map(|v| v.trim().to_lowercase() == "true")
         .unwrap_or(false);
     let policy_ok = validate_local_auth_client_email_policy(&client, &email, true).is_ok();
-    let mut user = get_user_by_primary_email(&db, &email).await?;
+    let (mut user, ambiguous_email) = match get_user_by_verified_email(&db, &email).await? {
+        Ok(user) => (user, false),
+        Err(_) => (None, true),
+    };
     // Pin the account at request time so a later-created account for the same email
     // cannot capture the link (magic-link pre-hijack).
-    if user.is_none() && allow_signup && policy_ok {
+    if user.is_none() && allow_signup && policy_ok && !ambiguous_email {
         let new_user_id = format!("usr_{}", random_token()?);
         insert_passkey_user(&db, &new_user_id, &email, None, None, now).await?;
         user = get_user(&db, &new_user_id).await?;
@@ -6575,8 +6577,9 @@ async fn magic_link_request(mut request: Request, env: Env) -> worker::Result<Re
         with_set_cookie(response, &magic_link_poll_binding_cookie(&poll_binding))
     };
 
-    let account_allowed = user.as_ref().is_some_and(|user| user.disabled_at.is_none())
-        || (user.is_none() && allow_signup);
+    let account_allowed = !ambiguous_email
+        && (user.as_ref().is_some_and(|user| user.disabled_at.is_none())
+            || (user.is_none() && allow_signup));
     if !policy_ok || !account_allowed {
         record_audit_event(
             &db,
@@ -6775,7 +6778,10 @@ async fn magic_link_consume(mut request: Request, env: Env) -> worker::Result<Re
     if let Err(error) = validate_local_auth_client_email_policy(&client, &row.email, true) {
         return oauth_error_json(&error.code, &error.description, 403);
     }
-    let (user_id, user_created) = ensure_magic_link_user(&db, &row, now).await?;
+    let (user_id, user_created) = match ensure_magic_link_user(&db, &row, now).await? {
+        Ok(user) => user,
+        Err(error) => return oauth_error_json("invalid_grant", error, 400),
+    };
     if let Some(user) = get_user(&db, &user_id).await? {
         if user.disabled_at.is_some() {
             return oauth_error_json("invalid_request", "user is disabled", 403);
@@ -10121,16 +10127,6 @@ async fn ensure_passkey_registration_user(
         .email
         .as_deref()
         .ok_or_else(|| worker_error("passkey registration challenge has no email".to_owned()))?;
-    if let Some(user) = get_user_by_primary_email(db, email).await? {
-        let stored_user_handle = ensure_passkey_user_handle(db, &user.id).await?;
-        if stored_user_handle != challenge_user_handle {
-            return Err(worker_error(
-                "passkey registration account changed; restart registration".to_owned(),
-            ));
-        }
-        return Ok((user.id, email.to_owned(), challenge.display_name.clone()));
-    }
-
     let user_id = format!("usr_{}", random_token()?);
     insert_passkey_user(
         db,
@@ -10293,13 +10289,28 @@ async fn upsert_local_auth_identity(
 ) -> worker::Result<()> {
     let email_verified =
         mode == "magic_link" || local_auth_email_is_verified(db, user_id, email).await?;
-    let profile = local_auth_profile(email, display_name, email_verified);
+    let profile = local_auth_identity_profile(email, display_name, email_verified, mode);
     let raw_profile_json = serde_json::json!({
         "kind": "local_auth",
         "mode": mode
     })
     .to_string();
-    upsert_identity_from_profile(db, user_id, &profile, Some(&raw_profile_json), now).await
+    if mode == "magic_link" {
+        upsert_account_identity_from_profile(
+            db,
+            ACCOUNT_NAMESPACE_GLOBAL,
+            user_id,
+            &profile,
+            Some(&raw_profile_json),
+            now,
+        )
+        .await?;
+        let actual_user_id = get_identity_user_id(db, ACCOUNT_NAMESPACE_GLOBAL, &profile).await?;
+        validate_provider_identity_attached_to_user(actual_user_id.as_deref(), user_id)
+            .map_err(worker_error)
+    } else {
+        upsert_identity_from_profile(db, user_id, &profile, Some(&raw_profile_json), now).await
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -10544,16 +10555,48 @@ async fn cleanup_expired_magic_links(db: &worker::d1::D1Database, now: i32) -> w
 async fn ensure_magic_link_user(
     db: &worker::d1::D1Database,
     row: &MagicLinkRow,
-    now: i32,
-) -> worker::Result<(String, bool)> {
-    if let Some(user_id) = row.user_id.as_deref() {
-        return Ok((user_id.to_owned(), false));
+    _now: i32,
+) -> worker::Result<Result<(String, bool), String>> {
+    let Some(user_id) = row.user_id.as_deref() else {
+        return Ok(Err(
+            "magic link has no account binding; request a new link".to_owned()
+        ));
+    };
+    match get_user_by_verified_email(db, &row.email).await? {
+        Ok(Some(user)) if user.id == user_id && user.disabled_at.is_none() => {
+            return Ok(Ok((user.id, false)));
+        }
+        Ok(Some(_)) | Err(_) => {
+            return Ok(Err(
+                "magic link account binding changed; request a new link".to_owned(),
+            ));
+        }
+        Ok(None) => {}
     }
-    // A NULL user_id means the account was not pinned at request time. Create a fresh
-    // user instead of attaching the login to whichever account now owns the email.
-    let user_id = format!("usr_{}", random_token()?);
-    insert_passkey_user(db, &user_id, &row.email, None, None, now).await?;
-    Ok((user_id, true))
+    // A new signup is pinned to an empty account created with this request. Old
+    // links that selected an unverified password/passkey account must not bless
+    // the attacker's credentials with the victim's mailbox proof.
+    #[derive(Deserialize)]
+    struct PendingMagicLinkAccount {
+        pending: i32,
+    }
+    let args = [
+        worker::d1::D1Type::Text(user_id),
+        worker::d1::D1Type::Text(&row.email),
+        worker::d1::D1Type::Integer(row.created_at),
+    ];
+    let pending = db
+        .prepare(PENDING_MAGIC_LINK_ACCOUNT_SQL)
+        .bind_refs(&args)?
+        .first::<PendingMagicLinkAccount>(None)
+        .await?
+        .is_some_and(|row| row.pending != 0);
+    if !pending {
+        return Ok(Err(
+            "magic link account binding is not verified; request a new link".to_owned(),
+        ));
+    }
+    Ok(Ok((user_id.to_owned(), true)))
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -10850,13 +10893,19 @@ async fn get_user_token_claims(
                         FROM zeroth_account_identities
                         WHERE user_id = u.id
                         UNION ALL
-                        SELECT provider_id, email, email_verified
-                        FROM zeroth_identities
-                        WHERE user_id = u.id
+                        SELECT li.provider_id, li.email, li.email_verified
+                        FROM zeroth_identities li
+                        WHERE li.user_id = u.id
+                          AND NOT EXISTS (
+                              SELECT 1 FROM zeroth_account_identities ai
+                              WHERE ai.account_namespace = 'global'
+                                AND ai.provider_id = li.provider_id
+                                AND ai.provider_subject = li.provider_subject
+                          )
                     ) i
                     WHERE i.email = u.primary_email
                       AND i.email_verified != 0
-                      AND i.provider_id IN ('google', 'apple', 'zeroth')
+                      AND i.provider_id IN ('google', 'apple', 'zeroth', 'magic_link')
                     LIMIT 1
                 ) AS email_verified,
                 EXISTS (
@@ -10910,13 +10959,19 @@ async fn get_admin_user_row(
                         FROM zeroth_account_identities
                         WHERE user_id = u.id
                         UNION ALL
-                        SELECT provider_id, email, email_verified
-                        FROM zeroth_identities
-                        WHERE user_id = u.id
+                        SELECT li.provider_id, li.email, li.email_verified
+                        FROM zeroth_identities li
+                        WHERE li.user_id = u.id
+                          AND NOT EXISTS (
+                              SELECT 1 FROM zeroth_account_identities ai
+                              WHERE ai.account_namespace = 'global'
+                                AND ai.provider_id = li.provider_id
+                                AND ai.provider_subject = li.provider_subject
+                          )
                     ) i
                     WHERE i.email = u.primary_email
                       AND i.email_verified != 0
-                      AND i.provider_id IN ('google', 'apple', 'zeroth')
+                      AND i.provider_id IN ('google', 'apple', 'zeroth', 'magic_link')
                     LIMIT 1
                 ) AS email_verified,
                 EXISTS (
@@ -10969,13 +11024,19 @@ async fn list_admin_user_rows(
                         FROM zeroth_account_identities
                         WHERE user_id = u.id
                         UNION ALL
-                        SELECT provider_id, email, email_verified
-                        FROM zeroth_identities
-                        WHERE user_id = u.id
+                        SELECT li.provider_id, li.email, li.email_verified
+                        FROM zeroth_identities li
+                        WHERE li.user_id = u.id
+                          AND NOT EXISTS (
+                              SELECT 1 FROM zeroth_account_identities ai
+                              WHERE ai.account_namespace = 'global'
+                                AND ai.provider_id = li.provider_id
+                                AND ai.provider_subject = li.provider_subject
+                          )
                     ) i
                     WHERE i.email = u.primary_email
                       AND i.email_verified != 0
-                      AND i.provider_id IN ('google', 'apple', 'zeroth')
+                      AND i.provider_id IN ('google', 'apple', 'zeroth', 'magic_link')
                     LIMIT 1
                 ) AS email_verified,
                 EXISTS (
@@ -15577,12 +15638,78 @@ fn validate_legacy_local_auth_namespace(namespace: &str) -> Result<(), String> {
 const VERIFIED_LOCAL_AUTH_EMAIL_SQL: &str = "SELECT EXISTS (
          SELECT 1 FROM zeroth_account_identities
          WHERE account_namespace = 'global' AND user_id = ? AND lower(email) = lower(?)
-           AND email_verified != 0 AND provider_id IN ('google', 'apple', 'zeroth')
+           AND email_verified != 0 AND provider_id IN ('google', 'apple', 'zeroth', 'magic_link')
          UNION ALL
-         SELECT 1 FROM zeroth_identities
-         WHERE user_id = ? AND lower(email) = lower(?)
-           AND email_verified != 0 AND provider_id IN ('google', 'apple', 'zeroth')
+         SELECT 1 FROM zeroth_identities li
+         WHERE li.user_id = ? AND lower(li.email) = lower(?)
+           AND li.email_verified != 0 AND li.provider_id IN ('google', 'apple', 'zeroth', 'magic_link')
+           AND NOT EXISTS (
+               SELECT 1 FROM zeroth_account_identities ai
+               WHERE ai.account_namespace = 'global'
+                 AND ai.provider_id = li.provider_id
+                 AND ai.provider_subject = li.provider_subject
+           )
      ) AS verified";
+
+const VERIFIED_EMAIL_ACCOUNT_SQL: &str =
+    "SELECT u.id, u.primary_email, u.display_name, u.picture_url, u.disabled_at
+     FROM zeroth_users u
+     WHERE u.id IN (
+         SELECT ai.user_id FROM zeroth_account_identities ai
+         WHERE ai.account_namespace = 'global' AND lower(ai.email) = lower(?)
+           AND ai.email_verified != 0
+           AND ai.provider_id IN ('google', 'apple', 'zeroth', 'magic_link')
+         UNION
+         SELECT li.user_id FROM zeroth_identities li
+         WHERE lower(li.email) = lower(?) AND li.email_verified != 0
+           AND li.provider_id IN ('google', 'apple', 'zeroth', 'magic_link')
+           AND NOT EXISTS (
+               SELECT 1 FROM zeroth_account_identities ai
+               WHERE ai.account_namespace = 'global'
+                 AND ai.provider_id = li.provider_id
+                 AND ai.provider_subject = li.provider_subject
+           )
+     ) LIMIT 2";
+
+const PENDING_MAGIC_LINK_ACCOUNT_SQL: &str = "SELECT EXISTS (
+         SELECT 1 FROM zeroth_users u
+         WHERE u.id = ? AND lower(u.primary_email) = lower(?)
+           AND u.created_at = ? AND u.disabled_at IS NULL
+           AND NOT EXISTS (SELECT 1 FROM zeroth_local_credentials WHERE user_id = u.id)
+           AND NOT EXISTS (SELECT 1 FROM zeroth_passkey_credentials WHERE user_id = u.id)
+           AND NOT EXISTS (SELECT 1 FROM zeroth_sessions WHERE user_id = u.id)
+           AND NOT EXISTS (SELECT 1 FROM zeroth_account_identities WHERE user_id = u.id)
+           AND NOT EXISTS (SELECT 1 FROM zeroth_identities WHERE user_id = u.id)
+           AND NOT EXISTS (SELECT 1 FROM zeroth_admin_memberships WHERE user_id = u.id)
+     ) AS pending";
+
+fn unique_verified_email_user(mut users: Vec<UserRow>) -> Result<Option<UserRow>, String> {
+    if users.len() > 1 {
+        return Err(
+            "verified mailbox belongs to multiple accounts; use the original sign-in method"
+                .to_owned(),
+        );
+    }
+    Ok(users.pop())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn get_user_by_verified_email(
+    db: &worker::d1::D1Database,
+    email: &str,
+) -> worker::Result<Result<Option<UserRow>, String>> {
+    let args = [
+        worker::d1::D1Type::Text(email),
+        worker::d1::D1Type::Text(email),
+    ];
+    let users = db
+        .prepare(VERIFIED_EMAIL_ACCOUNT_SQL)
+        .bind_refs(&args)?
+        .all()
+        .await?
+        .results::<UserRow>()?;
+    Ok(unique_verified_email_user(users))
+}
 
 #[cfg(target_arch = "wasm32")]
 async fn local_auth_email_is_verified(
@@ -15661,6 +15788,34 @@ fn local_auth_profile(
         display_name: display_name.map(str::to_owned),
         picture_url: None,
     }
+}
+
+fn local_auth_identity_profile(
+    email: &str,
+    display_name: Option<&str>,
+    email_verified: bool,
+    mode: &str,
+) -> ProviderProfile {
+    let mut profile = local_auth_profile(email, display_name, email_verified);
+    if mode == "magic_link" {
+        // A password's unverified email claim cannot reserve the separate
+        // confirmed-mailbox identity or inherit its verification.
+        profile.provider_id = ProviderId(MAGIC_LINK_PROVIDER_ID.to_owned());
+    }
+    profile
+}
+
+fn validate_passkey_registration_account_binding(
+    challenge_user_id: Option<&str>,
+    authenticated_user_id: Option<&str>,
+) -> Result<(), String> {
+    if challenge_user_id.is_some() && challenge_user_id != authenticated_user_id {
+        return Err(
+            "existing-account passkey registration requires that account's browser session"
+                .to_owned(),
+        );
+    }
+    Ok(())
 }
 
 fn local_auth_registration_user_id(
@@ -24924,6 +25079,180 @@ mod tests {
             "INSERT INTO zeroth_account_identities (account_namespace, provider_id, provider_subject, user_id, email, email_verified, created_at, updated_at) VALUES ('global', 'google', 'verified-global', 'usr_123', 'user@example.com', 1, 1, 1)", [],
         ).unwrap();
         assert!(proven("usr_123", "user@example.com"));
+    }
+
+    fn sqlite_verified_email_users(conn: &Connection, email: &str) -> Vec<UserRow> {
+        conn.prepare(VERIFIED_EMAIL_ACCOUNT_SQL)
+            .unwrap()
+            .query_map(params![email, email], |row| {
+                Ok(UserRow {
+                    id: row.get(0)?,
+                    primary_email: row.get(1)?,
+                    display_name: row.get(2)?,
+                    picture_url: row.get(3)?,
+                    disabled_at: row.get(4)?,
+                })
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn magic_link_cannot_verify_an_attackers_password_preclaimed_email() {
+        let conn = sqlite_bootstrap();
+        sqlite_seed_authorize_fixtures(&conn);
+        let email = "user@example.com";
+        conn.execute(
+            "INSERT INTO zeroth_local_credentials (email, user_id, password_hash, password_salt, password_alg, password_iterations, created_at, updated_at) VALUES (?, 'usr_123', 'attacker-hash', 'salt', 'pbkdf2-sha256', 600000, 1, 1)", params![email],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO zeroth_identities (provider_id, provider_subject, user_id, email, email_verified, created_at, updated_at) VALUES ('zeroth', ?, 'usr_123', ?, 0, 1, 1)", params![email, email],
+        ).unwrap();
+        // A preclaimed password user is not an eligible mailbox-login target.
+        assert!(sqlite_verified_email_users(&conn, email).is_empty());
+        let attacker_pending: i32 = conn
+            .query_row(
+                PENDING_MAGIC_LINK_ACCOUNT_SQL,
+                params!["usr_123", email, 1_780_000_000],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(attacker_pending, 0);
+
+        conn.execute("INSERT INTO zeroth_users (id, primary_email, created_at, updated_at) VALUES ('usr_mailbox', ?, 1780000100, 1780000100)", params![email]).unwrap();
+        let mailbox_pending: i32 = conn
+            .query_row(
+                PENDING_MAGIC_LINK_ACCOUNT_SQL,
+                params!["usr_mailbox", email, 1_780_000_100],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(mailbox_pending, 1);
+        let profile = local_auth_identity_profile(email, None, true, "magic_link");
+        assert_eq!(profile.provider_id.0, "magic_link");
+        assert_ne!(
+            profile.provider_id.0,
+            local_auth_identity_profile(email, None, false, "password")
+                .provider_id
+                .0
+        );
+        conn.execute(
+            "INSERT INTO zeroth_account_identities (account_namespace, provider_id, provider_subject, user_id, email, email_verified, created_at, updated_at) VALUES ('global', ?, ?, 'usr_mailbox', ?, 1, 1780000100, 1780000100)",
+            params![profile.provider_id.0, profile.subject.0, email],
+        ).unwrap();
+        let trusted = unique_verified_email_user(sqlite_verified_email_users(&conn, email))
+            .unwrap()
+            .unwrap();
+        assert_eq!(trusted.id, "usr_mailbox");
+        let attacker_verified: i32 = conn
+            .query_row(
+                VERIFIED_LOCAL_AUTH_EMAIL_SQL,
+                params!["usr_123", email, "usr_123", email],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(attacker_verified, 0);
+        let password_owner: String = conn
+            .query_row(
+                "SELECT user_id FROM zeroth_local_credentials WHERE email = ?",
+                params![email],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(password_owner, "usr_123");
+    }
+
+    #[test]
+    fn old_magic_link_pins_require_an_empty_account_created_at_issuance() {
+        let conn = sqlite_bootstrap();
+        sqlite_seed_authorize_fixtures(&conn);
+        conn.execute("INSERT INTO zeroth_users (id, primary_email, created_at, updated_at) VALUES ('pending', 'user@example.com', 100, 100)", []).unwrap();
+        let pending = |created_at: i32| -> i32 {
+            conn.query_row(
+                PENDING_MAGIC_LINK_ACCOUNT_SQL,
+                params!["pending", "user@example.com", created_at],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(pending(100), 1);
+        assert_eq!(pending(101), 0);
+        conn.execute("INSERT INTO zeroth_sessions (id, user_id, client_id, created_at, expires_at) VALUES ('attacker-session', 'pending', 'yl-web', 100, 200)", []).unwrap();
+        assert_eq!(pending(100), 0);
+        conn.execute("DELETE FROM zeroth_sessions WHERE user_id = 'pending'", [])
+            .unwrap();
+        assert_eq!(pending(100), 1);
+        conn.execute("INSERT INTO zeroth_identities (provider_id, provider_subject, user_id, email, email_verified, created_at, updated_at) VALUES ('passkey', 'attacker-key', 'pending', 'user@example.com', 1, 100, 100)", []).unwrap();
+        assert_eq!(pending(100), 0);
+        assert!(sqlite_verified_email_users(&conn, "user@example.com").is_empty());
+    }
+
+    #[test]
+    fn canonical_email_changes_and_downgrades_suppress_stale_legacy_verification() {
+        let conn = sqlite_bootstrap();
+        sqlite_seed_authorize_fixtures(&conn);
+        let email = "user@example.com";
+        conn.execute("INSERT INTO zeroth_identities (provider_id, provider_subject, user_id, email, email_verified, created_at, updated_at) VALUES ('google', 'google-sub', 'usr_123', ?, 1, 1, 1)", params![email]).unwrap();
+        let proven = || -> i32 {
+            conn.query_row(
+                VERIFIED_LOCAL_AUTH_EMAIL_SQL,
+                params!["usr_123", email, "usr_123", email],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(proven(), 1);
+        conn.execute("INSERT INTO zeroth_account_identities (account_namespace, provider_id, provider_subject, user_id, email, email_verified, created_at, updated_at) VALUES ('global', 'google', 'google-sub', 'usr_123', ?, 0, 2, 2)", params![email]).unwrap();
+        assert_eq!(proven(), 0);
+        assert!(sqlite_verified_email_users(&conn, email).is_empty());
+        conn.execute("UPDATE zeroth_account_identities SET email = 'changed@personal.example', email_verified = 1", []).unwrap();
+        assert_eq!(proven(), 0);
+        assert!(sqlite_verified_email_users(&conn, email).is_empty());
+    }
+
+    #[test]
+    fn magic_link_refuses_ambiguous_verified_email_owners() {
+        let conn = sqlite_bootstrap();
+        sqlite_seed_authorize_fixtures(&conn);
+        conn.execute("INSERT INTO zeroth_users (id, primary_email, created_at, updated_at) VALUES ('other', 'user@example.com', 1, 1)", []).unwrap();
+        for (provider, user) in [("google", "usr_123"), ("apple", "other")] {
+            conn.execute("INSERT INTO zeroth_account_identities (account_namespace, provider_id, provider_subject, user_id, email, email_verified, created_at, updated_at) VALUES ('global', ?, ?, ?, 'user@example.com', 1, 1, 1)", params![provider, provider, user]).unwrap();
+        }
+        assert!(
+            unique_verified_email_user(sqlite_verified_email_users(&conn, "user@example.com"))
+                .is_err()
+        );
+        conn.execute(
+            "DELETE FROM zeroth_account_identities WHERE provider_id = 'apple'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            unique_verified_email_user(sqlite_verified_email_users(&conn, "user@example.com"))
+                .unwrap()
+                .unwrap()
+                .id,
+            "usr_123"
+        );
+    }
+
+    #[test]
+    fn passkey_bootstrap_cannot_attach_admin_credentials_to_a_preclaimed_account() {
+        assert!(
+            validate_passkey_registration_account_binding(Some("attacker-account"), None).is_err()
+        );
+        assert!(validate_passkey_registration_account_binding(
+            Some("attacker-account"),
+            Some("admin-account")
+        )
+        .is_err());
+        assert!(validate_passkey_registration_account_binding(
+            Some("admin-account"),
+            Some("admin-account")
+        )
+        .is_ok());
+        assert!(validate_passkey_registration_account_binding(None, None).is_ok());
     }
 
     #[test]
