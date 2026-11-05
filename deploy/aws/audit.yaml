@@ -1,0 +1,166 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Optional Zeroth DynamoDB audit capture and SQS delivery resources (no application deployment).
+
+Parameters:
+  AuditNamePrefix:
+    Type: String
+    Default: zeroth-audit
+    MinLength: 1
+    MaxLength: 60
+    AllowedPattern: '[A-Za-z0-9_-]+'
+    Description: Unique queue prefix for this environment.
+
+Resources:
+  AuditTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: pending_partition
+          AttributeType: S
+        - AttributeName: pending_sort
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: pending
+          KeySchema:
+            - AttributeName: pending_partition
+              KeyType: HASH
+            - AttributeName: pending_sort
+              KeyType: RANGE
+          Projection:
+            ProjectionType: INCLUDE
+            NonKeyAttributes:
+              - event_id
+              - event_json
+      SSESpecification:
+        SSEEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  AuditDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      QueueName: !Sub '${AuditNamePrefix}-dead-letter.fifo'
+      FifoQueue: true
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 1209600
+
+  AuditQueue:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      QueueName: !Sub '${AuditNamePrefix}.fifo'
+      FifoQueue: true
+      ContentBasedDeduplication: false
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 1209600
+      VisibilityTimeout: 60
+      ReceiveMessageWaitTimeSeconds: 20
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt AuditDeadLetterQueue.Arn
+        maxReceiveCount: 5
+
+  QueueTransportPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref AuditQueue
+        - !Ref AuditDeadLetterQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: sqs:*
+            Resource:
+              - !GetAtt AuditQueue.Arn
+              - !GetAtt AuditDeadLetterQueue.Arn
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  # Attach to the application role. Add separately scoped transaction permissions
+  # on its business tables. No history update/delete or delivery permission here.
+  AuditCapturePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Example least-privilege capture policy; attach to the application role.
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ReadCaptureIdentity
+            Effect: Allow
+            Action: dynamodb:GetItem
+            Resource: !GetAtt AuditTable.Arn
+            Condition:
+              ForAllValues:StringLike:
+                dynamodb:LeadingKeys:
+                  - event#*
+          - Sid: TransactionalCaptureOnly
+            Effect: Allow
+            Action: dynamodb:PutItem
+            Resource: !GetAtt AuditTable.Arn
+            Condition:
+              ForAnyValue:StringEquals:
+                dynamodb:EnclosingOperation: TransactWriteItems
+              ForAllValues:StringLike:
+                dynamodb:LeadingKeys:
+                  - event#*
+                  - outbox#*
+
+  # Attach only to an outbox delivery runtime. It cannot update event# records,
+  # delete history, create resources or receive/delete queue messages.
+  AuditDeliveryPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Example least-privilege pending-outbox delivery policy.
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ReadPendingIndex
+            Effect: Allow
+            Action: dynamodb:Query
+            Resource: !Sub '${AuditTable.Arn}/index/pending'
+            Condition:
+              ForAllValues:StringEquals:
+                dynamodb:LeadingKeys:
+                  - pending
+          - Sid: CompletePendingOnly
+            Effect: Allow
+            Action: dynamodb:UpdateItem
+            Resource: !GetAtt AuditTable.Arn
+            Condition:
+              ForAllValues:StringLike:
+                dynamodb:LeadingKeys:
+                  - outbox#*
+          - Sid: SendToAuditQueue
+            Effect: Allow
+            Action: sqs:SendMessage
+            Resource: !GetAtt AuditQueue.Arn
+
+Outputs:
+  AuditTableName:
+    Value: !Ref AuditTable
+  PendingIndexName:
+    Value: pending
+  QueueUrl:
+    Value: !Ref AuditQueue
+  QueueArn:
+    Value: !GetAtt AuditQueue.Arn
+  DeadLetterQueueUrl:
+    Value: !Ref AuditDeadLetterQueue
+  CapturePolicyArn:
+    Value: !Ref AuditCapturePolicy
+  DeliveryPolicyArn:
+    Value: !Ref AuditDeliveryPolicy

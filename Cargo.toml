@@ -8,6 +8,9 @@ homepage.workspace = true
 
 [workspace]
 members = [
+    "crates/zeroth-audit",
+    "crates/zeroth-audit-collector",
+    "crates/zeroth-audit-aws",
     "crates/zeroth-aws-authorizer",
     "crates/zeroth-cli",
     "crates/zeroth-core",
@@ -32,6 +35,8 @@ license = "MIT"
 homepage = "https://wavey.ai"
 
 [workspace.dependencies]
+zeroth-audit = { version = "0.2.0", path = "crates/zeroth-audit" }
+zeroth-audit-aws = { version = "0.2.0", path = "crates/zeroth-audit-aws" }
 zeroth-core = { version = "0.2.0", path = "crates/zeroth-core" }
 zeroth-oidc = { version = "0.2.0", path = "crates/zeroth-oidc" }
 zeroth-providers = { version = "0.2.0", path = "crates/zeroth-providers" }

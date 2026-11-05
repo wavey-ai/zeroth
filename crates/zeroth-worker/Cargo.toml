@@ -13,12 +13,14 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 base64.workspace = true
 console_error_panic_hook.workspace = true
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 getrandom.workspace = true
 hmac.workspace = true
 k256.workspace = true
 p256.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tracing = { version = "0.1", default-features = false, features = ["std"] }
 serde_urlencoded.workspace = true
 sha2.workspace = true
 sha3.workspace = true
@@ -26,6 +28,7 @@ url.workspace = true
 urlencoding.workspace = true
 web-sys.workspace = true
 worker.workspace = true
+zeroth-audit.workspace = true
 zeroth-core.workspace = true
 zeroth-oidc.workspace = true
 zeroth-providers.workspace = true

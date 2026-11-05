@@ -1,0 +1,31 @@
+[package]
+name = "zeroth-audit-collector"
+version.workspace = true
+edition.workspace = true
+description = "Optional durable Zeroth audit stream delivery to PostgreSQL"
+license.workspace = true
+homepage.workspace = true
+
+[features]
+default = []
+cli = []
+postgres = ["cli", "zeroth-audit/postgres"]
+aws = ["cli", "dep:aws-config", "dep:aws-sdk-sqs", "dep:zeroth-audit-aws"]
+
+[[bin]]
+name = "zeroth-audit-collector"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+aws-config = { version = "1", optional = true }
+aws-sdk-sqs = { version = "1", optional = true }
+serde.workspace = true
+serde_json.workspace = true
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "json"] }
+url.workspace = true
+zeroth-audit.workspace = true
+zeroth-audit-aws = { workspace = true, optional = true }
