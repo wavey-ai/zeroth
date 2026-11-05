@@ -333,6 +333,27 @@ token for that mobile SDK path. When Spotify returns `account_id`, Zeroth uses
 that immutable profile value for account linking and falls back to legacy `id`
 only for older responses.
 
+Password, magic-link, and passkey authentication currently require a registered
+client with `account_sharing_mode=global`. Their credential and email lookups are
+globally keyed, so tenant- and client-scoped clients are rejected until local
+credentials support account namespaces. The check also runs when completing an
+in-flight login. OAuth provider and wallet identities retain their namespace
+support; wallet completion rechecks the client's current namespace and policy.
+
+For clients with `allowedEmailDomains`, password and passkey login require
+stored mailbox verification from Google, Apple, or a confirmed magic link.
+Typing an address or registering a passkey does not verify that address.
+Password signup cannot create a session for a domain-restricted client, and
+cannot attach a password to an existing account by matching its email. Adding
+or replacing a password on an existing account requires its browser session
+and the `X-Zeroth-CSRF` token. Legacy passkey `email_verified` flags no longer
+qualify for domain policy or `ADMIN_EMAILS` authorization; passkey admins can
+continue to use explicit admin memberships or `ADMIN_USER_IDS`.
+
+Deleting an account requires its hosted browser session and account CSRF token.
+Ordinary OAuth access tokens, including tokens with `profile` scope or a `sid`
+claim, cannot delete the account.
+
 Magic-link local auth defaults to `MAGIC_LINK_DELIVERY=cloudflare_email`. That
 requires `MAGIC_LINK_FROM` and a Worker `send_email` binding named `EMAIL`.
 Set `MAGIC_LINK_DELIVERY=webhook` to use a generic HTTPS email sender instead.

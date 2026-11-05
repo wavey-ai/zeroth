@@ -1852,7 +1852,6 @@ struct RateLimitExceeded {
 #[derive(Debug, Clone)]
 struct RateLimitSecret([u8; 32]);
 
-#[cfg(target_arch = "wasm32")]
 #[derive(Debug, Clone)]
 struct CsrfSecret([u8; 32]);
 
@@ -3015,7 +3014,6 @@ struct CurrentSession {
     user: UserRow,
 }
 
-#[cfg(target_arch = "wasm32")]
 #[derive(Debug, Clone)]
 struct CurrentAccount {
     user: UserRow,
@@ -3058,7 +3056,6 @@ impl AccountAuthError {
     }
 }
 
-#[cfg(target_arch = "wasm32")]
 impl CurrentAccount {
     fn profile_scope(&self) -> &str {
         self.scope.as_deref().unwrap_or("email profile")
@@ -3071,6 +3068,16 @@ impl CurrentAccount {
         Err(AccountAuthError::invalid_scope(
             "access token requires profile scope",
         ))
+    }
+
+    fn require_account_deletion_session(&self) -> Result<(), AccountAuthError> {
+        if self.access_token || self.session_id.as_deref().is_none_or(str::is_empty) {
+            return Err(AccountAuthError::invalid_request(
+                "account deletion requires hosted account session",
+                403,
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -5056,15 +5063,9 @@ async fn passkey_register_options(mut request: Request, env: Env) -> worker::Res
         Ok(client_id) => client_id,
         Err(error) => return oauth_error_json("invalid_request", error.to_string(), 400),
     };
-    let client = match get_client(&db, &client_id).await? {
-        Some(client) => client,
-        None => {
-            return oauth_error_json(
-                "invalid_request",
-                "passkey session client is not registered",
-                400,
-            )
-        }
+    let client = match global_local_auth_client(&db, &client_id).await? {
+        Ok(client) => client,
+        Err(error) => return oauth_error_json("invalid_request", error, 403),
     };
     let return_to = match passkey_return_to(&url, body.return_to.as_deref(), &client, &config) {
         Ok(return_to) => return_to,
@@ -5311,6 +5312,10 @@ async fn passkey_register_verify(mut request: Request, env: Env) -> worker::Resu
             );
         }
     }
+    let client_id = challenge.client_id.as_deref().unwrap_or_default();
+    if let Err(error) = global_local_auth_client(&db, client_id).await? {
+        return oauth_error_json("invalid_request", error, 403);
+    }
     if !consume_passkey_challenge(&db, &challenge.challenge_hash, now).await? {
         if let Some(blocked) =
             rate_limit_increment_subjects(&db, &rate_limit_key, now, &failure_rate_limit_subjects)
@@ -5401,15 +5406,9 @@ async fn passkey_authenticate_options(mut request: Request, env: Env) -> worker:
         Ok(client_id) => client_id,
         Err(error) => return oauth_error_json("invalid_request", error.to_string(), 400),
     };
-    let client = match get_client(&db, &client_id).await? {
-        Some(client) => client,
-        None => {
-            return oauth_error_json(
-                "invalid_request",
-                "passkey session client is not registered",
-                400,
-            )
-        }
+    let client = match global_local_auth_client(&db, &client_id).await? {
+        Ok(client) => client,
+        Err(error) => return oauth_error_json("invalid_request", error, 403),
     };
     let return_to = match passkey_return_to(&url, body.return_to.as_deref(), &client, &config) {
         Ok(return_to) => return_to,
@@ -5629,6 +5628,9 @@ async fn passkey_authenticate_verify(mut request: Request, env: Env) -> worker::
         .client_id
         .as_deref()
         .ok_or_else(|| worker_error("passkey challenge did not include a client_id".to_owned()))?;
+    if let Err(error) = local_auth_session_user(&db, client_id, &user.id).await? {
+        return oauth_error_json("access_denied", error, 403);
+    }
     let session_id = format!("sess_{}", random_token()?);
     let audit_context = audit_request_context(&request).unwrap_or_default();
     let success_rate_limit_subjects = [rate_limit_subject(
@@ -5718,6 +5720,7 @@ async fn password_register(mut request: Request, env: Env) -> worker::Result<Res
         body.client_id.as_deref(),
         body.return_to.as_deref(),
         &config,
+        true,
     )
     .await
     {
@@ -5760,6 +5763,25 @@ async fn password_register(mut request: Request, env: Env) -> worker::Result<Res
     let current = current_session_from_request(&request, &db, &config, now).await?;
     let existing_user = get_user_by_primary_email(&db, &email).await?;
 
+    if let Some(current) = current.as_ref() {
+        let csrf_token = csrf_token_from_header(&request)?;
+        if let Err(error) = validate_browser_session_mutation(
+            &request,
+            &env,
+            &db,
+            &config,
+            current.session.client_id.as_deref(),
+            &current.session.id,
+            CSRF_ROUTE_FAMILY_ACCOUNT,
+            csrf_token.as_deref(),
+            now,
+        )
+        .await?
+        {
+            return oauth_error_json("invalid_request", error, 403);
+        }
+    }
+
     let peppers = password_pepper_from_env(&env).map_err(worker_error)?;
     let salt = random_token()?;
     let _password_hash =
@@ -5791,7 +5813,11 @@ async fn password_register(mut request: Request, env: Env) -> worker::Result<Res
         return public_response();
     }
 
-    if let Err(error) = validate_local_auth_client_email_policy(&client, &email) {
+    let email_verified = match current.as_ref() {
+        Some(current) => local_auth_email_is_verified(&db, &current.user.id, &email).await?,
+        None => false,
+    };
+    if let Err(error) = validate_local_auth_client_email_policy(&client, &email, email_verified) {
         if current.is_none() {
             record_audit_event(
                 &db,
@@ -5915,6 +5941,7 @@ async fn password_login(mut request: Request, env: Env) -> worker::Result<Respon
         body.client_id.as_deref(),
         body.return_to.as_deref(),
         &config,
+        true,
     )
     .await
     {
@@ -5924,7 +5951,7 @@ async fn password_login(mut request: Request, env: Env) -> worker::Result<Respon
     if let Err(error) = validate_local_auth_origin(&request, &db, &client, &config).await? {
         return oauth_error_json("invalid_request", error, 403);
     }
-    if validate_local_auth_client_email_policy(&client, &email).is_err() {
+    if validate_local_auth_client_email_policy(&client, &email, true).is_err() {
         return oauth_error_json("invalid_grant", "invalid email or password", 401);
     }
     let ip = rate_limit_request_ip(&request)?.unwrap_or_else(|| "missing".to_owned());
@@ -5974,6 +6001,11 @@ async fn password_login(mut request: Request, env: Env) -> worker::Result<Respon
             .map(|v| v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
         if allow_signup {
+            if validate_local_auth_client_email_policy(&client, &email, false).is_err() {
+                let peppers = password_pepper_from_env(&env).map_err(worker_error)?;
+                password_dummy_verify_with_config(&peppers, &body.password).await?;
+                return oauth_error_json("invalid_grant", "invalid email or password", 401);
+            }
             if let Err(error) = validate_local_auth_password(&body.password) {
                 return oauth_error_json("invalid_request", error, 400);
             }
@@ -5984,18 +6016,19 @@ async fn password_login(mut request: Request, env: Env) -> worker::Result<Respon
                 return oauth_error_json("invalid_request", "passwords do not match", 400);
             }
             let existing_user = get_user_by_primary_email(&db, &email).await?;
-            let user_id = if let Some(user) = existing_user {
-                user.id
-            } else {
-                let id = format!("usr_{}", random_token()?);
-                insert_passkey_user(&db, &id, &email, None, None, now).await?;
-                id
-            };
             let peppers = password_pepper_from_env(&env).map_err(worker_error)?;
             let salt = random_token()?;
             let password_hash =
                 password_hash_current(&body.password, &salt, peppers.current.value.as_slice())
                     .await?;
+            // A matching email is not proof of control of an existing account.
+            // Signup may only create a new user; credential linking must use the
+            // authenticated registration route instead.
+            if local_auth_registration_user_id(None, existing_user.as_ref(), &email).is_err() {
+                return oauth_error_json("invalid_grant", "invalid email or password", 401);
+            }
+            let user_id = format!("usr_{}", random_token()?);
+            insert_passkey_user(&db, &user_id, &email, None, None, now).await?;
             upsert_local_credential(
                 &db,
                 &email,
@@ -6038,6 +6071,11 @@ async fn password_login(mut request: Request, env: Env) -> worker::Result<Respon
         return oauth_error_json("invalid_grant", "invalid email or password", 401);
     };
     if user.disabled_at.is_some() {
+        return oauth_error_json("invalid_grant", "invalid email or password", 401);
+    }
+    let email_verified = local_auth_email_is_verified(&db, &user.id, &credential.email).await?;
+    if validate_local_auth_client_email_policy(&client, &credential.email, email_verified).is_err()
+    {
         return oauth_error_json("invalid_grant", "invalid email or password", 401);
     }
     if password_verification.needs_rehash {
@@ -6127,6 +6165,7 @@ async fn evm_wallet_challenge(mut request: Request, env: Env) -> worker::Result<
         body.client_id.as_deref(),
         body.return_to.as_deref(),
         &config,
+        false,
     )
     .await
     {
@@ -6349,6 +6388,20 @@ async fn evm_wallet_verify(mut request: Request, env: Env) -> worker::Result<Res
         }
         return oauth_error_json("invalid_grant", "invalid wallet signature", 401);
     }
+    let Some(registered_client) = get_registered_client(&db, &challenge.client_id).await? else {
+        return oauth_error_json("access_denied", "wallet client is not registered", 403);
+    };
+    if registered_client.account_scope.namespace != challenge.account_namespace {
+        return oauth_error_json(
+            "access_denied",
+            "wallet client account namespace changed",
+            403,
+        );
+    }
+    let profile = evm_wallet_profile(&address);
+    if let Err(error) = validate_client_email_domain_policy(&registered_client.client, &profile) {
+        return oauth_error_json(&error.code, error.description, 403);
+    }
     if !consume_wallet_challenge(&db, &challenge_hash, now).await? {
         if let Some(blocked) =
             rate_limit_increment_subjects(&db, &rate_limit_key, now, &failure_rate_limit_subjects)
@@ -6359,7 +6412,6 @@ async fn evm_wallet_verify(mut request: Request, env: Env) -> worker::Result<Res
         return oauth_error_json("invalid_grant", "wallet challenge was already used", 401);
     }
 
-    let profile = evm_wallet_profile(&address);
     let raw_profile_json = serde_json::json!({
         "kind": "wallet",
         "provider": EVM_WALLET_PROVIDER_ID,
@@ -6433,6 +6485,7 @@ async fn magic_link_request(mut request: Request, env: Env) -> worker::Result<Re
         body.client_id.as_deref(),
         body.return_to.as_deref(),
         &config,
+        true,
     )
     .await
     {
@@ -6484,7 +6537,7 @@ async fn magic_link_request(mut request: Request, env: Env) -> worker::Result<Re
     let allow_signup = binding_value_from_env(&env, "MAGIC_LINK_ALLOW_SIGNUP")
         .map(|v| v.trim().to_lowercase() == "true")
         .unwrap_or(false);
-    let policy_ok = validate_local_auth_client_email_policy(&client, &email).is_ok();
+    let policy_ok = validate_local_auth_client_email_policy(&client, &email, true).is_ok();
     let mut user = get_user_by_primary_email(&db, &email).await?;
     // Pin the account at request time so a later-created account for the same email
     // cannot capture the link (magic-link pre-hijack).
@@ -6715,14 +6768,11 @@ async fn magic_link_consume(mut request: Request, env: Env) -> worker::Result<Re
     if let Err(error) = validate_magic_link(&row, now) {
         return oauth_error_json("invalid_request", error, 400);
     }
-    let Some(client) = get_client(&db, &row.client_id).await? else {
-        return oauth_error_json(
-            "invalid_request",
-            "magic link client is not registered",
-            400,
-        );
+    let client = match global_local_auth_client(&db, &row.client_id).await? {
+        Ok(client) => client,
+        Err(error) => return oauth_error_json("invalid_request", error, 403),
     };
-    if let Err(error) = validate_local_auth_client_email_policy(&client, &row.email) {
+    if let Err(error) = validate_local_auth_client_email_policy(&client, &row.email, true) {
         return oauth_error_json(&error.code, &error.description, 403);
     }
     let (user_id, user_created) = ensure_magic_link_user(&db, &row, now).await?;
@@ -6845,6 +6895,9 @@ async fn magic_link_poll(mut request: Request, env: Env) -> worker::Result<Respo
     };
     if user.disabled_at.is_some() {
         return oauth_error_json("invalid_request", "user is disabled", 403);
+    }
+    if let Err(error) = local_auth_session_user(&db, &row.client_id, &user_id).await? {
+        return oauth_error_json("access_denied", error, 403);
     }
     if !consume_magic_link_poll_token(&db, &poll_token_hash, now).await? {
         return json_status(&serde_json::json!({"status": "consumed"}), 409);
@@ -7600,39 +7653,33 @@ async fn delete_account(request: Request, env: Env) -> worker::Result<Response> 
             Err(error) => return oauth_error_json(error.code, error.description, error.status),
         };
 
-    if let Err(error) = current.require_profile_scope() {
+    if let Err(error) = current.require_account_deletion_session() {
         return oauth_error_json(error.code, error.description, error.status);
     }
 
-    if !current.access_token {
-        let csrf_token = csrf_token_from_header(&request)?;
-        if let Err(error) = validate_browser_session_mutation(
-            &request,
-            &env,
-            &db,
-            &config,
-            current.client_id.as_deref(),
-            current.session_id.as_deref().unwrap_or_default(),
-            CSRF_ROUTE_FAMILY_ACCOUNT,
-            csrf_token.as_deref(),
-            now,
-        )
-        .await?
-        {
-            return oauth_error_json("invalid_request", error, 403);
-        }
+    let csrf_token = csrf_token_from_header(&request)?;
+    if let Err(error) = validate_browser_session_mutation(
+        &request,
+        &env,
+        &db,
+        &config,
+        current.client_id.as_deref(),
+        current.session_id.as_deref().unwrap_or_default(),
+        CSRF_ROUTE_FAMILY_ACCOUNT,
+        csrf_token.as_deref(),
+        now,
+    )
+    .await?
+    {
+        return oauth_error_json("invalid_request", error, 403);
     }
 
     delete_user_account_data(&db, &current.user.id).await?;
     let response = json(&serde_json::json!({ "ok": true }))?;
-    let response = if current.access_token {
-        response
-    } else {
-        with_set_cookie(
-            response,
-            &clear_session_cookie(&config.cookie_name, config.cookie_domain.as_deref()),
-        )?
-    };
+    let response = with_set_cookie(
+        response,
+        &clear_session_cookie(&config.cookie_name, config.cookie_domain.as_deref()),
+    )?;
     with_cors_actual_headers(response, origin.as_deref())
 }
 
@@ -10118,7 +10165,7 @@ async fn upsert_passkey_identity(
         worker::d1::D1Type::Text(credential_id),
         worker::d1::D1Type::Text(user_id),
         email,
-        worker::d1::D1Type::Integer(1),
+        worker::d1::D1Type::Integer(0),
         display_name,
         worker::d1::D1Type::Text(&raw_profile_json),
         worker::d1::D1Type::Integer(now),
@@ -10244,7 +10291,9 @@ async fn upsert_local_auth_identity(
     mode: &str,
     now: i32,
 ) -> worker::Result<()> {
-    let profile = local_auth_profile(email, display_name, mode == "magic_link");
+    let email_verified =
+        mode == "magic_link" || local_auth_email_is_verified(db, user_id, email).await?;
+    let profile = local_auth_profile(email, display_name, email_verified);
     let raw_profile_json = serde_json::json!({
         "kind": "local_auth",
         "mode": mode
@@ -10797,16 +10846,17 @@ async fn get_user_token_claims(
                 EXISTS (
                     SELECT 1
                     FROM (
-                        SELECT email, email_verified
+                        SELECT provider_id, email, email_verified
                         FROM zeroth_account_identities
                         WHERE user_id = u.id
                         UNION ALL
-                        SELECT email, email_verified
+                        SELECT provider_id, email, email_verified
                         FROM zeroth_identities
                         WHERE user_id = u.id
                     ) i
                     WHERE i.email = u.primary_email
                       AND i.email_verified != 0
+                      AND i.provider_id IN ('google', 'apple', 'zeroth')
                     LIMIT 1
                 ) AS email_verified,
                 EXISTS (
@@ -10856,16 +10906,17 @@ async fn get_admin_user_row(
                 EXISTS (
                     SELECT 1
                     FROM (
-                        SELECT email, email_verified
+                        SELECT provider_id, email, email_verified
                         FROM zeroth_account_identities
                         WHERE user_id = u.id
                         UNION ALL
-                        SELECT email, email_verified
+                        SELECT provider_id, email, email_verified
                         FROM zeroth_identities
                         WHERE user_id = u.id
                     ) i
                     WHERE i.email = u.primary_email
                       AND i.email_verified != 0
+                      AND i.provider_id IN ('google', 'apple', 'zeroth')
                     LIMIT 1
                 ) AS email_verified,
                 EXISTS (
@@ -10914,16 +10965,17 @@ async fn list_admin_user_rows(
                 EXISTS (
                     SELECT 1
                     FROM (
-                        SELECT email, email_verified
+                        SELECT provider_id, email, email_verified
                         FROM zeroth_account_identities
                         WHERE user_id = u.id
                         UNION ALL
-                        SELECT email, email_verified
+                        SELECT provider_id, email, email_verified
                         FROM zeroth_identities
                         WHERE user_id = u.id
                     ) i
                     WHERE i.email = u.primary_email
                       AND i.email_verified != 0
+                      AND i.provider_id IN ('google', 'apple', 'zeroth')
                     LIMIT 1
                 ) AS email_verified,
                 EXISTS (
@@ -15455,13 +15507,20 @@ async fn local_auth_client_and_return_to(
     client_id: Option<&str>,
     return_to: Option<&str>,
     config: &ZerothServerConfig,
+    require_global_namespace: bool,
 ) -> Result<(Client, String), String> {
     let client_id =
         passkey_client_id_from_request(env, client_id).map_err(|error| error.to_string())?;
-    let client = get_client(db, &client_id)
-        .await
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| "local auth client is not registered".to_owned())?;
+    let client = if require_global_namespace {
+        global_local_auth_client(db, &client_id)
+            .await
+            .map_err(|error| error.to_string())??
+    } else {
+        get_client(db, &client_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "local auth client is not registered".to_owned())?
+    };
     let return_to = passkey_return_to(request_url, return_to, &client, config)
         .map_err(|error| error.to_string())?;
     Ok((client, return_to))
@@ -15502,9 +15561,91 @@ async fn validate_any_client_or_public_origin(
 fn validate_local_auth_client_email_policy(
     client: &Client,
     email: &str,
+    email_verified: bool,
 ) -> Result<(), ProviderCallbackError> {
-    let profile = local_auth_profile(email, None, true);
+    let profile = local_auth_profile(email, None, email_verified);
     validate_client_email_domain_policy(client, &profile)
+}
+
+fn validate_legacy_local_auth_namespace(namespace: &str) -> Result<(), String> {
+    if namespace != ACCOUNT_NAMESPACE_GLOBAL {
+        return Err("password, magic-link and passkey authentication require global account sharing until namespaced local credentials are supported".to_owned());
+    }
+    Ok(())
+}
+
+const VERIFIED_LOCAL_AUTH_EMAIL_SQL: &str = "SELECT EXISTS (
+         SELECT 1 FROM zeroth_account_identities
+         WHERE account_namespace = 'global' AND user_id = ? AND lower(email) = lower(?)
+           AND email_verified != 0 AND provider_id IN ('google', 'apple', 'zeroth')
+         UNION ALL
+         SELECT 1 FROM zeroth_identities
+         WHERE user_id = ? AND lower(email) = lower(?)
+           AND email_verified != 0 AND provider_id IN ('google', 'apple', 'zeroth')
+     ) AS verified";
+
+#[cfg(target_arch = "wasm32")]
+async fn local_auth_email_is_verified(
+    db: &worker::d1::D1Database,
+    user_id: &str,
+    email: &str,
+) -> worker::Result<bool> {
+    #[derive(Deserialize)]
+    struct VerifiedEmailRow {
+        verified: i32,
+    }
+    let args = [
+        worker::d1::D1Type::Text(user_id),
+        worker::d1::D1Type::Text(email),
+        worker::d1::D1Type::Text(user_id),
+        worker::d1::D1Type::Text(email),
+    ];
+    Ok(db
+        .prepare(VERIFIED_LOCAL_AUTH_EMAIL_SQL)
+        .bind_refs(&args)?
+        .first::<VerifiedEmailRow>(None)
+        .await?
+        .is_some_and(|row| row.verified != 0))
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn global_local_auth_client(
+    db: &worker::d1::D1Database,
+    client_id: &str,
+) -> worker::Result<Result<Client, String>> {
+    let Some(registered) = get_registered_client(db, client_id).await? else {
+        return Ok(Err("local auth client is not registered".to_owned()));
+    };
+    if let Err(error) = validate_legacy_local_auth_namespace(&registered.account_scope.namespace) {
+        return Ok(Err(error));
+    }
+    Ok(Ok(registered.client))
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn local_auth_session_user(
+    db: &worker::d1::D1Database,
+    client_id: &str,
+    user_id: &str,
+) -> worker::Result<Result<UserRow, String>> {
+    let client = match global_local_auth_client(db, client_id).await? {
+        Ok(client) => client,
+        Err(error) => return Ok(Err(error)),
+    };
+    let Some(user) = get_user(db, user_id).await? else {
+        return Ok(Err("local auth user was not found".to_owned()));
+    };
+    if user.disabled_at.is_some() {
+        return Ok(Err("local auth user is disabled".to_owned()));
+    }
+    if !client.allowed_email_domains.is_empty() {
+        let email = user.primary_email.as_deref().unwrap_or_default();
+        let verified = local_auth_email_is_verified(db, user_id, email).await?;
+        if let Err(error) = validate_local_auth_client_email_policy(&client, email, verified) {
+            return Ok(Err(error.description));
+        }
+    }
+    Ok(Ok(user))
 }
 
 fn local_auth_profile(
@@ -15673,12 +15814,10 @@ fn csrf_secret_from_env(env: &Env) -> Result<CsrfSecret, String> {
     Ok(CsrfSecret(bytes))
 }
 
-#[cfg(target_arch = "wasm32")]
 fn csrf_bucket(now: i32) -> i32 {
     now.div_euclid(24 * 60 * 60)
 }
 
-#[cfg(target_arch = "wasm32")]
 fn csrf_mac(secret: &CsrfSecret, subject: &str, bucket: i32, route_family: &str) -> String {
     use hmac::{Hmac, Mac};
 
@@ -15693,14 +15832,12 @@ fn csrf_mac(secret: &CsrfSecret, subject: &str, bucket: i32, route_family: &str)
     URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
 }
 
-#[cfg(target_arch = "wasm32")]
 fn csrf_token(secret: &CsrfSecret, session_id: &str, route_family: &str, now: i32) -> String {
     let bucket = csrf_bucket(now);
     let mac = csrf_mac(secret, session_id, bucket, route_family);
     format!("v1.{bucket}.{mac}")
 }
 
-#[cfg(target_arch = "wasm32")]
 fn validate_csrf_token(
     secret: &CsrfSecret,
     subject: &str,
@@ -16471,6 +16608,11 @@ async fn issue_local_auth_session(
     mode: &str,
     now: i32,
 ) -> worker::Result<LocalAuthSessionIssue> {
+    // Recheck live policy at issuance, including after a client was disabled or
+    // moved to another account namespace while an authenticator was in flight.
+    let user = local_auth_session_user(db, client_id, user_id)
+        .await?
+        .map_err(worker_error)?;
     let session_id = format!("sess_{}", random_token()?);
     let audit_context = audit_request_context(request).unwrap_or_default();
     put_session(
@@ -16494,9 +16636,6 @@ async fn issue_local_auth_session(
         now,
     )
     .await;
-    let user = get_user(db, user_id)
-        .await?
-        .ok_or_else(|| worker_error("local auth user was not found".to_owned()))?;
     Ok(LocalAuthSessionIssue {
         session_id,
         return_to: return_to.to_owned(),
@@ -24669,6 +24808,197 @@ mod tests {
             local_auth_registration_user_id(None, None, "new@example.com").unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn password_signup_cannot_claim_existing_non_password_accounts() {
+        let conn = sqlite_bootstrap();
+        sqlite_seed_authorize_fixtures(&conn);
+        let credential_count: i32 = conn
+            .query_row("SELECT COUNT(*) FROM zeroth_local_credentials", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(credential_count, 0);
+
+        // An account without a local credential still requires proof of control.
+        // Both public password registration paths use this policy before creating
+        // a credential or issuing a session.
+        let victim = valid_user_row();
+        assert!(local_auth_registration_user_id(None, Some(&victim), "user@example.com").is_err());
+        let mut disabled_victim = victim.clone();
+        disabled_victim.disabled_at = Some(1_780_000_100);
+        assert!(
+            local_auth_registration_user_id(None, Some(&disabled_victim), "user@example.com")
+                .is_err()
+        );
+
+        let current = CurrentSession {
+            session: valid_session_row(),
+            user: victim.clone(),
+        };
+        assert_eq!(
+            local_auth_registration_user_id(Some(&current), Some(&victim), "user@example.com")
+                .unwrap(),
+            Some(victim.id)
+        );
+    }
+
+    #[test]
+    fn password_email_domain_policy_requires_proven_mailbox_ownership() {
+        let mut client = registered_public_client().client;
+        client.allowed_email_domains = vec!["example.com".to_owned()];
+        assert!(
+            validate_local_auth_client_email_policy(&client, "ceo@example.com", false).is_err()
+        );
+        assert!(validate_local_auth_client_email_policy(&client, "ceo@example.com", true).is_ok());
+        assert!(
+            validate_local_auth_client_email_policy(&client, "ceo@attacker.example", true).is_err()
+        );
+        client.allowed_email_domains.clear();
+        assert!(validate_local_auth_client_email_policy(&client, "new@example.com", false).is_ok());
+    }
+
+    #[test]
+    fn globally_keyed_local_credentials_reject_tenant_and_client_accounts() {
+        assert!(validate_legacy_local_auth_namespace("global").is_ok());
+        assert!(validate_legacy_local_auth_namespace("tenant:wavey").is_err());
+        assert!(validate_legacy_local_auth_namespace("client:enterprise-app").is_err());
+        assert!(validate_legacy_local_auth_namespace("").is_err());
+    }
+
+    #[test]
+    fn persisted_local_email_proof_excludes_passkeys_unverified_and_other_namespaces() {
+        let conn = sqlite_bootstrap();
+        sqlite_seed_authorize_fixtures(&conn);
+        let proven = |user_id: &str, email: &str| -> bool {
+            conn.query_row(
+                VERIFIED_LOCAL_AUTH_EMAIL_SQL,
+                params![user_id, email, user_id, email],
+                |row| row.get::<_, i32>(0),
+            )
+            .unwrap()
+                != 0
+        };
+        for (namespace, provider, subject, email, verified) in [
+            ("global", "zeroth", "password", "user@example.com", 0),
+            ("global", "passkey", "legacy-passkey", "user@example.com", 1),
+            (
+                "tenant:another",
+                "google",
+                "tenant-google",
+                "user@example.com",
+                1,
+            ),
+            (
+                "global",
+                "google",
+                "different-email",
+                "other@example.com",
+                1,
+            ),
+        ] {
+            conn.execute(
+                "INSERT INTO zeroth_account_identities (account_namespace, provider_id, provider_subject, user_id, email, email_verified, created_at, updated_at) VALUES (?, ?, ?, 'usr_123', ?, ?, 1, 1)",
+                params![namespace, provider, subject, email, verified],
+            ).unwrap();
+        }
+        assert!(!proven("usr_123", "user@example.com"));
+        // Old passkeys also live in the legacy table; their forged verified flag
+        // cannot grant corporate-domain access or supply mailbox provenance.
+        conn.execute(
+            "INSERT INTO zeroth_identities (provider_id, provider_subject, user_id, email, email_verified, created_at, updated_at) VALUES ('passkey', 'legacy', 'usr_123', 'user@example.com', 1, 1, 1)", [],
+        ).unwrap();
+        assert!(!proven("usr_123", "user@example.com"));
+        conn.execute(
+            "INSERT INTO zeroth_identities (provider_id, provider_subject, user_id, email, email_verified, created_at, updated_at) VALUES ('zeroth', 'magic-link', 'usr_123', 'user@example.com', 1, 1, 1)", [],
+        ).unwrap();
+        assert!(proven("usr_123", "USER@EXAMPLE.COM"));
+        assert!(!proven("another-user", "user@example.com"));
+        conn.execute(
+            "DELETE FROM zeroth_identities WHERE provider_id = 'zeroth'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO zeroth_account_identities (account_namespace, provider_id, provider_subject, user_id, email, email_verified, created_at, updated_at) VALUES ('global', 'google', 'verified-global', 'usr_123', 'user@example.com', 1, 1, 1)", [],
+        ).unwrap();
+        assert!(proven("usr_123", "user@example.com"));
+    }
+
+    #[test]
+    fn ordinary_profile_tokens_cannot_delete_accounts_even_with_a_session_id() {
+        let mut current = CurrentAccount {
+            user: valid_user_row(),
+            client_id: Some("third-party-client".to_owned()),
+            session_id: Some("sess_123".to_owned()),
+            scope: Some("openid email profile".to_owned()),
+            access_token: true,
+        };
+        assert!(current.require_profile_scope().is_ok());
+        let error = current.require_account_deletion_session().unwrap_err();
+        assert_eq!(error.status, 403);
+        assert_eq!(
+            error.description,
+            "account deletion requires hosted account session"
+        );
+
+        // A bearer token wins over a cookie in current_account_from_request;
+        // adding a browser cookie must not turn a delegated token into authority
+        // to delete the account.
+        current.scope = Some("openid email profile admin".to_owned());
+        assert!(current.require_account_deletion_session().is_err());
+        current.access_token = false;
+        assert!(current.require_account_deletion_session().is_ok());
+        current.session_id = None;
+        assert!(current.require_account_deletion_session().is_err());
+    }
+
+    #[test]
+    fn account_mutation_csrf_tokens_bind_session_route_and_time() {
+        let secret = CsrfSecret([42; 32]);
+        let now = 1_780_000_000;
+        let token = csrf_token(&secret, "victim-session", CSRF_ROUTE_FAMILY_ACCOUNT, now);
+        assert!(validate_csrf_token(
+            &secret,
+            "victim-session",
+            CSRF_ROUTE_FAMILY_ACCOUNT,
+            &token,
+            now
+        )
+        .is_ok());
+        assert!(validate_csrf_token(
+            &secret,
+            "attacker-session",
+            CSRF_ROUTE_FAMILY_ACCOUNT,
+            &token,
+            now
+        )
+        .is_err());
+        assert!(validate_csrf_token(
+            &secret,
+            "victim-session",
+            CSRF_ROUTE_FAMILY_ADMIN,
+            &token,
+            now
+        )
+        .is_err());
+        assert!(validate_csrf_token(
+            &secret,
+            "victim-session",
+            CSRF_ROUTE_FAMILY_ACCOUNT,
+            "",
+            now
+        )
+        .is_err());
+        assert!(validate_csrf_token(
+            &secret,
+            "victim-session",
+            CSRF_ROUTE_FAMILY_ACCOUNT,
+            &token,
+            now + 2 * 24 * 60 * 60
+        )
+        .is_err());
     }
 
     #[test]
