@@ -51,7 +51,14 @@ Worker consumers do not pull UI dependencies by default.
 
 Implemented so far:
 
-- provider presets for Apple, Google, and Spotify
+- provider presets for Apple, Google, Spotify, tenant-pinned Microsoft Entra,
+  and Google Workspace with an exact signed hosted-domain policy
+- per-client `enterpriseProvider` requirements, upstream PKCE and nonce binding,
+  and persisted provider/policy context across browser sessions, authorization
+  codes, refresh rotation, and silent SSO. Local or consumer-provider sessions
+  cannot satisfy an enterprise-required client. The initial configuration supports
+  one Entra tenant and one Workspace domain policy per deployment; see the
+  [enterprise setup guide](docs/enterprise-sso-setup.html)
 - OIDC authorization request parsing and registered-client validation
 - native loopback redirect validation for Swift clients that use an ephemeral
   localhost callback port

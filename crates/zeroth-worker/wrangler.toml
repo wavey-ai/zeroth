@@ -10,6 +10,12 @@ SESSION_COOKIE_NAME = "zeroth_session"
 TX_COOKIE_NAME = "zeroth_tx"
 APPLE_CLIENT_ID = "replace-with-apple-client-id"
 GOOGLE_CLIENT_ID = "replace-with-google-client-id"
+# Optional enterprise providers, configured separately from consumer Google.
+# ENTRA_TENANT_ID = "replace-with-entra-directory-guid"
+# ENTRA_CLIENT_ID = "replace-with-entra-application-guid"
+# GOOGLE_WORKSPACE_CLIENT_ID = "replace-with-workspace-web-client-id"
+# GOOGLE_WORKSPACE_DOMAINS = "example.com"
+# Set ENTRA_CLIENT_SECRET and GOOGLE_WORKSPACE_CLIENT_SECRET as Worker secrets.
 SPOTIFY_CLIENT_ID = "replace-with-spotify-client-id"
 MAGIC_LINK_FROM = "login@example.com"
 MAGIC_LINK_DELIVERY = "cloudflare_email"

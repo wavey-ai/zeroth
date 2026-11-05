@@ -3653,6 +3653,8 @@ dependencies = [
 name = "zeroth-providers"
 version = "0.2.0"
 dependencies = [
+ "serde",
+ "serde_json",
  "url",
  "zeroth-core",
 ]

@@ -50,6 +50,10 @@ npx wrangler secret put GOOGLE_WORKSPACE_CLIENT_SECRET --config wrangler.generat
 <pre><code>node scripts/check-enterprise-config.mjs --provider all --auth-origin https://id.example.com</code></pre>
 <p>The preflight reports binding names, presence and validation errors. It does not print credentials, contact providers, inspect managed cloud secrets or verify login. Remove a provider from <code>DISABLED_PROVIDERS</code> when ready to enable it in the selected deployment.</p>
 
+<h3>4.1 Apply the schema upgrade during rollout</h3>
+<p>This build reads the new columns on authentication paths. During rollout, run the existing admin-only <code>POST /__zeroth/db/ensure</code> bootstrap with deployment bootstrap authentication, and verify <code>GET /__zeroth/db/status</code> reports migration <code>0012_enterprise_auth_policy</code> applied before admitting normal login traffic. The ledger prevents repeat application. Existing sessions and grants retain null enterprise proof and cannot satisfy a newly enterprise-required client; users must sign in through that provider.</p>
+<p>The migration source is <a href="../crates/zeroth-storage/migrations/0012_enterprise_auth_policy.sql">0012_enterprise_auth_policy.sql</a>. The CLI can export schema SQL with <code>cargo run -p zeroth-cli -- schema</code>; do not replay the full migration history blindly on an existing database.</p>
+
 <h2>5. Require enterprise sign-in for an application</h2>
 <p>In the client editor, choose <strong>Required enterprise sign-in → Microsoft Entra</strong> or <strong>Google Workspace</strong>. The API field is <code>enterpriseProvider</code>: <code>entra</code>, <code>google_workspace</code> or an empty value to clear it. Client updates replace the resource; preserve this field on every edit.</p>
 <table><thead><tr><th>Setting</th><th>Entra</th><th>Google Workspace</th></tr></thead><tbody>
@@ -65,6 +69,8 @@ npx wrangler secret put GOOGLE_WORKSPACE_CLIENT_SECRET --config wrangler.generat
 <li><strong>Exercise session policy.</strong> Check codes, refresh tokens and silent SSO against the required provider and current configuration. A policy edit must not reopen access through an older session.</li>
 <li><strong>Build the application proxy last.</strong> Use the project's own web0services crates once enterprise-policy tests pass. Forwarding, product-local sessions and private-upstream enforcement are a separate implementation.</li>
 </ol>
+<p><strong>Combined checks:</strong> 354 Rust tests and four configuration tests pass. The native all-targets and Worker wasm checks pass. Browser tests cover client-policy editing, clearing and cloning with a mock management API. Live provider login remains untested until credentials are supplied.</p>
+<p><strong>Implementation validation:</strong> fixture tests cover signed enterprise tokens, tenant/key-issuer scope, Workspace membership, tampering, policy changes, persisted proof, refresh rotation and cross-application SSO. The cross-application session retains the original authentication time and expiry. Code and refresh grants require their bound browser session to remain active; linking an enterprise identity does not upgrade a local session.</p>
 <p>OIDC login is not provisioning or immediate offboarding. Session revocation and access-token expiry define the current access window. Directory synchronization and richer connection lifecycle controls need separate work.</p>
 <footer>Prepared from repository interfaces and linked primary provider documentation. Credentials, production deployment and live provider acceptance are intentionally deferred.</footer>
 </main></body></html>

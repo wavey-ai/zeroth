@@ -1,5 +1,14 @@
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 
+mod enterprise;
+#[cfg(test)]
+mod enterprise_persistence_tests;
+#[cfg(test)]
+mod enterprise_signed_tests;
+#[cfg(any(test, target_arch = "wasm32"))]
+use enterprise::provider_policy_hash;
+use enterprise::{is_enterprise_provider, AuthContext};
+
 use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE, URL_SAFE_NO_PAD},
     Engine as _,
@@ -65,7 +74,8 @@ use zeroth_ui::{
 };
 
 #[cfg(target_arch = "wasm32")]
-use zeroth_providers::{OAuthProvider, Provider, ProviderAuthorizeRequest};
+use zeroth_providers::ProviderAuthorizeRequest;
+use zeroth_providers::{EnterpriseOidcEvidence, EnterpriseProviderPolicy, OAuthProvider, Provider};
 
 #[cfg(target_arch = "wasm32")]
 use zeroth_server::ROUTES;
@@ -76,10 +86,21 @@ const AUTH_CODE_TTL_SECONDS: i32 = 10 * 60;
 const ACCESS_TOKEN_TTL_SECONDS: i32 = 60 * 60;
 const ID_TOKEN_TTL_SECONDS: i32 = 60 * 60;
 const REFRESH_TOKEN_TTL_SECONDS: i32 = 60 * 60 * 24 * 30;
+const INSERT_AUTH_CODE_SQL: &str = "INSERT INTO zeroth_auth_codes (
+             code_hash, client_id, redirect_uri, user_id, session_id, auth_time, nonce,
+             code_challenge, code_challenge_method, scope, created_at, expires_at,
+             auth_provider, auth_policy_hash
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+const INSERT_REFRESH_TOKEN_SQL: &str = "INSERT INTO zeroth_refresh_tokens (
+             token_hash, client_id, user_id, session_id, auth_time, scope, created_at, expires_at, auth_provider, auth_policy_hash
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+const INSERT_SESSION_SQL: &str = "INSERT INTO zeroth_sessions (
+             id, user_id, client_id, created_at, expires_at, user_agent, ip_hash, auth_provider, auth_policy_hash
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
 const INSERT_ROTATED_REFRESH_TOKEN_SQL: &str = "INSERT INTO zeroth_refresh_tokens (
-         token_hash, client_id, user_id, session_id, auth_time, scope, created_at, expires_at
+         token_hash, client_id, user_id, session_id, auth_time, scope, created_at, expires_at, auth_provider, auth_policy_hash
      )
-     SELECT ?, client_id, user_id, session_id, auth_time, scope, ?, ?
+     SELECT ?, client_id, user_id, session_id, auth_time, scope, ?, ?, auth_provider, auth_policy_hash
      FROM zeroth_refresh_tokens
      WHERE token_hash = ? AND rotated_at = ? AND revoked_at IS NULL AND expires_at > ?";
 const REVOKE_USER_REFRESH_TOKENS_SQL: &str = "UPDATE zeroth_refresh_tokens
@@ -1929,6 +1950,10 @@ struct AuthTransactionRow {
     expires_at: i32,
     #[serde(default)]
     consumed_at: Option<i32>,
+    #[serde(default)]
+    provider_policy_hash: Option<String>,
+    #[serde(default)]
+    provider_code_verifier: Option<String>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -2075,6 +2100,8 @@ struct ProviderJwk {
     n: Option<String>,
     #[serde(default)]
     e: Option<String>,
+    #[serde(default)]
+    issuer: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -2102,6 +2129,14 @@ struct ProviderIdTokenClaims {
     name: Option<String>,
     #[serde(default)]
     picture: Option<String>,
+    #[serde(default)]
+    tid: Option<String>,
+    #[serde(default)]
+    hd: Option<String>,
+    #[serde(default)]
+    azp: Option<String>,
+    #[serde(default)]
+    nbf: Option<i64>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Deserialize, Serialize)]
@@ -2117,6 +2152,7 @@ struct ProviderIdTokenValidation<'a> {
     client_id: &'a str,
     nonce: Option<&'a str>,
     now: i32,
+    enterprise_policy: Option<&'a EnterpriseProviderPolicy>,
 }
 
 #[derive(Debug, Clone)]
@@ -2679,6 +2715,8 @@ struct AuthCodeRow {
     expires_at: i32,
     #[serde(default)]
     consumed_at: Option<i32>,
+    #[serde(flatten)]
+    auth_context: AuthContext,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -2797,6 +2835,8 @@ struct RefreshTokenRow {
     rotated_at: Option<i32>,
     #[serde(default)]
     revoked_at: Option<i32>,
+    #[serde(flatten)]
+    auth_context: AuthContext,
 }
 
 #[allow(dead_code)]
@@ -2814,6 +2854,8 @@ struct SessionRow {
     user_agent: Option<String>,
     #[serde(default)]
     ip_hash: Option<String>,
+    #[serde(flatten)]
+    auth_context: AuthContext,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -2829,6 +2871,7 @@ struct TokenIssue {
     name: Option<String>,
     picture: Option<String>,
     roles: Vec<String>,
+    auth_context: AuthContext,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -3057,6 +3100,173 @@ impl ProviderJwksCache {
 struct CurrentSession {
     session: SessionRow,
     user: UserRow,
+}
+
+fn session_bound_to_client(source: &SessionRow, client_id: &str, session_id: String) -> SessionRow {
+    let mut session = source.clone();
+    session.id = session_id;
+    session.client_id = Some(client_id.to_owned());
+    session
+}
+
+fn validate_grant_session(
+    client: &Client,
+    user_id: &str,
+    session_id: Option<&str>,
+    context: &AuthContext,
+    session: Option<&SessionRow>,
+    now: i32,
+) -> Result<(), String> {
+    let Some(session_id) = session_id else {
+        return if client.enterprise_provider.is_some() {
+            Err("enterprise grants require an active browser session".to_owned())
+        } else {
+            Ok(())
+        };
+    };
+    let Some(session) = session else {
+        return Err("grant session is missing".to_owned());
+    };
+    if session.id != session_id
+        || session.user_id != user_id
+        || session.client_id.as_deref() != Some(client.id.0.as_str())
+        || &session.auth_context != context
+        || !session_row_is_active(session, now)
+    {
+        return Err(
+            "grant session is inactive or does not match its authentication context".to_owned(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn validate_grant_authentication(
+    db: &worker::d1::D1Database,
+    env: &Env,
+    client: &Client,
+    user_id: &str,
+    session_id: Option<&str>,
+    context: &AuthContext,
+    now: i32,
+) -> worker::Result<Result<(), String>> {
+    if let Err(error) = validate_auth_context_for_client(env, client, context) {
+        return Ok(Err(error));
+    }
+    let session = match session_id {
+        Some(id) => get_session(db, id).await?,
+        None => None,
+    };
+    Ok(validate_grant_session(
+        client,
+        user_id,
+        session_id,
+        context,
+        session.as_ref(),
+        now,
+    ))
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn session_for_client_code(
+    db: &worker::d1::D1Database,
+    source: &SessionRow,
+    client_id: &str,
+) -> worker::Result<SessionRow> {
+    if source.client_id.as_deref() == Some(client_id) {
+        return Ok(source.clone());
+    }
+    let session = session_bound_to_client(source, client_id, format!("sess_{}", random_token()?));
+    // Preserve the original authentication time and lifetime. SSO is not a fresh
+    // upstream authentication, and must not reset max_age or grant a new month.
+    put_session_with_auth_context(
+        db,
+        &session.id,
+        &session.user_id,
+        client_id,
+        session.created_at,
+        session.user_agent.as_deref(),
+        session.ip_hash.as_deref(),
+        &session.auth_context,
+        session.expires_at,
+    )
+    .await?;
+    Ok(session)
+}
+
+fn validate_client_login_provider(client: &Client, provider_id: &str) -> Result<(), String> {
+    match client.enterprise_provider.as_deref() {
+        Some(required) if required != provider_id => {
+            Err("this application requires its configured enterprise provider".to_owned())
+        }
+        _ => Ok(()),
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn validate_auth_context_for_client(
+    env: &Env,
+    client: &Client,
+    context: &AuthContext,
+) -> Result<(), String> {
+    let active_hash = match context
+        .auth_provider
+        .as_deref()
+        .filter(|id| is_enterprise_provider(id))
+    {
+        Some(id) if provider_configured_for_login(env, id) => provider_policy_hash(
+            &provider_from_env(env, id)
+                .map_err(|_| "enterprise provider configuration is invalid")?,
+        )?,
+        _ => None,
+    };
+    context.validate(
+        client.enterprise_provider.as_deref(),
+        active_hash.as_deref(),
+    )
+}
+
+#[cfg(target_arch = "wasm32")]
+fn bind_provider_transaction(
+    transaction: &mut AuthTransaction,
+    provider: &OAuthProvider,
+) -> Result<(), String> {
+    transaction.provider_policy_hash = provider_policy_hash(provider)?;
+    transaction.provider_code_verifier = if provider.enterprise_policy().is_some() {
+        Some(random_token().map_err(|_| "secure randomness is unavailable")?)
+    } else {
+        None
+    };
+    Ok(())
+}
+
+fn validate_provider_transaction_policy(
+    transaction: &AuthTransaction,
+    provider: &OAuthProvider,
+) -> Result<AuthContext, String> {
+    if transaction.provider_id != *provider.id() {
+        return Err("provider transaction did not match configured provider".to_owned());
+    }
+    let context = AuthContext::from_provider(provider)?;
+    if context.auth_policy_hash != transaction.provider_policy_hash {
+        return Err("provider policy changed; restart sign-in".to_owned());
+    }
+    if provider.enterprise_policy().is_some()
+        && (transaction.provider_nonce.is_none() || transaction.provider_code_verifier.is_none())
+    {
+        return Err("enterprise transaction requires nonce and PKCE binding".to_owned());
+    }
+    Ok(context)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn restrict_enterprise_login_ui(state: &mut ZerothUiState, client: &Client) {
+    if let Some(provider) = client.enterprise_provider.as_deref() {
+        state.providers.retain(|entry| entry.id == provider);
+        state.config.allow_local_login = false;
+        state.config.show_passkey_login = false;
+        state.config.show_magic_link_login = false;
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -3351,13 +3561,35 @@ async fn provider_callback(mut request: Request, env: Env) -> worker::Result<Res
         );
     };
 
+    if !provider_configured_for_login(&env, &record.transaction.provider_id.0) {
+        return provider_callback_error_json(
+            &ProviderCallbackError::access_denied("provider is disabled or not configured"),
+            403,
+        );
+    }
     let provider = provider_from_env(&env, &record.transaction.provider_id.0)?;
+    let auth_context = match validate_provider_transaction_policy(&record.transaction, &provider) {
+        Ok(context) => context,
+        Err(error) => {
+            return provider_callback_error_json(&ProviderCallbackError::access_denied(error), 403)
+        }
+    };
+    let Some(callback_client) = get_client(&db, &record.transaction.client_id.0).await? else {
+        return provider_callback_error_json(
+            &ProviderCallbackError::access_denied("client is disabled or missing"),
+            403,
+        );
+    };
+    if let Err(error) = validate_client_login_provider(&callback_client, &provider.id().0) {
+        return provider_callback_error_json(&ProviderCallbackError::access_denied(error), 403);
+    }
+
     let client_secret = provider_client_secret_from_env(&env, &record.transaction.provider_id.0)?;
     let token_request = provider
         .token_exchange_request(
             provider_code,
             &record.transaction.provider_redirect_uri,
-            None,
+            record.transaction.provider_code_verifier.as_deref(),
             client_secret.as_deref(),
         )
         .map_err(|error| worker::Error::RustError(error.description))?;
@@ -3497,6 +3729,10 @@ async fn provider_callback(mut request: Request, env: Env) -> worker::Result<Res
             &clear_transaction_cookie(&config.transaction_cookie_name),
         );
     };
+    if let Err(error) = validate_client_login_provider(&registered_client.client, &provider.id().0)
+    {
+        return provider_callback_error_json(&ProviderCallbackError::access_denied(error), 403);
+    }
     if let Err(error) =
         validate_client_email_domain_policy(&registered_client.client, &resolved_profile.profile)
     {
@@ -3537,7 +3773,7 @@ async fn provider_callback(mut request: Request, env: Env) -> worker::Result<Res
         let session_id = format!("sess_{}", random_token()?);
         let user_agent = request_header(&request, "User-Agent")?;
         let ip_hash = request_header(&request, "CF-Connecting-IP")?.map(|ip| hash_secret(&ip));
-        put_session(
+        put_session_with_auth_context(
             &db,
             &session_id,
             &user_id,
@@ -3545,6 +3781,8 @@ async fn provider_callback(mut request: Request, env: Env) -> worker::Result<Res
             now,
             user_agent.as_deref(),
             ip_hash.as_deref(),
+            &auth_context,
+            now + SESSION_TTL_SECONDS,
         )
         .await?;
         record_audit_event(
@@ -3597,7 +3835,7 @@ async fn provider_callback(mut request: Request, env: Env) -> worker::Result<Res
     .await?;
     let user_agent = request_header(&request, "User-Agent")?;
     let ip_hash = request_header(&request, "CF-Connecting-IP")?.map(|ip| hash_secret(&ip));
-    put_session(
+    put_session_with_auth_context(
         &db,
         &session_id,
         &user_id,
@@ -3605,6 +3843,8 @@ async fn provider_callback(mut request: Request, env: Env) -> worker::Result<Res
         now,
         user_agent.as_deref(),
         ip_hash.as_deref(),
+        &auth_context,
+        now + SESSION_TTL_SECONDS,
     )
     .await?;
     record_audit_event(
@@ -4128,11 +4368,28 @@ async fn oauth_token(mut request: Request, env: Env) -> worker::Result<Response>
     let config = server_config(&env, &request_url);
     let response = match form.grant_type.as_str() {
         "authorization_code" => {
-            authorization_code_token(&db, &config, &signing_key, &registered_client, &form, now)
-                .await
+            authorization_code_token(
+                &db,
+                &env,
+                &config,
+                &signing_key,
+                &registered_client,
+                &form,
+                now,
+            )
+            .await
         }
         "refresh_token" => {
-            refresh_token_token(&db, &config, &signing_key, &registered_client, &form, now).await
+            refresh_token_token(
+                &db,
+                &env,
+                &config,
+                &signing_key,
+                &registered_client,
+                &form,
+                now,
+            )
+            .await
         }
         TOKEN_EXCHANGE_GRANT_TYPE => {
             native_provider_token(
@@ -4178,6 +4435,7 @@ async fn oauth_token(mut request: Request, env: Env) -> worker::Result<Response>
 #[cfg(target_arch = "wasm32")]
 async fn authorization_code_token(
     db: &worker::d1::D1Database,
+    env: &Env,
     config: &ZerothServerConfig,
     signing_key: &Es256SigningKey,
     client: &RegisteredClient,
@@ -4198,6 +4456,19 @@ async fn authorization_code_token(
 
     if let Err(error) = validate_authorization_code_exchange(&auth_code, &fields, now) {
         return token_exchange_error_json(&error, 400);
+    }
+    if let Err(error) = validate_grant_authentication(
+        db,
+        env,
+        &client.client,
+        &auth_code.user_id,
+        auth_code.session_id.as_deref(),
+        &auth_code.auth_context,
+        now,
+    )
+    .await?
+    {
+        return token_exchange_error_json(&TokenExchangeError::invalid_grant(error), 400);
     }
     if let Err(error) = validate_user_client_admission(db, client, &auth_code.user_id).await? {
         return token_exchange_error_json(
@@ -4254,6 +4525,7 @@ async fn authorization_code_token(
 #[cfg(target_arch = "wasm32")]
 async fn refresh_token_token(
     db: &worker::d1::D1Database,
+    env: &Env,
     config: &ZerothServerConfig,
     signing_key: &Es256SigningKey,
     client: &RegisteredClient,
@@ -4277,6 +4549,19 @@ async fn refresh_token_token(
             revoke_refresh_token_family(db, &refresh_token_row, now).await?;
         }
         return token_exchange_error_json(&error, 400);
+    }
+    if let Err(error) = validate_grant_authentication(
+        db,
+        env,
+        &client.client,
+        &refresh_token_row.user_id,
+        refresh_token_row.session_id.as_deref(),
+        &refresh_token_row.auth_context,
+        now,
+    )
+    .await?
+    {
+        return token_exchange_error_json(&TokenExchangeError::invalid_grant(error), 400);
     }
     if let Err(error) =
         validate_user_client_admission(db, client, &refresh_token_row.user_id).await?
@@ -4339,6 +4624,14 @@ async fn native_provider_token(
     form: &TokenExchangeForm,
     now: i32,
 ) -> worker::Result<Response> {
+    if client.client.enterprise_provider.is_some() {
+        return token_exchange_error_json(
+            &TokenExchangeError::invalid_grant(
+                "enterprise applications require the hosted authorization-code flow",
+            ),
+            400,
+        );
+    }
     let fields = match native_provider_token_fields(form) {
         Ok(fields) => fields,
         Err(error) => return token_exchange_error_json(&error, 400),
@@ -4440,6 +4733,7 @@ async fn resolve_native_oidc_provider_profile(
         fields.subject_token,
         &jwks,
         ProviderIdTokenValidation {
+            enterprise_policy: None,
             provider_id: fields.provider_id,
             client_id: provider_client_id,
             nonce: fields.nonce,
@@ -4550,6 +4844,7 @@ async fn oauth_introspect(mut request: Request, env: Env) -> worker::Result<Resp
     let material = signing_material_from_env(&env)?;
     let response = introspection_response_for_token(
         &db,
+        &env,
         &config,
         &material.jwks,
         &form,
@@ -4584,7 +4879,7 @@ async fn userinfo(request: Request, env: Env) -> worker::Result<Response> {
     if user.disabled_at.is_some() {
         return oauth_error_json("invalid_token", "user is disabled", 401);
     }
-    if let Err(error) = validate_access_token_session(&db, &claims, now).await? {
+    if let Err(error) = validate_access_token_session(&db, &env, &claims, now).await? {
         return oauth_error_json("invalid_token", error, 401);
     }
     let allowed_origins = match active_client_allowed_origins(&db, &claims.aud).await? {
@@ -4607,7 +4902,8 @@ async fn client_issuer_access_token(request: Request, env: Env) -> worker::Resul
     let db = env.d1(D1_BINDING)?;
     let now = unix_timestamp_seconds();
 
-    let Some(current) = (match current_session_from_request(&request, &db, &config, now).await {
+    let Some(current) = (match current_session_from_request(&request, &env, &db, &config, now).await
+    {
         Ok(current) => current,
         Err(_) => {
             return token_issuer_error_json(
@@ -4764,7 +5060,8 @@ async fn session(request: Request, env: Env) -> worker::Result<Response> {
     let config = server_config(&env, &request_url);
     let db = env.d1(D1_BINDING)?;
     let current =
-        current_session_from_request(&request, &db, &config, unix_timestamp_seconds()).await?;
+        current_session_from_request(&request, &env, &db, &config, unix_timestamp_seconds())
+            .await?;
 
     if let Some(current) = &current {
         if let Err(error) =
@@ -5068,7 +5365,7 @@ async fn passkey_register_options(mut request: Request, env: Env) -> worker::Res
         Err(error) => return oauth_error_json("invalid_request", error, 400),
     };
 
-    let current = current_session_from_request(&request, &db, &config, now).await?;
+    let current = current_session_from_request(&request, &env, &db, &config, now).await?;
     if current.is_none() {
         if let Err(error) = validate_admin_request(&request, &env, &db, &config, now).await {
             return client_management_error_json(&error);
@@ -5325,7 +5622,8 @@ async fn passkey_register_verify(mut request: Request, env: Env) -> worker::Resu
     }
     let mut session_user_id: Option<String> = None;
     if admin_authorization.is_none() {
-        let Some(current) = current_session_from_request(&request, &db, &config, now).await? else {
+        let Some(current) = current_session_from_request(&request, &env, &db, &config, now).await?
+        else {
             return oauth_error_json(
                 "login_required",
                 "active browser session was not found",
@@ -5809,7 +6107,7 @@ async fn password_register(mut request: Request, env: Env) -> worker::Result<Res
         return rate_limit_error_json(blocked.retry_after_seconds);
     }
 
-    let current = current_session_from_request(&request, &db, &config, now).await?;
+    let current = current_session_from_request(&request, &env, &db, &config, now).await?;
     let existing_user = get_user_by_primary_email(&db, &email).await?;
 
     if let Some(current) = current.as_ref() {
@@ -6440,6 +6738,13 @@ async fn evm_wallet_verify(mut request: Request, env: Env) -> worker::Result<Res
     let Some(registered_client) = get_registered_client(&db, &challenge.client_id).await? else {
         return oauth_error_json("access_denied", "wallet client is not registered", 403);
     };
+    if registered_client.client.enterprise_provider.is_some() {
+        return oauth_error_json(
+            "access_denied",
+            "this application requires enterprise login",
+            403,
+        );
+    }
     if registered_client.account_scope.namespace != challenge.account_namespace {
         return oauth_error_json(
             "access_denied",
@@ -6998,7 +7303,8 @@ async fn identity_link(request: Request, env: Env) -> worker::Result<Response> {
     let now = unix_timestamp_seconds();
     let mut request = request;
     let csrf_token = csrf_token_from_request(&mut request).await?;
-    let Some(current) = current_session_from_request(&request, &db, &config, now).await? else {
+    let Some(current) = current_session_from_request(&request, &env, &db, &config, now).await?
+    else {
         return oauth_error_json(
             "login_required",
             "active browser session was not found",
@@ -7059,7 +7365,7 @@ async fn identity_link(request: Request, env: Env) -> worker::Result<Response> {
     let provider_state = random_token()?;
     let provider_nonce = random_token()?;
     cleanup_expired_auth_transactions(&db, now).await?;
-    let transaction = auth_transaction_from_link_request(
+    let mut transaction = auth_transaction_from_link_request(
         &client,
         &provider_id,
         provider_state,
@@ -7071,6 +7377,11 @@ async fn identity_link(request: Request, env: Env) -> worker::Result<Response> {
         &current.session.id,
         now,
     );
+    bind_provider_transaction(&mut transaction, &provider).map_err(worker_error)?;
+    let upstream_challenge = transaction
+        .provider_code_verifier
+        .as_deref()
+        .map(pkce_s256_challenge);
     put_auth_transaction(&db, &transaction).await?;
 
     let auth = provider
@@ -7078,7 +7389,7 @@ async fn identity_link(request: Request, env: Env) -> worker::Result<Response> {
             redirect_uri: &transaction.provider_redirect_uri,
             state: &transaction.provider_state,
             nonce: provider_authorize_nonce(&transaction),
-            code_challenge: None,
+            code_challenge: upstream_challenge.as_deref(),
             scopes: None,
         })
         .map_err(|error| worker::Error::RustError(error.description))?;
@@ -7122,7 +7433,7 @@ async fn validate(request: Request, env: Env) -> worker::Result<Response> {
         if user.disabled_at.is_some() {
             return oauth_error_json("invalid_token", "user is disabled", 401);
         }
-        if let Err(error) = validate_access_token_session(&db, &claims, now).await? {
+        if let Err(error) = validate_access_token_session(&db, &env, &claims, now).await? {
             return oauth_error_json("invalid_token", error, 401);
         }
         let allowed_origins = match active_client_allowed_origins(&db, &claims.aud).await? {
@@ -7139,7 +7450,8 @@ async fn validate(request: Request, env: Env) -> worker::Result<Response> {
 
     let config = server_config(&env, &request_url);
     let Some(current) =
-        current_session_from_request(&request, &db, &config, unix_timestamp_seconds()).await?
+        current_session_from_request(&request, &env, &db, &config, unix_timestamp_seconds())
+            .await?
     else {
         return oauth_error_json(
             "invalid_token",
@@ -7163,7 +7475,7 @@ async fn logout(request: Request, env: Env) -> worker::Result<Response> {
     let config = server_config(&env, &request_url);
     let db = env.d1(D1_BINDING)?;
     let now = unix_timestamp_seconds();
-    let current = current_session_from_request(&request, &db, &config, now).await?;
+    let current = current_session_from_request(&request, &env, &db, &config, now).await?;
     match request.method() {
         Method::Get => {
             let cancel_href = current
@@ -7646,6 +7958,9 @@ async fn hosted_session_login(request: Request, env: Env) -> worker::Result<Resp
         )
         .await;
     };
+    if let Err(error) = validate_client_login_provider(client, &provider_id) {
+        return oauth_error_json("access_denied", error, 403);
+    }
     if !provider_configured_for_login(&env, &provider_id) {
         return auth_error_json(
             &AuthorizationRequestError::invalid_request(format!(
@@ -7661,7 +7976,7 @@ async fn hosted_session_login(request: Request, env: Env) -> worker::Result<Resp
     let provider_nonce = random_token()?;
     let now = unix_timestamp_seconds();
     cleanup_expired_auth_transactions(&db, now).await?;
-    let transaction = auth_transaction_from_session_login_request(
+    let mut transaction = auth_transaction_from_session_login_request(
         client,
         &provider_id,
         provider_state,
@@ -7671,6 +7986,11 @@ async fn hosted_session_login(request: Request, env: Env) -> worker::Result<Resp
         query_param(&url, "state"),
         now,
     );
+    bind_provider_transaction(&mut transaction, &provider).map_err(worker_error)?;
+    let upstream_challenge = transaction
+        .provider_code_verifier
+        .as_deref()
+        .map(pkce_s256_challenge);
     put_auth_transaction(&db, &transaction).await?;
 
     let auth = provider
@@ -7678,7 +7998,7 @@ async fn hosted_session_login(request: Request, env: Env) -> worker::Result<Resp
             redirect_uri: &transaction.provider_redirect_uri,
             state: &transaction.provider_state,
             nonce: provider_authorize_nonce(&transaction),
-            code_challenge: None,
+            code_challenge: upstream_challenge.as_deref(),
             scopes: None,
         })
         .map_err(|error| worker::Error::RustError(error.description))?;
@@ -7777,7 +8097,7 @@ async fn hosted_account(request: Request, env: Env) -> worker::Result<Response> 
     let config = server_config(&env, &url);
     let db = env.d1(D1_BINDING)?;
     let now = unix_timestamp_seconds();
-    let current = current_session_from_request(&request, &db, &config, now).await?;
+    let current = current_session_from_request(&request, &env, &db, &config, now).await?;
 
     let mut registered_client = None;
     if let Some(current) = &current {
@@ -7874,7 +8194,7 @@ async fn hosted_clients_admin(request: Request, env: Env) -> worker::Result<Resp
 
     match authorize_admin_request(&request, &env, &db, &config, now).await {
         Ok(_) => {
-            let current = current_session_from_request(&request, &db, &config, now).await?;
+            let current = current_session_from_request(&request, &env, &db, &config, now).await?;
             state = state.with_csrf_token(current.as_ref().and_then(|current| {
                 csrf_secret_from_env(&env).ok().map(|secret| {
                     csrf_token(&secret, &current.session.id, CSRF_ROUTE_FAMILY_ACCOUNT, now)
@@ -7902,7 +8222,7 @@ async fn hosted_clients_admin(request: Request, env: Env) -> worker::Result<Resp
                 .collect();
         }
         Err(error) => {
-            let current = current_session_from_request(&request, &db, &config, now).await?;
+            let current = current_session_from_request(&request, &env, &db, &config, now).await?;
             if current.is_none()
                 && error.status == 401
                 && provider_configured_for_login(&env, well_known::APPLE)
@@ -7967,7 +8287,7 @@ async fn authorize(request: Request, env: Env) -> worker::Result<Response> {
     };
     if provider_id.is_none() {
         let now = unix_timestamp_seconds();
-        if let Some(current) = current_session_from_request(&request, &db, &config, now)
+        if let Some(current) = current_session_from_request(&request, &env, &db, &config, now)
             .await?
             .filter(|current| {
                 authorization_request_may_reuse_session(
@@ -7978,7 +8298,7 @@ async fn authorize(request: Request, env: Env) -> worker::Result<Response> {
             })
         {
             if let Err(error) =
-                validate_user_client_admission(&db, &registered_client, &current.user.id).await?
+                validate_session_client_admission(&db, &env, &registered_client, &current).await?
             {
                 if authorization_request.prompt != AuthorizationPrompt::None {
                     return hosted_authorization_document(
@@ -7998,14 +8318,16 @@ async fn authorize(request: Request, env: Env) -> worker::Result<Response> {
                     &error.description,
                 );
             }
+            let code_session = session_for_client_code(&db, &current.session, &client.id.0).await?;
             let zeroth_code = random_token()?;
             put_authorization_code_for_request(
                 &db,
                 &zeroth_code,
                 &authorization_request,
                 &current.user.id,
-                Some(&current.session.id),
+                Some(&code_session.id),
                 current.session.created_at,
+                &code_session.auth_context,
                 now,
             )
             .await?;
@@ -8024,16 +8346,26 @@ async fn authorize(request: Request, env: Env) -> worker::Result<Response> {
             )
             .await;
 
-            return redirect_to_authorization_request_client(
+            let response = redirect_to_authorization_request_client(
                 &authorization_request,
                 &config.issuer().issuer,
                 &zeroth_code,
+            )?;
+            return with_set_cookie(
+                response,
+                &session_cookie(
+                    &config.cookie_name,
+                    &code_session.id,
+                    code_session.expires_at.saturating_sub(now),
+                    config.cookie_domain.as_deref(),
+                ),
             );
         }
     }
     if authorization_request.prompt == AuthorizationPrompt::None {
         let now = unix_timestamp_seconds();
-        let Some(current) = current_session_from_request(&request, &db, &config, now).await? else {
+        let Some(current) = current_session_from_request(&request, &env, &db, &config, now).await?
+        else {
             return redirect_to_authorization_request_error(
                 &authorization_request,
                 &config.issuer().issuer,
@@ -8050,7 +8382,7 @@ async fn authorize(request: Request, env: Env) -> worker::Result<Response> {
             );
         }
         if let Err(error) =
-            validate_user_client_admission(&db, &registered_client, &current.user.id).await?
+            validate_session_client_admission(&db, &env, &registered_client, &current).await?
         {
             return redirect_to_authorization_request_error(
                 &authorization_request,
@@ -8060,14 +8392,16 @@ async fn authorize(request: Request, env: Env) -> worker::Result<Response> {
             );
         }
 
+        let code_session = session_for_client_code(&db, &current.session, &client.id.0).await?;
         let zeroth_code = random_token()?;
         put_authorization_code_for_request(
             &db,
             &zeroth_code,
             &authorization_request,
             &current.user.id,
-            Some(&current.session.id),
+            Some(&code_session.id),
             current.session.created_at,
+            &code_session.auth_context,
             now,
         )
         .await?;
@@ -8086,10 +8420,19 @@ async fn authorize(request: Request, env: Env) -> worker::Result<Response> {
         )
         .await;
 
-        return redirect_to_authorization_request_client(
+        let response = redirect_to_authorization_request_client(
             &authorization_request,
             &config.issuer().issuer,
             &zeroth_code,
+        )?;
+        return with_set_cookie(
+            response,
+            &session_cookie(
+                &config.cookie_name,
+                &code_session.id,
+                code_session.expires_at.saturating_sub(now),
+                config.cookie_domain.as_deref(),
+            ),
         );
     }
     let Some(provider_id) = provider_id else {
@@ -8103,6 +8446,14 @@ async fn authorize(request: Request, env: Env) -> worker::Result<Response> {
         )
         .await;
     };
+    if let Err(error) = validate_client_login_provider(client, &provider_id) {
+        return redirect_to_authorization_request_error(
+            &authorization_request,
+            &config.issuer().issuer,
+            "access_denied",
+            &error,
+        );
+    }
     if !provider_configured_for_login(&env, &provider_id) {
         return redirect_to_authorization_request_error(
             &authorization_request,
@@ -8118,7 +8469,7 @@ async fn authorize(request: Request, env: Env) -> worker::Result<Response> {
     let provider_nonce = random_token()?;
     let now = unix_timestamp_seconds();
     cleanup_expired_auth_transactions(&db, now).await?;
-    let transaction = auth_transaction_from_request(
+    let mut transaction = auth_transaction_from_request(
         &authorization_request,
         &provider_id,
         provider_state,
@@ -8126,6 +8477,11 @@ async fn authorize(request: Request, env: Env) -> worker::Result<Response> {
         provider_redirect_uri,
         now,
     );
+    bind_provider_transaction(&mut transaction, &provider).map_err(worker_error)?;
+    let upstream_challenge = transaction
+        .provider_code_verifier
+        .as_deref()
+        .map(pkce_s256_challenge);
     put_auth_transaction(&db, &transaction).await?;
 
     let auth = provider
@@ -8133,7 +8489,7 @@ async fn authorize(request: Request, env: Env) -> worker::Result<Response> {
             redirect_uri: &transaction.provider_redirect_uri,
             state: &transaction.provider_state,
             nonce: provider_authorize_nonce(&transaction),
-            code_challenge: None,
+            code_challenge: upstream_challenge.as_deref(),
             scopes: None,
         })
         .map_err(|error| worker::Error::RustError(error.description))?;
@@ -8163,7 +8519,15 @@ async fn hosted_session_login_document(
     let client = &registered_client.client;
     let config = server_config(env, url);
     let now = unix_timestamp_seconds();
-    let current = current_session_from_request(request, db, &config, now).await?;
+    let mut current = current_session_from_request(request, env, db, &config, now).await?;
+    if let Some(existing) = current.as_ref() {
+        if validate_session_client_admission(db, env, registered_client, existing)
+            .await?
+            .is_err()
+        {
+            current = None;
+        }
+    }
     if current.is_some() {
         let target = url::Url::parse(&return_to)
             .map_err(|error| worker_error(format!("invalid session login return_to: {error}")))?;
@@ -8205,6 +8569,7 @@ async fn hosted_session_login_document(
         target_url.as_deref(),
     );
     state.providers = provider_ui_rows(env, &identities, true);
+    restrict_enterprise_login_ui(&mut state, client);
     state.profile = current
         .as_ref()
         .map(|current| profile_ui_from_user(&current.user, &identities));
@@ -8227,10 +8592,18 @@ async fn hosted_authorization_document(
     let client = &registered_client.client;
     let config = server_config(env, url);
     let now = unix_timestamp_seconds();
-    let current = current_session_from_request(request, db, &config, now).await?;
-    let current = current.filter(|current| {
+    let current = current_session_from_request(request, env, db, &config, now).await?;
+    let mut current = current.filter(|current| {
         authorization_request_may_reuse_session(authorization_request, &current.session, now)
     });
+    if let Some(existing) = current.as_ref() {
+        if validate_session_client_admission(db, env, registered_client, existing)
+            .await?
+            .is_err()
+        {
+            current = None;
+        }
+    }
     let identities = if let Some(current) = &current {
         list_identities_for_user(db, &current.user.id).await?
     } else {
@@ -8261,6 +8634,7 @@ async fn hosted_authorization_document(
         Some(&target_url),
     );
     state.providers = provider_ui_rows(env, &identities, true);
+    restrict_enterprise_login_ui(&mut state, client);
     state.profile = current
         .as_ref()
         .map(|current| profile_ui_from_user(&current.user, &identities));
@@ -8319,10 +8693,23 @@ fn provider_ui_rows(
             ProviderKind::Spotify,
             identities,
         ),
+        provider_ui(
+            well_known::ENTRA,
+            "Microsoft Entra",
+            ProviderKind::Entra,
+            identities,
+        ),
+        provider_ui(
+            well_known::GOOGLE_WORKSPACE,
+            "Google Workspace",
+            ProviderKind::Google,
+            identities,
+        ),
     ];
     // Keep Google visible in the YL login surface even before its secret is configured.
     providers.retain(|provider| {
-        !provider_disabled(env, &provider.id) || provider.id == well_known::GOOGLE
+        (!is_enterprise_provider(&provider.id) || provider_client_id_configured(env, &provider.id))
+            && (!provider_disabled(env, &provider.id) || provider.id == well_known::GOOGLE)
     });
     for provider in &mut providers {
         provider.enabled = actions_enabled && provider_configured_for_login(env, &provider.id);
@@ -8344,6 +8731,14 @@ fn provider_responses(env: &Env) -> Vec<ProviderResponse> {
         ProviderResponse {
             id: well_known::SPOTIFY,
             kind: "oauth2",
+        },
+        ProviderResponse {
+            id: well_known::ENTRA,
+            kind: "oidc",
+        },
+        ProviderResponse {
+            id: well_known::GOOGLE_WORKSPACE,
+            kind: "oidc",
         },
     ]
     .into_iter()
@@ -8377,6 +8772,8 @@ fn provider_client_id_binding(provider_id: &str) -> Option<&'static str> {
     Some(match provider_id {
         well_known::APPLE => "APPLE_CLIENT_ID",
         well_known::GOOGLE => "GOOGLE_CLIENT_ID",
+        well_known::ENTRA => "ENTRA_CLIENT_ID",
+        well_known::GOOGLE_WORKSPACE => "GOOGLE_WORKSPACE_CLIENT_ID",
         well_known::SPOTIFY => "SPOTIFY_CLIENT_ID",
         _ => return None,
     })
@@ -8387,6 +8784,23 @@ fn provider_configured_for_login(env: &Env, provider_id: &str) -> bool {
     !provider_disabled(env, provider_id)
         && provider_client_id_configured(env, provider_id)
         && provider_client_secret_configured(env, provider_id)
+        && (!is_enterprise_provider(provider_id) || provider_from_env(env, provider_id).is_ok())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn enterprise_provider_requested(env: &Env, provider_id: &str) -> bool {
+    let bindings: &[&str] = match provider_id {
+        well_known::ENTRA => &["ENTRA_CLIENT_ID", "ENTRA_TENANT_ID", "ENTRA_CLIENT_SECRET"],
+        well_known::GOOGLE_WORKSPACE => &[
+            "GOOGLE_WORKSPACE_CLIENT_ID",
+            "GOOGLE_WORKSPACE_DOMAINS",
+            "GOOGLE_WORKSPACE_CLIENT_SECRET",
+        ],
+        _ => return true,
+    };
+    bindings
+        .iter()
+        .any(|binding| config_value_configured(binding_value_from_env(env, binding).as_deref()))
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -8396,11 +8810,18 @@ fn provider_status_rows(
     include_disabled: bool,
     provider_failures: &[(String, ProviderFailureStatus)],
 ) -> Vec<ProviderStatus> {
-    [well_known::APPLE, well_known::GOOGLE, well_known::SPOTIFY]
-        .into_iter()
-        .filter(|provider_id| include_disabled || !provider_disabled(env, provider_id))
-        .filter_map(|provider_id| provider_status_row(env, config, provider_id, provider_failures))
-        .collect()
+    [
+        well_known::APPLE,
+        well_known::GOOGLE,
+        well_known::SPOTIFY,
+        well_known::ENTRA,
+        well_known::GOOGLE_WORKSPACE,
+    ]
+    .into_iter()
+    .filter(|provider_id| include_disabled || enterprise_provider_requested(env, provider_id))
+    .filter(|provider_id| include_disabled || !provider_disabled(env, provider_id))
+    .filter_map(|provider_id| provider_status_row(env, config, provider_id, provider_failures))
+    .collect()
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -8722,6 +9143,8 @@ fn provider_status_row(
     let (id, label, kind) = match provider_id {
         well_known::APPLE => (well_known::APPLE, "Apple", "oidc"),
         well_known::GOOGLE => (well_known::GOOGLE, "Google", "oidc"),
+        well_known::ENTRA => (well_known::ENTRA, "Microsoft Entra", "oidc"),
+        well_known::GOOGLE_WORKSPACE => (well_known::GOOGLE_WORKSPACE, "Google Workspace", "oidc"),
         well_known::SPOTIFY => (well_known::SPOTIFY, "Spotify", "oauth2"),
         _ => return None,
     };
@@ -8745,12 +9168,21 @@ fn provider_status_row(
     if !client_secret_configured {
         notes.push("missing_client_secret");
     }
+    let policy_configured =
+        !is_enterprise_provider(provider_id) || provider_from_env(env, provider_id).is_ok();
+    if !policy_configured {
+        notes.push(match provider_id {
+            well_known::ENTRA => "missing_or_invalid_entra_tenant_or_client",
+            _ => "missing_or_invalid_workspace_domains_or_client",
+        });
+    }
 
     Some(ProviderStatus {
         id,
         label,
         kind,
-        enabled: provider_status_enabled(client_id_configured, client_secret_configured, disabled),
+        enabled: provider_status_enabled(client_id_configured, client_secret_configured, disabled)
+            && policy_configured,
         client_id_configured,
         client_secret_configured,
         client_id_binding,
@@ -8813,6 +9245,8 @@ fn provider_secret_binding_sets(provider_id: &str) -> Vec<Vec<&'static str>> {
             vec!["APPLE_TEAM_ID", "APPLE_KEY_ID", "APPLE_PRIVATE_KEY_PEM"],
         ],
         well_known::GOOGLE => vec![vec!["GOOGLE_CLIENT_SECRET"]],
+        well_known::ENTRA => vec![vec!["ENTRA_CLIENT_SECRET"]],
+        well_known::GOOGLE_WORKSPACE => vec![vec!["GOOGLE_WORKSPACE_CLIENT_SECRET"]],
         well_known::SPOTIFY => vec![vec!["SPOTIFY_CLIENT_SECRET"]],
         _ => Vec::new(),
     }
@@ -9082,6 +9516,10 @@ fn provider_client_secret_configured(env: &Env, provider_id: &str) -> bool {
         well_known::APPLE => apple_client_secret_configured(env),
         well_known::GOOGLE => provider_secret_binding_configured(env, "GOOGLE_CLIENT_SECRET"),
         well_known::SPOTIFY => provider_secret_binding_configured(env, "SPOTIFY_CLIENT_SECRET"),
+        well_known::ENTRA => provider_secret_binding_configured(env, "ENTRA_CLIENT_SECRET"),
+        well_known::GOOGLE_WORKSPACE => {
+            provider_secret_binding_configured(env, "GOOGLE_WORKSPACE_CLIENT_SECRET")
+        }
         _ => false,
     }
 }
@@ -9802,7 +10240,7 @@ async fn get_auth_transaction(
     let row = db
         .prepare(
             "SELECT provider_state, client_id, provider_id, redirect_uri, provider_redirect_uri,
-                    app_state, nonce, provider_nonce, code_challenge, code_challenge_method, scope,
+                    app_state, nonce, provider_nonce, provider_policy_hash, provider_code_verifier, code_challenge, code_challenge_method, scope,
                     link_user_id, link_session_id, session_return_to, created_at, expires_at,
                     consumed_at
              FROM zeroth_auth_transactions
@@ -10993,7 +11431,7 @@ async fn get_user_token_claims(
                     ) i
                     WHERE i.email = u.primary_email
                       AND i.email_verified != 0
-                      AND i.provider_id IN ('google', 'apple', 'zeroth', 'magic_link')
+                      AND i.provider_id IN ('google', 'google_workspace', 'apple', 'zeroth', 'magic_link')
                     LIMIT 1
                 ) AS email_verified,
                 EXISTS (
@@ -11059,7 +11497,7 @@ async fn get_admin_user_row(
                     ) i
                     WHERE i.email = u.primary_email
                       AND i.email_verified != 0
-                      AND i.provider_id IN ('google', 'apple', 'zeroth', 'magic_link')
+                      AND i.provider_id IN ('google', 'google_workspace', 'apple', 'zeroth', 'magic_link')
                     LIMIT 1
                 ) AS email_verified,
                 EXISTS (
@@ -11124,7 +11562,7 @@ async fn list_admin_user_rows(
                     ) i
                     WHERE i.email = u.primary_email
                       AND i.email_verified != 0
-                      AND i.provider_id IN ('google', 'apple', 'zeroth', 'magic_link')
+                      AND i.provider_id IN ('google', 'google_workspace', 'apple', 'zeroth', 'magic_link')
                     LIMIT 1
                 ) AS email_verified,
                 EXISTS (
@@ -11980,6 +12418,10 @@ async fn put_authorization_code(
         code_challenge,
         code_challenge_method,
         &scope,
+        &AuthContext {
+            auth_provider: Some(transaction.provider_id.0.clone()),
+            auth_policy_hash: transaction.provider_policy_hash.clone(),
+        },
         now,
     )
     .await
@@ -11993,6 +12435,7 @@ async fn put_authorization_code_for_request(
     user_id: &str,
     session_id: Option<&str>,
     auth_time: i32,
+    auth_context: &AuthContext,
     now: i32,
 ) -> worker::Result<()> {
     let code_hash = hash_secret(code);
@@ -12018,6 +12461,7 @@ async fn put_authorization_code_for_request(
         code_challenge,
         code_challenge_method,
         &scope,
+        auth_context,
         now,
     )
     .await
@@ -12036,6 +12480,7 @@ async fn put_authorization_code_values(
     code_challenge: worker::d1::D1Type<'_>,
     code_challenge_method: worker::d1::D1Type<'_>,
     scope: &str,
+    auth_context: &AuthContext,
     now: i32,
 ) -> worker::Result<()> {
     let args = [
@@ -12051,17 +12496,14 @@ async fn put_authorization_code_values(
         worker::d1::D1Type::Text(scope),
         worker::d1::D1Type::Integer(now),
         worker::d1::D1Type::Integer(now + AUTH_CODE_TTL_SECONDS),
+        d1_optional_text(auth_context.auth_provider.as_deref()),
+        d1_optional_text(auth_context.auth_policy_hash.as_deref()),
     ];
 
-    db.prepare(
-        "INSERT INTO zeroth_auth_codes (
-             code_hash, client_id, redirect_uri, user_id, session_id, auth_time, nonce,
-             code_challenge, code_challenge_method, scope, created_at, expires_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-    )
-    .bind_refs(&args)?
-    .run()
-    .await?;
+    db.prepare(INSERT_AUTH_CODE_SQL)
+        .bind_refs(&args)?
+        .run()
+        .await?;
     Ok(())
 }
 
@@ -12074,7 +12516,7 @@ async fn get_authorization_code(
     let args = [worker::d1::D1Type::Text(&code_hash)];
     db.prepare(
         "SELECT code_hash, client_id, redirect_uri, user_id, session_id, auth_time, nonce,
-                code_challenge, code_challenge_method, scope, created_at, expires_at, consumed_at
+                code_challenge, code_challenge_method, scope, created_at, expires_at, consumed_at, auth_provider, auth_policy_hash
          FROM zeroth_auth_codes
          WHERE code_hash = ?
          LIMIT 1",
@@ -12162,15 +12604,13 @@ async fn put_refresh_token_row(
         worker::d1::D1Type::Text(&issue.scope),
         worker::d1::D1Type::Integer(now),
         worker::d1::D1Type::Integer(now + REFRESH_TOKEN_TTL_SECONDS),
+        d1_optional_text(issue.auth_context.auth_provider.as_deref()),
+        d1_optional_text(issue.auth_context.auth_policy_hash.as_deref()),
     ];
-    db.prepare(
-        "INSERT INTO zeroth_refresh_tokens (
-             token_hash, client_id, user_id, session_id, auth_time, scope, created_at, expires_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-    )
-    .bind_refs(&args)?
-    .run()
-    .await?;
+    db.prepare(INSERT_REFRESH_TOKEN_SQL)
+        .bind_refs(&args)?
+        .run()
+        .await?;
     Ok(())
 }
 
@@ -12183,7 +12623,7 @@ async fn get_refresh_token(
     let args = [worker::d1::D1Type::Text(&token_hash)];
     db.prepare(
         "SELECT token_hash, client_id, user_id, session_id, auth_time, scope,
-                created_at, expires_at, rotated_at, revoked_at
+                created_at, expires_at, rotated_at, revoked_at, auth_provider, auth_policy_hash
          FROM zeroth_refresh_tokens
          WHERE token_hash = ?
          LIMIT 1",
@@ -12278,6 +12718,40 @@ async fn put_session(
     user_agent: Option<&str>,
     ip_hash: Option<&str>,
 ) -> worker::Result<()> {
+    let client = get_client(db, client_id)
+        .await?
+        .ok_or_else(|| worker_error("session client is not registered".to_owned()))?;
+    if client.enterprise_provider.is_some() {
+        return Err(worker_error(
+            "this application requires enterprise login".to_owned(),
+        ));
+    }
+    put_session_with_auth_context(
+        db,
+        session_id,
+        user_id,
+        client_id,
+        now,
+        user_agent,
+        ip_hash,
+        &AuthContext::default(),
+        now + SESSION_TTL_SECONDS,
+    )
+    .await
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn put_session_with_auth_context(
+    db: &worker::d1::D1Database,
+    session_id: &str,
+    user_id: &str,
+    client_id: &str,
+    now: i32,
+    user_agent: Option<&str>,
+    ip_hash: Option<&str>,
+    auth_context: &AuthContext,
+    expires_at: i32,
+) -> worker::Result<()> {
     let user_agent = d1_optional_text(user_agent);
     let ip_hash = d1_optional_text(ip_hash);
     let args = [
@@ -12285,18 +12759,16 @@ async fn put_session(
         worker::d1::D1Type::Text(user_id),
         worker::d1::D1Type::Text(client_id),
         worker::d1::D1Type::Integer(now),
-        worker::d1::D1Type::Integer(now + SESSION_TTL_SECONDS),
+        worker::d1::D1Type::Integer(expires_at),
         user_agent,
         ip_hash,
+        d1_optional_text(auth_context.auth_provider.as_deref()),
+        d1_optional_text(auth_context.auth_policy_hash.as_deref()),
     ];
-    db.prepare(
-        "INSERT INTO zeroth_sessions (
-             id, user_id, client_id, created_at, expires_at, user_agent, ip_hash
-         ) VALUES (?, ?, ?, ?, ?, ?, ?)",
-    )
-    .bind_refs(&args)?
-    .run()
-    .await?;
+    db.prepare(INSERT_SESSION_SQL)
+        .bind_refs(&args)?
+        .run()
+        .await?;
     Ok(())
 }
 
@@ -12307,7 +12779,7 @@ async fn get_session(
 ) -> worker::Result<Option<SessionRow>> {
     let args = [worker::d1::D1Type::Text(session_id)];
     db.prepare(
-        "SELECT id, user_id, client_id, created_at, expires_at, revoked_at, user_agent, ip_hash
+        "SELECT id, user_id, client_id, created_at, expires_at, revoked_at, user_agent, ip_hash, auth_provider, auth_policy_hash
          FROM zeroth_sessions
          WHERE id = ?
          LIMIT 1",
@@ -12329,7 +12801,7 @@ async fn list_active_sessions_for_user(
         worker::d1::D1Type::Integer(SESSION_LIST_LIMIT),
     ];
     db.prepare(
-        "SELECT id, user_id, client_id, created_at, expires_at, revoked_at, user_agent, ip_hash
+        "SELECT id, user_id, client_id, created_at, expires_at, revoked_at, user_agent, ip_hash, auth_provider, auth_policy_hash
          FROM zeroth_sessions
          WHERE user_id = ? AND revoked_at IS NULL AND expires_at > ?
          ORDER BY created_at DESC
@@ -12411,6 +12883,7 @@ async fn revoke_refresh_token_family_for_session(
 #[cfg(target_arch = "wasm32")]
 async fn current_session_from_request(
     request: &Request,
+    env: &Env,
     db: &worker::d1::D1Database,
     config: &ZerothServerConfig,
     now: i32,
@@ -12432,6 +12905,21 @@ async fn current_session_from_request(
         return Ok(None);
     }
 
+    if let Some(client_id) = session.client_id.as_deref() {
+        let Some(client) = get_client(db, client_id).await? else {
+            return Ok(None);
+        };
+        if validate_auth_context_for_client(env, &client, &session.auth_context).is_err() {
+            return Ok(None);
+        }
+    } else if session
+        .auth_context
+        .auth_provider
+        .as_deref()
+        .is_some_and(is_enterprise_provider)
+    {
+        return Ok(None);
+    }
     Ok(Some(CurrentSession { session, user }))
 }
 
@@ -12463,7 +12951,7 @@ async fn current_account_from_request(
         if user.disabled_at.is_some() {
             return Ok(Err(AccountAuthError::invalid_token("user is disabled")));
         }
-        if let Err(error) = validate_access_token_session(db, &claims, now).await? {
+        if let Err(error) = validate_access_token_session(db, env, &claims, now).await? {
             return Ok(Err(AccountAuthError::invalid_token(error)));
         }
         let allowed_origins = match active_client_allowed_origins(db, &claims.aud).await? {
@@ -12482,7 +12970,7 @@ async fn current_account_from_request(
         }));
     }
 
-    let Some(current) = current_session_from_request(request, db, config, now).await? else {
+    let Some(current) = current_session_from_request(request, env, db, config, now).await? else {
         return Ok(Err(AccountAuthError::login_required(
             "active browser session or bearer token was not found",
         )));
@@ -12555,6 +13043,8 @@ async fn put_auth_transaction(
         app_state,
         nonce,
         provider_nonce,
+        d1_optional_text(transaction.provider_policy_hash.as_deref()),
+        d1_optional_text(transaction.provider_code_verifier.as_deref()),
         code_challenge,
         code_challenge_method,
         worker::d1::D1Type::Text(&scope),
@@ -12568,9 +13058,9 @@ async fn put_auth_transaction(
     db.prepare(
         "INSERT INTO zeroth_auth_transactions (
              provider_state, client_id, provider_id, redirect_uri, provider_redirect_uri,
-             app_state, nonce, provider_nonce, code_challenge, code_challenge_method, scope, link_user_id,
+             app_state, nonce, provider_nonce, provider_policy_hash, provider_code_verifier, code_challenge, code_challenge_method, scope, link_user_id,
              link_session_id, session_return_to, created_at, expires_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind_refs(&args)?
     .run()
@@ -12887,6 +13377,8 @@ fn auth_transaction_from_request(
         app_state: request.state.clone(),
         nonce: request.nonce.clone(),
         provider_nonce: Some(provider_nonce),
+        provider_policy_hash: None,
+        provider_code_verifier: None,
         code_challenge: request.code_challenge.clone(),
         code_challenge_method: request
             .code_challenge_method
@@ -12920,6 +13412,8 @@ fn auth_transaction_from_session_login_request(
         app_state,
         nonce: None,
         provider_nonce: Some(provider_nonce),
+        provider_policy_hash: None,
+        provider_code_verifier: None,
         code_challenge: None,
         code_challenge_method: None,
         scope: ScopeSet::new(["openid", "email", "profile"]),
@@ -12952,6 +13446,8 @@ fn auth_transaction_from_link_request(
         app_state,
         nonce: None,
         provider_nonce: Some(provider_nonce),
+        provider_policy_hash: None,
+        provider_code_verifier: None,
         code_challenge: None,
         code_challenge_method: None,
         scope: ScopeSet::new(["openid", "email", "profile"]),
@@ -12974,6 +13470,8 @@ fn auth_transaction_from_row(row: AuthTransactionRow) -> Result<StoredAuthTransa
             app_state: row.app_state,
             nonce: row.nonce,
             provider_nonce: row.provider_nonce,
+            provider_policy_hash: row.provider_policy_hash,
+            provider_code_verifier: row.provider_code_verifier,
             code_challenge: row.code_challenge,
             code_challenge_method: row.code_challenge_method,
             scope: ScopeSet::new(row.scope.split_whitespace()),
@@ -14223,6 +14721,7 @@ fn zeroth_token_error_description(
 #[cfg(target_arch = "wasm32")]
 async fn introspection_response_for_token(
     db: &worker::d1::D1Database,
+    env: &Env,
     config: &ZerothServerConfig,
     jwks: &JwksResponse,
     form: &TokenIntrospectionForm,
@@ -14230,7 +14729,7 @@ async fn introspection_response_for_token(
 ) -> worker::Result<TokenIntrospectionResponse> {
     if form.token_type_hint.as_deref() != Some("refresh_token") {
         if let Ok(claims) = verify_zeroth_access_token(&form.token, config, jwks, now) {
-            return introspection_response_for_access_token_claims(db, &claims, now).await;
+            return introspection_response_for_access_token_claims(db, env, &claims, now).await;
         }
     }
 
@@ -14238,6 +14737,7 @@ async fn introspection_response_for_token(
         if let Some(refresh_token) = get_refresh_token(db, &form.token).await? {
             return introspection_response_for_refresh_token_row(
                 db,
+                env,
                 &refresh_token,
                 &form.client_id,
                 now,
@@ -14252,6 +14752,7 @@ async fn introspection_response_for_token(
 #[cfg(target_arch = "wasm32")]
 async fn introspection_response_for_access_token_claims(
     db: &worker::d1::D1Database,
+    env: &Env,
     claims: &JwtClaims,
     now: i32,
 ) -> worker::Result<TokenIntrospectionResponse> {
@@ -14261,7 +14762,7 @@ async fn introspection_response_for_access_token_claims(
     if user.disabled_at.is_some() {
         return Ok(TokenIntrospectionResponse::inactive());
     }
-    if validate_access_token_session(db, claims, now)
+    if validate_access_token_session(db, env, claims, now)
         .await?
         .is_err()
     {
@@ -14280,11 +14781,29 @@ async fn introspection_response_for_access_token_claims(
 #[cfg(target_arch = "wasm32")]
 async fn introspection_response_for_refresh_token_row(
     db: &worker::d1::D1Database,
+    env: &Env,
     row: &RefreshTokenRow,
     client_id: &str,
     now: i32,
 ) -> worker::Result<TokenIntrospectionResponse> {
     if validate_refresh_token_exchange(row, client_id, now).is_err() {
+        return Ok(TokenIntrospectionResponse::inactive());
+    }
+    let Some(client) = get_registered_client(db, client_id).await? else {
+        return Ok(TokenIntrospectionResponse::inactive());
+    };
+    if validate_grant_authentication(
+        db,
+        env,
+        &client.client,
+        &row.user_id,
+        row.session_id.as_deref(),
+        &row.auth_context,
+        now,
+    )
+    .await?
+    .is_err()
+    {
         return Ok(TokenIntrospectionResponse::inactive());
     }
     let Some(user) = get_user(db, &row.user_id).await? else {
@@ -14953,6 +15472,21 @@ fn validate_client_email_domain_policy(
 }
 
 #[cfg(target_arch = "wasm32")]
+async fn validate_session_client_admission(
+    db: &worker::d1::D1Database,
+    env: &Env,
+    client: &RegisteredClient,
+    current: &CurrentSession,
+) -> worker::Result<Result<(), ProviderCallbackError>> {
+    if let Err(error) =
+        validate_auth_context_for_client(env, &client.client, &current.session.auth_context)
+    {
+        return Ok(Err(ProviderCallbackError::access_denied(error)));
+    }
+    validate_user_client_admission(db, client, &current.user.id).await
+}
+
+#[cfg(target_arch = "wasm32")]
 async fn validate_user_client_admission(
     db: &worker::d1::D1Database,
     client: &RegisteredClient,
@@ -15164,6 +15698,8 @@ fn provider_label(provider_id: &str) -> &'static str {
     match provider_id {
         well_known::APPLE => "Apple",
         well_known::GOOGLE => "Google",
+        well_known::ENTRA => "Microsoft Entra",
+        well_known::GOOGLE_WORKSPACE => "Google Workspace",
         well_known::SPOTIFY => "Spotify",
         _ => "provider",
     }
@@ -15774,6 +16310,9 @@ async fn local_auth_client_and_return_to(
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "local auth client is not registered".to_owned())?
     };
+    if client.enterprise_provider.is_some() {
+        return Err("this application requires enterprise login".to_owned());
+    }
     let return_to = passkey_return_to(request_url, return_to, &client, config)
         .map_err(|error| error.to_string())?;
     Ok((client, return_to))
@@ -15816,6 +16355,11 @@ fn validate_local_auth_client_email_policy(
     email: &str,
     email_verified: bool,
 ) -> Result<(), ProviderCallbackError> {
+    if client.enterprise_provider.is_some() {
+        return Err(ProviderCallbackError::access_denied(
+            "this application requires enterprise login",
+        ));
+    }
     let profile = local_auth_profile(email, None, email_verified);
     validate_client_email_domain_policy(client, &profile)
 }
@@ -15830,11 +16374,11 @@ fn validate_legacy_local_auth_namespace(namespace: &str) -> Result<(), String> {
 const VERIFIED_LOCAL_AUTH_EMAIL_SQL: &str = "SELECT EXISTS (
          SELECT 1 FROM zeroth_account_identities
          WHERE account_namespace = 'global' AND user_id = ? AND lower(email) = lower(?)
-           AND email_verified != 0 AND provider_id IN ('google', 'apple', 'zeroth', 'magic_link')
+           AND email_verified != 0 AND provider_id IN ('google', 'google_workspace', 'apple', 'zeroth', 'magic_link')
          UNION ALL
          SELECT 1 FROM zeroth_identities li
          WHERE li.user_id = ? AND lower(li.email) = lower(?)
-           AND li.email_verified != 0 AND li.provider_id IN ('google', 'apple', 'zeroth', 'magic_link')
+           AND li.email_verified != 0 AND li.provider_id IN ('google', 'google_workspace', 'apple', 'zeroth', 'magic_link')
            AND NOT EXISTS (
                SELECT 1 FROM zeroth_account_identities ai
                WHERE ai.account_namespace = 'global'
@@ -15850,11 +16394,11 @@ const VERIFIED_EMAIL_ACCOUNT_SQL: &str =
          SELECT ai.user_id FROM zeroth_account_identities ai
          WHERE ai.account_namespace = 'global' AND lower(ai.email) = lower(?)
            AND ai.email_verified != 0
-           AND ai.provider_id IN ('google', 'apple', 'zeroth', 'magic_link')
+           AND ai.provider_id IN ('google', 'google_workspace', 'apple', 'zeroth', 'magic_link')
          UNION
          SELECT li.user_id FROM zeroth_identities li
          WHERE lower(li.email) = lower(?) AND li.email_verified != 0
-           AND li.provider_id IN ('google', 'apple', 'zeroth', 'magic_link')
+           AND li.provider_id IN ('google', 'google_workspace', 'apple', 'zeroth', 'magic_link')
            AND NOT EXISTS (
                SELECT 1 FROM zeroth_account_identities ai
                WHERE ai.account_namespace = 'global'
@@ -15935,6 +16479,9 @@ async fn global_local_auth_client(
     let Some(registered) = get_registered_client(db, client_id).await? else {
         return Ok(Err("local auth client is not registered".to_owned()));
     };
+    if registered.client.enterprise_provider.is_some() {
+        return Ok(Err("this application requires enterprise login".to_owned()));
+    }
     if let Err(error) = validate_legacy_local_auth_namespace(&registered.account_scope.namespace) {
         return Ok(Err(error));
     }
@@ -18193,18 +18740,28 @@ fn validate_session_response(session: &SessionRow, user: &UserRow) -> ValidateRe
 #[cfg(target_arch = "wasm32")]
 async fn validate_access_token_session(
     db: &worker::d1::D1Database,
+    env: &Env,
     claims: &JwtClaims,
     now: i32,
 ) -> worker::Result<Result<(), String>> {
-    let Some(session_id) = claims.sid.as_deref() else {
-        return Ok(Ok(()));
+    let Some(client) = get_registered_client(db, &claims.aud).await? else {
+        return Ok(Err("token client is disabled or missing".to_owned()));
     };
-    let session = get_session(db, session_id).await?;
-    Ok(validate_access_token_session_claims(
-        claims,
-        session.as_ref(),
-        now,
-    ))
+    let session = match claims.sid.as_deref() {
+        Some(id) => get_session(db, id).await?,
+        None => None,
+    };
+    if let Err(error) = validate_access_token_session_claims(claims, session.as_ref(), now) {
+        return Ok(Err(error));
+    }
+    let context = session
+        .as_ref()
+        .map(|row| row.auth_context.clone())
+        .unwrap_or_default();
+    if let Err(error) = validate_auth_context_for_client(env, &client.client, &context) {
+        return Ok(Err(error));
+    }
+    Ok(Ok(()))
 }
 
 fn validate_access_token_session_claims(
@@ -18498,6 +19055,7 @@ impl TokenIssue {
             client_id: code.client_id.clone(),
             user_id: code.user_id.clone(),
             session_id: code.session_id.clone(),
+            auth_context: code.auth_context.clone(),
             scope: code.scope.clone(),
             auth_time: Some(code.auth_time.unwrap_or(code.created_at)),
             nonce: code.nonce.clone(),
@@ -18514,6 +19072,7 @@ impl TokenIssue {
             client_id: client_id.to_owned(),
             user_id: user_id.to_owned(),
             session_id: None,
+            auth_context: AuthContext::default(),
             scope: scope.to_owned(),
             auth_time: Some(auth_time),
             nonce: None,
@@ -18530,6 +19089,7 @@ impl TokenIssue {
             client_id: row.client_id.clone(),
             user_id: row.user_id.clone(),
             session_id: row.session_id.clone(),
+            auth_context: row.auth_context.clone(),
             scope: row.scope.clone(),
             auth_time: row.auth_time,
             nonce: None,
@@ -18995,7 +19555,11 @@ fn optional_provider_id_from_url(
 fn is_supported_provider_id(provider_id: &str) -> bool {
     matches!(
         provider_id,
-        well_known::APPLE | well_known::GOOGLE | well_known::SPOTIFY
+        well_known::APPLE
+            | well_known::GOOGLE
+            | well_known::SPOTIFY
+            | well_known::ENTRA
+            | well_known::GOOGLE_WORKSPACE
     )
 }
 
@@ -19010,7 +19574,10 @@ fn provider_authorize_nonce(transaction: &AuthTransaction) -> Option<&str> {
 }
 
 fn provider_uses_oidc_nonce(provider_id: &str) -> bool {
-    matches!(provider_id, well_known::APPLE | well_known::GOOGLE)
+    matches!(
+        provider_id,
+        well_known::APPLE | well_known::GOOGLE | well_known::ENTRA | well_known::GOOGLE_WORKSPACE
+    )
 }
 
 fn authorization_login_request_present(url: &url::Url) -> bool {
@@ -19045,6 +19612,22 @@ fn provider_from_env(env: &Env, provider_id: &str) -> worker::Result<OAuthProvid
         well_known::SPOTIFY => provider_client_id_from_env(env, "SPOTIFY_CLIENT_ID")
             .map(OAuthProvider::spotify)
             .ok_or_else(|| missing_provider_config("SPOTIFY_CLIENT_ID")),
+        well_known::ENTRA => {
+            let client_id = provider_client_id_from_env(env, "ENTRA_CLIENT_ID")
+                .ok_or_else(|| missing_provider_config("ENTRA_CLIENT_ID"))?;
+            let tenant_id = provider_client_id_from_env(env, "ENTRA_TENANT_ID")
+                .ok_or_else(|| missing_provider_config("ENTRA_TENANT_ID"))?;
+            OAuthProvider::entra(client_id, tenant_id)
+                .map_err(|error| worker_error(error.description))
+        }
+        well_known::GOOGLE_WORKSPACE => {
+            let client_id = provider_client_id_from_env(env, "GOOGLE_WORKSPACE_CLIENT_ID")
+                .ok_or_else(|| missing_provider_config("GOOGLE_WORKSPACE_CLIENT_ID"))?;
+            let domains = provider_client_id_from_env(env, "GOOGLE_WORKSPACE_DOMAINS")
+                .ok_or_else(|| missing_provider_config("GOOGLE_WORKSPACE_DOMAINS"))?;
+            OAuthProvider::google_workspace(client_id, split_token_list(&domains))
+                .map_err(|error| worker_error(error.description))
+        }
         _ => Err(worker::Error::RustError(format!(
             "unknown provider: {provider_id}"
         ))),
@@ -19060,6 +19643,8 @@ fn provider_client_secret_from_env(env: &Env, provider_id: &str) -> worker::Resu
     let binding = match provider_id {
         well_known::GOOGLE => "GOOGLE_CLIENT_SECRET",
         well_known::SPOTIFY => "SPOTIFY_CLIENT_SECRET",
+        well_known::ENTRA => "ENTRA_CLIENT_SECRET",
+        well_known::GOOGLE_WORKSPACE => "GOOGLE_WORKSPACE_CLIENT_SECRET",
         _ => {
             return Err(worker::Error::RustError(format!(
                 "unknown provider: {provider_id}"
@@ -19357,7 +19942,7 @@ async fn authorize_admin_request(
         return Ok(AdminAuthorization::BootstrapToken);
     }
 
-    let Some(current) = current_session_from_request(request, db, config, now)
+    let Some(current) = current_session_from_request(request, env, db, config, now)
         .await
         .map_err(|error| {
             ClientManagementError::server_error(format!(
@@ -19426,7 +20011,7 @@ async fn authorize_admin_write_request(
         return Ok(AdminAuthorization::BootstrapToken);
     }
 
-    let Some(current) = current_session_from_request(request, db, config, now)
+    let Some(current) = current_session_from_request(request, env, db, config, now)
         .await
         .map_err(|error| {
             ClientManagementError::server_error(format!(
@@ -19519,7 +20104,7 @@ async fn maybe_authorize_admin_write_request(
         return Ok(Some(AdminAuthorization::BootstrapToken));
     }
 
-    let Some(current) = current_session_from_request(request, db, config, now)
+    let Some(current) = current_session_from_request(request, env, db, config, now)
         .await
         .map_err(|error| {
             ClientManagementError::server_error(format!(
@@ -19910,7 +20495,10 @@ async fn resolve_provider_profile(
 ) -> Result<ResolvedProviderProfile, ProviderProfileError> {
     match provider.id().0.as_str() {
         well_known::SPOTIFY => fetch_spotify_profile(provider, token_set).await,
-        well_known::APPLE | well_known::GOOGLE => {
+        well_known::APPLE
+        | well_known::GOOGLE
+        | well_known::ENTRA
+        | well_known::GOOGLE_WORKSPACE => {
             resolve_oidc_provider_profile(provider, token_set, transaction, callback).await
         }
         provider_id => Err(ProviderProfileError::invalid_response(format!(
@@ -19931,11 +20519,21 @@ async fn resolve_oidc_provider_profile(
         .as_deref()
         .ok_or_else(|| ProviderProfileError::invalid_response("missing provider id_token"))?;
     let now = unix_timestamp_seconds();
-    let jwks = cached_provider_jwks(&provider.id().0, now).await?;
+    let mut jwks = cached_provider_jwks_for_provider(provider, now).await?;
+    let segments = jwt_segments(id_token)?;
+    let header = decode_jwt_segment::<ProviderJwtHeader>(segments[0])?;
+    if header.alg == "RS256" && provider_jwk_for_header(&jwks, &header).is_err() {
+        // Providers can rotate keys before this isolate's cache expires. Refresh
+        // once for an unknown signing key, using only the pinned endpoint.
+        let endpoint = provider_jwks_url(provider)?;
+        jwks = fetch_provider_jwks(&endpoint).await?;
+        PROVIDER_JWKS_CACHE.with(|cache| cache.borrow_mut().put(&endpoint, jwks.clone(), now));
+    }
     let verified = verify_provider_id_token_with_web_crypto(
         id_token,
         &jwks,
         ProviderIdTokenValidation {
+            enterprise_policy: provider.enterprise_policy(),
             provider_id: &provider.id().0,
             client_id: &provider.config().client_id,
             nonce: provider_authorize_nonce(transaction),
@@ -20021,20 +20619,42 @@ async fn cached_provider_jwks(
     provider_id: &str,
     now: i32,
 ) -> Result<ProviderJwksResponse, ProviderProfileError> {
-    if let Some(jwks) = PROVIDER_JWKS_CACHE.with(|cache| cache.borrow_mut().get(provider_id, now)) {
+    let endpoint = provider_jwks_endpoint(provider_id)?;
+    cached_jwks_at_endpoint(endpoint, now).await
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn cached_provider_jwks_for_provider(
+    provider: &OAuthProvider,
+    now: i32,
+) -> Result<ProviderJwksResponse, ProviderProfileError> {
+    let endpoint = provider_jwks_url(provider)?;
+    cached_jwks_at_endpoint(&endpoint, now).await
+}
+
+fn provider_jwks_url(provider: &OAuthProvider) -> Result<String, ProviderProfileError> {
+    Ok(match provider.enterprise_policy() {
+        Some(policy) => policy.jwks_uri(),
+        None => provider_jwks_endpoint(&provider.id().0)?.to_owned(),
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn cached_jwks_at_endpoint(
+    endpoint: &str,
+    now: i32,
+) -> Result<ProviderJwksResponse, ProviderProfileError> {
+    if let Some(jwks) = PROVIDER_JWKS_CACHE.with(|cache| cache.borrow_mut().get(endpoint, now)) {
         return Ok(jwks);
     }
 
-    let jwks = fetch_provider_jwks(provider_id).await?;
-    PROVIDER_JWKS_CACHE.with(|cache| cache.borrow_mut().put(provider_id, jwks.clone(), now));
+    let jwks = fetch_provider_jwks(endpoint).await?;
+    PROVIDER_JWKS_CACHE.with(|cache| cache.borrow_mut().put(endpoint, jwks.clone(), now));
     Ok(jwks)
 }
 
 #[cfg(target_arch = "wasm32")]
-async fn fetch_provider_jwks(
-    provider_id: &str,
-) -> Result<ProviderJwksResponse, ProviderProfileError> {
-    let endpoint = provider_jwks_endpoint(provider_id)?;
+async fn fetch_provider_jwks(endpoint: &str) -> Result<ProviderJwksResponse, ProviderProfileError> {
     let headers = Headers::new();
     headers
         .set("Accept", "application/json")
@@ -20064,7 +20684,9 @@ async fn fetch_provider_jwks(
 fn provider_jwks_endpoint(provider_id: &str) -> Result<&'static str, ProviderProfileError> {
     match provider_id {
         well_known::APPLE => Ok("https://appleid.apple.com/auth/keys"),
-        well_known::GOOGLE => Ok("https://www.googleapis.com/oauth2/v3/certs"),
+        well_known::GOOGLE | well_known::GOOGLE_WORKSPACE => {
+            Ok("https://www.googleapis.com/oauth2/v3/certs")
+        }
         _ => Err(ProviderProfileError::invalid_response(format!(
             "provider does not expose OIDC JWKS: {provider_id}"
         ))),
@@ -20087,6 +20709,7 @@ async fn verify_provider_id_token_with_web_crypto(
     }
 
     let jwk = provider_jwk_for_header(jwks, &header)?;
+    validate_provider_signing_key_issuer(jwk, &validation)?;
     verify_rs256_signature_with_web_crypto(
         jwk,
         &format!("{}.{}", segments[0], segments[1]),
@@ -20112,6 +20735,7 @@ fn verify_provider_id_token(
         )));
     }
 
+    validate_provider_signing_key_issuer(provider_jwk_for_header(jwks, &header)?, &validation)?;
     let key = provider_rsa_key_for_header(jwks, &header)?;
     verify_rs256_signature(
         &key,
@@ -20369,6 +20993,36 @@ fn validate_provider_id_token_claims(
     claims: &ProviderIdTokenClaims,
     validation: ProviderIdTokenValidation<'_>,
 ) -> Result<(), ProviderProfileError> {
+    if let Some(policy) = validation.enterprise_policy {
+        let audiences = match &claims.aud {
+            AudienceClaim::One(value) => vec![value.as_str()],
+            AudienceClaim::Many(values) => values.iter().map(String::as_str).collect(),
+        };
+        return policy
+            .validate_oidc_evidence(
+                &EnterpriseOidcEvidence {
+                    issuer: &claims.iss,
+                    audiences: &audiences,
+                    subject: &claims.sub,
+                    tenant_id: claims.tid.as_deref(),
+                    hosted_domain: claims.hd.as_deref(),
+                    authorized_party: claims.azp.as_deref(),
+                    expires_at: claims.exp,
+                    issued_at: claims.iat.unwrap_or(0),
+                    not_before: claims.nbf,
+                    nonce: claims.nonce.as_deref(),
+                },
+                validation.client_id,
+                validation.nonce,
+                i64::from(validation.now),
+            )
+            .map_err(|error| ProviderProfileError::invalid_response(error.description));
+    }
+    if is_enterprise_provider(validation.provider_id) {
+        return Err(ProviderProfileError::invalid_response(
+            "enterprise provider policy is required",
+        ));
+    }
     if !provider_issuer_matches(validation.provider_id, &claims.iss) {
         return Err(ProviderProfileError::invalid_response(format!(
             "id_token issuer did not match provider: {}",
@@ -20405,10 +21059,30 @@ fn validate_provider_id_token_claims(
     Ok(())
 }
 
+fn validate_provider_signing_key_issuer(
+    jwk: &ProviderJwk,
+    validation: &ProviderIdTokenValidation<'_>,
+) -> Result<(), ProviderProfileError> {
+    if let Some(policy) = validation.enterprise_policy {
+        if let Some(tenant_id) = policy.tenant_id() {
+            let expected = policy.issuer();
+            let issuer = jwk.issuer.as_deref().ok_or_else(|| {
+                ProviderProfileError::invalid_response("Entra signing key has no issuer scope")
+            })?;
+            if issuer.replace("{tenantid}", tenant_id) != expected {
+                return Err(ProviderProfileError::invalid_response(
+                    "Entra signing key issuer did not match tenant",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn provider_issuer_matches(provider_id: &str, issuer: &str) -> bool {
     match provider_id {
         well_known::APPLE => issuer == "https://appleid.apple.com",
-        well_known::GOOGLE => {
+        well_known::GOOGLE | well_known::GOOGLE_WORKSPACE => {
             issuer == "https://accounts.google.com" || issuer == "accounts.google.com"
         }
         _ => false,
@@ -23416,6 +24090,8 @@ mod tests {
     #[test]
     fn provider_callback_error_return_url_uses_oidc_redirect() {
         let transaction = AuthTransaction {
+            provider_policy_hash: None,
+            provider_code_verifier: None,
             provider_state: "provider-state".to_owned(),
             client_id: ClientId("ios".to_owned()),
             provider_id: ProviderId(well_known::APPLE.to_owned()),
@@ -23530,6 +24206,8 @@ mod tests {
     #[test]
     fn client_redirect_url_includes_auth_code_and_app_state() {
         let transaction = AuthTransaction {
+            provider_policy_hash: None,
+            provider_code_verifier: None,
             provider_state: "provider-state".to_owned(),
             client_id: ClientId("ios".to_owned()),
             provider_id: ProviderId(well_known::SPOTIFY.to_owned()),
@@ -25041,6 +25719,7 @@ mod tests {
         };
         let signing_key = test_signing_key();
         let issue = TokenIssue {
+            auth_context: AuthContext::default(),
             client_id: "ios".to_owned(),
             user_id: "usr_123".to_owned(),
             session_id: Some("sess_123".to_owned()),
@@ -25081,6 +25760,7 @@ mod tests {
         let previous_json = serde_json::to_string(&previous_jwks).unwrap();
         let jwks = jwks_response(&active_signing_key, Some(&previous_json)).unwrap();
         let issue = TokenIssue {
+            auth_context: AuthContext::default(),
             client_id: "ios".to_owned(),
             user_id: "usr_123".to_owned(),
             session_id: Some("sess_123".to_owned()),
@@ -25112,6 +25792,7 @@ mod tests {
         };
         let signing_key = test_signing_key();
         let issue = TokenIssue {
+            auth_context: AuthContext::default(),
             client_id: "ios".to_owned(),
             user_id: "usr_123".to_owned(),
             session_id: Some("sess_123".to_owned()),
@@ -26451,6 +27132,7 @@ mod tests {
             &id_token,
             &jwks,
             ProviderIdTokenValidation {
+                enterprise_policy: None,
                 provider_id: well_known::GOOGLE,
                 client_id: "google-client",
                 nonce: Some("nonce-1"),
@@ -26476,6 +27158,7 @@ mod tests {
         let error = validate_provider_id_token_claims(
             &claims,
             ProviderIdTokenValidation {
+                enterprise_policy: None,
                 provider_id: well_known::APPLE,
                 client_id: "different-client",
                 nonce: Some("nonce-1"),
@@ -26503,6 +27186,7 @@ mod tests {
         let error = validate_provider_id_token_claims(
             &claims,
             ProviderIdTokenValidation {
+                enterprise_policy: None,
                 provider_id: well_known::GOOGLE,
                 client_id: "google-client",
                 nonce: Some("nonce-2"),
@@ -26641,6 +27325,8 @@ mod tests {
     #[test]
     fn transaction_row_hydrates_stored_transaction() {
         let record = auth_transaction_from_row(AuthTransactionRow {
+            provider_policy_hash: None,
+            provider_code_verifier: None,
             provider_state: "provider-state".to_owned(),
             client_id: "ios".to_owned(),
             provider_id: well_known::GOOGLE.to_owned(),
@@ -26689,6 +27375,8 @@ mod tests {
     #[test]
     fn expired_transactions_are_rejected() {
         let record = auth_transaction_from_row(AuthTransactionRow {
+            provider_policy_hash: None,
+            provider_code_verifier: None,
             provider_state: "provider-state".to_owned(),
             client_id: "ios".to_owned(),
             provider_id: well_known::GOOGLE.to_owned(),
@@ -26718,6 +27406,8 @@ mod tests {
     #[test]
     fn consumed_transactions_are_rejected() {
         let record = auth_transaction_from_row(AuthTransactionRow {
+            provider_policy_hash: None,
+            provider_code_verifier: None,
             provider_state: "provider-state".to_owned(),
             client_id: "ios".to_owned(),
             provider_id: well_known::GOOGLE.to_owned(),
@@ -26999,6 +27689,7 @@ mod tests {
 
     fn valid_auth_code_row(code_challenge: String) -> AuthCodeRow {
         AuthCodeRow {
+            auth_context: AuthContext::default(),
             code_hash: hash_secret("zeroth-code"),
             client_id: "ios".to_owned(),
             redirect_uri: "wavey://auth/callback".to_owned(),
@@ -27017,6 +27708,7 @@ mod tests {
 
     fn valid_refresh_token_row() -> RefreshTokenRow {
         RefreshTokenRow {
+            auth_context: AuthContext::default(),
             token_hash: hash_secret("refresh-token"),
             client_id: "ios".to_owned(),
             user_id: "usr_123".to_owned(),
@@ -27032,6 +27724,7 @@ mod tests {
 
     fn valid_session_row() -> SessionRow {
         SessionRow {
+            auth_context: AuthContext::default(),
             id: "sess_123".to_owned(),
             user_id: "usr_123".to_owned(),
             client_id: Some("ios".to_owned()),
@@ -27124,6 +27817,10 @@ mod tests {
         expires_at: i64,
     ) -> ProviderIdTokenClaims {
         ProviderIdTokenClaims {
+            tid: None,
+            hd: None,
+            azp: None,
+            nbf: None,
             iss: issuer.to_owned(),
             sub: "provider-sub".to_owned(),
             aud: AudienceClaim::One(audience.to_owned()),
@@ -27164,6 +27861,7 @@ mod tests {
         );
         let jwks = ProviderJwksResponse {
             keys: vec![ProviderJwk {
+                issuer: None,
                 kty: "RSA".to_owned(),
                 key_use: Some("sig".to_owned()),
                 kid: Some(key_id),
@@ -27179,6 +27877,7 @@ mod tests {
     fn provider_jwks_with_kid(kid: &str) -> ProviderJwksResponse {
         ProviderJwksResponse {
             keys: vec![ProviderJwk {
+                issuer: None,
                 kty: "RSA".to_owned(),
                 key_use: Some("sig".to_owned()),
                 kid: Some(kid.to_owned()),
