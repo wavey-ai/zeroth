@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Zeroth — Entra and Google Workspace setup</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#eeece6;color:#20252a;font:17px/1.65 Georgia,serif}main{max-width:1040px;margin:44px auto;background:#fffefa;padding:64px 76px;border:1px solid #d9d5cc}.cover{border-top:6px solid #295b56;border-bottom:1px solid #c8c7bd;padding-bottom:32px;margin-bottom:30px}.eyebrow,dt,h2,th{font-family:system-ui,sans-serif}.eyebrow{font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:#38615d}h1{font-size:46px;line-height:1.12;letter-spacing:-.025em;margin:20px 0 24px;font-weight:500}h2{font-size:24px;line-height:1.3;margin:42px 0 14px;padding-top:18px;border-top:1px solid #dad8cf}p{margin:12px 0}dl{font:13px/1.6 system-ui,sans-serif;display:grid;grid-template-columns:80px 1fr;gap:4px 12px;margin:0}dt{font-weight:600}dd{margin:0}.summary{font-size:20px;color:#244b46}a{color:#195f61;text-underline-offset:3px}table{border-collapse:collapse;width:100%;font:14px/1.55 system-ui,sans-serif;margin:20px 0}th,td{text-align:left;vertical-align:top;padding:12px 10px;border-bottom:1px solid #d9d8d0}th{border-top:2px solid #6b7c77;background:#f1f3ed}code{font:13px/1.5 ui-monospace,monospace;overflow-wrap:anywhere}pre{white-space:pre-wrap;overflow-wrap:anywhere;padding:20px;border-left:3px solid #5d7974;background:#f2f3ee}li{margin:10px 0}footer{margin-top:38px;padding-top:18px;border-top:1px solid #ccc;font:12px/1.6 system-ui,sans-serif;color:#59615e}@media(max-width:700px){main{margin:0;padding:28px 22px;border:0}h1{font-size:34px}table{font-size:12px}th,td{padding:9px 6px}}@media print{body{background:white}main{margin:0;border:0;padding:22px}h2{break-after:avoid}tr,pre{break-inside:avoid}}
+</style></head><body><main>
+<header class="cover"><p class="eyebrow">Wavey.ai · Zeroth · Implementation guide</p><h1>Microsoft Entra and<br>Google Workspace setup</h1><dl><dt>Ticket</dt><dd>Not supplied</dd><dt>Date</dt><dd>5 November 2026, UTC</dd><dt>Author</dt><dd>Codex</dd><dt>Scope</dt><dd>One Entra tenant and one Google hosted-domain policy per deployment</dd></dl></header>
+<p class="summary">Implement and test both providers before supplying live credentials. Keep each provider disabled until its application registration, secret binding and live login checks are complete. Applications continue to trust Zeroth's issuer.</p>
+<p>All domains and identifiers below are examples. This guide does not create cloud resources or claim that a production organization is connected. Customer-specific connection management and the application proxy are later work.</p>
+
+<h2>1. Configuration contract</h2>
+<p>Both providers use the exact callback <code>https://id.example.com/oauth2/callback</code>. Replace the example origin with the deployment's <code>PUBLIC_BASE_URL</code>.</p>
+<table><thead><tr><th>Provider</th><th>Public configuration</th><th>Secret binding</th></tr></thead><tbody>
+<tr><td>Microsoft Entra<br><code>entra</code></td><td><code>ENTRA_TENANT_ID</code> — directory GUID<br><code>ENTRA_CLIENT_ID</code> — application GUID</td><td><code>ENTRA_CLIENT_SECRET</code></td></tr>
+<tr><td>Google Workspace<br><code>google_workspace</code></td><td><code>GOOGLE_WORKSPACE_CLIENT_ID</code> — OAuth web client ID<br><code>GOOGLE_WORKSPACE_DOMAINS</code> — comma-separated exact hosted domains</td><td><code>GOOGLE_WORKSPACE_CLIENT_SECRET</code></td></tr>
+</tbody></table>
+<p>Workspace credentials are separate from consumer Google login's <code>GOOGLE_CLIENT_ID</code> and <code>GOOGLE_CLIENT_SECRET</code>. Public client IDs may go in Wrangler variables. Secrets stay in managed secret bindings.</p>
+
+<h2>2. Microsoft Entra registration</h2>
+<ol>
+<li>In the intended directory, open <strong>Entra ID → App registrations → New registration</strong>. Choose the single-tenant account type for this implementation and record the directory and application GUIDs. <a href="https://learn.microsoft.com/en-us/entra/identity-platform/quickstart-register-app">Microsoft registration guide</a>.</li>
+<li>Add a <strong>Web</strong> platform with the exact callback. Zeroth requests <code>openid profile email</code> using the authorization-code flow and redeems the code on the server. An implicit-flow token response is not needed. <a href="https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-auth-code-flow">Microsoft code-flow documentation</a>.</li>
+<li>For this client-secret adapter, create a credential under <strong>Certificates &amp; secrets</strong>. Put its <em>value</em>, rather than its secret ID, into <code>ENTRA_CLIENT_SECRET</code> and track expiry. Microsoft recommends certificates or federated credentials for production; those methods require separate adapter support. <a href="https://learn.microsoft.com/en-us/entra/identity-platform/how-to-add-credentials">Microsoft credential guidance</a>.</li>
+<li>Use enterprise-app assignment to control admitted users and guests. The adapter pins the tenant and issuer. Email and <code>preferred_username</code> are optional profile data, not tenant-membership proof. <a href="https://learn.microsoft.com/en-us/entra/identity-platform/id-token-claims-reference">Microsoft claim semantics</a>.</li>
+</ol>
+
+<h2>3. Google Workspace registration</h2>
+<ol>
+<li>In the selected Google Cloud project, configure OAuth branding and audience. Create a <strong>Web application</strong> OAuth client and add the exact callback to its authorized redirect URIs. Use its client ID and secret for the Workspace bindings. <a href="https://developers.google.com/identity/openid-connect/openid-connect">Google OIDC setup</a>.</li>
+<li>Set <code>GOOGLE_WORKSPACE_DOMAINS</code> to the exact managed domains to admit. Add secondary domains explicitly. Do not enter URLs, email addresses or wildcards.</li>
+<li>Require the signed token's <code>hd</code> claim to match. The authorization request's <code>hd</code> parameter only guides account selection; an email suffix alone does not prove Workspace membership. Reject consumer accounts and unexpected hosted domains. <a href="https://developers.google.com/identity/gsi/web/guides/verify-google-id-token">Google hosted-domain validation</a>.</li>
+</ol>
+
+<h2>4. Prepare configuration before credentials</h2>
+<p>From <code>crates/zeroth-worker</code>, run <code>npm run test:config</code>. These fixture tests need no cloud account. Once real public identifiers are available, use these installer options or the matching environment variables:</p>
+<pre><code>node scripts/install-config.mjs \
+  --auth-origin https://id.example.com \
+  --d1-id YOUR_D1_DATABASE_UUID \
+  --entra-tenant-id YOUR_DIRECTORY_GUID \
+  --entra-client-id YOUR_APPLICATION_GUID \
+  --google-workspace-client-id YOUR_WEB_CLIENT_ID.apps.googleusercontent.com \
+  --google-workspace-domains example.com,subsidiary.example \
+  --disabled-providers entra,google_workspace \
+  --out wrangler.generated.jsonc</code></pre>
+<p>This creates a complete deployment configuration. Preserve the existing deployment's other installer options and provider-disable settings. The installer validates public settings and never copies secrets from the environment into the file.</p>
+<p>After credentials exist, supply secrets for the selected target:</p>
+<pre><code>npx wrangler secret put ENTRA_CLIENT_SECRET --config wrangler.generated.jsonc
+npx wrangler secret put GOOGLE_WORKSPACE_CLIENT_SECRET --config wrangler.generated.jsonc</code></pre>
+<p>For a local presence check, inject bindings into the process environment from your secret manager and run:</p>
+<pre><code>node scripts/check-enterprise-config.mjs --provider all --auth-origin https://id.example.com</code></pre>
+<p>The preflight reports binding names, presence and validation errors. It does not print credentials, contact providers, inspect managed cloud secrets or verify login. Remove a provider from <code>DISABLED_PROVIDERS</code> when ready to enable it in the selected deployment.</p>
+
+<h2>5. Require enterprise sign-in for an application</h2>
+<p>In the client editor, choose <strong>Required enterprise sign-in → Microsoft Entra</strong> or <strong>Google Workspace</strong>. The API field is <code>enterpriseProvider</code>: <code>entra</code>, <code>google_workspace</code> or an empty value to clear it. Client updates replace the resource; preserve this field on every edit.</p>
+<table><thead><tr><th>Setting</th><th>Entra</th><th>Google Workspace</th></tr></thead><tbody>
+<tr><td>Organization boundary</td><td>Configured directory GUID and issuer</td><td>Configured exact hosted-domain policy</td></tr>
+<tr><td>Email domains</td><td>Leave empty unless a separate verified-mailbox policy is intended. Entra email is optional; Zeroth does not invent email verification.</td><td>An optional additional mailbox rule; it does not replace the signed hosted-domain check.</td></tr>
+<tr><td>Account sharing</td><td colspan="2">Choose a Zeroth tenant/client namespace deliberately. Its tenant identifier is an account-sharing setting, separate from Microsoft's directory GUID.</td></tr>
+</tbody></table>
+
+<h2>6. Acceptance and recommendations</h2>
+<ol>
+<li><strong>Complete implementation checks first.</strong> Run workspace tests, the Worker wasm check, UI checks and configuration tests with fixture identities.</li>
+<li><strong>Connect test organizations later.</strong> Exercise valid login, incorrect tenant/domain, personal accounts, guest assignment, nonce mismatch, wrong audience and key rotation. Another login method must not satisfy an enterprise-required client.</li>
+<li><strong>Exercise session policy.</strong> Check codes, refresh tokens and silent SSO against the required provider and current configuration. A policy edit must not reopen access through an older session.</li>
+<li><strong>Build the application proxy last.</strong> Use the project's own web0services crates once enterprise-policy tests pass. Forwarding, product-local sessions and private-upstream enforcement are a separate implementation.</li>
+</ol>
+<p>OIDC login is not provisioning or immediate offboarding. Session revocation and access-token expiry define the current access window. Directory synchronization and richer connection lifecycle controls need separate work.</p>
+<footer>Prepared from repository interfaces and linked primary provider documentation. Credentials, production deployment and live provider acceptance are intentionally deferred.</footer>
+</main></body></html>

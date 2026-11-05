@@ -2,8 +2,9 @@
 
 import { writeFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { enterprisePublicVars } from "./enterprise-config.mjs";
 
-const knownProviders = new Set(["apple", "google", "spotify"]);
+const knownProviders = new Set(["apple", "google", "spotify", "entra", "google_workspace"]);
 const defaultCompatibilityDate = "2026-06-05";
 const defaultOutput = "wrangler.generated.jsonc";
 
@@ -55,10 +56,14 @@ options:
   --product-name NAME
   --session-cookie-domain DOMAIN
   --default-login-client-id CLIENT_ID
-  --disabled-providers apple,google,spotify
+  --disabled-providers apple,google,spotify,entra,google_workspace
   --apple-client-id CLIENT_ID
   --google-client-id CLIENT_ID
   --spotify-client-id CLIENT_ID
+  --entra-tenant-id TENANT_GUID
+  --entra-client-id CLIENT_GUID
+  --google-workspace-client-id CLIENT_ID
+  --google-workspace-domains DOMAIN[,DOMAIN]
   --apple-native-client-ids CLIENT_ID[,CLIENT_ID]
   --google-native-client-ids CLIENT_ID[,CLIENT_ID]
   --spotify-native-client-ids CLIENT_ID[,CLIENT_ID]
@@ -223,6 +228,12 @@ function main() {
   }
   setVar(vars, "APPLE_CLIENT_ID", option(options, "apple-client-id", ["APPLE_CLIENT_ID"]));
   setVar(vars, "GOOGLE_CLIENT_ID", option(options, "google-client-id", ["GOOGLE_CLIENT_ID"]));
+  Object.assign(vars, enterprisePublicVars({
+    ENTRA_TENANT_ID: option(options, "entra-tenant-id", ["ENTRA_TENANT_ID"]),
+    ENTRA_CLIENT_ID: option(options, "entra-client-id", ["ENTRA_CLIENT_ID"]),
+    GOOGLE_WORKSPACE_CLIENT_ID: option(options, "google-workspace-client-id", ["GOOGLE_WORKSPACE_CLIENT_ID"]),
+    GOOGLE_WORKSPACE_DOMAINS: option(options, "google-workspace-domains", ["GOOGLE_WORKSPACE_DOMAINS"]),
+  }));
   setVar(
     vars,
     "SPOTIFY_CLIENT_ID",

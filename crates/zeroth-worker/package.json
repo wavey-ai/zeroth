@@ -9,6 +9,8 @@
     "dev": "wrangler dev",
     "dev:generated": "wrangler dev --config wrangler.generated.jsonc",
     "config:install": "node scripts/install-config.mjs",
+    "config:enterprise": "node scripts/check-enterprise-config.mjs",
+    "test:config": "node --test test/enterprise-config.test.mjs",
     "deploy": "wrangler deploy",
     "deploy:generated": "wrangler deploy --config wrangler.generated.jsonc",
     "startup:generated": "wrangler check startup --config wrangler.generated.jsonc"
