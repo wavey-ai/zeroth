@@ -75,6 +75,25 @@ const AUTH_CODE_TTL_SECONDS: i32 = 10 * 60;
 const ACCESS_TOKEN_TTL_SECONDS: i32 = 60 * 60;
 const ID_TOKEN_TTL_SECONDS: i32 = 60 * 60;
 const REFRESH_TOKEN_TTL_SECONDS: i32 = 60 * 60 * 24 * 30;
+const INSERT_ROTATED_REFRESH_TOKEN_SQL: &str =
+    "INSERT INTO zeroth_refresh_tokens (
+         token_hash, client_id, user_id, session_id, auth_time, scope, created_at, expires_at
+     )
+     SELECT ?, client_id, user_id, session_id, auth_time, scope, ?, ?
+     FROM zeroth_refresh_tokens
+     WHERE token_hash = ? AND rotated_at = ? AND revoked_at IS NULL AND expires_at > ?";
+const REVOKE_USER_REFRESH_TOKENS_SQL: &str =
+    "UPDATE zeroth_refresh_tokens
+     SET revoked_at = ?
+     WHERE user_id = ? AND revoked_at IS NULL";
+const REVOKE_SESSION_REFRESH_TOKEN_FAMILY_SQL: &str =
+    "UPDATE zeroth_refresh_tokens
+     SET revoked_at = ?
+     WHERE client_id = ? AND user_id = ? AND session_id = ? AND revoked_at IS NULL";
+const REVOKE_NATIVE_REFRESH_TOKEN_FAMILY_SQL: &str =
+    "UPDATE zeroth_refresh_tokens
+     SET revoked_at = ?
+     WHERE client_id = ? AND user_id = ? AND session_id IS NULL AND revoked_at IS NULL";
 const SESSION_TTL_SECONDS: i32 = 60 * 60 * 24 * 30;
 const AUTH_TRANSACTION_CLEANUP_LIMIT: i32 = 64;
 const CORS_ORIGIN_SCAN_LIMIT: i32 = 256;
@@ -4239,7 +4258,12 @@ async fn refresh_token_token(
         );
     }
     let new_refresh_token = random_token()?;
-    put_rotated_refresh_token(db, &new_refresh_token, &refresh_token_row, now).await?;
+    if !put_rotated_refresh_token(db, &new_refresh_token, &refresh_token_row, now).await? {
+        return token_exchange_error_json(
+            &TokenExchangeError::invalid_grant("refresh token was revoked during rotation"),
+            400,
+        );
+    }
 
     let response = token_response(
         config,
@@ -11094,13 +11118,7 @@ async fn revoke_active_refresh_tokens_for_user(
         worker::d1::D1Type::Integer(revoked_at),
         worker::d1::D1Type::Text(user_id),
     ];
-    db.prepare(
-        "UPDATE zeroth_refresh_tokens
-            SET revoked_at = ?
-          WHERE user_id = ?
-            AND revoked_at IS NULL
-            AND rotated_at IS NULL",
-    )
+    db.prepare(REVOKE_USER_REFRESH_TOKENS_SQL)
     .bind_refs(&args)?
     .run()
     .await?;
@@ -11928,9 +11946,25 @@ async fn put_rotated_refresh_token(
     refresh_token: &str,
     row: &RefreshTokenRow,
     now: i32,
-) -> worker::Result<()> {
+) -> worker::Result<bool> {
     let token_hash = hash_secret(refresh_token);
-    put_refresh_token_row(db, &token_hash, &TokenIssue::from_refresh_token(row), now).await
+    let args = [
+        worker::d1::D1Type::Text(&token_hash),
+        worker::d1::D1Type::Integer(now),
+        worker::d1::D1Type::Integer(now + REFRESH_TOKEN_TTL_SECONDS),
+        worker::d1::D1Type::Text(&row.token_hash),
+        worker::d1::D1Type::Integer(now),
+        worker::d1::D1Type::Integer(now),
+    ];
+    // A concurrent replay, logout, or user disable may have revoked the parent
+    // after rotation won. Check it in the same statement that inserts the child
+    // so a replacement cannot appear after the family has been revoked.
+    let result = db
+        .prepare(INSERT_ROTATED_REFRESH_TOKEN_SQL)
+        .bind_refs(&args)?
+        .run()
+        .await?;
+    d1_result_changed_one(result)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -12038,11 +12072,7 @@ async fn revoke_refresh_token_family(
             worker::d1::D1Type::Text(&row.user_id),
             worker::d1::D1Type::Text(session_id),
         ];
-        db.prepare(
-            "UPDATE zeroth_refresh_tokens
-             SET revoked_at = ?
-             WHERE client_id = ? AND user_id = ? AND session_id = ? AND revoked_at IS NULL",
-        )
+        db.prepare(REVOKE_SESSION_REFRESH_TOKEN_FAMILY_SQL)
         .bind_refs(&args)?
         .run()
         .await?;
@@ -12054,11 +12084,7 @@ async fn revoke_refresh_token_family(
         worker::d1::D1Type::Text(&row.client_id),
         worker::d1::D1Type::Text(&row.user_id),
     ];
-    db.prepare(
-        "UPDATE zeroth_refresh_tokens
-         SET revoked_at = ?
-         WHERE client_id = ? AND user_id = ? AND session_id IS NULL AND revoked_at IS NULL",
-    )
+    db.prepare(REVOKE_NATIVE_REFRESH_TOKEN_FAMILY_SQL)
     .bind_refs(&args)?
     .run()
     .await?;
@@ -23552,6 +23578,143 @@ mod tests {
         row.rotated_at = Some(1_780_000_100);
         row.revoked_at = Some(1_780_000_150);
         assert!(!refresh_token_replay_detected(&row, "ios"));
+    }
+
+    #[test]
+    fn refresh_replay_revocation_cannot_be_bypassed_by_in_flight_replacement() {
+        for session_id in [Some("sess_123"), None] {
+            for revoke_before_replacement in [true, false] {
+                let conn = sqlite_bootstrap();
+                sqlite_seed_authorize_fixtures(&conn);
+                let now = 1_780_000_100_i32;
+                conn.execute(
+                    "INSERT INTO zeroth_refresh_tokens (
+                        token_hash, client_id, user_id, session_id, auth_time, scope,
+                        created_at, expires_at, rotated_at
+                     ) VALUES ('parent', 'yl-web', 'usr_123', ?, ?,
+                               'openid offline_access', ?, ?, ?)",
+                    params![session_id, now - 10, now - 10, now + 600, now],
+                )
+                .unwrap();
+
+                // Request A has won the parent rotation. Request B replays that
+                // parent and revokes its family either side of A's child insert.
+                let revoke_family = || match session_id {
+                    Some(session_id) => conn.execute(
+                        REVOKE_SESSION_REFRESH_TOKEN_FAMILY_SQL,
+                        params![now, "yl-web", "usr_123", session_id],
+                    ),
+                    None => conn.execute(
+                        REVOKE_NATIVE_REFRESH_TOKEN_FAMILY_SQL,
+                        params![now, "yl-web", "usr_123"],
+                    ),
+                };
+                if revoke_before_replacement {
+                    assert_eq!(revoke_family().unwrap(), 1);
+                }
+                let inserted = conn
+                    .execute(
+                        INSERT_ROTATED_REFRESH_TOKEN_SQL,
+                        params!["child", now, now + 600, "parent", now, now],
+                    )
+                    .unwrap();
+                assert_eq!(inserted, usize::from(!revoke_before_replacement));
+                if !revoke_before_replacement {
+                    assert_eq!(revoke_family().unwrap(), 2);
+                }
+                let active_count: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM zeroth_refresh_tokens WHERE revoked_at IS NULL",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(active_count, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn user_revocation_tombstones_rotated_parents_before_replacement() {
+        let conn = sqlite_bootstrap();
+        sqlite_seed_authorize_fixtures(&conn);
+        let now = 1_780_000_100_i32;
+        conn.execute(
+            "INSERT INTO zeroth_refresh_tokens (
+                token_hash, client_id, user_id, scope, created_at, expires_at, rotated_at
+             ) VALUES ('parent', 'yl-web', 'usr_123', 'openid offline_access', ?, ?, ?)",
+            params![now - 10, now + 600, now],
+        )
+        .unwrap();
+
+        assert_eq!(
+            conn.execute(REVOKE_USER_REFRESH_TOKENS_SQL, params![now, "usr_123"])
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.execute(
+                INSERT_ROTATED_REFRESH_TOKEN_SQL,
+                params!["child", now, now + 600, "parent", now, now],
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn refresh_replacement_requires_live_rotated_parent_and_preserves_grant() {
+        let conn = sqlite_bootstrap();
+        sqlite_seed_authorize_fixtures(&conn);
+        let now = 1_780_000_100_i32;
+        conn.execute(
+            "INSERT INTO zeroth_refresh_tokens (
+                token_hash, client_id, user_id, session_id, auth_time, scope,
+                created_at, expires_at
+             ) VALUES ('parent', 'yl-web', 'usr_123', 'sess_123', ?,
+                       'openid offline_access', ?, ?)",
+            params![now - 10, now - 10, now + 600],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.execute(
+                INSERT_ROTATED_REFRESH_TOKEN_SQL,
+                params!["child", now, now + 600, "parent", now, now],
+            )
+            .unwrap(),
+            0
+        );
+        conn.execute(
+            "UPDATE zeroth_refresh_tokens SET rotated_at = ? WHERE token_hash = 'parent'",
+            params![now],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.execute(
+                INSERT_ROTATED_REFRESH_TOKEN_SQL,
+                params!["child", now, now + 600, "parent", now, now],
+            )
+            .unwrap(),
+            1
+        );
+        let grant: (String, String, String, i32, String) = conn
+            .query_row(
+                "SELECT client_id, user_id, session_id, auth_time, scope
+                 FROM zeroth_refresh_tokens WHERE token_hash = 'child'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            grant,
+            (
+                "yl-web".to_owned(),
+                "usr_123".to_owned(),
+                "sess_123".to_owned(),
+                now - 10,
+                "openid offline_access".to_owned(),
+            )
+        );
     }
 
     #[test]
