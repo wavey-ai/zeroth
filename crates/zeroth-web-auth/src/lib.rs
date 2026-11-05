@@ -109,14 +109,21 @@ pub fn now_seconds() -> i64 {
         .unwrap_or(0)
 }
 
+/// Generates a token using the operating system's cryptographic random source.
+///
+/// # Panics
+/// Panics if secure randomness is unavailable. Authentication must fail rather
+/// than issue predictable tokens or PKCE verifiers.
 pub fn random_token(byte_length: usize) -> String {
+    random_token_with_rng(byte_length, getrandom::getrandom)
+}
+
+fn random_token_with_rng(
+    byte_length: usize,
+    fill: impl FnOnce(&mut [u8]) -> Result<(), getrandom::Error>,
+) -> String {
     let mut bytes = vec![0u8; byte_length];
-    if getrandom::getrandom(&mut bytes).is_err() {
-        let fallback = now_seconds().to_be_bytes();
-        for (index, byte) in bytes.iter_mut().enumerate() {
-            *byte = fallback[index % fallback.len()];
-        }
-    }
+    fill(&mut bytes).expect("secure randomness is unavailable");
     base64url_encode(&bytes)
 }
 
@@ -131,19 +138,26 @@ pub fn pkce_challenge(code_verifier: &str) -> String {
 }
 
 pub fn sanitize_return_to(origin: &Url, value: Option<&str>, fallback: &str) -> String {
-    let candidate = value.filter(|input| !input.is_empty()).unwrap_or(fallback);
-    let Ok(url) = origin.join(candidate) else {
-        return fallback.to_string();
-    };
-    if url.origin().ascii_serialization() != origin.origin().ascii_serialization() {
-        return fallback.to_string();
+    value
+        .filter(|input| !input.is_empty())
+        .and_then(|input| same_origin_return_path(origin, input))
+        .or_else(|| same_origin_return_path(origin, fallback))
+        .unwrap_or_else(|| "/".to_owned())
+}
+
+fn same_origin_return_path(origin: &Url, candidate: &str) -> Option<String> {
+    let url = origin.join(candidate).ok()?;
+    if url.origin() != origin.origin() || url.path().starts_with("//") {
+        // A same-origin absolute URL may still have a //host path. Returning
+        // that path as a Location or re-joining it would redirect off origin.
+        return None;
     }
-    format!(
+    Some(format!(
         "{}{}{}",
         url.path(),
         url.query().map(|q| format!("?{q}")).unwrap_or_default(),
         url.fragment().map(|f| format!("#{f}")).unwrap_or_default()
-    )
+    ))
 }
 
 pub fn absolute_return_to(origin: &Url, value: Option<&str>, fallback: &str) -> Url {
@@ -163,10 +177,13 @@ pub fn seal_auth_state(state: &AuthState, secret: &[u8]) -> Result<String, AuthE
 
 pub fn unseal_auth_state(value: &str, secret: &[u8]) -> Result<AuthState, AuthError> {
     let (body, signature) = value.rsplit_once('.').ok_or(AuthError::InvalidToken)?;
-    let expected = hmac_sha256(secret, body);
-    if signature != expected {
-        return Err(AuthError::InvalidSignature);
-    }
+    let signature = URL_SAFE_NO_PAD
+        .decode(signature)
+        .map_err(|_| AuthError::InvalidSignature)?;
+    let mut mac = HmacSha256::new_from_slice(secret).expect("invalid HMAC key length");
+    mac.update(body.as_bytes());
+    mac.verify_slice(&signature)
+        .map_err(|_| AuthError::InvalidSignature)?;
     let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(body)
         .map_err(|_| AuthError::InvalidToken)?;
@@ -332,6 +349,37 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "secure randomness is unavailable")]
+    fn unavailable_randomness_never_produces_a_token() {
+        random_token_with_rng(48, |_| Err(getrandom::Error::UNSUPPORTED));
+    }
+
+    #[test]
+    fn auth_state_rejects_forged_or_malformed_signatures() {
+        let state = AuthState {
+            state: "state".into(),
+            return_to: "/private".into(),
+            expires_at: 1_700_000_000,
+        };
+        let token = seal_auth_state(&state, secret()).unwrap();
+        let (body, _) = token.rsplit_once('.').unwrap();
+        for signature in [
+            URL_SAFE_NO_PAD.encode([0; 32]),
+            URL_SAFE_NO_PAD.encode([0; 31]),
+            "!malformed".into(),
+        ] {
+            assert_eq!(
+                unseal_auth_state(&format!("{body}.{signature}"), secret()),
+                Err(AuthError::InvalidSignature)
+            );
+        }
+        assert_eq!(
+            unseal_auth_state(&token, b"wrong-secret"),
+            Err(AuthError::InvalidSignature)
+        );
+    }
+
+    #[test]
     fn return_to_helpers_match_js_fixture() {
         let origin = Url::parse("https://yl.vin").unwrap();
         assert_eq!(
@@ -351,5 +399,29 @@ mod tests {
             &[("b", "2"), ("c", "")],
         );
         assert_eq!(appended.to_string(), "https://yl.vin/path?a=1&b=2");
+    }
+
+    #[test]
+    fn same_origin_urls_cannot_be_reinterpreted_as_external_redirects() {
+        let origin = Url::parse("https://app.example").unwrap();
+        for candidate in [
+            "https://app.example//evil.example/path",
+            "https://app.example///evil.example/path",
+            "https://app.example/\\evil.example/path",
+        ] {
+            assert_eq!(
+                sanitize_return_to(&origin, Some(candidate), "/safe"),
+                "/safe",
+                "{candidate}"
+            );
+            let target = absolute_return_to(&origin, Some(candidate), "/safe");
+            assert_eq!(target.origin(), origin.origin(), "{candidate}");
+            assert_eq!(target.path(), "/safe");
+        }
+        assert_eq!(sanitize_return_to(&origin, None, "//evil.example"), "/");
+        assert_eq!(
+            absolute_return_to(&origin, Some("https://evil.example"), "//evil.example").origin(),
+            origin.origin()
+        );
     }
 }
