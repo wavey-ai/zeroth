@@ -1,5 +1,11 @@
 # zeroth-worker
 
+Enterprise setup for Microsoft Entra and Google Workspace is documented in
+[the HTML onboarding guide](../../docs/enterprise-sso-setup.html).
+`npm run test:config` validates installer and secret-redaction behavior without
+cloud credentials. `npm run config:enterprise` checks local enterprise binding
+presence; it does not verify managed cloud secrets or a live login.
+
 Cloudflare Worker deployment surface for Zeroth.
 
 This crate is intentionally separate from `zeroth-server`. Cloudflare bindings,
