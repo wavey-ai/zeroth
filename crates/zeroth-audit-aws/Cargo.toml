@@ -7,8 +7,10 @@ license.workspace = true
 homepage.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-aws-sdk-dynamodb = "1"
-aws-sdk-sqs = "1"
+# The legacy `rustls` SDK default pulls an obsolete TLS 0.21 stack. Select the
+# current HTTPS connector explicitly, keeping the regular Tokio runtime.
+aws-sdk-dynamodb = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client"] }
+aws-sdk-sqs = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client"] }
 serde_json.workspace = true
 sha2.workspace = true
 url.workspace = true
