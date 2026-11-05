@@ -206,6 +206,11 @@ The current UI/security/implementation review and prioritized production gates
 are documented in
 [`docs/security-technical-feature-audit-2026-07-14.md`](docs/security-technical-feature-audit-2026-07-14.md).
 
+The November adversarial review and enterprise SSO/proxy investigation is in
+[`docs/enterprise-sso-security-review-2026-11-05.html`](docs/enterprise-sso-security-review-2026-11-05.html).
+It records the security fixes, compatibility changes, validation limits, and
+proposed Microsoft Entra, Google Workspace, and application proxy architecture.
+
 Still required before Auth0 can be removed:
 
 - deployment-specific Wavey/Bitneedle Apple Developer identifier setup

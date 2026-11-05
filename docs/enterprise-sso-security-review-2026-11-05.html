@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Zeroth — security review, enterprise SSO and application proxy</title>
+  <style>
+    :root { color-scheme: light; --ink:#172c38; --muted:#53646e; --rule:#d7dfe2; --accent:#1b6663; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:#eef1f2; color:var(--ink); font:16px/1.65 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+    main { max-width:1040px; margin:44px auto; padding:64px 76px; background:#fff; border-top:7px solid var(--accent); }
+    .cover { padding-bottom:32px; margin-bottom:34px; border-bottom:1px solid var(--ink); }
+    .eyebrow { color:var(--accent); font-size:12px; letter-spacing:.14em; text-transform:uppercase; font-weight:750; }
+    h1,h2,h3 { line-height:1.18; }
+    h1 { font:normal 44px/1.12 Georgia,"Times New Roman",serif; margin:18px 0 24px; max-width:720px; }
+    h2 { font:normal 29px/1.2 Georgia,"Times New Roman",serif; margin:44px 0 18px; padding-top:20px; border-top:1px solid var(--rule); }
+    h3 { font-size:18px; margin:25px 0 10px; }
+    p { margin:12px 0; }
+    .meta { display:grid; grid-template-columns:1fr 1fr; gap:6px 26px; font-size:13px; color:var(--muted); }
+    .meta strong { color:var(--ink); }
+    .summary { font-size:18px; line-height:1.65; }
+    .summary strong { color:var(--accent); }
+    a { color:#155f72; text-decoration-thickness:1px; text-underline-offset:3px; overflow-wrap:anywhere; }
+    table { width:100%; border-collapse:collapse; margin:22px 0; font-size:14px; line-height:1.5; }
+    th { padding:11px 10px; text-align:left; border-top:2px solid var(--ink); border-bottom:1px solid var(--ink); vertical-align:bottom; }
+    td { padding:13px 10px; border-bottom:1px solid var(--rule); vertical-align:top; }
+    th:first-child,td:first-child { padding-left:0; }
+    th:last-child,td:last-child { padding-right:0; }
+    code { font-size:.86em; background:#f1f4f4; padding:2px 4px; border-radius:2px; overflow-wrap:anywhere; }
+    pre { padding:20px 22px; background:#f1f4f4; border-left:3px solid var(--accent); white-space:pre-wrap; overflow-wrap:anywhere; font-size:13px; line-height:1.65; }
+    pre code { padding:0; background:none; font-size:inherit; }
+    li { margin:10px 0; padding-left:5px; }
+    ol,ul { padding-left:24px; }
+    .note,figcaption { color:var(--muted); font-size:13px; }
+    figure { margin:24px 0; }
+    footer { margin-top:46px; padding-top:18px; border-top:1px solid var(--ink); color:var(--muted); font-size:13px; }
+    @media(max-width:760px) { main { margin:0; padding:32px 22px; } h1 { font-size:35px; } .meta { grid-template-columns:1fr; } table { font-size:12px; } }
+    @media print { body { background:white; font-size:10pt; } main { margin:0; padding:10mm; max-width:none; border-top-width:3px; } h1 { font-size:30pt; } h2 { break-after:avoid; font-size:20pt; } tr { break-inside:avoid; } a { color:inherit; } }
+  </style>
+</head>
+<body><main>
+  <header class="cover">
+    <div class="eyebrow">Wavey.ai / Zeroth / Engineering investigation</div>
+    <h1>Security review,<br>enterprise SSO and an application proxy</h1>
+    <div class="meta">
+      <span><strong>Ticket</strong> — Not supplied</span>
+      <span><strong>Date</strong> — 5 November 2026, UTC</span>
+      <span><strong>Author</strong> — Codex, with three security review agents</span>
+      <span><strong>Baseline</strong> — <code>c57badc</code>, <code>wavey-ai/zeroth</code></span>
+    </div>
+  </header>
+
+  <p class="summary"><strong>Recommendation:</strong> keep Zeroth as the identity broker, add organization-bound OIDC connections for Microsoft Entra and Google Workspace, and use OAuth2 Proxy as the first container-based application proxy. Build a Cloudflare proxy adapter only where Workers deployment is needed. The existing Google login is a useful starting point; enterprise admission policy and the proxy request lifecycle still need implementation.</p>
+  <p>This investigation assumes separate connections for customer organizations. A single Wavey workforce connection can use the same model. It covers Cloudflare and container deployment options; neither target has been selected. The security changes are tracked separately below. Proposed enterprise features are not implemented by this review.</p>
+
+  <h2>1. What the repository already provides</h2>
+  <table>
+    <thead><tr><th>Area</th><th>Observed implementation</th><th>Remaining work</th></tr></thead>
+    <tbody>
+      <tr><td>Identity broker</td><td>Apple, Google and Spotify adapters; a hosted login; one Google client ID and secret per deployment.</td><td>Entra adapter and multiple named enterprise connections.</td></tr>
+      <tr><td>OIDC issuer</td><td>Discovery, ES256 JWKS, authorization code with S256 PKCE, confidential client authentication, scoped claims and rotating refresh tokens.</td><td>Bind organization and connection policy to every grant and session reuse path.</td></tr>
+      <tr><td>Account isolation</td><td>Provider identities can use global, tenant or client account namespaces.</td><td>These namespaces are account-sharing settings, not proof of Entra or Workspace membership. Local authentication also needs a consistent isolation model.</td></tr>
+      <tr><td>Application protection</td><td><code>zeroth-oidc</code> validates tokens and path policies locally. The AWS authorizer validates issuer tokens. The JavaScript gate calls <code>/validate</code> and serves static assets.</td><td>A general HTTP upstream proxy, OIDC callback handling, proxy sessions, renewal, logout and external authorization endpoints.</td></tr>
+    </tbody>
+  </table>
+  <p class="note">Code evidence: <a href="../crates/zeroth-providers/src/lib.rs">provider adapters</a>, <a href="../crates/zeroth-worker/src/lib.rs">Worker routing, claims and account policy</a>, <a href="../crates/zeroth-storage/migrations/0005_account_namespaces.sql">namespace schema</a>, <a href="../crates/zeroth-oidc/README.md">relying-party helpers</a> and <a href="../workers/gate/src/worker.js">static gate</a>.</p>
+
+  <h2>2. Security review and fixes</h2>
+  <div id="security-findings">
+    <table>
+      <thead><tr><th>Priority / attack path</th><th>Confirmed failure and correction</th></tr></thead>
+      <tbody>
+        <tr><td>Critical — password signup</td><td>With password auto-signup enabled, a caller could attach a new password to an existing account by supplying its email. Signup now refuses existing accounts; authenticated password changes require the account CSRF token.</td></tr>
+        <tr><td>High — silent SSO</td><td>A session from an unrestricted app could receive a code for an app in another namespace or with a restricted email domain. Both session-reuse paths now check the destination policy. Code redemption and refresh issuance recheck current admission.</td></tr>
+        <tr><td>High — fabricated mailbox proof</td><td>Password signup accepted a claimed corporate address; passkey registration set the email verification flag without mailbox proof. Restricted clients now require trusted stored verification. Legacy passkey flags no longer satisfy email-domain or email-based admin admission.</td></tr>
+        <tr><td>High — local credential isolation</td><td>Globally keyed local credentials were usable with tenant/client account settings. Password, magic-link and passkey flows now reject non-global clients at initiation and completion. Wallet completion checks the current namespace and domain policy.</td></tr>
+        <tr><td>High — account deletion</td><td>An ordinary OAuth access token with profile access could delete the whole user account. Deletion now requires the hosted account session and its CSRF token.</td></tr>
+        <tr><td>High — refresh replay race</td><td>Replay revocation could run between parent rotation and child insertion, leaving a new active token after family revocation. Replacement insertion now atomically requires an unrevoked parent. User-wide revocation also tombstones rotated parents.</td></tr>
+        <tr><td>High — gate audience confusion</td><td>A valid credential for another Zeroth client could open the static gate. The gate now requires a configured application client ID and an exact match in the validation response.</td></tr>
+        <tr><td>High — protected response caching</td><td>Origin asset responses could retain public/shared cache directives after authentication. The gate now applies private caching or no-store and removes CDN/surrogate cache overrides.</td></tr>
+        <tr><td>Medium — return URL reinterpretation</td><td>A same-origin absolute URL with a double-slash path could become an external authority when rejoined. The web-auth helper now rejects ambiguous paths and validates fallback targets.</td></tr>
+        <tr><td>Medium — failed random source</td><td>The web-auth helper generated predictable timestamp-derived state and PKCE values when secure randomness failed. It now fails closed. State MAC verification also uses the library's constant-time verification API.</td></tr>
+      </tbody>
+    </table>
+    <p>An existing AWS authorizer test also had a wall-clock boundary race. Its clock is now fixed during the test; the production expiry and issue-time checks retain their behavior.</p>
+    <p><strong>Native Spotify exchange now fails closed.</strong> Fetching a profile with a Spotify access token did not establish which upstream client received that token. A caller-supplied allowed client ID did not fix that. Hosted Spotify authorization-code login remains supported; native clients must use that flow.</p>
+    <p><strong>Dependency updates:</strong> the lockfile now includes patched TLS, certificate-verification, root-store, event-listener and Tokio versions. P-256 and K-256 were upgraded to 0.14, resolving <code>crypto-bigint</code> to 0.7.10. Frozen signatures from the previous versions check ES256 verification and EVM recovery compatibility. The crypto arithmetic advisory concerns timing leakage whose practical exploitability depends on the operation, compiler and target; this review did not demonstrate signing-key recovery. <a href="https://rustsec.org/advisories/RUSTSEC-2026-0387.html">RUSTSEC-2026-0387</a>.</p>
+    <p><strong>Self-requested permission scopes now fail closed.</strong> A caller could request a scope such as <code>api:write</code>, receive it in a signed token and satisfy a downstream scope check without a grant decision. The issuer now accepts only <code>openid</code>, <code>profile</code>, <code>email</code> and <code>offline_access</code>. Requests and stored grants with custom scopes are rejected; application permissions need an explicit grant model.</p>
+    <p><strong>Mailbox preclaims and passkey bootstrap:</strong> an attacker could register an unverified password account with the victim's email. A later magic link or admin passkey bootstrap could select that account by email and give it the victim's mailbox proof or admin membership. Magic links now select only a unique verified global mailbox owner; otherwise signup uses a fresh empty account and a separate canonical <code>magic_link</code> identity. Bootstrap passkeys use a fresh account; attaching a passkey to an existing account requires its matching authenticated session. Old unsafe pinned links and ambiguous owners are rejected.</p>
+    <p><strong>Canonical identity evidence:</strong> a stale legacy identity row could retain a verified email after the canonical row changed. Local login, token claims and admin queries now suppress shadowed legacy rows. Regression tests exercise both downgrading and restoring canonical verification.</p>
+    <p><strong>Compatibility changes:</strong> non-global local authentication and native Spotify exchange now fail closed; custom permission scopes cannot be minted or renewed. An unverified legacy account is not recovered by matching its email. New mailbox login may create a separate account, and ambiguous ownership requires explicit resolution. These restrictions are deliberate until namespaced local credentials, verified signup and grant policy are implemented.</p>
+  </div>
+  <p>The agents reviewed protocol and token handling; browser, local-auth and account management; and downstream gates and relying-party helpers. Findings require a concrete attack path or demonstrable failure. Existing audit notes were treated as investigation leads. Regression tests exercise policy helpers, real SQL transitions or the gate request handler; a deployed Worker/D1 adversarial exercise remains a separate validation step.</p>
+
+  <h2>3. Enterprise connections and the trust boundary</h2>
+  <p>Applications should continue trusting Zeroth's issuer and keys. Zeroth should broker upstream enterprise login and enforce which organization and connection can access each application. A login provider button or an email-domain filter alone cannot enforce this.</p>
+  <p>Introduce a connection record containing an opaque connection ID, organization ID, provider kind, upstream client ID, secret-binding reference, allowed issuer, tenant or hosted-domain restrictions, enabled state and configuration revision. Keep secrets in deployment secret storage. Start with admin-managed, provider-specific connection configuration; postpone arbitrary discovery URLs until outbound URL validation and SSRF controls exist.</p>
+  <table>
+    <thead><tr><th>Object</th><th>Required binding</th></tr></thead>
+    <tbody>
+      <tr><td>Application policy</td><td>Allowed connection IDs and organization; whether enterprise login is mandatory; admission rules and session lifetime.</td></tr>
+      <tr><td>Upstream transaction</td><td>Connection ID and revision, organization, downstream client, redirect URI, browser state, fresh upstream nonce and upstream PKCE verifier. Resolve the connection from stored state on callback.</td></tr>
+      <tr><td>Identity</td><td>Unique by account namespace, connection ID, exact upstream issuer and stable subject. Preserve existing social identities through an explicit migration. Never merge by email.</td></tr>
+      <tr><td>Session and grants</td><td>Organization, connection and authentication provenance. Preserve them through authorization codes and refresh rotation. A social or password session must not silently satisfy an enterprise-required application.</td></tr>
+      <tr><td>Membership and roles</td><td>Explicit organization membership and application role mapping. Zeroth's deployment-wide admin role must not automatically become a customer application's admin role.</td></tr>
+    </tbody>
+  </table>
+  <p>Enforce this policy before issuing a browser session, authorization code, native-exchange token or refreshed token. Recheck it during silent SSO and account linking. Reject a disabled connection or incompatible session, and require a fresh enterprise login where appropriate. Disabling a connection should revoke its Zeroth sessions and refresh tokens. Locally validated access tokens remain usable until expiry unless the application makes an online revocation check.</p>
+  <p>Until local authentication is isolated and its policy enforced consistently, enterprise-required applications should reject password, magic-link, passkey and wallet sessions that lack an approved enterprise authentication context. Verified email ownership can be useful account data; it does not establish continuing employment or organization membership.</p>
+  <h3>3.1 Implementation touchpoints</h3>
+  <table>
+    <thead><tr><th>Repository area</th><th>Proposed change</th></tr></thead>
+    <tbody>
+      <tr><td><code>zeroth-providers</code></td><td>Add Entra configuration and distinguish provider kind from an individual connection ID. Reuse Google's endpoints with a Workspace policy.</td></tr>
+      <tr><td><code>zeroth-core</code> and <code>zeroth-storage</code></td><td>Add connection policy, connection-to-client assignments, identity provenance and session/grant bindings. Migrate existing social identities explicitly. Keep product account namespaces separate from upstream tenant IDs.</td></tr>
+      <tr><td><code>zeroth-worker</code></td><td>Resolve a connection through stored transactions; validate Entra tenant/key issuer and Google hosted domain; partition JWKS caches by trusted issuer/key set; enforce policy through login, linking, code issuance, refresh and silent SSO.</td></tr>
+      <tr><td>Provider token validation</td><td>Add connection-specific audience/presenter rules and validity-window checks. Current upstream validation lacks <code>nbf</code>/<code>iat</code> enforcement and an explicit authorized-presenter policy. These are protocol-hardening gaps; no real-provider exploitation was demonstrated. Avoid a blanket <code>azp == aud</code> check that breaks configured native Google presenters.</td></tr>
+      <tr><td><code>zeroth-ui</code> and CLI</td><td>Admin connection setup and readiness; organization-aware login selection; diagnostics that omit secrets. Client requests cannot select an unassigned connection.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>4. Microsoft Entra and Google Workspace</h2>
+  <h3>4.1 Microsoft Entra</h3>
+  <p>Start with the Microsoft public cloud and a tenant-specific v2 OIDC authority for each connection. Pin the configured tenant GUID and exact issuer. Verify the ID-token signature, audience, nonce and validity window, plus agreement between <code>tid</code>, the expected tenant and issuer. Do not infer tenant membership from an email or <code>preferred_username</code>. For tenant-independent metadata, Microsoft also requires signing-key issuer validation. <a href="https://learn.microsoft.com/en-us/entra/identity-platform/access-tokens#validate-the-issuer">Microsoft issuer-validation requirements</a>.</p>
+  <p>Use <code>(connection, issuer, sub)</code> as the OIDC identity key. Keep <code>(tid, oid)</code> as directory identity provenance when cross-application mapping is needed. Treat email and display names as optional, mutable profile data; do not manufacture <code>email_verified=true</code>. Decide whether invited guests are admitted, and use enterprise-app assignment or explicit membership for admission. Group overage requires a deliberate Graph lookup or denial policy. <a href="https://learn.microsoft.com/en-us/entra/identity-platform/id-token-claims-reference">Microsoft claims reference</a>.</p>
+  <p>Setup requires a Web app registration, the exact Zeroth callback URI, client credentials, <code>openid profile email</code> scopes and a test user in the selected tenant. OIDC sign-in does not require reading Microsoft Graph. Leave directory sync, group enrichment and sovereign-cloud authorities for later explicit support. <a href="https://learn.microsoft.com/en-us/entra/identity-platform/v2-protocols-oidc">Microsoft OIDC endpoints and flow</a>.</p>
+
+  <h3>4.2 Google Workspace</h3>
+  <p>Reuse the existing Google OIDC adapter, adding a Workspace connection policy. Require the signed <code>hd</code> claim to match an exact configured hosted-domain allowlist after normal issuer, signature, audience, expiry and nonce validation. Reject a missing or unexpected <code>hd</code>. The authorization-request <code>hd</code> parameter is a selection hint; enforce the claim returned in the token. An email ending in the company's domain is insufficient. <a href="https://developers.google.com/identity/openid-connect/openid-connect">Google OIDC hosted-domain guidance</a>.</p>
+  <p>Use Google's stable <code>sub</code> for identity, and retain verified email separately. Support additional Workspace domains by explicit configuration and tests. Consumer Google login can remain available for social applications while enterprise-required applications accept only approved Workspace connections. <a href="https://developers.google.com/identity/gsi/web/guides/verify-google-id-token">Google ID-token validation guidance</a>.</p>
+  <p>Neither provider's login flow is a provisioning or immediate offboarding mechanism. Define a maximum session age and a short access-token lifetime. Add explicit organization suspension and revocation before claiming reliable offboarding. SCIM, directory synchronization, SAML and customer group-to-role mapping are separate capabilities.</p>
+
+  <h2>5. An OAuth2 Proxy style application proxy</h2>
+  <figure>
+    <pre>Browser → application proxy → private application upstream
+                  ↓
+            Zeroth OIDC issuer → Entra / Google Workspace</pre>
+    <figcaption>The proxy trusts Zeroth. Provider credentials and enterprise connection policy stay in Zeroth.</figcaption>
+  </figure>
+  <h3>5.1 First integration: OAuth2 Proxy with Zeroth</h3>
+  <p>OAuth2 Proxy supports generic OIDC, HTTP upstream forwarding and an <code>/oauth2/auth</code> endpoint for an ingress authorization subrequest. Zeroth already exposes the corresponding issuer endpoints. This makes an integration spike a smaller first step than implementing the full proxy lifecycle. Compatibility with Zeroth is an engineering inference until the live flow passes. <a href="https://oauth2-proxy.github.io/oauth2-proxy/configuration/providers/openid_connect/">Generic OIDC configuration</a>; <a href="https://oauth2-proxy.github.io/oauth2-proxy/features/endpoints/">proxy and authorization endpoints</a>.</p>
+  <p>The candidate <a href="../deploy/oauth2-proxy/zeroth.cfg.example">configuration example</a> explicitly permits Zeroth's ES256 signatures, enables S256 PKCE and nonce verification, retains issuer and email verification, uses a secure host-only cookie and avoids forwarding issued tokens by default. Supply client and cookie secrets through the environment. Treat proxy identity headers as trusted only on an upstream reachable exclusively through the proxy.</p>
+  <p>Header stripping covers the headers configured for injection, not every credential-like header. Strip unused caller-supplied <code>Authorization</code>, <code>X-Forwarded-Access-Token</code> and identity headers at the ingress. Direct proxy requests and ingress authorization responses have different header contracts; <code>set_xauthrequest</code> emits response headers. The example also disables full request-URL logs to avoid recording callback codes. <a href="https://raw.githubusercontent.com/oauth2-proxy/oauth2-proxy/v7.15.6/pkg/middleware/headers.go">OAuth2 Proxy header middleware</a>.</p>
+  <p>Choose a session store after exercising parallel refresh. OAuth2 Proxy documents that cookie sessions can conflict during concurrent renewal; that matters because Zeroth rotates refresh tokens and detects replay. Test Redis-backed locking for a container deployment before relying on parallel renewal. Cookie-based sessions remain an option if reauthentication and the tested concurrency behavior are acceptable. <a href="https://oauth2-proxy.github.io/oauth2-proxy/configuration/session_storage/">Session-store behavior</a>.</p>
+  <p>A proxy login proves authentication. Each protected application still needs an explicit organization and admission policy. Proxy logout, Zeroth logout and upstream-provider logout are separate operations; define which sessions each sign-out action ends.</p>
+
+  <h3>5.2 A native Zeroth proxy</h3>
+  <p>If a Worker proxy is needed, add a separate deployable adapter using the existing <code>zeroth-oidc</code> verification and path-policy helpers. Its first version should support one configured upstream or service binding, a fixed public origin, login/callback/logout endpoints, opaque product-local sessions, renewal and an authorization-only endpoint. Use fixed upstream configuration, never a caller-supplied target URL.</p>
+  <p>Forward bodies and methods without silently replaying unauthenticated mutations after login. Return <code>401</code> for API authentication failures and <code>403</code> for authenticated policy failures; redirect only browser navigations. Strip spoofed identity and forwarding headers, limit trusted ingress hops, suppress caching of protected responses, bound body size and timeouts, and define streaming and WebSocket behavior. Keep the application origin private. Use one canonical path interpretation for authorization and forwarding.</p>
+  <p>A Rust container adapter can share the pure policy crate but needs its own HTTP server, streaming transport and session store. Cloudflare service bindings and native network transports should stay in their adapters. Measure Worker CPU and D1 usage; the repository's free-tier latency target is not a result measured by this investigation.</p>
+
+  <h2>6. Recommended delivery sequence</h2>
+  <ol>
+    <li><strong>Land and validate the security fixes.</strong> Run native tests, the wasm check and the gate tests on the combined main branch. Record dependency advisories that remain and exercise the affected flows in a disposable Worker/D1 deployment.</li>
+    <li><strong>Add connection policy and authentication provenance.</strong> Implement schema, admin configuration, application allowlists, transaction binding and session/grant enforcement before enabling enterprise-required access. Test cross-organization login, linking, refresh and silent SSO denial.</li>
+    <li><strong>Add Entra and Workspace together behind disabled connections.</strong> Implement tenant-specific Entra OIDC and signed Google hosted-domain policy. Exercise wrong tenant/domain, personal accounts, guests, wrong audience, expired credentials, nonce mismatch and key rotation using dedicated test organizations.</li>
+    <li><strong>Prove the existing proxy integration.</strong> Register a confidential Zeroth client and test OAuth2 Proxy through login, callback, ES256 validation, parallel refresh, logout, revocation, cross-client denial, forged headers and private-upstream enforcement.</li>
+    <li><strong>Implement the Worker adapter if the deployment requires it.</strong> Reuse the verified protocol and policy helpers; add end-to-end tests covering forwarding, sessions, streaming and failure behavior. Treat native proxy parity as a separate increment.</li>
+  </ol>
+
+  <h2>7. Validation and limits</h2>
+  <div id="validation-results">
+    <p>The combined code changes through <code>86c8dbf</code> passed the following checks on local <code>main</code>. A separate agent reviewed the combined admission, revocation, mailbox and bootstrap changes.</p>
+    <table>
+      <thead><tr><th>Check</th><th>Result</th></tr></thead>
+      <tbody>
+        <tr><td><code>cargo test --workspace --locked</code></td><td>322 passed, zero failed or ignored; includes 230 Worker tests.</td></tr>
+        <tr><td>Worker wasm32 check</td><td>Passed on the combined code. Three existing dead-code warnings remain.</td></tr>
+        <tr><td>Native all-targets check</td><td>Passed on the combined code.</td></tr>
+        <tr><td>Gate syntax and request tests</td><td>Nine passed, including cross-client denial and public-cache suppression.</td></tr>
+        <tr><td>Crypto compatibility</td><td>Frozen pre-upgrade ES256 JWT and EIP-191 signature fixtures passed; CLI signing-key smoke check passed.</td></tr>
+        <tr><td>SQL attack reproductions</td><td>Passed for refresh revocation orderings, cross-namespace admission, forged mailbox proof, canonical shadowing and preclaimed mailbox accounts. Actual token/admin queries were also exercised against migrated SQLite.</td></tr>
+        <tr><td>Proxy example</td><td>OAuth2 Proxy 7.15.6 configuration validation passed. No live discovery or login test.</td></tr>
+        <tr><td>Dependency audit</td><td>Reduced from eight vulnerability advisories to one; the audit still exits nonzero. See the retained advisory below. No advisory suppressions were added.</td></tr>
+        <tr><td>Document and diff</td><td>Local report references resolve; desktop and mobile HTML render inspected; committed diff whitespace checks passed.</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Retained dependency advisory:</strong> <code>rsa 0.9.10</code> has the unpatched Marvin private-key timing advisory. The reviewed non-wasm code uses RSA public-key signature verification; private RSA signing appears in tests, and no production RSA decryption path was found. This is a reachability assessment, not a clean audit result. The scan also reports unmaintained <code>paste</code>/<code>proc-macro-error2</code> and yanked <code>spin 0.9.8</code>. The advisory database revision was <code>26fd2d43</code>, updated 5 November 2026. <a href="https://rustsec.org/advisories/RUSTSEC-2023-0071.html">RUSTSEC-2023-0071</a>.</p>
+    <p><strong>Existing access and credentials:</strong> previously signed access tokens can retain old admission or custom scopes until expiry, currently up to one hour. Online validation and introspection check active users, sessions and clients but do not re-evaluate namespace/domain admission. Existing credential links and privileges created before these fixes need operational review; the patch does not automatically remove them. Local JWT validation cannot provide immediate offboarding by itself.</p>
+  </div>
+  <p>The OAuth2 Proxy example passed <code>--config-test</code> using the official v7.15.6 Linux ARM64 binary, checked against its release SHA-256 file. That validates configuration syntax and local option checks, not issuer discovery or a real login. No enterprise credentials, test tenant, Workspace organization or private backend were configured. No production deployment or GitHub push was performed.</p>
+  <footer>Prepared from repository inspection and linked first-party provider documentation on 5 November 2026. Proposed architecture is labelled as a recommendation; it is not a claim of implemented enterprise support or a security certification.</footer>
+</main></body>
+</html>
