@@ -327,11 +327,22 @@ fn code_and_refresh_guards_recheck_user_client_session_and_expiry_in_transaction
         connection.execute_batch(change).unwrap();
         {
             let tx = connection.transaction().unwrap();
-            assert!(code_transition(&tx, &event("evt_code_denied", "token.issue")).is_err(), "{change}");
+            assert!(
+                code_transition(&tx, &event("evt_code_denied", "token.issue")).is_err(),
+                "{change}"
+            );
         }
         {
             let tx = connection.transaction().unwrap();
-            assert!(refresh_transition(&tx, &event("evt_refresh_denied", "token.issue"), "forbidden_child").is_err(), "{change}");
+            assert!(
+                refresh_transition(
+                    &tx,
+                    &event("evt_refresh_denied", "token.issue"),
+                    "forbidden_child"
+                )
+                .is_err(),
+                "{change}"
+            );
         }
         assert_eq!(count(&connection, "zeroth_audit_events"), 0);
         assert_eq!(count(&connection, "zeroth_refresh_tokens"), 1);
@@ -674,4 +685,66 @@ fn late_enterprise_requirement_rejects_native_or_other_provider_even_with_tenant
         .unwrap();
     assert_eq!(count(&connection, "zeroth_audit_write_guards"), 0);
     assert_eq!(count(&connection, "zeroth_audit_events"), 0);
+}
+
+#[test]
+fn downstream_token_capture_rejects_changed_audience_ttl_or_disabled_client() {
+    let mut connection = database();
+    connection.execute("UPDATE zeroth_clients SET issuer_token_audience='https://api.example',issuer_token_ttl_seconds=300 WHERE id='app'", []).unwrap();
+    for (audience, ttl, disabled) in [
+        (Some("https://different-api.example"), Some(300), None),
+        (None, Some(300), None),
+        (Some("https://api.example"), Some(60), None),
+        (Some("https://api.example"), None, None),
+        (Some("https://api.example"), Some(300), Some(100)),
+    ] {
+        connection.execute("UPDATE zeroth_clients SET issuer_token_audience=?1,issuer_token_ttl_seconds=?2,disabled_at=?3 WHERE id='app'", params![audience,ttl,disabled]).unwrap();
+        {
+            let tx = connection.transaction().unwrap();
+            assert!(tx
+                .execute(
+                    ISSUER_TOKEN_CONFIG_GUARD_SQL,
+                    params!["issuer_config", "app", "https://api.example", 300]
+                )
+                .is_err());
+        }
+        assert_eq!(count(&connection, "zeroth_audit_events"), 0);
+        assert_eq!(count(&connection, "zeroth_audit_outbox"), 0);
+    }
+    // NULL is a real preimage value, rather than an arbitrary configured TTL.
+    connection.execute("UPDATE zeroth_clients SET issuer_token_audience='https://api.example',issuer_token_ttl_seconds=NULL,disabled_at=NULL WHERE id='app'", []).unwrap();
+    let tx = connection.transaction().unwrap();
+    tx.execute(
+        &identity_account_auth_guard_sql(),
+        params![
+            "issuer_account",
+            "usr_owner",
+            "sess_bearer_secret",
+            "app",
+            100
+        ],
+    )
+    .unwrap();
+    tx.execute(
+        &audit_capture::client_user_scope_guard_sql(),
+        params!["issuer_scope", "usr_owner", "app", "entra", 100],
+    )
+    .unwrap();
+    tx.execute(
+        ISSUER_TOKEN_CONFIG_GUARD_SQL,
+        params!["issuer_config", "app", "https://api.example", None::<i32>],
+    )
+    .unwrap();
+    let mut issued = event("evt_downstream_issued", "token.issue");
+    issued.details = zeroth_audit::SafeDetails::from_json_allowlisted(
+        &serde_json::json!({"grantType":"downstream_issuer"}),
+    );
+    capture(&tx, &issued).unwrap();
+    for guard in ["issuer_account", "issuer_scope", "issuer_config"] {
+        tx.execute(DELETE_AUDIT_WRITE_GUARD_SQL, [guard]).unwrap();
+    }
+    tx.commit().unwrap();
+    assert_eq!(count(&connection, "zeroth_audit_events"), 1);
+    assert_eq!(count(&connection, "zeroth_audit_outbox"), 1);
+    assert_eq!(count(&connection, "zeroth_audit_write_guards"), 0);
 }

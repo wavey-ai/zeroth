@@ -284,6 +284,7 @@ function main() {
       option(options, "compatibility-date", ["ZEROTH_COMPATIBILITY_DATE"]) ??
       defaultCompatibilityDate,
     workers_dev: workersDev,
+    triggers: { crons: ["*/5 * * * *"] },
     observability: {
       enabled: true,
     },

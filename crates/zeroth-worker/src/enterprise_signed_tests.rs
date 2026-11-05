@@ -31,9 +31,36 @@ fn claims_for(provider: &OAuthProvider) -> ProviderIdTokenClaims {
         name: None,
         picture: None,
         tid: policy.tenant_id().map(str::to_owned),
+        oid: Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into()),
         hd: policy.domains().first().cloned(),
         azp: Some(provider.config().client_id.clone()),
     }
+}
+
+#[test]
+fn entra_lifecycle_links_signed_tenant_and_object_not_email_or_pairwise_subject() {
+    let provider = OAuthProvider::entra("enterprise-client", TENANT).unwrap();
+    let mut claims = claims_for(&provider);
+    let (token, keys) = signed(&claims);
+    let verified = verify_provider_id_token(&token, &keys, validation_for(&provider)).unwrap();
+    let identity = verified_directory_identity_from_token("entra", &verified)
+        .unwrap()
+        .unwrap();
+    assert_eq!(identity.authority_id.as_deref(), Some(TENANT));
+    assert_eq!(identity.external_id, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+    assert_ne!(identity.external_id, claims.sub);
+    assert_ne!(identity.external_id, claims.email.as_deref().unwrap());
+    claims.oid = None;
+    let (token, keys) = signed(&claims);
+    let verified = verify_provider_id_token(&token, &keys, validation_for(&provider)).unwrap();
+    assert!(verified_directory_identity_from_token("entra", &verified).is_err());
+    claims.oid = Some("person@example.com".into());
+    let (token, keys) = signed(&claims);
+    let verified = verify_provider_id_token(&token, &keys, validation_for(&provider)).unwrap();
+    assert!(verified_directory_identity_from_token("entra", &verified).is_err());
+    assert!(verified_directory_identity_from_token("google", &verified)
+        .unwrap()
+        .is_none());
 }
 
 fn validation_for(provider: &OAuthProvider) -> ProviderIdTokenValidation<'_> {

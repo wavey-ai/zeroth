@@ -53,6 +53,7 @@ test("installer writes only validated public enterprise vars and recognizes disa
   const file = readFileSync(output, "utf8");
   const config = JSON.parse(file);
   assert.equal(config.vars.ENTRA_TENANT_ID, fixture.ENTRA_TENANT_ID);
+  assert.deepEqual(config.triggers.crons, ["*/5 * * * *"]);
   assert.equal(config.vars.GOOGLE_WORKSPACE_DOMAINS, "example.com,subsidiary.example");
   assert.equal(config.vars.DISABLED_PROVIDERS, "entra,google_workspace");
   assert.equal(config.vars.ENTRA_CLIENT_SECRET, undefined);

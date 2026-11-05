@@ -87,3 +87,19 @@
 .zeroth-admin #events .zeroth-table th:first-child { min-width: 190px; }
 .zeroth-admin #users .zeroth-table { min-width: 980px; }
 .zeroth-binding-picker { margin-bottom: 16px; }
+.zeroth-provisioning { border-top: 2px solid var(--z-line); }
+.zeroth-provisioning h4 { font-size: 15px; margin: 0 0 12px; }
+.zeroth-provisioning .zeroth-form { margin-top: 20px; gap: 18px; }
+.zeroth-copy-field { display: flex; gap: 8px; }
+.zeroth-copy-field input { flex: 1; min-width: 0; }
+.zeroth-admin .zeroth-field input[readonly] { background: var(--z-bg); color: var(--z-muted); }
+.zeroth-provisioning-status { display: grid; grid-template-columns: minmax(150px, 0.5fr) minmax(0, 1fr); gap: 0; margin: 20px 0; font-size: 13px; }
+.zeroth-provisioning-status dt, .zeroth-provisioning-status dd { margin: 0; padding: 10px 12px; border-bottom: 1px solid var(--z-line); overflow-wrap: anywhere; }
+.zeroth-provisioning-status dt { color: var(--z-muted); background: #f8fafc; }
+.zeroth-provisioning-policy { margin: 0; border-left: 3px solid #d4a72c; background: #fff8e5; color: #6e5416; padding: 12px; font-size: 13px; }
+.zeroth-provisioning-footnote { margin: 18px 0 0; }
+.zeroth-scope { display: block; padding: 8px 0; overflow-wrap: anywhere; }
+@media(max-width:600px) { .zeroth-copy-field { flex-direction: column; } .zeroth-copy-field button { align-self: flex-start; } .zeroth-provisioning-status { grid-template-columns: minmax(115px, 0.6fr) minmax(0, 1fr); font-size: 12px; } }
+.zeroth-tenant-access { max-width: 230px; font-weight: 600; }
+.zeroth-tenant-access[data-state="active"] { color: var(--z-green); }
+.zeroth-tenant-access[data-state="inactive"], .zeroth-tenant-access[data-state="deleted"], .zeroth-tenant-access[data-state="unprovisioned"], .zeroth-tenant-access[data-state="stale"], .zeroth-tenant-access[data-state="tenant_disabled"] { color: var(--z-red); }

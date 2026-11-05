@@ -48,6 +48,12 @@ const CONNECTION_PREIMAGE_GUARD_SQL: &str = "INSERT INTO zeroth_audit_write_guar
       OR (?3=1 AND EXISTS(SELECT 1 FROM zeroth_tenants WHERE id=?2 AND disabled=?4
         AND enterprise_provider IS ?5 AND entra_tenant_id IS ?6 AND google_workspace_domains_json=?7
         AND oidc_client_id IS ?8 AND client_secret_binding IS ?9)) THEN 1 ELSE 0 END";
+const DIRECTORY_AUTHORITY_GUARD_SQL: &str = "INSERT INTO zeroth_audit_write_guards(id,valid)
+    SELECT ?1,CASE WHEN EXISTS(SELECT 1 FROM zeroth_tenants WHERE id=?2
+        AND enterprise_provider IS ?3 AND entra_tenant_id IS ?4)
+      OR (NOT EXISTS(SELECT 1 FROM zeroth_directory_users WHERE tenant_id=?2)
+        AND NOT EXISTS(SELECT 1 FROM zeroth_directory_links WHERE tenant_id=?2))
+    THEN 1 ELSE 0 END";
 
 fn connection_changed(previous: Option<&TenantRow>, next: &TenantUpsert, domains: &str) -> bool {
     previous.is_none_or(|old| {
@@ -561,7 +567,20 @@ pub(super) async fn require_audit_read(
         .await
         .map_err(|_| ClientManagementError::server_error("could not load audit reader"))?;
     if permission.is_some_and(|row| !export || row.can_export != 0) {
-        Ok(())
+        let active = provisioning::tenant_user_is_active(db, &current.user.id, tenant_id, now)
+            .await
+            .map_err(|_| {
+                ClientManagementError::server_error("could not validate tenant audit access")
+            })?;
+        if active {
+            Ok(())
+        } else {
+            Err(ClientManagementError {
+                code: "access_denied".into(),
+                description: "active tenant directory access is required".into(),
+                status: 403,
+            })
+        }
     } else {
         Err(ClientManagementError {
             code: "access_denied".into(),
@@ -615,6 +634,23 @@ async fn save(
     use worker::d1::D1Type as V;
     let storage_error = |_| ClientManagementError::server_error("tenant registration failed");
     let old = get(db, &upsert.id).await.map_err(storage_error)?;
+    if old.as_ref().is_some_and(|old| {
+        old.enterprise_provider != upsert.enterprise_provider
+            || old.entra_tenant_id != upsert.entra_tenant_id
+    }) {
+        #[derive(Deserialize)]
+        struct Locked {
+            value: i32,
+        }
+        let locked=db.prepare("SELECT CASE WHEN EXISTS(SELECT 1 FROM zeroth_directory_users WHERE tenant_id=?1)
+            OR EXISTS(SELECT 1 FROM zeroth_directory_links WHERE tenant_id=?1) THEN 1 ELSE 0 END AS value")
+            .bind_refs(&[V::Text(&upsert.id)]).map_err(storage_error)?.first::<Locked>(None).await.map_err(storage_error)?;
+        if locked.is_some_and(|row| row.value != 0) {
+            return Err(ClientManagementError::invalid_request(
+                "tenant directory authority is immutable after provisioned identities or tombstones exist",
+            ));
+        }
+    }
     if old.is_none() {
         let count = db
             .prepare("SELECT COUNT(*) AS value FROM zeroth_tenants")
@@ -800,6 +836,23 @@ async fn save(
     business.push(
         db.prepare("DELETE FROM zeroth_audit_write_guards WHERE id=?1")
             .bind_refs(&[V::Text(&preimage_guard)])
+            .map_err(storage_error)?,
+    );
+    let authority_guard = format!("tenant_authority_{}", event.0.event_id);
+    business.insert(
+        0,
+        db.prepare(DIRECTORY_AUTHORITY_GUARD_SQL)
+            .bind_refs(&[
+                V::Text(&authority_guard),
+                V::Text(&upsert.id),
+                d1_optional_text(upsert.enterprise_provider.as_deref()),
+                d1_optional_text(upsert.entra_tenant_id.as_deref()),
+            ])
+            .map_err(storage_error)?,
+    );
+    business.push(
+        db.prepare("DELETE FROM zeroth_audit_write_guards WHERE id=?1")
+            .bind_refs(&[V::Text(&authority_guard)])
             .map_err(storage_error)?,
     );
     audit_capture::commit(db, business, &[event])
@@ -1070,8 +1123,8 @@ mod tests {
             "UPDATE zeroth_clients SET enterprise_provider='google_workspace' WHERE id='app'",
         ] {
             let tx = db.transaction().unwrap();
-            tx.execute(sql,[]).unwrap();
-            assert!(tx.commit().is_err(),"{sql}");
+            tx.execute(sql, []).unwrap();
+            assert!(tx.commit().is_err(), "{sql}");
         }
         assert_eq!(
             db.query_row(
@@ -1157,6 +1210,41 @@ mod tests {
     }
 
     #[test]
+    fn offboarded_reader_cannot_use_another_tenants_active_session_to_read_old_tenant() {
+        let mut db = database();
+        insert_tenant(&db, "acme", "entra");
+        insert_tenant(&db, "other", "entra");
+        bind(&mut db, "other");
+        db.execute_batch("INSERT INTO zeroth_tenant_audit_readers VALUES ('acme','usr_reader',1),('other','usr_reader',1);
+          INSERT INTO zeroth_sessions(id,user_id,client_id,created_at,expires_at) VALUES ('session_other','usr_reader','app',1,3000);
+          INSERT INTO zeroth_directory_sources(tenant_id,provider_id,authority_id,enabled,created_at,updated_at)
+            VALUES ('acme','entra','12345678-1234-1234-1234-123456789012',0,1,1);
+          INSERT INTO zeroth_directory_users(id,tenant_id,provider_id,authority_id,external_id,user_name,user_name_key,active,user_id,created_at,updated_at)
+            VALUES ('dir_inactive','acme','entra','12345678-1234-1234-1234-123456789012','aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee','reader@example.com','reader@example.com',0,'usr_reader',1,1);").unwrap();
+        assert_eq!(db.query_row("SELECT COUNT(*) FROM zeroth_sessions WHERE id='session_other' AND revoked_at IS NULL AND expires_at>2000", [], |row| row.get::<_, i32>(0)).unwrap(), 1);
+        // The manually assigned reader grants remain present in both tenants.
+        // The requested tenant's lifecycle policy decides access independently
+        // of the session's client, even when the tenant has no bound client.
+        for (tenant, allowed) in [("acme", false), ("other", true)] {
+            assert_eq!(
+                db.query_row(READER_SQL, params![tenant, "usr_reader"], |row| row
+                    .get::<_, i32>(0))
+                    .unwrap(),
+                1
+            );
+            let active = db
+                .query_row(
+                    provisioning::TENANT_USER_ACTIVE_SQL,
+                    params!["usr_reader", tenant, 2000],
+                    |row| row.get::<_, i32>(0),
+                )
+                .unwrap()
+                != 0;
+            assert_eq!(active, allowed);
+        }
+    }
+
+    #[test]
     fn binding_invalidates_every_existing_credential_in_the_same_transaction() {
         let mut db = database();
         insert_tenant(&db, "acme", "entra");
@@ -1191,6 +1279,61 @@ mod tests {
                 .unwrap(),
             "acme"
         );
+    }
+
+    #[test]
+    fn provisioned_objects_and_immutable_links_lock_the_directory_authority_atomically() {
+        for tombstone in [false, true] {
+            let mut db = database();
+            insert_tenant(&db, "acme", "entra");
+            // The preliminary admin read can occur before a concurrent login
+            // pins the first link. The guard must check inside the write batch.
+            if tombstone {
+                db.execute("INSERT INTO zeroth_directory_sources(tenant_id,provider_id,authority_id,created_at,updated_at) VALUES ('acme','entra',?1,1,1)",[ENTRA_TENANT]).unwrap();
+                db.execute("INSERT INTO zeroth_directory_users(id,tenant_id,provider_id,authority_id,external_id,user_name,user_name_key,active,deleted,created_at,updated_at)
+                    VALUES ('dir_deleted','acme','entra',?1,'object','deleted','deleted',0,1,1,1)",[ENTRA_TENANT]).unwrap();
+            } else {
+                db.execute("INSERT INTO zeroth_directory_links(tenant_id,provider_id,authority_id,external_id,user_id,created_at) VALUES ('acme','entra',?1,'object','usr_reader',1)",[ENTRA_TENANT]).unwrap();
+            }
+            let tx = db.transaction().unwrap();
+            assert!(tx
+                .execute(
+                    DIRECTORY_AUTHORITY_GUARD_SQL,
+                    params!["move", "acme", "google_workspace", None::<String>]
+                )
+                .is_err());
+            assert!(tx
+                .execute(
+                    DIRECTORY_AUTHORITY_GUARD_SQL,
+                    params![
+                        "realm",
+                        "acme",
+                        "entra",
+                        "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+                    ]
+                )
+                .is_err());
+            tx.execute(
+                DIRECTORY_AUTHORITY_GUARD_SQL,
+                params!["same", "acme", "entra", ENTRA_TENANT],
+            )
+            .unwrap();
+            tx.execute(
+                "UPDATE zeroth_tenants SET name='New name',disabled=1 WHERE id='acme'",
+                [],
+            )
+            .unwrap();
+            tx.execute("DELETE FROM zeroth_audit_write_guards", [])
+                .unwrap();
+            tx.commit().unwrap();
+        }
+        let db = database();
+        insert_tenant(&db, "acme", "entra");
+        db.execute(
+            DIRECTORY_AUTHORITY_GUARD_SQL,
+            params!["draft", "acme", "google_workspace", None::<String>],
+        )
+        .unwrap();
     }
 
     #[test]

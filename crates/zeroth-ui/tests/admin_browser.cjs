@@ -24,10 +24,16 @@ const events = [
   {id:'evt_07',eventType:'session.login',recordedAt:1793870800,actorId:'usr_samira',actorType:'user',organizationId:'acme',clientId:'acme-portal',outcome:'success',details:{provider:'entra'}},
   {id:'evt_06',eventType:'legacy.event',createdAt:1793750400,outcome:'unknown',details:{note:'<img src=x onerror=alert(1)>'}}
 ];
+const scim = {tenantId:'acme',enabled:false,tokenBinding:null,credentialsConfigured:false,endpoint:'https://id.example.com/scim/v2/acme',managedUsers:0,activeUsers:0,lastActivityAt:null};
+const directory = {tenantId:'northstar',enabled:false,customerId:null,customerIdLocked:false,delegatedAdminEmail:null,serviceAccountSecretBinding:null,credentialsConfigured:false,managedEnforced:false,stale:false,staleAfterSeconds:900,lastAttemptAt:null,lastSuccessAt:null,lastErrorCode:null,lastSeenCount:null,lastDeactivatedCount:null,syncIntervalSeconds:300,nextSyncAt:null};
+let failDirectorySync = false;
+let delayScimRead = false;
+let releaseDelayedScim = null;
 const requests = [];
 const server = http.createServer(async (req,res) => {
   const url = new URL(req.url, 'http://fixture');
   if (url.pathname === '/admin/tenants' || url.pathname === '/') {res.writeHead(200,{'Content-Type':'text/html'});return res.end(html);}
+  if (url.pathname === '/admin/setup') {res.writeHead(200,{'Content-Type':'text/html'});return res.end(fs.readFileSync(path.resolve(__dirname,'../../../docs/enterprise-admin-setup.html'),'utf8'));}
   if (url.pathname === '/profile-menu.js') {res.writeHead(200,{'Content-Type':'text/javascript'});return res.end('');}
   if (url.pathname === '/favicon.svg') {res.writeHead(204);return res.end();}
   let payload = null;
@@ -40,11 +46,23 @@ const server = http.createServer(async (req,res) => {
   if (url.pathname === '/tenants') {
     if (payload) { const existing=tenants.findIndex(t=>t.id===payload.id); const next={...payload,connectionConfigured:false}; if(existing<0)tenants.push(next);else tenants[existing]=next; }
     body={tenants};
-  } else if (url.pathname === '/users') {
+  } else if (url.pathname === '/tenants/provisioning') {
+    if (payload) { assert.equal(payload.tenantId,url.searchParams.get('tenant_id'));Object.assign(scim,payload); }
+    if (delayScimRead && !payload) await new Promise(resolve=>{releaseDelayedScim=resolve;});
+    body=scim;
+  } else if (url.pathname === '/tenants/google-directory-config') {
+    Object.assign(directory,payload);directory.credentialsConfigured=Boolean(payload.serviceAccountSecretBinding);directory.managedEnforced ||= payload.enabled;directory.stale=directory.managedEnforced&&!directory.lastSuccessAt;body=directory;
+  } else if (url.pathname === '/tenants/google-directory-sync') {
+    assert.equal(payload.tenantId,'northstar');await new Promise(resolve=>setTimeout(resolve,200));
+    directory.lastAttemptAt=1793871300;
+    if(failDirectorySync){directory.lastErrorCode='directory_upstream_failed';res.writeHead(502,{'Content-Type':'application/json'});return res.end(JSON.stringify({error:'directory_sync_failed',error_description:'directory_upstream_failed'}));}
+    Object.assign(directory,{lastSuccessAt:1793871300,lastErrorCode:null,lastSeenCount:3,lastDeactivatedCount:1,customerIdLocked:true,stale:false,nextSyncAt:1793871600});body=directory;
+  } else if (url.pathname === '/tenants/google-directory') body=directory;
+  else if (url.pathname === '/users') {
     const id=url.searchParams.get('user_id');
     if (payload) { const user=users.find(u=>u.id===id);Object.assign(user,payload);if(payload.disabled)user.activeSessionCount=0; }
     if (id) body={user:users.find(u=>u.id===id),identities:[{providerId:'entra',email:'samira@acme.example',emailVerified:true}],activeSessions:[{clientId:'acme-portal',expiresAt:1793956800}]};
-    else body={users:users.filter(u=>!url.searchParams.get('tenant_id')||u.tenant===url.searchParams.get('tenant_id'))};
+    else {const tenant=url.searchParams.get('tenant_id');body={users:users.filter(u=>!tenant||u.tenant===tenant).map(u=>tenant?{...u,tenantAccess:{state:u.id==='usr_morgan'?'inactive':'active',source:'entra',updatedAt:1793871000,lastSyncAt:null,managed:true}}:u)};}
   } else if (url.pathname === '/events') {
     if (url.searchParams.get('format') === 'csv') {res.writeHead(200,{'Content-Type':'text/csv','Content-Disposition':'attachment; filename="zeroth-audit-events.csv"'});return res.end('id,event_type\r\nevt_06,legacy.event\r\n');}
     const scoped=events.filter(e=>!url.searchParams.get('organization_id')||e.organizationId===url.searchParams.get('organization_id'));
@@ -68,6 +86,24 @@ const server = http.createServer(async (req,res) => {
     await page.screenshot({path:path.join(output,'tenants-desktop.png'),fullPage:true});
     await page.locator('[data-zeroth-edit-tenant]').first().click();
     assert.equal(await page.locator('#zeroth-tenant-id').isDisabled(),true);
+    await page.locator('#zeroth-scim-panel').waitFor({state:'visible'});
+    assert.equal(await page.locator('#zeroth-scim-endpoint').inputValue(),'https://id.example.com/scim/v2/acme');
+    assert.match(await page.locator('#zeroth-scim-status').textContent(),/Awaiting deployment token/);
+    await page.locator('#zeroth-scim-binding').fill('pasted-token-value');
+    const scimBefore=requests.filter(r=>r.path==='/tenants/provisioning'&&r.method==='POST').length;
+    await page.locator('#zeroth-scim-form button[type=submit]').click();
+    await page.locator('#zeroth-admin-message').filter({hasText:'Never paste a token value'}).waitFor();
+    assert.equal(requests.filter(r=>r.path==='/tenants/provisioning'&&r.method==='POST').length,scimBefore);
+    await page.locator('#zeroth-scim-binding').fill('TENANT_ACME_SCIM_TOKEN');await page.locator('#zeroth-scim-form [name=enabled]').check();
+    page.once('dialog',dialog=>{assert.match(dialog.message(),/grants will be revoked/);dialog.accept();});
+    await page.locator('#zeroth-scim-form button[type=submit]').click();
+    await page.waitForFunction(()=>document.querySelector('#zeroth-scim-form button[type=submit]').disabled===false&&document.querySelector('#zeroth-scim-form [name=enabled]').checked);
+    const scimSaved=requests.findLast(r=>r.path==='/tenants/provisioning'&&r.method==='POST').payload;
+    assert.deepEqual(scimSaved,{tenantId:'acme',enabled:true,tokenBinding:'TENANT_ACME_SCIM_TOKEN'});
+    assert.match(await page.locator('#zeroth-scim-status').textContent(),/Awaiting deployment token/);
+    assert.match(await page.locator('#zeroth-provisioning-policy').textContent(),/active provisioned/);
+    await page.locator('nav a[href="#users"]').click();await page.locator('nav a[href="#tenants"]').click();
+    await page.locator('#zeroth-provisioning').screenshot({path:path.join(output,'provisioning-scim-desktop.png')});
     assert.equal(await page.locator('#zeroth-tenant-clients').inputValue(),'acme-portal');
     assert.match(await page.locator('#zeroth-tenant-connection-status').textContent(),/Awaiting/);
     await page.screenshot({path:path.join(output,'tenant-editor-desktop.png'),fullPage:true});
@@ -93,6 +129,43 @@ const server = http.createServer(async (req,res) => {
     await page.locator('#zeroth-tenant-domains').fill('draft.example');await page.locator('#zeroth-tenant-form button[type=submit]').click();
     await page.waitForFunction(()=>document.getElementById('zeroth-tenant-editor').hidden);
     assert.equal(requests.findLast(r=>r.method==='POST').payload.enterpriseProvider,'google_workspace');
+    await page.locator('#zeroth-tenant-rows tr').filter({hasText:'Northstar Studio'}).locator('[data-zeroth-edit-tenant]').click();
+    await page.locator('#zeroth-google-directory-panel').waitFor({state:'visible'});
+    await page.locator('#zeroth-directory-customer').fill('C01234567');
+    await page.locator('#zeroth-directory-admin').fill('superadmin@northstar.example');
+    const directoryWrites=requests.filter(r=>r.path==='/tenants/google-directory-config'&&r.method==='POST').length;
+    await page.locator('#zeroth-directory-binding').fill('{"private_key":"fixture-value-must-not-leave-browser"}');
+    await page.locator('#zeroth-google-directory-form button[type=submit]').click();
+    await page.locator('#zeroth-admin-message').filter({hasText:'Never paste the JSON key'}).waitFor();
+    assert.equal(requests.filter(r=>r.path==='/tenants/google-directory-config'&&r.method==='POST').length,directoryWrites);
+    await page.locator('#zeroth-directory-binding').fill('TENANT_NORTHSTAR_GOOGLE_DIRECTORY_SERVICE_ACCOUNT');
+    await page.locator('#zeroth-google-directory-form [name=enabled]').check();
+    page.once('dialog',dialog=>{assert.match(dialog.message(),/Managed access becomes permanent/);dialog.accept();});
+    await page.locator('#zeroth-google-directory-form button[type=submit]').click();
+    await page.waitForFunction(()=>document.getElementById('zeroth-directory-sync').disabled===false);
+    assert.match(await page.locator('#zeroth-google-directory-status').textContent(),/Stale/);
+    page.once('dialog',dialog=>dialog.accept());await page.locator('#zeroth-directory-sync').click();
+    assert.equal(await page.locator('#zeroth-directory-sync').isDisabled(),true);
+    await page.locator('#zeroth-provisioning-intro').filter({hasText:'Directory sync completed'}).waitFor();
+    assert.equal(await page.locator('#zeroth-directory-customer').getAttribute('readonly'),'');
+    assert.match(await page.locator('#zeroth-google-directory-status').textContent(),/Fresh.*completed sync recorded/);
+    await page.locator('nav a[href="#users"]').click();await page.locator('nav a[href="#tenants"]').click();
+    await page.locator('#zeroth-provisioning').screenshot({path:path.join(output,'provisioning-directory-desktop.png')});
+    failDirectorySync=true;
+    page.once('dialog',dialog=>dialog.accept());await page.locator('#zeroth-directory-sync').click();
+    await page.locator('#zeroth-admin-message').filter({hasText:'Directory sync failed'}).waitFor();
+    assert.equal(directory.lastSuccessAt,1793871300);
+    assert.match(await page.locator('#zeroth-google-directory-status').textContent(),/directory_upstream_failed/);
+    delayScimRead=true;
+    const delayedRead=page.waitForRequest(request=>new URL(request.url()).pathname==='/tenants/provisioning');
+    await page.locator('#zeroth-tenant-rows tr').filter({hasText:'Acme Operations'}).locator('[data-zeroth-edit-tenant]').click();await delayedRead;
+    await page.locator('#zeroth-tenant-rows tr').filter({hasText:'Northstar Studio'}).locator('[data-zeroth-edit-tenant]').click();
+    await page.locator('#zeroth-google-directory-panel').waitFor({state:'visible'});
+    const lateResponse=page.waitForResponse(response=>new URL(response.url()).pathname==='/tenants/provisioning');releaseDelayedScim();
+    await (await lateResponse).finished();await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
+    assert.equal(await page.locator('#zeroth-scim-panel').isVisible(),false);
+    assert.equal(await page.locator('#zeroth-directory-admin').inputValue(),'superadmin@northstar.example');
+    delayScimRead=false;
     await page.locator('nav a[href="#users"]').click();
     await page.locator('#zeroth-user-search').fill('samira');await page.waitForFunction(()=>document.querySelectorAll('#zeroth-user-rows tr').length===1);
     await page.locator('[data-zeroth-view-user]').click();await page.locator('#zeroth-user-detail-body').filter({hasText:'Linked identities (1)'}).waitFor();
@@ -108,6 +181,13 @@ const server = http.createServer(async (req,res) => {
     assert.equal(requests.filter(r=>r.method==='PATCH').length,afterDisable);
     await page.locator('#zeroth-user-search').fill('');await page.locator('#zeroth-user-status-filter').selectOption('');
     await page.locator('#zeroth-user-tenant').selectOption('acme');await page.waitForFunction(()=>document.querySelectorAll('#zeroth-user-rows tr').length===2);
+    const scopedMorgan=page.locator('#zeroth-user-rows tr[data-user-id="usr_morgan"]');
+    assert.equal(await scopedMorgan.getAttribute('data-user-disabled'),'false');
+    assert.match(await scopedMorgan.textContent(),/Account active.*Tenant: Inactive.*access denied/s);
+    await page.locator('#zeroth-user-tenant-access').selectOption('inactive');
+    await page.waitForFunction(()=>document.querySelectorAll('#zeroth-user-rows tr').length===1);
+    assert.equal(await page.locator('#zeroth-user-rows tr').getAttribute('data-user-id'),'usr_morgan');
+    await page.locator('#zeroth-user-tenant-access').selectOption('');
     await page.screenshot({path:path.join(output,'users-desktop.png'),fullPage:true});
     await page.locator('nav a[href="#events"]').click();
     await page.locator('#zeroth-events-next').click();await page.waitForFunction(()=>document.getElementById('zeroth-events-page-status').textContent.includes('Page 2'));
@@ -131,7 +211,17 @@ const server = http.createServer(async (req,res) => {
     await page.locator('nav a[href="#tenants"]').click();await page.locator('[data-zeroth-edit-tenant]').first().click();
     assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true,'tenant editor');
     await page.screenshot({path:path.join(output,'tenant-editor-mobile.png'),fullPage:true});
+    await page.locator('#zeroth-scim-panel').waitFor({state:'visible'});
+    await page.locator('#zeroth-provisioning').screenshot({path:path.join(output,'provisioning-scim-mobile.png')});
+    await page.locator('#zeroth-tenant-rows tr').filter({hasText:'Northstar Studio'}).locator('[data-zeroth-edit-tenant]').click();
+    await page.locator('#zeroth-google-directory-panel').waitFor({state:'visible'});
+    assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true,'Directory form');
+    await page.locator('#zeroth-provisioning').screenshot({path:path.join(output,'provisioning-directory-mobile.png')});
+    await page.goto(`${base}/admin/setup`);
+    assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true,'setup guide');
+    assert.match(await page.locator('body').textContent(),/customer-owned Entra tenant and application are sufficient/);
+    await page.screenshot({path:path.join(output,'provisioning-guide-mobile.png'),fullPage:true});
     assert.deepEqual(errors,[]);
-    console.log('Passed: tenant create/edit/draft policy, CSRF writes, user filtering/details/disable confirmation, audit cursor and applied-filter CSV, safe text rendering, desktop/mobile layout.');
+    console.log('Passed: tenant/user/audit workflows; provisioning binding-only config, managed-mode confirmation, CSRF, Directory sync success/failure and immutable pin, tenant-switch race isolation, safe text, desktop/mobile layouts.');
   } finally {await browser.close();await new Promise(resolve=>server.close(resolve));}
 })().catch(error=>{console.error(error);server.close();process.exitCode=1;});

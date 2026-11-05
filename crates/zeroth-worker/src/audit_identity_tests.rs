@@ -576,7 +576,7 @@ fn account_mutation_guard_rechecks_revocation_and_rejects_old_global_users_after
     let mut db = database();
     db.execute("INSERT INTO zeroth_sessions(id,user_id,client_id,created_at,expires_at) VALUES ('sess_a','usr_a','app',1,200)",[]).unwrap();
     db.execute(
-        IDENTITY_ACCOUNT_AUTH_GUARD_SQL,
+        &identity_account_auth_guard_sql(),
         params!["active", "usr_a", "sess_a", "app", 100],
     )
     .unwrap();
@@ -588,13 +588,13 @@ fn account_mutation_guard_rechecks_revocation_and_rejects_old_global_users_after
     .unwrap();
     assert!(db
         .execute(
-            IDENTITY_ACCOUNT_AUTH_GUARD_SQL,
+            &identity_account_auth_guard_sql(),
             params!["revoked", "usr_a", "sess_a", "app", 100]
         )
         .is_err());
     // Unbound native/profile tokens may intentionally have no browser session.
     db.execute(
-        IDENTITY_ACCOUNT_AUTH_GUARD_SQL,
+        &identity_account_auth_guard_sql(),
         params!["native", "usr_a", Option::<String>::None, "app", 100],
     )
     .unwrap();
@@ -608,8 +608,88 @@ fn account_mutation_guard_rechecks_revocation_and_rejects_old_global_users_after
     }
     assert!(db
         .execute(
-            IDENTITY_ACCOUNT_AUTH_GUARD_SQL,
+            &identity_account_auth_guard_sql(),
             params!["old_global", "usr_a", Option::<String>::None, "app", 100]
         )
         .is_err());
+}
+
+#[test]
+fn account_mutation_guard_atomically_denies_offboarded_unknown_and_stale_directory_users() {
+    let mut db = database();
+    {
+        let tx = db.transaction().unwrap();
+        tx.execute_batch("INSERT INTO zeroth_tenants(id,name,enterprise_provider,google_workspace_domains_json,created_at,updated_at)
+          VALUES ('acme','Acme','google_workspace','[\"example.com\"]',1,1);
+          UPDATE zeroth_clients SET account_sharing_mode='tenant',account_tenant_id='acme',enterprise_provider='google_workspace' WHERE id='app';
+          INSERT INTO zeroth_tenant_clients(client_id,tenant_id,enterprise_provider) VALUES ('app','acme','google_workspace');
+          INSERT INTO zeroth_account_identities(account_namespace,provider_id,provider_subject,user_id,created_at,updated_at)
+            VALUES ('tenant:acme','google_workspace','10987654321','usr_a',1,1),('tenant:acme','google_workspace','10987654322','usr_b',1,1);
+          INSERT INTO zeroth_sessions(id,user_id,client_id,created_at,expires_at) VALUES ('sess_a','usr_a','app',1,4000),('sess_b','usr_b','app',1,4000);
+          INSERT INTO zeroth_directory_sources(tenant_id,provider_id,authority_id,enabled,last_full_sync_at,created_at,updated_at)
+            VALUES ('acme','google_workspace','C01customer',1,1100,1,1);
+          INSERT INTO zeroth_directory_users(id,tenant_id,provider_id,authority_id,external_id,user_name,user_name_key,active,user_id,created_at,updated_at)
+            VALUES ('dir_a','acme','google_workspace','C01customer','10987654321','person@example.com','person@example.com',1,'usr_a',1,1);").unwrap();
+        tx.commit().unwrap();
+    }
+    let sql = identity_account_auth_guard_sql();
+    assert_eq!(db.prepare(&sql).unwrap().parameter_count(), 5);
+    db.execute(&sql, params!["active", "usr_a", "sess_a", "app", 2000])
+        .unwrap();
+    db.execute(IDENTITY_CLEANUP_GUARD_SQL, ["active"]).unwrap();
+    assert!(db
+        .execute(&sql, params!["unknown", "usr_b", "sess_b", "app", 2000])
+        .is_err());
+    assert!(db
+        .execute(
+            &sql,
+            params!["no_session", "usr_a", Option::<String>::None, "app", 2000]
+        )
+        .is_err());
+    db.execute(
+        "UPDATE zeroth_directory_users SET active=0 WHERE id='dir_a'",
+        [],
+    )
+    .unwrap();
+    // Mutation, audit and outbox share the transaction: an admission failure
+    // leaves the profile and durable audit untouched.
+    let mutation = event("evt_inactive_patch", "usr_a", "user.profile.update");
+    assert!(capture(&mut db, &mutation, |tx| {
+        tx.execute(&sql, params!["inactive", "usr_a", "sess_a", "app", 2000])?;
+        tx.execute(
+            "UPDATE zeroth_users SET display_name='Changed' WHERE id='usr_a'",
+            [],
+        )?;
+        Ok(())
+    })
+    .is_err());
+    assert_eq!(
+        db.query_row(
+            "SELECT display_name FROM zeroth_users WHERE id='usr_a'",
+            [],
+            |row| row.get::<_, String>(0)
+        )
+        .unwrap(),
+        "Original"
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT COUNT(*) FROM zeroth_audit_outbox WHERE event_id='evt_inactive_patch'",
+            [],
+            |row| row.get::<_, i32>(0)
+        )
+        .unwrap(),
+        0
+    );
+    db.execute_batch("UPDATE zeroth_directory_users SET active=1 WHERE id='dir_a'; UPDATE zeroth_directory_sources SET last_full_sync_at=1099;").unwrap();
+    assert!(db
+        .execute(&sql, params!["stale", "usr_a", "sess_a", "app", 2000])
+        .is_err());
+    db.execute(
+        "UPDATE zeroth_directory_sources SET last_full_sync_at=1100",
+        [],
+    )
+    .unwrap();
+    db.execute(&sql, params!["fresh", "usr_a", "sess_a", "app", 2000])
+        .unwrap();
 }

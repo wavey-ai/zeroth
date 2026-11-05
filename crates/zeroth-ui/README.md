@@ -24,6 +24,8 @@ Zeroth now:
   management APIs
 - `/admin/tenants` organization settings, Entra or Google Workspace connection
   drafts, application bindings, and separate audit read/export grants
+- tenant SCIM endpoint and token-binding configuration, provisioned-user
+  admission policy, and Google Directory polling, freshness and manual sync
 - audit filters, cursor navigation, and CSV export of the displayed page
 
 It is server-renderable today with `render_account_html` or
@@ -38,6 +40,13 @@ Tenant forms accept a deployment secret **binding name**, never the provider
 secret value. Configuration presence is distinct from a successful provider
 sign-in. Retention days currently record policy metadata; they do not schedule
 automatic deletion.
+
+Provisioning settings are separate from tenant metadata. They load only after
+the tenant is saved. SCIM can require active provisioned members; disabling that
+requirement relaxes admission for unknown corporate identities but preserves
+inactive-member tombstones. Google polling can be paused, while its managed
+access policy stays enforced and denies online access after the directory
+freshness limit. The setup guide is served at `/admin/setup#provisioning`.
 
 The rendered document is intentionally SSR-first. CSS is inline, and provider
 actions are ordinary links. A small same-origin form handler is the only
@@ -62,3 +71,5 @@ Set `PLAYWRIGHT_MODULE` or `CHROMIUM_EXECUTABLE` when those are outside the
 default installation. Set `SCREENSHOT_DIR` to choose where desktop and mobile
 screenshots are saved. It verifies UI/API contracts, CSRF headers, confirmations,
 filtering, paging, and exports; it does not exercise a live identity provider.
+It also checks binding-only provisioning writes, source-status isolation when
+switching tenants, immutable customer IDs, and completed/failed sync feedback.

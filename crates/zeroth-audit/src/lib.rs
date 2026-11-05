@@ -281,7 +281,7 @@ fn validate_detail(key: DetailKey, value: &DetailValue) -> Result<(), AuditError
     let valid = match (key, value) {
         (K::GrantType, V::Code(code)) => matches!(
             code.as_str(),
-            "authorization_code" | "refresh_token" | "token_exchange"
+            "authorization_code" | "refresh_token" | "token_exchange" | "downstream_issuer"
         ),
         (K::AuthenticationMethod, V::Code(code)) => matches!(
             code.as_str(),

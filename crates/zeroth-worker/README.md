@@ -730,3 +730,43 @@ curl -X POST "https://id.example.com/oauth/token" \
   session, `client_id`, or a valid `id_token_hint`. It validates the return URL
   against registered redirect URIs or allowed origins. It adds `state` when
   present and redirects after it clears the cookie.
+
+## Local Worker/D1 HTTP integration
+
+`npm run test:http` builds the real Worker and runs it in local workerd with an
+isolated D1 database. It never deploys or uses cloud credentials. The harness
+passes only build/system variables to child processes and forces
+Wrangler's local mode. It creates synthetic tenants, dedicated source tokens,
+opaque browser sessions, and immutable links representing prior verified logins.
+It does not add test routes or bypasses to the Worker.
+
+Install compatible tools in a temporary directory when they are unavailable:
+
+```sh
+npm install --prefix /tmp/zeroth-http-tools --no-save --package-lock=false wrangler@4.96.0
+cargo install worker-build --version 0.8.3 --locked --root /tmp/zeroth-http-tools/builder
+# Use the wasm-bindgen version recorded in the repository's Cargo.lock:
+cargo install wasm-bindgen-cli --version 0.2.122 --locked --root /tmp/zeroth-http-tools/bindgen
+
+WRANGLER_BIN=/tmp/zeroth-http-tools/node_modules/.bin/wrangler \
+WORKER_BUILD_BIN=/tmp/zeroth-http-tools/builder/bin/worker-build \
+WASM_BINDGEN_BIN=/tmp/zeroth-http-tools/bindgen/bin/wasm-bindgen \
+ESBUILD_BIN=/tmp/zeroth-http-tools/node_modules/.bin/esbuild \
+  npm run test:http
+```
+
+Node 22 and Python 3 are required. Run the command from this crate. An existing
+built entry can be supplied with `WORKER_ENTRY`; otherwise the build and runtime
+state are created in a private directory under the system temporary directory.
+`ZEROTH_HTTP_TARGET_DIR` optionally selects a reusable Cargo build cache. The
+harness prints its local diagnostic directory and retains synthetic state for
+inspection; no generated credential or runtime state is added to the repository.
+
+The checks exercise SCIM create/list/get/deactivate/delete, dedicated-token and
+cross-tenant isolation, immutable external IDs, session-backed admin CSRF,
+revocation and tombstone persistence, audit capture/outbox/stream checkpoints,
+and a user shared across two tenants. Tenant A offboarding must not disable that
+user globally or revoke tenant B's grants, while a B session must not restore A's
+audit-reader access. Enterprise JWT signatures and the five-minute lifetime cap
+are checked. These local tests do not contact a real upstream identity provider;
+the Google adapter's mock transport tests cover directory scans separately.

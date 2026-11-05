@@ -36,6 +36,8 @@
   const tenantEditor = $("zeroth-tenant-editor");
   const userFilterForm = $("zeroth-users-filter-form");
   let loadedUsers = [];
+  let loadedUsersTenantId = "";
+  let usersLoading = false;
   let loadedClients = [];
   let loadedTenants = [];
   let eventCursor = null;
@@ -45,6 +47,11 @@
   let appliedEventParams = null;
   let userRequestId = 0;
   let editingTenant = null;
+  let provisioningEpoch = 0;
+  let scimStatus = null;
+  let directoryStatus = null;
+  const scimForm = $("zeroth-scim-form");
+  const directoryForm = $("zeroth-google-directory-form");
 
   function setMessage(value, error = false) {
     if (!message) return;
@@ -641,6 +648,20 @@
     }
   }
 
+  function tenantAccessDescription(access) {
+    const states = {
+      active: ["Active membership", "An active directory membership is recorded. Global account restrictions and corporate authentication policy still apply."],
+      inactive: ["Inactive · access denied", "This member was deactivated for this tenant. Their account can remain active in another tenant."],
+      deleted: ["Deleted · access denied", "A retained directory tombstone denies access to this tenant."],
+      unprovisioned: ["Not provisioned · access denied", "Managed access requires an active provisioned record before this identity can sign in."],
+      stale: ["Directory stale · access denied", "A complete successful sync is needed to restore directory freshness."],
+      unmanaged: ["Not managed", "Provisioned membership is not required. Corporate authentication and any inactive tombstones still apply."],
+      tenant_disabled: ["Tenant disabled · access denied", "The tenant is disabled independently of this user's global account state."]
+    };
+    const [label, description] = states[access && access.state] || ["Not reported", "The server did not report this tenant's lifecycle state. Global account status does not establish tenant access."];
+    return {label, description};
+  }
+
   function renderUserRows(users) {
     userRows.replaceChildren();
     setCountLabel(userCount, users.length, "users");
@@ -654,6 +675,7 @@
       row.dataset.userId = user.id;
       row.dataset.userDisabled = String(user.disabled);
       row.dataset.userAdmin = String(user.admin);
+      row.dataset.userTenantAccess = user.tenantAccess?.state || "";
 
       const profile = document.createElement("td");
       setText(profile, user.displayName || user.email || "Unnamed user", "zeroth-row-title");
@@ -663,8 +685,18 @@
       const state = document.createElement("td");
       const statePill = document.createElement("span");
       statePill.className = user.disabled ? "zeroth-status zeroth-status-warn" : "zeroth-status zeroth-status-ok";
-      statePill.textContent = user.disabled ? "Disabled" : "Active";
+      statePill.textContent = user.disabled ? "Account disabled" : "Account active";
+      statePill.title = "Global Zeroth account status; this is separate from directory access to a selected tenant.";
       state.appendChild(statePill);
+      if (loadedUsersTenantId) {
+        const access = user.tenantAccess;
+        const summary = tenantAccessDescription(access);
+        const line = setText(state, `Tenant: ${summary.label}`, "zeroth-row-meta zeroth-tenant-access");
+        line.dataset.state = access?.state || "unknown";
+        const source = access?.source === "entra" ? "Microsoft Entra" : access?.source === "google_workspace" ? "Google Workspace" : access?.source || "No directory source";
+        line.title = `${summary.description}\nSource: ${source}\nUpdated: ${displayTime(access?.updatedAt)}\nLast completed sync: ${displayTime(access?.lastSyncAt)}\nManaged: ${access?.managed ? "yes" : "no"}`;
+        if (access?.source) setText(state, source, "zeroth-row-meta");
+      }
 
       const admin = document.createElement("td");
       const adminPill = document.createElement("span");
@@ -796,17 +828,22 @@
   }
 
   function applyUserFilters() {
+    $("zeroth-user-tenant-access-field").hidden = !loadedUsersTenantId;
+    userFilterForm.elements.tenant_access.disabled = !loadedUsersTenantId;
+    if (usersLoading) return;
     const search = userFilterForm.elements.search.value.trim().toLowerCase();
     const state = userFilterForm.elements.status.value;
     const role = userFilterForm.elements.role.value;
+    const lifecycle = loadedUsersTenantId ? userFilterForm.elements.tenant_access.value : "";
     const selected = loadedUsers.filter((user) => {
       const searchable = [user.id, user.displayName, user.email].filter(Boolean).join(" ").toLowerCase();
       return (!search || searchable.includes(search))
         && (!state || (state === "disabled") === Boolean(user.disabled))
-        && (!role || (role === "admin") === Boolean(user.admin));
+        && (!role || (role === "admin") === Boolean(user.admin))
+        && (!lifecycle || user.tenantAccess?.state === lifecycle);
     });
     renderUserRows(selected);
-    $("zeroth-users-summary").textContent = `${selected.length} of ${loadedUsers.length} loaded users · Search applies to this list, not the full directory.`;
+    $("zeroth-users-summary").textContent = `${selected.length} of ${loadedUsers.length} loaded users${loadedUsersTenantId ? ` · Tenant ${loadedUsersTenantId}` : " · All tenants"} · Search applies to this list. Account state is global; tenant lifecycle is separate.`;
   }
 
   async function viewUser(row) {
@@ -821,7 +858,7 @@
       setText(body, user.displayName || user.email || user.id || "User", "zeroth-row-title");
       setText(body, user.email || "No email recorded", "zeroth-row-meta");
       setText(body, user.id || "", "zeroth-row-meta zeroth-code");
-      setText(body, `${user.disabled ? "Disabled" : "Active"} · ${user.admin ? "Deployment administrator" : "Member"}`, "zeroth-row-meta");
+      setText(body, `Global account: ${user.disabled ? "Disabled" : "Active"} · ${user.admin ? "Deployment administrator" : "Member"}`, "zeroth-row-meta");
       for (const [label, entries, describe] of [
         ["Linked identities", result.identities || [], (identity) => `${identity.providerId || "Identity"} · ${identity.email || identity.providerSubject || "No email"}${identity.emailVerified ? " · Email verified" : ""}`],
         ["Active sessions", result.activeSessions || [], (session) => `${session.clientId || "Browser session"} · Expires ${displayTime(session.expiresAt)}`]
@@ -855,6 +892,178 @@
     }
   }
 
+  function provisioningStatusRows(target, entries) {
+    target.replaceChildren();
+    for (const [label, value] of entries) {
+      const term = document.createElement("dt"); term.textContent = label;
+      const definition = document.createElement("dd"); definition.textContent = String(value ?? "Not recorded");
+      target.append(term, definition);
+    }
+  }
+
+  function provisioningPolicy(enabled, stale = false) {
+    const policy = $("zeroth-provisioning-policy");
+    policy.hidden = false;
+    policy.textContent = stale
+      ? "Directory health is stale. New sign-ins and online grants are denied until a complete validated sync restores freshness."
+      : enabled
+      ? "Managed access is enabled. An identity must have an active provisioned directory record before it can sign in. Enabling this policy invalidates earlier tenant grants."
+      : "Managed-only admission is not active. Previously unknown signed corporate identities may be admitted without a provisioned record. Inactive-member tombstones continue to deny access.";
+  }
+
+  function renderScimStatus(body) {
+    scimStatus = body;
+    scimForm.elements.enabled.checked = Boolean(body.enabled);
+    scimForm.elements.tokenBinding.value = body.tokenBinding || "";
+    $("zeroth-scim-endpoint").value = body.endpoint || "Not available";
+    provisioningStatusRows($("zeroth-scim-status"), [
+      ["Provisioned-user requirement", body.enabled ? "Required · active provisioned identities only" : "Not required · unknown corporate identities may sign in"],
+      ["Token credential", body.credentialsConfigured ? "Configured in deployment · not a live connection test" : "Awaiting deployment token"],
+      ["Last SCIM activity", displayTime(body.lastActivityAt)],
+      ["Last recorded error code", body.lastErrorCode || "None recorded"],
+      ["Managed directory members", body.managedUsers ?? 0],
+      ["Active directory members", body.activeUsers ?? 0]
+    ]);
+    provisioningPolicy(Boolean(body.enabled));
+  }
+
+  function renderDirectoryStatus(body) {
+    directoryStatus = body;
+    const managed = Boolean(body.managedEnforced);
+    const stale = managed && (body.stale !== false || body.lastSuccessAt == null);
+    for (const name of ["customerId", "delegatedAdminEmail", "serviceAccountSecretBinding"]) directoryForm.elements[name].value = body[name] || "";
+    directoryForm.elements.customerId.readOnly = Boolean(body.customerIdLocked);
+    directoryForm.elements.enabled.checked = Boolean(body.enabled);
+    provisioningStatusRows($("zeroth-google-directory-status"), [
+      ["Automatic polling", body.enabled ? "Enabled" : "Paused"],
+      ["Managed access", body.managedEnforced ? "Enforced · active directory identities only" : "Not activated"],
+      ["Directory freshness", managed ? (stale ? "Stale / not yet synced · online access denied" : "Fresh · completed sync recorded") : "Not activated"],
+      ["Freshness limit", body.staleAfterSeconds ? `${body.staleAfterSeconds} seconds after a completed sync` : "Not recorded"],
+      ["Service-account credential", body.credentialsConfigured ? "Configured in deployment · not a live directory test" : "Awaiting deployment service-account key"],
+      ["Directory boundary", body.customerIdLocked ? "Verified customer ID · locked" : "Customer ID not yet verified"],
+      ["Last attempted sync", displayTime(body.lastAttemptAt)],
+      ["Last complete successful sync", displayTime(body.lastSuccessAt)],
+      ["Last error code", body.lastErrorCode || "None recorded"],
+      ["Users seen at last success", body.lastSeenCount],
+      ["Users deactivated at last success", body.lastDeactivatedCount],
+      ["Target polling interval", body.syncIntervalSeconds ? `${body.syncIntervalSeconds} seconds` : "Not configured"],
+      ["Next scheduled attempt", displayTime(body.nextSyncAt)]
+    ]);
+    $("zeroth-directory-sync").disabled = !body.enabled || !body.credentialsConfigured || Boolean(editingTenant && editingTenant.disabled);
+    provisioningPolicy(managed, stale);
+  }
+
+  function setProvisioningBusy(busy) {
+    for (const form of [scimForm, directoryForm]) {
+      form.setAttribute("aria-busy", String(busy));
+      for (const control of form.querySelectorAll("input,button")) control.disabled = busy;
+    }
+    $("zeroth-provisioning-refresh").disabled = busy || !editingTenant;
+    $("zeroth-scim-copy").disabled = busy;
+    if (!busy && directoryStatus) $("zeroth-directory-sync").disabled = !directoryStatus.enabled || !directoryStatus.credentialsConfigured || Boolean(editingTenant && editingTenant.disabled);
+  }
+
+  function invalidateProvisioningView(message) {
+    provisioningEpoch += 1; scimStatus = null; directoryStatus = null;
+    $("zeroth-scim-panel").hidden = true;
+    $("zeroth-google-directory-panel").hidden = true;
+    $("zeroth-provisioning-policy").hidden = true;
+    $("zeroth-provisioning-intro").textContent = message;
+    $("zeroth-provisioning-refresh").disabled = true;
+  }
+
+  async function loadTenantProvisioning(tenant) {
+    invalidateProvisioningView("Save the tenant before configuring provisioning.");
+    if (!tenant) return;
+    const provider = tenant.enterpriseProvider;
+    if (!["entra", "google_workspace"].includes(provider)) {
+      $("zeroth-provisioning-intro").textContent = "Select and save a corporate provider before configuring provisioning.";
+      return;
+    }
+    const epoch = provisioningEpoch;
+    $("zeroth-provisioning-intro").textContent = `Loading provisioning settings for ${tenant.name}…`;
+    setProvisioningBusy(true);
+    try {
+      const path = provider === "entra" ? "/tenants/provisioning" : "/tenants/google-directory";
+      const body = await api(`${path}?tenant_id=${encodeURIComponent(tenant.id)}`);
+      if (epoch !== provisioningEpoch || !editingTenant || editingTenant.id !== tenant.id) return;
+      if (body.tenantId !== tenant.id) throw new Error("Provisioning response did not match the selected tenant");
+      if (provider === "entra") { renderScimStatus(body); $("zeroth-scim-panel").hidden = false; }
+      else { renderDirectoryStatus(body); $("zeroth-google-directory-panel").hidden = false; }
+      $("zeroth-provisioning-intro").textContent = `Provisioning settings for ${tenant.name}. Save these separately from the tenant settings above.`;
+    } catch (error) {
+      if (epoch === provisioningEpoch) $("zeroth-provisioning-intro").textContent = `Could not load provisioning settings: ${error.message}. Refresh status to try again.`;
+      throw error;
+    } finally { if (epoch === provisioningEpoch) setProvisioningBusy(false); }
+  }
+
+  function confirmLifecycleChange(previous, enabled) {
+    if (Boolean(previous) === enabled) return true;
+    return window.confirm(enabled
+      ? "Require provisioned users? Existing tenant grants will be revoked, possibly including this session. Users without an active provisioned record cannot sign in until initial provisioning succeeds."
+      : "Stop requiring provisioned users? Previously unknown signed corporate identities may sign in without a provisioned record. Inactive or deleted member records will still deny access.");
+  }
+
+  async function saveScim(event) {
+    event.preventDefault();
+    if (!editingTenant || !scimStatus || editingTenant.enterpriseProvider !== "entra") throw new Error("Refresh the saved tenant's SCIM settings before saving");
+    const tenant = editingTenant;
+    const enabled = scimForm.elements.enabled.checked;
+    const tokenBinding = scimForm.elements.tokenBinding.value.trim() || null;
+    if (tokenBinding && !/^TENANT_[A-Z0-9_]+_SCIM_TOKEN$/.test(tokenBinding)) throw new Error("Enter a SCIM secret binding such as TENANT_ACME_SCIM_TOKEN. Never paste a token value.");
+    if (!confirmLifecycleChange(scimStatus.enabled, enabled)) return;
+    const epoch = provisioningEpoch; setProvisioningBusy(true);
+    try {
+      await api(`/tenants/provisioning?tenant_id=${encodeURIComponent(tenant.id)}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({tenantId:tenant.id,enabled,tokenBinding}) });
+      if (epoch !== provisioningEpoch) return;
+      try { await loadTenantProvisioning(tenant); }
+      catch (error) { setMessage(`SCIM settings saved. Could not refresh status: ${error.message}. Activating the requirement may revoke this session; sign in again after initial provisioning if needed.`, true); return; }
+      setMessage(`Saved SCIM settings for ${tenant.name}. Credential presence and received activity are shown separately below.`);
+    } finally { if (epoch === provisioningEpoch) setProvisioningBusy(false); }
+  }
+
+  async function saveDirectory(event) {
+    event.preventDefault();
+    if (!editingTenant || !directoryStatus || editingTenant.enterpriseProvider !== "google_workspace") throw new Error("Refresh the saved tenant's Directory settings before saving");
+    const tenant = editingTenant;
+    const optional = (name) => directoryForm.elements[name].value.trim() || null;
+    const payload = {tenantId:tenant.id,enabled:directoryForm.elements.enabled.checked,customerId:optional("customerId"),delegatedAdminEmail:optional("delegatedAdminEmail"),serviceAccountSecretBinding:optional("serviceAccountSecretBinding")};
+    if (payload.customerId === "my_customer") throw new Error("Use the exact pinned Google Workspace customer ID, not my_customer");
+    if (payload.serviceAccountSecretBinding && !/^TENANT_[A-Z0-9_]+_GOOGLE_DIRECTORY_SERVICE_ACCOUNT$/.test(payload.serviceAccountSecretBinding)) throw new Error("Enter a service-account secret binding such as TENANT_ACME_GOOGLE_DIRECTORY_SERVICE_ACCOUNT. Never paste the JSON key.");
+    if (Boolean(directoryStatus.enabled) !== payload.enabled && !window.confirm(payload.enabled
+      ? "Enable automatic directory polling? Managed access becomes permanent after first activation, existing tenant grants are revoked, and users require active directory records from a complete fresh sync."
+      : "Pause directory polling? Managed access remains enforced. New sign-ins and online grants will be denied once the last completed sync is more than 15 minutes old.")) return;
+    const epoch = provisioningEpoch; setProvisioningBusy(true);
+    try {
+      await api("/tenants/google-directory-config", {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
+      if (epoch !== provisioningEpoch) return;
+      try { await loadTenantProvisioning(tenant); }
+      catch (error) { setMessage(`Directory settings saved. Could not refresh status: ${error.message}. Activating managed access may revoke this session; sign in again after a complete sync if needed.`, true); return; }
+      setMessage(`Saved Directory settings for ${tenant.name}. Run and verify a complete sync before onboarding users.`);
+    } finally { if (epoch === provisioningEpoch) setProvisioningBusy(false); }
+  }
+
+  async function syncDirectory() {
+    if (!editingTenant || !directoryStatus || !directoryStatus.enabled || !directoryStatus.credentialsConfigured) throw new Error("Enable and configure Directory sync before running it");
+    const tenant = editingTenant;
+    if (!window.confirm(`Run a full Directory sync for ${tenant.name}? Confirmed inactive members can lose tenant access and have their local grants revoked.`)) return;
+    const epoch = provisioningEpoch; setProvisioningBusy(true);
+    $("zeroth-provisioning-intro").textContent = `Running a full directory sync for ${tenant.name}…`;
+    try {
+      const body = await api("/tenants/google-directory-sync", {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({tenantId:tenant.id})});
+      if (epoch !== provisioningEpoch || !editingTenant || editingTenant.id !== tenant.id) return;
+      if (body.tenantId !== tenant.id) throw new Error("Sync response did not match the selected tenant");
+      renderDirectoryStatus(body);
+      $("zeroth-provisioning-intro").textContent = body.lastErrorCode ? `Directory sync reported ${body.lastErrorCode}. Last successful sync is shown below.` : `Directory sync completed for ${tenant.name}.`;
+      setMessage(body.lastErrorCode ? `Directory sync reported ${body.lastErrorCode}.` : `Completed directory sync for ${tenant.name}.`, Boolean(body.lastErrorCode));
+    } catch (error) {
+      if (epoch === provisioningEpoch) {
+        await loadTenantProvisioning(tenant).catch(() => {});
+        setMessage(`Directory sync failed: ${error.message}. Check the last completed sync and error status.`, true);
+      }
+    } finally { if (epoch === provisioningEpoch) setProvisioningBusy(false); }
+  }
+
   function editTenant(tenant = null) {
     editingTenant = tenant;
     refreshTenantClientPicker();
@@ -875,6 +1084,7 @@
       ? "Provider credentials are configured. This confirms configuration presence; it does not prove a successful sign-in."
       : "Awaiting provider settings or deployment credentials. Saving a draft does not enable corporate sign-in.";
     syncTenantProvider();
+    loadTenantProvisioning(tenant).catch((error) => setMessage(error.message, true));
     tenantEditor.hidden = false;
     tenantEditor.scrollIntoView({ block: "start", behavior: "smooth" });
     tenantForm.elements[tenant ? "name" : "id"].focus({ preventScroll: true });
@@ -972,10 +1182,20 @@
   async function loadUsers() {
     const requestId = ++userRequestId;
     const tenant = userFilterForm.elements.tenant_id.value;
-    const body = await api(tenant ? `${usersEndpoint}?tenant_id=${encodeURIComponent(tenant)}` : usersEndpoint);
-    if (requestId !== userRequestId) return;
-    loadedUsers = body.users || [];
-    applyUserFilters(); status.textContent = "Connected";
+    usersLoading = true; userRows.setAttribute("aria-busy", "true");
+    if (tenant !== loadedUsersTenantId) { loadedUsers = []; loadedUsersTenantId = tenant; userRows.replaceChildren(); }
+    $("zeroth-users-summary").textContent = tenant ? `Loading users for tenant ${tenant}…` : "Loading deployment users…";
+    try {
+      const body = await api(tenant ? `${usersEndpoint}?tenant_id=${encodeURIComponent(tenant)}` : usersEndpoint);
+      if (requestId !== userRequestId) return;
+      loadedUsers = body.users || []; loadedUsersTenantId = tenant;
+      usersLoading = false; applyUserFilters(); status.textContent = "Connected";
+    } catch (error) {
+      if (requestId === userRequestId) $("zeroth-users-summary").textContent = "Could not load users for the selected scope. Refresh users to try again.";
+      throw error;
+    } finally {
+      if (requestId === userRequestId) { usersLoading = false; userRows.setAttribute("aria-busy", "false"); }
+    }
   }
 
   async function loadEvents(cursor = null, useApplied = false) {
@@ -1283,7 +1503,16 @@
   tenantForm.elements.id.addEventListener("input", refreshTenantClientPicker);
   tenantForm.elements.enterpriseProvider.addEventListener("change", () => {
     syncTenantProvider();
+    invalidateProvisioningView("Save the changed corporate provider before configuring provisioning.");
     $("zeroth-tenant-connection-status").textContent = "Unsaved settings. Credential availability will be checked after saving.";
+  });
+  scimForm.addEventListener("submit", (event) => saveScim(event).catch((error) => setMessage(error.message, true)));
+  directoryForm.addEventListener("submit", (event) => saveDirectory(event).catch((error) => setMessage(error.message, true)));
+  $("zeroth-provisioning-refresh").addEventListener("click", () => { if (editingTenant) loadTenantProvisioning(editingTenant).catch((error) => setMessage(error.message, true)); });
+  $("zeroth-directory-sync").addEventListener("click", () => syncDirectory().catch((error) => setMessage(error.message, true)));
+  $("zeroth-scim-copy").addEventListener("click", async () => {
+    try { await navigator.clipboard.writeText($("zeroth-scim-endpoint").value); setMessage("Copied the tenant SCIM endpoint."); }
+    catch (_) { $("zeroth-scim-endpoint").select(); setMessage("Select and copy the SCIM endpoint from the field."); }
   });
   tenantForm.addEventListener("submit", (event) => saveTenant(event).catch((error) => setMessage(error.message, true)));
   tenantRows.addEventListener("click", (event) => {
@@ -1297,7 +1526,7 @@
     }
   });
   userFilterForm.addEventListener("submit", (event) => event.preventDefault());
-  for (const name of ["search", "status", "role"]) userFilterForm.elements[name].addEventListener("input", applyUserFilters);
+  for (const name of ["search", "status", "role", "tenant_access"]) userFilterForm.elements[name].addEventListener("input", applyUserFilters);
   userFilterForm.elements.tenant_id.addEventListener("change", () => loadUsers().catch((error) => setMessage(error.message, true)));
   $("zeroth-events-next").addEventListener("click", () => { if (nextEventCursor) loadEvents(nextEventCursor).catch((error) => setMessage(error.message, true)); });
   $("zeroth-events-latest").addEventListener("click", () => loadEvents(null, true).catch((error) => setMessage(error.message, true)));

@@ -71,6 +71,58 @@ pub const ROUTES: &[Route] = &[
     },
     Route {
         method: "GET",
+        path: "/tenants/provisioning",
+    },
+    Route {
+        method: "POST",
+        path: "/tenants/provisioning",
+    },
+    Route {
+        method: "GET",
+        path: "/tenants/google-directory",
+    },
+    Route {
+        method: "POST",
+        path: "/tenants/google-directory-config",
+    },
+    Route {
+        method: "POST",
+        path: "/tenants/google-directory-sync",
+    },
+    Route {
+        method: "GET",
+        path: "/scim/v2/:tenant_id/ServiceProviderConfig",
+    },
+    Route {
+        method: "GET",
+        path: "/scim/v2/:tenant_id/Schemas",
+    },
+    Route {
+        method: "GET",
+        path: "/scim/v2/:tenant_id/Users",
+    },
+    Route {
+        method: "POST",
+        path: "/scim/v2/:tenant_id/Users",
+    },
+    Route {
+        method: "GET",
+        path: "/scim/v2/:tenant_id/Users/:id",
+    },
+    Route {
+        method: "PUT",
+        path: "/scim/v2/:tenant_id/Users/:id",
+    },
+    Route {
+        method: "PATCH",
+        path: "/scim/v2/:tenant_id/Users/:id",
+    },
+    Route {
+        method: "DELETE",
+        path: "/scim/v2/:tenant_id/Users/:id",
+    },
+    Route {
+        method: "GET",
         path: "/audit",
     },
     Route {

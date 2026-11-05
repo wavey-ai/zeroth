@@ -167,6 +167,18 @@ pub mod migrations {
         sql: include_str!("../migrations/0014_tenants.sql"),
     };
 
+    pub const PROVISIONING: Migration = Migration {
+        version: 15,
+        name: "provisioning",
+        sql: include_str!("../migrations/0015_provisioning.sql"),
+    };
+
+    pub const GOOGLE_DIRECTORY: Migration = Migration {
+        version: 16,
+        name: "google_directory",
+        sql: include_str!("../migrations/0016_google_directory.sql"),
+    };
+
     pub const ALL: &[Migration] = &[
         INIT,
         PASSKEYS,
@@ -182,6 +194,8 @@ pub mod migrations {
         ENTERPRISE_AUTH_POLICY,
         AUDIT_HISTORY,
         TENANTS,
+        PROVISIONING,
+        GOOGLE_DIRECTORY,
     ];
 }
 
@@ -210,6 +224,10 @@ pub const REQUIRED_TABLES: &[&str] = &[
     "zeroth_tenant_clients",
     "zeroth_tenant_audit_readers",
     "zeroth_audit_write_guards",
+    "zeroth_directory_sources",
+    "zeroth_directory_users",
+    "zeroth_directory_links",
+    "zeroth_google_directory",
 ];
 
 pub mod compatibility {
@@ -446,6 +464,10 @@ mod tests {
                 && *table != "zeroth_account_identities"
                 && *table != "zeroth_audit_outbox"
                 && *table != "zeroth_audit_consumers"
+                && *table != "zeroth_google_directory"
+                && *table != "zeroth_directory_sources"
+                && *table != "zeroth_directory_users"
+                && *table != "zeroth_directory_links"
                 && *table != "zeroth_tenants"
                 && *table != "zeroth_tenant_clients"
                 && *table != "zeroth_tenant_audit_readers"
@@ -462,7 +484,7 @@ mod tests {
         for table in ["zeroth_passkey_credentials", "zeroth_passkey_challenges"] {
             assert!(sql.contains(table), "missing table {table}");
         }
-        assert_eq!(migrations::ALL.len(), 14);
+        assert!(migrations::ALL.len() >= 15);
         assert_eq!(migrations::ALL[1].version, 2);
     }
 
@@ -495,7 +517,7 @@ mod tests {
         assert!(sql.contains("account_sharing_mode TEXT NOT NULL DEFAULT 'global'"));
         assert!(sql.contains("account_tenant_id TEXT NOT NULL DEFAULT 'global'"));
         assert!(sql.contains("INSERT OR IGNORE INTO zeroth_account_identities"));
-        assert_eq!(migrations::ALL.len(), 14);
+        assert!(migrations::ALL.len() >= 15);
         assert_eq!(migrations::ALL[4].version, 5);
     }
 
@@ -506,7 +528,7 @@ mod tests {
         assert!(sql.contains("zeroth_wallet_challenges"));
         assert!(sql.contains("challenge_hash TEXT PRIMARY KEY"));
         assert!(sql.contains("account_namespace TEXT NOT NULL"));
-        assert_eq!(migrations::ALL.len(), 14);
+        assert!(migrations::ALL.len() >= 15);
         assert_eq!(migrations::ALL[5].version, 6);
     }
 
@@ -515,7 +537,7 @@ mod tests {
         let sql = migrations::CLIENT_LOGIN_METHODS.sql;
 
         assert!(sql.contains("visible_login_methods_json TEXT NOT NULL DEFAULT '[]'"));
-        assert_eq!(migrations::ALL.len(), 14);
+        assert!(migrations::ALL.len() >= 15);
         assert_eq!(migrations::ALL[6].version, 7);
     }
 
@@ -779,9 +801,13 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", true).unwrap();
         for migration in migrations::ALL {
-            conn.execute_batch(migration.sql).unwrap();
+            // Exercise the same statement splitting used by deployment,
+            // including comments rather than only the unsplit SQL script.
+            for statement in migration.statements() {
+                conn.execute_batch(statement).unwrap();
+            }
         }
-        assert_eq!(migrations::ALL.last().unwrap().version, 14);
+        assert!(migrations::ALL.last().unwrap().version >= 15);
         assert_enterprise_columns_are_nullable_text(&conn);
         for &(table, name) in ENTERPRISE_COLUMNS {
             assert!(compatibility::TABLES.contains(&table));

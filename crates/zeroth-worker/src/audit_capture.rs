@@ -42,9 +42,11 @@ pub(super) const CLIENT_POLICY_GUARD_SQL: &str = "INSERT INTO zeroth_audit_write
         AND account_tenant_id IS ?13 AND visible_login_methods_json IS ?14
         AND confidential IS ?15 AND disabled_at IS ?16)) THEN 1 ELSE 0 END";
 
-pub(super) const CLIENT_USER_SCOPE_GUARD_SQL: &str =
-    "INSERT INTO zeroth_audit_write_guards (id, valid)
-    SELECT ?1, CASE WHEN EXISTS (
+// One predicate supplies both the historical core-only SQL and the production
+// composite guard, so tenant/provider checks cannot diverge between them.
+macro_rules! client_user_scope_predicate_sql {
+    () => {
+        "EXISTS (
         SELECT 1 FROM zeroth_clients c WHERE c.id=?3 AND c.disabled_at IS NULL
           AND (c.enterprise_provider IS NULL OR c.enterprise_provider=?4)
           AND EXISTS (SELECT 1 FROM zeroth_users u WHERE u.id=?2 AND u.disabled_at IS NULL)
@@ -56,7 +58,29 @@ pub(super) const CLIENT_USER_SCOPE_GUARD_SQL: &str =
                   AND ai.provider_id=t.enterprise_provider
                   AND c.account_sharing_mode='tenant' AND c.account_tenant_id=t.id
                   AND c.enterprise_provider=t.enterprise_provider))
-    ) THEN 1 ELSE 0 END";
+    )"
+    };
+}
+
+#[cfg(test)]
+pub(super) const CLIENT_USER_SCOPE_GUARD_SQL: &str = concat!(
+    "INSERT INTO zeroth_audit_write_guards (id, valid) SELECT ?1, CASE WHEN ",
+    client_user_scope_predicate_sql!(),
+    " THEN 1 ELSE 0 END"
+);
+
+pub(super) fn client_user_scope_guard_sql() -> String {
+    // The shared lifecycle SELECT uses exactly ?1=user, ?2=client, ?3=now.
+    // Descending replacement avoids remapping a newly generated placeholder.
+    let lifecycle = super::provisioning::LIFECYCLE_USER_ACTIVE_SQL
+        .replace("?3", "?5")
+        .replace("?2", "?3")
+        .replace("?1", "?2");
+    format!(
+        "INSERT INTO zeroth_audit_write_guards (id, valid) SELECT ?1, CASE WHEN {} AND ({lifecycle})=1 THEN 1 ELSE 0 END",
+        client_user_scope_predicate_sql!()
+    )
+}
 
 #[cfg(target_arch = "wasm32")]
 pub(super) fn client_user_scope_guard(
@@ -67,11 +91,12 @@ pub(super) fn client_user_scope_guard(
     auth_provider: Option<&str>,
 ) -> worker::Result<worker::d1::D1PreparedStatement> {
     use worker::d1::D1Type as V;
-    db.prepare(CLIENT_USER_SCOPE_GUARD_SQL).bind_refs(&[
+    db.prepare(client_user_scope_guard_sql()).bind_refs(&[
         V::Text(guard_id),
         V::Text(user_id),
         V::Text(client_id),
         super::d1_optional_text(auth_provider),
+        V::Integer(super::unix_timestamp_seconds()),
     ])
 }
 
@@ -398,7 +423,9 @@ mod tests {
         let connection = Connection::open_in_memory().unwrap();
         connection.execute_batch("PRAGMA foreign_keys=ON").unwrap();
         for migration in zeroth_storage::migrations::ALL {
-            connection.execute_batch(migration.sql).unwrap();
+            for statement in migration.statements() {
+                connection.execute_batch(statement).unwrap();
+            }
         }
         connection
     }
@@ -433,6 +460,167 @@ mod tests {
             params![event.event_id, json, event.recorded_at],
         )?;
         Ok(())
+    }
+
+    fn guarded_connection(provider: &str) -> Connection {
+        let db = connection();
+        db.execute_batch("INSERT INTO zeroth_users(id,created_at,updated_at) VALUES ('usr_subject',1,1);
+            INSERT INTO zeroth_tenants(id,name,enterprise_provider,entra_tenant_id,created_at,updated_at)
+              VALUES ('acme','Acme','entra','11111111-2222-3333-4444-555555555555',1,1);").unwrap();
+        db.execute(
+            "UPDATE zeroth_tenants SET enterprise_provider=?1 WHERE id='acme'",
+            [provider],
+        )
+        .unwrap();
+        db.execute("INSERT INTO zeroth_clients(id,name,redirect_uris_json,enterprise_provider,account_sharing_mode,account_tenant_id,created_at,updated_at)
+            VALUES ('app','App','[]',?1,'tenant','acme',1,1)",[provider]).unwrap();
+        db.execute("INSERT INTO zeroth_tenant_clients(client_id,tenant_id,enterprise_provider) VALUES ('app','acme',?1)",[provider]).unwrap();
+        db.execute("INSERT INTO zeroth_account_identities(account_namespace,provider_id,provider_subject,user_id,created_at,updated_at)
+            VALUES ('tenant:acme',?1,'subject','usr_subject',1,1)",[provider]).unwrap();
+        db.execute("INSERT INTO zeroth_directory_sources(tenant_id,provider_id,authority_id,enabled,last_full_sync_at,created_at,updated_at)
+            VALUES ('acme',?1,?2,1,100,1,1)",params![provider,if provider=="entra" {"11111111-2222-3333-4444-555555555555"}else{"C012345"}]).unwrap();
+        db.execute("INSERT INTO zeroth_directory_users(id,tenant_id,provider_id,authority_id,external_id,user_name,user_name_key,active,deleted,user_id,created_at,updated_at)
+            SELECT 'dir_one',tenant_id,provider_id,authority_id,'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee','user@example.com','user@example.com',1,0,'usr_subject',1,1 FROM zeroth_directory_sources WHERE tenant_id='acme'",[]).unwrap();
+        db
+    }
+
+    fn assert_scope(db: &Connection, provider: Option<&str>, now: i32, allowed: bool) {
+        let result = db.execute(
+            &client_user_scope_guard_sql(),
+            params!["scope_check", "usr_subject", "app", provider, now],
+        );
+        assert_eq!(result.is_ok(), allowed, "provider={provider:?} now={now}");
+        db.execute(
+            "DELETE FROM zeroth_audit_write_guards WHERE id='scope_check'",
+            [],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn lifecycle_race_rolls_back_each_credential_and_its_audit_in_the_same_transaction() {
+        for mutation in [
+            "INSERT INTO zeroth_sessions(id,user_id,client_id,created_at,expires_at) VALUES ('session','usr_subject','app',100,10000)",
+            "INSERT INTO zeroth_auth_codes(code_hash,client_id,redirect_uri,user_id,scope,created_at,expires_at) VALUES ('code','app','https://app.example/callback','usr_subject','openid',100,10000)",
+            "INSERT INTO zeroth_refresh_tokens(token_hash,client_id,user_id,scope,created_at,expires_at) VALUES ('refresh','app','usr_subject','openid',100,10000)",
+        ] {
+            let mut db = guarded_connection("entra");
+            // Simulate a successful asynchronous precheck followed by a
+            // committed offboarding signal before the issuance transaction.
+            assert_scope(&db, Some("entra"), 100, true);
+            db.execute(
+                "UPDATE zeroth_directory_users SET active=0,updated_at=101",
+                [],
+            )
+            .unwrap();
+            let audit = event(
+                "evt_racing_issue".into(),
+                "token.issue",
+                AuditActor::new("user", "usr_subject").unwrap(),
+                Some("usr_subject"),
+                Some("app"),
+                Some("entra"),
+                &serde_json::json!({}),
+                102,
+            )
+            .unwrap();
+            {
+                let tx = db.transaction().unwrap();
+                tx.execute(mutation, []).unwrap();
+                insert(&tx, &audit).unwrap();
+                assert!(
+                    tx.execute(
+                        &client_user_scope_guard_sql(),
+                        params!["scope", "usr_subject", "app", "entra", 102]
+                    )
+                    .is_err()
+                );
+                // Dropping the failed transaction matches D1 batch rollback,
+                // including writes that preceded the failing CHECK guard.
+            }
+            for table in [
+                "zeroth_sessions",
+                "zeroth_auth_codes",
+                "zeroth_refresh_tokens",
+                "zeroth_audit_events",
+                "zeroth_audit_outbox",
+                "zeroth_audit_write_guards",
+            ] {
+                assert_eq!(
+                    db.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row
+                        .get::<_, i32>(0))
+                        .unwrap(),
+                    0,
+                    "{table}"
+                );
+            }
+            assert_eq!(
+                db.query_row("SELECT active FROM zeroth_directory_users", [], |row| row
+                    .get::<_, i32>(
+                    0
+                ))
+                .unwrap(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn production_scope_guard_enforces_unknown_stale_and_persistent_denial_states() {
+        let db = guarded_connection("entra");
+        assert_scope(&db, Some("entra"), 100, true);
+        db.execute("UPDATE zeroth_directory_users SET user_id=NULL", [])
+            .unwrap();
+        assert_scope(&db, Some("entra"), 100, false);
+        db.execute("UPDATE zeroth_directory_sources SET enabled=0", [])
+            .unwrap();
+        assert_scope(&db, Some("entra"), 100, true);
+        db.execute("INSERT INTO zeroth_directory_links(tenant_id,provider_id,authority_id,external_id,user_id,created_at)
+            SELECT tenant_id,provider_id,authority_id,external_id,'usr_subject',1 FROM zeroth_directory_users",[]).unwrap();
+        db.execute("UPDATE zeroth_directory_users SET active=0", [])
+            .unwrap();
+        assert_scope(&db, Some("entra"), 100, false);
+
+        let google = guarded_connection("google_workspace");
+        assert_scope(&google, Some("google_workspace"), 1000, true);
+        assert_scope(&google, Some("google_workspace"), 1001, false);
+        google
+            .execute(
+                "UPDATE zeroth_directory_sources SET last_full_sync_at=NULL",
+                [],
+            )
+            .unwrap();
+        assert_scope(&google, Some("google_workspace"), 100, false);
+    }
+
+    #[test]
+    fn combined_scope_guard_preserves_tenant_provider_proof_and_legacy_behavior() {
+        let db = guarded_connection("entra");
+        assert_scope(&db, None, 100, false);
+        assert_scope(&db, Some("google_workspace"), 100, false);
+        assert_scope(&db, Some("entra"), 100, true);
+        db.execute(
+            "UPDATE zeroth_account_identities SET account_namespace='global'",
+            [],
+        )
+        .unwrap();
+        assert_scope(&db, Some("entra"), 100, false);
+        db.execute(
+            "UPDATE zeroth_account_identities SET account_namespace='tenant:acme'",
+            [],
+        )
+        .unwrap();
+        db.execute("UPDATE zeroth_tenants SET disabled=1", [])
+            .unwrap();
+        assert_scope(&db, Some("entra"), 100, false);
+        db.execute("DELETE FROM zeroth_tenant_clients", []).unwrap();
+        db.execute("UPDATE zeroth_clients SET enterprise_provider=NULL,account_sharing_mode='global',account_tenant_id='global'",[]).unwrap();
+        db.execute("UPDATE zeroth_directory_users SET active=0,deleted=1", [])
+            .unwrap();
+        assert_scope(&db, None, 50000, true);
+        db.execute("UPDATE zeroth_users SET disabled_at=100", [])
+            .unwrap();
+        assert_scope(&db, None, 50000, false);
     }
 
     #[test]

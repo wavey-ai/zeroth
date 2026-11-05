@@ -64,6 +64,12 @@ Implemented so far:
   customer-owned connections, tenant account isolation, application bindings and
   audit-reader permissions. Credentials remain in dedicated deployment secret
   bindings. See the [enterprise administration guide](docs/enterprise-admin-setup.html)
+- Entra SCIM 2.0 user provisioning and Google Workspace Directory sync with
+  tenant-scoped offboarding, immutable directory object links, dedicated secret
+  references, scheduled polling and safe stale-directory denial. Directory removal
+  revokes that tenant's grants without disabling a shared account in other tenants.
+  Enterprise access JWTs last five minutes; hosted corporate sessions have an
+  eight-hour absolute lifetime. Upstream provisioning/polling latency still applies
 - OIDC authorization request parsing and registered-client validation
 - native loopback redirect validation for Swift clients that use an ephemeral
   localhost callback port

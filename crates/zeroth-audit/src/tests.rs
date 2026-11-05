@@ -312,3 +312,28 @@ fn persistence_is_explicit_and_works_when_tracing_is_disabled() {
     });
     assert_eq!(sink.0.lock().unwrap().len(), 1);
 }
+
+#[test]
+fn downstream_issuer_grant_is_retained_without_accepting_unapproved_grant_values() {
+    let details = SafeDetails::from_json_allowlisted(&serde_json::json!({
+        "grantType": "downstream_issuer", "access_token": "must-not-retain"
+    }));
+    assert_eq!(
+        details.get(DetailKey::GrantType),
+        Some(&DetailValue::Code("downstream_issuer".into()))
+    );
+    assert!(!serde_json::to_string(&details)
+        .unwrap()
+        .contains("must-not-retain"));
+    let invalid =
+        SafeDetails::from_json_allowlisted(&serde_json::json!({"grantType":"unapproved-grant"}));
+    assert!(invalid.get(DetailKey::GrantType).is_none());
+    let mut captured = event();
+    captured.event_type = "token.issue".into();
+    captured.details = details;
+    let restored: AuditEvent = serde_json::from_str(&captured.canonical_json().unwrap()).unwrap();
+    assert_eq!(
+        restored.details.get(DetailKey::GrantType),
+        Some(&DetailValue::Code("downstream_issuer".into()))
+    );
+}

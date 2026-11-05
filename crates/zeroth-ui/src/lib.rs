@@ -4,6 +4,9 @@
 //! client state, profile data, and session data in through typed structs.
 
 use leptos::prelude::*;
+
+mod provisioning;
+use provisioning::TenantProvisioningPanel;
 use url::{form_urlencoded, Url};
 use zeroth_providers::well_known;
 
@@ -2899,10 +2902,11 @@ pub fn ClientsAdminApp(state: ClientsAdminUiState) -> impl IntoView {
                                 <div class="zeroth-field"><label for="zeroth-user-tenant">"Tenant"</label><select id="zeroth-user-tenant" name="tenant_id"><option value="">"All tenants"</option>{tenant_options}</select></div>
                                 <div class="zeroth-field"><label for="zeroth-user-status-filter">"Account status"</label><select id="zeroth-user-status-filter" name="status"><option value="">"All statuses"</option><option value="active">"Active"</option><option value="disabled">"Disabled"</option></select></div>
                                 <div class="zeroth-field"><label for="zeroth-user-role-filter">"Deployment role"</label><select id="zeroth-user-role-filter" name="role"><option value="">"All roles"</option><option value="admin">"Administrator"</option><option value="member">"Member"</option></select></div>
+                                <div class="zeroth-field" id="zeroth-user-tenant-access-field" hidden=true><label for="zeroth-user-tenant-access">"Tenant lifecycle access"</label><select id="zeroth-user-tenant-access" name="tenant_access"><option value="">"All lifecycle states"</option><option value="active">"Active membership"</option><option value="inactive">"Inactive"</option><option value="deleted">"Deleted"</option><option value="unprovisioned">"Not provisioned"</option><option value="stale">"Directory stale"</option><option value="unmanaged">"Not managed"</option><option value="tenant_disabled">"Tenant disabled"</option></select></div>
                             </form>
                             <div class="zeroth-list-summary" id="zeroth-users-summary" role="status">"Showing recently loaded users. Search applies to this list."</div>
                             <div class="zeroth-table-scroll"><table class="zeroth-table">
-                                <thead><tr><th>"User"</th><th>"Status"</th><th>"Deployment role"</th><th>"Identities"</th><th>"Sessions"</th><th>"Updated"</th><th>"Manage access"</th></tr></thead>
+                                <thead><tr><th>"User"</th><th>"Account / tenant access"</th><th>"Deployment role"</th><th>"Identities"</th><th>"Sessions"</th><th>"Updated"</th><th>"Manage access"</th></tr></thead>
                                 <tbody id="zeroth-user-rows">{user_rows}</tbody>
                             </table></div>
                         </section>
@@ -2936,6 +2940,7 @@ pub fn ClientsAdminApp(state: ClientsAdminUiState) -> impl IntoView {
                                     </div></fieldset>
                                     <div class="zeroth-form-footer"><label class="zeroth-checkbox-field"><input name="disabled" type="checkbox" />"Disable this tenant"</label><div class="zeroth-form-actions"><button class="zeroth-action" id="zeroth-tenant-cancel" type="button">"Cancel"</button><button class="zeroth-action zeroth-primary" type="submit">"Save tenant"</button></div></div>
                                 </form>
+                                <TenantProvisioningPanel />
                             </div>
                         </section>
 

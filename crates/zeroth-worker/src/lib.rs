@@ -16,6 +16,11 @@ mod enterprise;
 mod enterprise_persistence_tests;
 #[cfg(test)]
 mod enterprise_signed_tests;
+mod google_directory;
+mod google_directory_worker;
+mod provisioning;
+mod provisioning_admin;
+mod scim;
 mod tenants;
 #[cfg(any(test, target_arch = "wasm32"))]
 use enterprise::provider_policy_hash;
@@ -98,6 +103,8 @@ pub const D1_BINDING: &str = "ZEROTH_DB";
 const AUTH_TRANSACTION_TTL_SECONDS: i32 = 10 * 60;
 const AUTH_CODE_TTL_SECONDS: i32 = 10 * 60;
 const ACCESS_TOKEN_TTL_SECONDS: i32 = 60 * 60;
+const ENTERPRISE_ACCESS_TOKEN_TTL_SECONDS: i32 = 5 * 60;
+const ENTERPRISE_SESSION_TTL_SECONDS: i32 = 8 * 60 * 60;
 const ID_TOKEN_TTL_SECONDS: i32 = 60 * 60;
 const REFRESH_TOKEN_TTL_SECONDS: i32 = 60 * 60 * 24 * 30;
 const INSERT_AUTH_CODE_SQL: &str = "INSERT INTO zeroth_auth_codes (
@@ -1903,6 +1910,8 @@ struct AdminUserResponse {
     admin: bool,
     identity_count: i32,
     active_session_count: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tenant_access: Option<provisioning_admin::TenantAccessStatus>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2214,6 +2223,7 @@ struct AppleCallbackUserName {
 struct ResolvedProviderProfile {
     profile: ProviderProfile,
     raw_profile_json: Option<String>,
+    directory_identity: Option<provisioning::VerifiedDirectoryIdentity>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -2307,6 +2317,8 @@ struct ProviderIdTokenClaims {
     picture: Option<String>,
     #[serde(default)]
     tid: Option<String>,
+    #[serde(default)]
+    oid: Option<String>,
     #[serde(default)]
     hd: Option<String>,
     #[serde(default)]
@@ -3329,6 +3341,14 @@ async fn validate_grant_authentication(
     if let Err(error) = validate_auth_context_for_client(db, env, client, context).await {
         return Ok(Err(error));
     }
+    if !provisioning::user_is_active(db, user_id, &client.id.0, now)
+        .await
+        .map_err(|_| worker_error("directory admission is unavailable".into()))?
+    {
+        return Ok(Err(
+            "directory access is inactive or awaiting synchronization".into(),
+        ));
+    }
     let session = match session_id {
         Some(id) => get_session(db, id).await?,
         None => None,
@@ -3549,6 +3569,15 @@ pub async fn main(request: Request, env: Env, _ctx: worker::Context) -> worker::
 }
 
 #[cfg(target_arch = "wasm32")]
+#[event(scheduled)]
+pub async fn scheduled(_event: ScheduledEvent, env: Env, _context: ScheduleContext) {
+    audit_trace::init();
+    if google_directory_worker::sync_due(&env).await.is_err() {
+        tracing::error!(target: "zeroth.audit.directory", code = "directory_scheduling_failed");
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
 async fn handle_request(request: Request, env: Env) -> worker::Result<Response> {
     let url = request.url()?;
     let canonical_path = canonical_route_path(url.path());
@@ -3570,6 +3599,14 @@ async fn handle_request(request: Request, env: Env) -> worker::Result<Response> 
         (Method::Get | Method::Patch, "/users") => users(request, env).await,
         (Method::Get, "/events" | "/audit/events" | "/audit") => events(request, env).await,
         (Method::Get | Method::Post, "/tenants") => tenants::tenants(request, env).await,
+        (Method::Get | Method::Post, "/tenants/provisioning") => {
+            provisioning_admin::handle(request, env).await
+        }
+        (Method::Get, "/tenants/google-directory")
+        | (Method::Post, "/tenants/google-directory-config" | "/tenants/google-directory-sync") => {
+            google_directory_worker::handle(request, env).await
+        }
+        (_, path) if path.starts_with("/scim/v2/") => scim::scim(request, env).await,
         (Method::Get, "/admin/setup") => hosted_admin_setup(request, env).await,
         (Method::Get, "/audit/stream") | (Method::Post, "/audit/stream/ack") => {
             audit_stream::stream(request, env).await
@@ -3697,7 +3734,7 @@ async fn provider_callback(mut request: Request, env: Env) -> worker::Result<Res
             return provider_callback_error_json(
                 &ProviderCallbackError::invalid_request("unknown provider callback state"),
                 400,
-            )
+            );
         }
     };
 
@@ -3993,12 +4030,43 @@ async fn provider_callback(mut request: Request, env: Env) -> worker::Result<Res
         );
     }
 
+    if let Err(error) = provisioning::admit_login(
+        &db,
+        &registered_client.client.id.0,
+        resolved_profile.directory_identity.as_ref(),
+    )
+    .await
+    {
+        record_audit_event(
+            &db,
+            &request,
+            "client.login.denied",
+            None,
+            Some(&registered_client.client.id.0),
+            Some(&resolved_profile.profile.provider_id.0),
+            serde_json::json!({"errorCode":"directory_access_denied"}),
+            now,
+        )
+        .await?;
+        let denial = ProviderCallbackError::access_denied(error.detail);
+        let response = redirect_to_provider_callback_error(
+            &record.transaction,
+            &config.issuer().issuer,
+            &denial,
+        )?;
+        return with_set_cookie(
+            response,
+            &clear_transaction_cookie(&config.transaction_cookie_name),
+        );
+    }
+
     if record.transaction.session_return_to.is_some() {
         let user_id = upsert_provider_profile(
             &db,
             &registered_client,
             &resolved_profile.profile,
             resolved_profile.raw_profile_json.as_deref(),
+            resolved_profile.directory_identity.as_ref(),
             Some(&request),
             now,
         )
@@ -4015,7 +4083,7 @@ async fn provider_callback(mut request: Request, env: Env) -> worker::Result<Res
             user_agent.as_deref(),
             ip_hash.as_deref(),
             &auth_context,
-            now + SESSION_TTL_SECONDS,
+            now.saturating_add(session_ttl(&auth_context)),
         )
         .await?;
         let response = redirect_to_session_login_return(&record.transaction)?;
@@ -4024,7 +4092,7 @@ async fn provider_callback(mut request: Request, env: Env) -> worker::Result<Res
             &session_cookie(
                 &config.cookie_name,
                 &session_id,
-                SESSION_TTL_SECONDS,
+                session_ttl(&auth_context),
                 config.cookie_domain.as_deref(),
             ),
         )?;
@@ -4039,6 +4107,7 @@ async fn provider_callback(mut request: Request, env: Env) -> worker::Result<Res
         &registered_client,
         &resolved_profile.profile,
         resolved_profile.raw_profile_json.as_deref(),
+        resolved_profile.directory_identity.as_ref(),
         Some(&request),
         now,
     )
@@ -4066,7 +4135,7 @@ async fn provider_callback(mut request: Request, env: Env) -> worker::Result<Res
         user_agent.as_deref(),
         ip_hash.as_deref(),
         &auth_context,
-        now + SESSION_TTL_SECONDS,
+        now.saturating_add(session_ttl(&auth_context)),
     )
     .await?;
     let response = redirect_to_client(&record.transaction, &config.issuer().issuer, &zeroth_code)?;
@@ -4075,7 +4144,7 @@ async fn provider_callback(mut request: Request, env: Env) -> worker::Result<Res
         &session_cookie(
             &config.cookie_name,
             &session_id,
-            SESSION_TTL_SECONDS,
+            session_ttl(&auth_context),
             config.cookie_domain.as_deref(),
         ),
     )?;
@@ -4108,7 +4177,7 @@ async fn clients(mut request: Request, env: Env) -> worker::Result<Response> {
             Ok(None) => {
                 return client_management_error_json(&ClientManagementError::unauthorized(
                     "admin bearer token or allowed Zeroth session is required",
-                ))
+                ));
             }
             Err(error) => return client_management_error_json(&error),
         }
@@ -4149,7 +4218,7 @@ async fn clients(mut request: Request, env: Env) -> worker::Result<Response> {
                 Err(error) => {
                     return client_management_error_json(&ClientManagementError::invalid_request(
                         error,
-                    ))
+                    ));
                 }
             };
             json(&ClientsResponse { clients })
@@ -4271,7 +4340,7 @@ async fn users(mut request: Request, env: Env) -> worker::Result<Response> {
             Ok(None) => {
                 return client_management_error_json(&ClientManagementError::unauthorized(
                     "admin bearer token or allowed Zeroth session is required",
-                ))
+                ));
             }
             Err(error) => return client_management_error_json(&error),
         }
@@ -4299,7 +4368,13 @@ async fn users(mut request: Request, env: Env) -> worker::Result<Response> {
 
             let tenant_id = query_param(&request_url, "tenant_id");
             let rows = list_admin_user_rows_for_tenant(&db, now, tenant_id.as_deref()).await?;
-            let users = rows.into_iter().map(admin_user_response_from_row).collect();
+            let mut users = rows
+                .into_iter()
+                .map(admin_user_response_from_row)
+                .collect::<Vec<_>>();
+            if let Some(tenant) = tenant_id.as_deref().filter(|id| !id.is_empty()) {
+                provisioning_admin::hydrate_tenant_access(&db, tenant, now, &mut users).await?;
+            }
             json(&AdminUsersResponse { users })
         }
         Method::Patch => {
@@ -4769,7 +4844,7 @@ async fn authorization_code_token(
             return token_exchange_error_json(
                 &TokenExchangeError::invalid_grant("authorization code was not found"),
                 400,
-            )
+            );
         }
     };
     if let Err(error) = validate_authorization_code_exchange(&auth_code, &fields, now) {
@@ -4802,7 +4877,7 @@ async fn authorization_code_token(
                     "authorization code user is missing or disabled",
                 ),
                 400,
-            )
+            );
         }
     };
     let issue = TokenIssue::from_auth_code(&auth_code).with_user_claims(&user_claims);
@@ -4882,7 +4957,7 @@ async fn refresh_token_token(
             return token_exchange_error_json(
                 &TokenExchangeError::invalid_grant("refresh token was not found"),
                 400,
-            )
+            );
         }
     };
     if let Err(error) = validate_refresh_token_exchange(&row, &form.client_id, now) {
@@ -4931,7 +5006,7 @@ async fn refresh_token_token(
             return token_exchange_error_json(
                 &TokenExchangeError::invalid_grant("refresh token user is missing or disabled"),
                 400,
-            )
+            );
         }
     };
     let issue = TokenIssue::from_refresh_token(&row).with_user_claims(&user_claims);
@@ -5050,6 +5125,7 @@ async fn native_provider_token(
         client,
         &resolved.profile,
         resolved.raw_profile_json.as_deref(),
+        resolved.directory_identity.as_ref(),
         Some(request),
         now,
     )
@@ -5060,7 +5136,7 @@ async fn native_provider_token(
             return token_exchange_error_json(
                 &TokenExchangeError::invalid_grant("provider identity user was not found"),
                 400,
-            )
+            );
         }
     };
     if user_claims.disabled_at.is_some() {
@@ -5174,7 +5250,7 @@ async fn oauth_revoke(mut request: Request, env: Env) -> worker::Result<Response
             return token_exchange_error_json(
                 &TokenExchangeError::invalid_client("client is not registered"),
                 401,
-            )
+            );
         }
     };
     if let Err(error) =
@@ -5249,7 +5325,7 @@ async fn oauth_introspect(mut request: Request, env: Env) -> worker::Result<Resp
             return token_exchange_error_json(
                 &TokenExchangeError::invalid_client("client is not registered"),
                 401,
-            )
+            );
         }
     };
     if let Err(error) =
@@ -5416,6 +5492,7 @@ async fn client_issuer_access_token(request: Request, env: Env) -> worker::Resul
             return token_issuer_error_json("token_signing_unavailable", error, 503, Some(origin));
         }
     };
+    let ttl_seconds = bounded_issuer_token_ttl(ttl_seconds, &current.session.auth_context);
     let material = match signing_material_from_env(&env) {
         Ok(material) => material,
         Err(_) => {
@@ -5424,7 +5501,7 @@ async fn client_issuer_access_token(request: Request, env: Env) -> worker::Resul
                 "the access token could not be issued",
                 503,
                 Some(origin),
-            )
+            );
         }
     };
     let Some(session_client_id) = current.session.client_id.as_deref() else {
@@ -5473,7 +5550,58 @@ async fn client_issuer_access_token(request: Request, env: Env) -> worker::Resul
         },
         200,
     )?;
-    with_cors_actual_headers(response, Some(origin))
+    let response = with_cors_actual_headers(response, Some(origin))?;
+    let event = prepare_audit_event(
+        &db,
+        Some(&request),
+        Some(audit_capture::actor_from_user(Some(&current.user.id)).map_err(worker_error)?),
+        "token.issue",
+        Some(&current.user.id),
+        Some(client_id),
+        current.session.auth_context.auth_provider.as_deref(),
+        serde_json::json!({"grantType":"downstream_issuer"}),
+        now,
+    )
+    .await?;
+    let scope_guard = format!("scope_{}", event.0.event_id);
+    let config_guard = format!("config_{}", event.0.event_id);
+    let configured_ttl = client_row
+        .issuer_token_ttl_seconds
+        .map(worker::d1::D1Type::Integer)
+        .unwrap_or(worker::d1::D1Type::Null);
+    let identity_guard = db.prepare(identity_account_auth_guard_sql()).bind_refs(&[
+        worker::d1::D1Type::Text(&event.0.event_id),
+        worker::d1::D1Type::Text(&current.user.id),
+        worker::d1::D1Type::Text(&current.session.id),
+        worker::d1::D1Type::Text(client_id),
+        worker::d1::D1Type::Integer(unix_timestamp_seconds().max(now)),
+    ])?;
+    let config_check = db.prepare(ISSUER_TOKEN_CONFIG_GUARD_SQL).bind_refs(&[
+        worker::d1::D1Type::Text(&config_guard),
+        worker::d1::D1Type::Text(client_id),
+        d1_optional_text(client_row.issuer_token_audience.as_deref()),
+        configured_ttl,
+    ])?;
+    commit_credential_transition(
+        &db,
+        vec![
+            identity_guard,
+            audit_capture::client_user_scope_guard(
+                &db,
+                &current.user.id,
+                client_id,
+                &scope_guard,
+                current.session.auth_context.auth_provider.as_deref(),
+            )?,
+            config_check,
+            audit_capture::clear_guard(&db, &scope_guard)?,
+            audit_capture::clear_guard(&db, &config_guard)?,
+            audit_capture::clear_guard(&db, &event.0.event_id)?,
+        ],
+        &event,
+    )
+    .await?;
+    Ok(response)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -5637,7 +5765,7 @@ async fn profile(mut request: Request, env: Env) -> worker::Result<Response> {
             let patch = match profile_patch_from_request(&mut request).await {
                 Ok(patch) => patch,
                 Err(error) => {
-                    return oauth_error_json("invalid_request", error.description, error.status)
+                    return oauth_error_json("invalid_request", error.description, error.status);
                 }
             };
             let now = unix_timestamp_seconds();
@@ -7218,6 +7346,7 @@ async fn evm_wallet_verify(mut request: Request, env: Env) -> worker::Result<Res
         &registered_client,
         &profile,
         Some(&raw_profile_json),
+        None,
         Some(&request),
         now,
     )
@@ -7739,6 +7868,13 @@ async fn identity_link(request: Request, env: Env) -> worker::Result<Response> {
         Ok(provider_id) => provider_id,
         Err(error) => return auth_error_json(&error, 400),
     };
+    if is_enterprise_provider(&provider_id) {
+        return oauth_error_json(
+            "access_denied",
+            "corporate identity links are managed by the organization",
+            403,
+        );
+    }
     let config = server_config(&env, &request_url);
     let db = env.d1(D1_BINDING)?;
     let now = unix_timestamp_seconds();
@@ -7782,9 +7918,16 @@ async fn identity_link(request: Request, env: Env) -> worker::Result<Response> {
                 "unauthorized_client",
                 "session client is not registered",
                 400,
-            )
+            );
         }
     };
+    if client.enterprise_provider.is_some() {
+        return oauth_error_json(
+            "access_denied",
+            "corporate identity links are managed by the organization",
+            403,
+        );
+    }
     let return_to = match identity_link_return_to_from_url(
         &request_url,
         &client,
@@ -8326,7 +8469,7 @@ async fn hosted_login(request: Request, env: Env) -> worker::Result<Response> {
                 return auth_error_json(
                     &AuthorizationRequestError::unauthorized_client("client is not registered"),
                     400,
-                )
+                );
             }
         };
     let client = &registered_client.client;
@@ -8367,14 +8510,14 @@ async fn hosted_session_login(request: Request, env: Env) -> worker::Result<Resp
             return auth_error_json(
                 &AuthorizationRequestError::unauthorized_client("client is not registered"),
                 400,
-            )
+            );
         }
     };
     let client = &registered_client.client;
     let return_to = match session_login_return_to_from_url(&url, client, &config.public_base_url) {
         Ok(return_to) => return_to,
         Err(error) => {
-            return auth_error_json(&AuthorizationRequestError::invalid_request(error), 400)
+            return auth_error_json(&AuthorizationRequestError::invalid_request(error), 400);
         }
     };
 
@@ -8790,7 +8933,7 @@ async fn authorize(request: Request, env: Env) -> worker::Result<Response> {
                 return auth_error_json(
                     &AuthorizationRequestError::unauthorized_client("client is not registered"),
                     400,
-                )
+                );
             }
         };
     let client = &registered_client.client;
@@ -8818,7 +8961,7 @@ async fn authorize(request: Request, env: Env) -> worker::Result<Response> {
                 &config.issuer().issuer,
                 error.code,
                 &error.description,
-            )
+            );
         }
     };
     if provider_id.is_none() {
@@ -10853,6 +10996,11 @@ async fn complete_provider_identity_link(
     raw_profile_json: Option<&str>,
     now: i32,
 ) -> worker::Result<Result<(), IdentityLinkError>> {
+    if is_enterprise_provider(&profile.provider_id.0) {
+        return Ok(Err(IdentityLinkError::invalid_request(
+            "corporate identity links are managed by the organization",
+        )));
+    }
     let Some(link_session_id) = link_session_id else {
         return Ok(Err(IdentityLinkError::invalid_request(
             "identity link transaction is missing session binding",
@@ -10894,6 +11042,11 @@ async fn complete_provider_identity_link(
     {
         return Ok(Err(IdentityLinkError::invalid_request(
             "identity link session requires a fresh login",
+        )));
+    }
+    if client.client.enterprise_provider.is_some() {
+        return Ok(Err(IdentityLinkError::invalid_request(
+            "corporate identity links are managed by the organization",
         )));
     }
     let account_namespace = &client.account_scope.namespace;
@@ -11087,14 +11240,26 @@ const IDENTITY_ACCOUNT_AUTH_GUARD_SQL: &str = "INSERT INTO zeroth_audit_write_gu
       AND (?3 IS NULL OR EXISTS (SELECT 1 FROM zeroth_sessions WHERE id=?3 AND user_id=?2
           AND client_id IS ?4 AND revoked_at IS NULL AND expires_at>?5))
       AND (?4 IS NULL OR EXISTS (SELECT 1 FROM zeroth_clients c WHERE c.id=?4 AND c.disabled_at IS NULL
+          AND (c.enterprise_provider IS NULL OR ?3 IS NOT NULL)
           AND (NOT EXISTS (SELECT 1 FROM zeroth_tenant_clients tc WHERE tc.client_id=c.id)
             OR EXISTS (SELECT 1 FROM zeroth_tenant_clients tc JOIN zeroth_tenants t ON t.id=tc.tenant_id
                 JOIN zeroth_account_identities ai ON ai.account_namespace='tenant:'||t.id
                 WHERE tc.client_id=c.id AND t.disabled=0 AND ai.user_id=?2
                   AND ai.provider_id=t.enterprise_provider AND c.account_sharing_mode='tenant'
                   AND c.account_tenant_id=t.id AND c.enterprise_provider=t.enterprise_provider))))
+      AND ({lifecycle_active})
     THEN 1 ELSE 0 END";
 const IDENTITY_CLEANUP_GUARD_SQL: &str = "DELETE FROM zeroth_audit_write_guards WHERE id=?1";
+
+fn identity_account_auth_guard_sql() -> String {
+    // Remap descending parameter numbers so replacing one does not replace an
+    // earlier substitution: lifecycle user/client/time become guard ?2/?4/?5.
+    let lifecycle = provisioning::LIFECYCLE_USER_ACTIVE_SQL
+        .replace("?3", "?5")
+        .replace("?2", "?4")
+        .replace("?1", "?2");
+    IDENTITY_ACCOUNT_AUTH_GUARD_SQL.replace("{lifecycle_active}", &lifecycle)
+}
 
 #[cfg(target_arch = "wasm32")]
 fn identity_account_auth_guard_statement(
@@ -11103,12 +11268,12 @@ fn identity_account_auth_guard_statement(
     guard_id: &str,
     now: i32,
 ) -> worker::Result<worker::d1::D1PreparedStatement> {
-    db.prepare(IDENTITY_ACCOUNT_AUTH_GUARD_SQL).bind_refs(&[
+    db.prepare(identity_account_auth_guard_sql()).bind_refs(&[
         worker::d1::D1Type::Text(guard_id),
         worker::d1::D1Type::Text(&current.user.id),
         d1_optional_text(current.session_id.as_deref()),
         d1_optional_text(current.client_id.as_deref()),
-        worker::d1::D1Type::Integer(now),
+        worker::d1::D1Type::Integer(unix_timestamp_seconds().max(now)),
     ])
 }
 
@@ -12463,7 +12628,9 @@ fn audit_event_query(filter: &AuditEventFilter) -> Result<AuditEventQuery, Clien
     };
     parameters.push((limit + 1).to_string());
     Ok(AuditEventQuery {
-        sql: format!("SELECT id, event_type, user_id, client_id, provider_id, created_at, ip_hash, user_agent, details_json, schema_version, organization_id, actor_type, actor_id, target_type, target_id, outcome, reason_code, request_id, COALESCE(recorded_at, created_at) AS recorded_at, event_json FROM zeroth_audit_events{where_clause} ORDER BY COALESCE(recorded_at, created_at) DESC, id DESC LIMIT CAST(? AS INTEGER)"),
+        sql: format!(
+            "SELECT id, event_type, user_id, client_id, provider_id, created_at, ip_hash, user_agent, details_json, schema_version, organization_id, actor_type, actor_id, target_type, target_id, outcome, reason_code, request_id, COALESCE(recorded_at, created_at) AS recorded_at, event_json FROM zeroth_audit_events{where_clause} ORDER BY COALESCE(recorded_at, created_at) DESC, id DESC LIMIT CAST(? AS INTEGER)"
+        ),
         parameters,
     })
 }
@@ -13003,16 +13170,28 @@ async fn upsert_provider_profile(
     client: &RegisteredClient,
     profile: &ProviderProfile,
     raw_profile_json: Option<&str>,
+    directory_identity: Option<&provisioning::VerifiedDirectoryIdentity>,
     request: Option<&Request>,
     now: i32,
 ) -> worker::Result<String> {
     let account_namespace = &client.account_scope.namespace;
+    let admission = provisioning::admit_login(db, &client.client.id.0, directory_identity)
+        .await
+        .map_err(|error| worker_error(error.detail.into()))?;
     let existing = get_identity_user_id(db, account_namespace, profile).await?;
-    let is_new = existing.is_none();
-    let user_id = match existing {
-        Some(user_id) => user_id,
-        None => format!("usr_{}", random_token()?),
-    };
+    if existing
+        .as_deref()
+        .zip(admission.linked_user_id.as_deref())
+        .is_some_and(|(subject_owner, directory_owner)| subject_owner != directory_owner)
+    {
+        return Err(worker_error(
+            "directory and provider identity ownership conflict".into(),
+        ));
+    }
+    let is_new = existing.is_none() && admission.linked_user_id.is_none();
+    let user_id = existing
+        .or_else(|| admission.linked_user_id.clone())
+        .unwrap_or(format!("usr_{}", random_token()?));
     let event = prepare_audit_event(
         db,
         request,
@@ -13030,7 +13209,7 @@ async fn upsert_provider_profile(
     )
     .await?;
     let scope_guard = format!("scope_{}", event.0.event_id);
-    let changes = vec![
+    let mut changes = vec![
         identity_client_scope_guard_statement(db, client, &scope_guard)?,
         if is_new {
             insert_user_from_profile_statement(db, &user_id, profile, now)?
@@ -13056,6 +13235,25 @@ async fn upsert_provider_profile(
         identity_cleanup_guard_statement(db, &scope_guard)?,
         identity_cleanup_guard_statement(db, &event.0.event_id)?,
     ];
+    let active_guard = format!("active_{}", event.0.event_id);
+    changes.push(db.prepare(IDENTITY_ACTIVE_USER_GUARD_SQL).bind_refs(&[
+        worker::d1::D1Type::Text(&active_guard),
+        worker::d1::D1Type::Text(&user_id),
+    ])?);
+    changes.extend(
+        provisioning::link_login_statements(db, &admission, &user_id, &event.0.event_id, now)
+            .map_err(|error| worker_error(error.detail.into()))?,
+    );
+    let lifecycle_guard = format!("login_{}", event.0.event_id);
+    changes.push(audit_capture::client_user_scope_guard(
+        db,
+        &user_id,
+        &client.client.id.0,
+        &lifecycle_guard,
+        Some(&profile.provider_id.0),
+    )?);
+    changes.push(audit_capture::clear_guard(db, &lifecycle_guard)?);
+    changes.push(audit_capture::clear_guard(db, &active_guard)?);
     audit_capture::commit(db, changes, &[event]).await?;
     Ok(user_id)
 }
@@ -13610,6 +13808,7 @@ async fn put_session_with_auth_context(
     auth_context: &AuthContext,
     expires_at: i32,
 ) -> worker::Result<()> {
+    let expires_at = bounded_session_expiry(now, expires_at, auth_context);
     let user_agent = d1_optional_text(user_agent);
     let ip_hash = d1_optional_text(ip_hash);
     let args = [
@@ -13781,6 +13980,12 @@ async fn current_session_from_request(
         let Some(client) = get_client(db, client_id).await? else {
             return Ok(None);
         };
+        if !provisioning::user_is_active(db, &user.id, client_id, now)
+            .await
+            .map_err(|_| worker_error("directory admission is unavailable".into()))?
+        {
+            return Ok(None);
+        }
         if validate_auth_context_for_client(db, env, &client, &session.auth_context)
             .await
             .is_err()
@@ -13966,7 +14171,7 @@ async fn ensure_d1_schema(request: Request, env: Env) -> worker::Result<Response
         Ok(None) => {
             return client_management_error_json(&ClientManagementError::unauthorized(
                 "admin bearer token or allowed Zeroth session is required",
-            ))
+            ));
         }
         Err(error) => return client_management_error_json(&error),
     }
@@ -15160,7 +15365,7 @@ fn validate_token_exchange_form(form: &TokenExchangeForm) -> Result<(), TokenExc
         _ => {
             return Err(TokenExchangeError::unsupported_grant_type(
                 "grant_type must be authorization_code, refresh_token, or token exchange",
-            ))
+            ));
         }
     }
 
@@ -15312,7 +15517,7 @@ fn native_provider_token_fields(
         (well_known::APPLE | well_known::GOOGLE, Some(_)) => {
             return Err(TokenExchangeError::invalid_request(
                 "subject_token_type must be urn:ietf:params:oauth:token-type:id_token",
-            ))
+            ));
         }
         _ => unreachable!("native provider was checked above"),
     };
@@ -15433,7 +15638,7 @@ fn validate_authorization_code_exchange(
         Some(_) => {
             return Err(TokenExchangeError::invalid_grant(
                 "authorization code used unsupported PKCE method",
-            ))
+            ));
         }
         None => {
             if code.code_challenge.is_some() {
@@ -15449,6 +15654,50 @@ fn validate_authorization_code_exchange(
     Ok(())
 }
 
+const ISSUER_TOKEN_CONFIG_GUARD_SQL: &str = "INSERT INTO zeroth_audit_write_guards(id,valid)
+    SELECT ?1,CASE WHEN EXISTS(SELECT 1 FROM zeroth_clients WHERE id=?2 AND disabled_at IS NULL
+        AND issuer_token_audience IS ?3 AND issuer_token_ttl_seconds IS ?4) THEN 1 ELSE 0 END";
+
+fn bounded_issuer_token_ttl(configured: i32, context: &AuthContext) -> i32 {
+    if context
+        .auth_provider
+        .as_deref()
+        .is_some_and(is_enterprise_provider)
+    {
+        configured.min(ENTERPRISE_ACCESS_TOKEN_TTL_SECONDS)
+    } else {
+        configured
+    }
+}
+
+fn access_token_ttl(context: &AuthContext) -> i32 {
+    if context
+        .auth_provider
+        .as_deref()
+        .is_some_and(is_enterprise_provider)
+    {
+        ENTERPRISE_ACCESS_TOKEN_TTL_SECONDS
+    } else {
+        ACCESS_TOKEN_TTL_SECONDS
+    }
+}
+
+fn session_ttl(context: &AuthContext) -> i32 {
+    if context
+        .auth_provider
+        .as_deref()
+        .is_some_and(is_enterprise_provider)
+    {
+        ENTERPRISE_SESSION_TTL_SECONDS
+    } else {
+        SESSION_TTL_SECONDS
+    }
+}
+
+fn bounded_session_expiry(auth_time: i32, requested_expiry: i32, context: &AuthContext) -> i32 {
+    requested_expiry.min(auth_time.saturating_add(session_ttl(context)))
+}
+
 fn token_response(
     config: &ZerothServerConfig,
     signing_key: &Es256SigningKey,
@@ -15457,11 +15706,12 @@ fn token_response(
     now: i32,
 ) -> Result<TokenResponse, String> {
     validate_issuer_scope(&issue.scope).map_err(|error| error.description)?;
+    let access_ttl = access_token_ttl(&issue.auth_context);
     let access_claims = JwtClaims {
         iss: config.issuer().issuer.clone(),
         sub: issue.user_id.clone(),
         aud: issue.client_id.clone(),
-        exp: now + ACCESS_TOKEN_TTL_SECONDS,
+        exp: now + access_ttl,
         iat: now,
         auth_time: None,
         sid: issue.session_id.clone(),
@@ -15499,7 +15749,7 @@ fn token_response(
         id_token: sign_jwt(signing_key, &id_claims)?,
         refresh_token,
         token_type: "Bearer",
-        expires_in: ACCESS_TOKEN_TTL_SECONDS,
+        expires_in: access_ttl,
         scope: issue.scope.clone(),
     })
 }
@@ -16070,7 +16320,7 @@ fn audit_event_filter_from_url(url: &url::Url) -> Result<AuditEventFilter, Clien
         _ => {
             return Err(ClientManagementError::invalid_request(
                 "audit format must be json or csv",
-            ))
+            ));
         }
     };
     if let Some(encoded) = parameter("cursor") {
@@ -16317,6 +16567,9 @@ fn validate_account_tenant_id(
 
 fn validate_account_tenant_id_value(raw: &str) -> Result<String, String> {
     let value = raw.trim();
+    if matches!(value, "." | "..") {
+        return Err("tenant ID cannot be a URL dot segment".into());
+    }
     if value.is_empty() {
         return Err("account tenant id must not be empty".to_owned());
     }
@@ -16759,6 +17012,7 @@ fn native_oidc_profile_from_verified_token(
             picture_url: claims.picture,
         },
         raw_profile_json: Some(verified.raw_claims_json),
+        directory_identity: None,
     }
 }
 
@@ -16871,6 +17125,7 @@ fn client_response_from_row(row: ClientRow) -> Result<ClientResponse, String> {
 
 fn admin_user_response_from_row(row: AdminUserRow) -> AdminUserResponse {
     AdminUserResponse {
+        tenant_access: None,
         id: row.id,
         email: row.primary_email,
         display_name: row.display_name,
@@ -16984,6 +17239,16 @@ fn content_type_is_form_urlencoded(content_type: Option<&str>) -> bool {
         .and_then(|value| value.split(';').next())
         .map(str::trim)
         .is_some_and(|value| value.eq_ignore_ascii_case("application/x-www-form-urlencoded"))
+}
+
+fn content_type_is_form(content_type: Option<&str>) -> bool {
+    content_type
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .is_some_and(|value| {
+            value.eq_ignore_ascii_case("application/x-www-form-urlencoded")
+                || value.eq_ignore_ascii_case("multipart/form-data")
+        })
 }
 
 fn userinfo_response(user: &UserRow, scope: Option<&str>) -> UserInfoResponse {
@@ -17793,6 +18058,10 @@ fn csrf_token_from_header(request: &Request) -> worker::Result<Option<String>> {
 async fn csrf_token_from_request(request: &mut Request) -> worker::Result<Option<String>> {
     if let Some(token) = csrf_token_from_header(request)?.filter(|value| !value.trim().is_empty()) {
         return Ok(Some(token));
+    }
+    let content_type = request_header(request, "Content-Type")?;
+    if !content_type_is_form(content_type.as_deref()) {
+        return Ok(None);
     }
     let form = request.form_data().await?;
     Ok(match form.get("_csrf") {
@@ -19787,6 +20056,14 @@ async fn validate_access_token_session(
     let Some(client) = get_registered_client(db, &claims.aud).await? else {
         return Ok(Err("token client is disabled or missing".to_owned()));
     };
+    if !provisioning::user_is_active(db, &claims.sub, &client.client.id.0, now)
+        .await
+        .map_err(|_| worker_error("directory admission is unavailable".into()))?
+    {
+        return Ok(Err(
+            "directory access is inactive or awaiting synchronization".into(),
+        ));
+    }
     let session = match claims.sid.as_deref() {
         Some(id) => get_session(db, id).await?,
         None => None,
@@ -19985,7 +20262,12 @@ fn session_info_response(session: &SessionRow) -> SessionInfoResponse {
 }
 
 fn session_row_is_active(session: &SessionRow, now: i32) -> bool {
-    session.revoked_at.is_none() && session.expires_at > now
+    session.revoked_at.is_none()
+        && bounded_session_expiry(
+            session.created_at,
+            session.expires_at,
+            &session.auth_context,
+        ) > now
 }
 
 fn authorization_request_may_reuse_session(
@@ -20552,7 +20834,7 @@ fn validate_stored_visible_login_methods(methods: &[String]) -> Result<Vec<Strin
             value => {
                 return Err(format!(
                     "client visible_login_methods_json includes unsupported method: {value}"
-                ))
+                ));
             }
         }
     }
@@ -20688,7 +20970,7 @@ fn provider_client_secret_from_env(env: &Env, provider_id: &str) -> worker::Resu
         _ => {
             return Err(worker::Error::RustError(format!(
                 "unknown provider: {provider_id}"
-            )))
+            )));
         }
     };
 
@@ -20711,7 +20993,7 @@ fn apple_client_secret_from_env(env: &Env) -> worker::Result<Option<String>> {
         None => {
             return Err(missing_provider_config(
                 "APPLE_CLIENT_SECRET or APPLE_TEAM_ID/APPLE_KEY_ID/APPLE_PRIVATE_KEY",
-            ))
+            ));
         }
     };
     let now = i64::from(unix_timestamp_seconds());
@@ -21109,7 +21391,7 @@ async fn authorize_admin_write_request(
         ))
     })?;
     if let Err(error) = browser_session_validation {
-        return Err(ClientManagementError::unauthorized(error));
+        return Err(ClientManagementError::forbidden(error));
     }
 
     Ok(AdminAuthorization::Session {
@@ -21196,7 +21478,7 @@ async fn maybe_authorize_admin_write_request(
         ))
     })?;
     if let Err(error) = browser_session_validation {
-        return Err(ClientManagementError::unauthorized(error));
+        return Err(ClientManagementError::forbidden(error));
     }
 
     Ok(Some(AdminAuthorization::Session {
@@ -21581,6 +21863,7 @@ async fn resolve_oidc_provider_profile(
         },
     )
     .await?;
+    let directory_identity = verified_directory_identity_from_token(&provider.id().0, &verified)?;
     let claims = verified.claims;
     let apple_user = if provider.id().0 == well_known::APPLE {
         callback
@@ -21619,6 +21902,7 @@ async fn resolve_oidc_provider_profile(
     Ok(ResolvedProviderProfile {
         profile,
         raw_profile_json,
+        directory_identity,
     })
 }
 
@@ -21806,6 +22090,43 @@ fn verified_provider_id_token_from_segments(
         claims,
         raw_claims_json,
     })
+}
+
+/// Called only with signature-verified claims. Entra's pairwise sub remains the
+/// OIDC identity subject; SCIM correlation uses the independently signed tid+oid.
+fn verified_directory_identity_from_token(
+    provider_id: &str,
+    verified: &VerifiedProviderIdToken,
+) -> Result<Option<provisioning::VerifiedDirectoryIdentity>, ProviderProfileError> {
+    match provider_id {
+        well_known::ENTRA => {
+            let tenant = verified.claims.tid.as_deref().ok_or_else(|| {
+                ProviderProfileError::invalid_response("signed Entra tenant ID is missing")
+            })?;
+            let object = verified.claims.oid.as_deref().ok_or_else(|| {
+                ProviderProfileError::invalid_response(
+                    "signed Entra object ID is missing; profile scope is required",
+                )
+            })?;
+            let tenant = zeroth_providers::normalize_entra_tenant_id(tenant).map_err(|_| {
+                ProviderProfileError::invalid_response("signed Entra tenant ID is invalid")
+            })?;
+            let object = zeroth_providers::normalize_entra_tenant_id(object).map_err(|_| {
+                ProviderProfileError::invalid_response("signed Entra object ID is invalid")
+            })?;
+            Ok(Some(provisioning::VerifiedDirectoryIdentity {
+                provider_id: provider_id.into(),
+                authority_id: Some(tenant),
+                external_id: object,
+            }))
+        }
+        well_known::GOOGLE_WORKSPACE => Ok(Some(provisioning::VerifiedDirectoryIdentity {
+            provider_id: provider_id.into(),
+            authority_id: None,
+            external_id: verified.claims.sub.clone(),
+        })),
+        _ => Ok(None),
+    }
 }
 
 fn jwt_segments(jwt: &str) -> Result<Vec<&str>, ProviderProfileError> {
@@ -22215,6 +22536,7 @@ async fn fetch_spotify_profile(
     Ok(ResolvedProviderProfile {
         profile,
         raw_profile_json: Some(raw_profile_json),
+        directory_identity: None,
     })
 }
 
@@ -22492,6 +22814,14 @@ impl ClientManagementError {
             code: "invalid_token".to_owned(),
             description: description.into(),
             status: 401,
+        }
+    }
+
+    fn forbidden(description: impl Into<String>) -> Self {
+        Self {
+            code: "forbidden".to_owned(),
+            description: description.into(),
+            status: 403,
         }
     }
 
@@ -25538,7 +25868,13 @@ mod tests {
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        assert_eq!(migration_versions, (1..=14).collect::<Vec<_>>());
+        assert_eq!(
+            migration_versions,
+            zeroth_storage::migrations::ALL
+                .iter()
+                .map(|migration| migration.version)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -26333,6 +26669,24 @@ mod tests {
     }
 
     #[test]
+    fn csrf_body_fallback_only_reads_form_media_types() {
+        assert!(content_type_is_form(Some(
+            "application/x-www-form-urlencoded"
+        )));
+        assert!(content_type_is_form(Some(
+            "Multipart/Form-Data; boundary=fixture"
+        )));
+        for media_type in [
+            None,
+            Some("application/json"),
+            Some("text/plain"),
+            Some("application/scim+json"),
+        ] {
+            assert!(!content_type_is_form(media_type));
+        }
+    }
+
+    #[test]
     fn token_introspection_form_accepts_access_and_refresh_hints() {
         let access_form = TokenIntrospectionForm {
             client_id: "web".to_owned(),
@@ -26719,6 +27073,68 @@ mod tests {
         assert_eq!(id_claims["email_verified"], true);
         assert_eq!(id_claims["name"], "Example User");
         assert_eq!(id_claims["picture"], "https://example.com/avatar.png");
+    }
+
+    #[test]
+    fn enterprise_tokens_bound_offline_access_to_five_minutes() {
+        let config = ZerothServerConfig::default();
+        let signing_key = test_signing_key();
+        for provider in ["entra", "google_workspace"] {
+            let code = valid_auth_code_row("challenge".to_owned());
+            let mut issue = TokenIssue::from_auth_code(&code);
+            issue.auth_context.auth_provider = Some(provider.to_owned());
+            let response =
+                token_response(&config, &signing_key, &issue, None, 1_780_000_000).unwrap();
+            let claims = decode_jwt_claims(&response.access_token);
+            assert_eq!(response.expires_in, 300, "{provider}");
+            assert_eq!(bounded_issuer_token_ttl(3600, &issue.auth_context), 300);
+            assert_eq!(bounded_issuer_token_ttl(60, &issue.auth_context), 60);
+            assert_eq!(
+                claims["exp"].as_i64().unwrap() - claims["iat"].as_i64().unwrap(),
+                300
+            );
+        }
+    }
+
+    #[test]
+    fn enterprise_sessions_preserve_original_eight_hour_deadline() {
+        let auth_time = 1_780_000_000;
+        for provider in ["entra", "google_workspace"] {
+            let context = AuthContext {
+                auth_provider: Some(provider.to_owned()),
+                ..AuthContext::default()
+            };
+            let deadline = auth_time + 8 * 60 * 60;
+            assert_eq!(
+                bounded_session_expiry(auth_time, auth_time + SESSION_TTL_SECONDS, &context),
+                deadline
+            );
+            assert_eq!(
+                bounded_session_expiry(auth_time, auth_time + 60, &context),
+                auth_time + 60
+            );
+            let session = SessionRow {
+                id: "sess_enterprise".into(),
+                user_id: "usr_employee".into(),
+                client_id: Some("corp".into()),
+                user_agent: None,
+                ip_hash: None,
+                created_at: auth_time,
+                expires_at: auth_time + SESSION_TTL_SECONDS,
+                revoked_at: None,
+                auth_context: context,
+            };
+            assert!(session_row_is_active(&session, deadline - 1));
+            assert!(!session_row_is_active(&session, deadline));
+        }
+        assert_eq!(
+            bounded_session_expiry(
+                auth_time,
+                auth_time + SESSION_TTL_SECONDS,
+                &AuthContext::default()
+            ),
+            auth_time + SESSION_TTL_SECONDS
+        );
     }
 
     #[test]
@@ -28869,6 +29285,7 @@ mod tests {
     ) -> ProviderIdTokenClaims {
         ProviderIdTokenClaims {
             tid: None,
+            oid: None,
             hd: None,
             azp: None,
             nbf: None,

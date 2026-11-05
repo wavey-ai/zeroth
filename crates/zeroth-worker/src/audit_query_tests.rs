@@ -176,7 +176,9 @@ fn organization_actor_target_time_and_outcome_filters_are_bound_and_immutable() 
     );
     conn.execute("UPDATE zeroth_clients SET account_tenant_id = 'org-b'", [])
         .unwrap();
-    let selected = filter("organization_id=org-a&actor_type=user&actor_id=administrator&target_type=client&target_id=application&outcome=success&event_type=client.upsert&provider_id=entra&client_id=shared-client&user_id=shared-user&from=5000000000&until=5000000001");
+    let selected = filter(
+        "organization_id=org-a&actor_type=user&actor_id=administrator&target_type=client&target_id=application&outcome=success&event_type=client.upsert&provider_id=entra&client_id=shared-client&user_id=shared-user&from=5000000000&until=5000000001",
+    );
     let page = audit_event_page(rows(&conn, &selected), &selected).unwrap();
     assert_eq!(page.events.len(), 1);
     assert_eq!(page.events[0].id, "matching");

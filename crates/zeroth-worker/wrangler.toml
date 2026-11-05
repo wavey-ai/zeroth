@@ -3,6 +3,10 @@ main = "build/worker/shim.mjs"
 compatibility_date = "2026-06-04"
 workers_dev = true
 
+# Poll enabled Google Workspace directories every five minutes.
+[triggers]
+crons = ["*/5 * * * *"]
+
 [vars]
 PUBLIC_BASE_URL = "http://localhost:8787"
 PRODUCT_NAME = "Zeroth"
