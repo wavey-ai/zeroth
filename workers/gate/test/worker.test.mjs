@@ -6,6 +6,7 @@ import {
   authBypassEnabled,
   cacheControlForPath,
   handleGateRequest,
+  isAuthenticated,
   loginUrl,
   pathAllowedByRoute,
   routeConfig,
@@ -90,4 +91,80 @@ test("cache policy keeps gated binary assets private", () => {
   assert.equal(cacheControlForPath("/index.html"), "private, no-store");
   assert.equal(cacheControlForPath("/pitch.pdf"), "private, no-store");
   assert.equal(cacheControlForPath("/app.js"), "private, max-age=300");
+});
+
+test("a valid credential for another client cannot read gated assets", async (t) => {
+  t.mock.method(globalThis, "fetch", async () => Response.json({
+    valid: true,
+    kind: "access_token",
+    clientId: "public-app",
+    sub: "attacker",
+  }));
+  let assetsRead = false;
+  const response = await handleGateRequest(new Request("https://app.example.com/private/file.pdf", {
+    headers: { Authorization: "Bearer public-app-token" },
+  }), {
+    ZEROTH_ISSUER: "https://id.example.com",
+    ZEROTH_CLIENT_ID: "private-app",
+    ASSETS: { fetch: async () => { assetsRead = true; return new Response("private document"); } },
+  });
+
+  assert.equal(response.status, 307);
+  assert.equal(assetsRead, false);
+});
+
+test("validation requires a configured client and a strict successful response for that client", async (t) => {
+  let result;
+  let validations = 0;
+  t.mock.method(globalThis, "fetch", async () => {
+    validations++;
+    return Response.json(result);
+  });
+  const request = new Request("https://app.example.com/private/", {
+    headers: { Cookie: "zeroth_session=session" },
+  });
+  result = { valid: true, clientId: "private-app" };
+  assert.equal(await isAuthenticated(request, {}), false);
+  assert.equal(validations, 0);
+
+  const env = { ZEROTH_CLIENT_ID: "private-app", ZEROTH_ISSUER: "https://id.example.com" };
+  for (result of [
+    { valid: true },
+    { valid: true, clientId: "public-app" },
+    { valid: "false", clientId: "private-app" },
+    { authenticated: "false", clientId: "private-app" },
+    { valid: false, clientId: "private-app" },
+  ]) {
+    assert.equal(await isAuthenticated(request, env), false, JSON.stringify(result));
+  }
+  for (result of [
+    { valid: true, kind: "session", clientId: "private-app" },
+    { valid: true, kind: "access_token", clientId: "private-app" },
+  ]) {
+    assert.equal(await isAuthenticated(request, env), true, JSON.stringify(result));
+  }
+});
+
+test("gated assets cannot inherit shared cache directives from the asset binding", async () => {
+  for (const path of ["/private/file.pdf", "/private/app.js"]) {
+    const response = await handleGateRequest(new Request(`https://app.example.com${path}`), {
+      ZEROTH_AUTH_BYPASS: "always",
+      ASSETS: {
+        fetch: async () => new Response("private asset", {
+          headers: {
+            "Cache-Control": "public, max-age=86400, s-maxage=86400",
+            "CDN-Cache-Control": "public, max-age=86400",
+            "Cloudflare-CDN-Cache-Control": "public, max-age=86400",
+            "Surrogate-Control": "max-age=86400",
+          },
+        }),
+      },
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("Cache-Control"), cacheControlForPath(path));
+    for (const header of ["CDN-Cache-Control", "Cloudflare-CDN-Cache-Control", "Surrogate-Control"]) {
+      assert.equal(response.headers.get(header), null);
+    }
+  }
 });
