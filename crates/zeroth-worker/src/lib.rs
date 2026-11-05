@@ -94,6 +94,21 @@ const REVOKE_NATIVE_REFRESH_TOKEN_FAMILY_SQL: &str =
     "UPDATE zeroth_refresh_tokens
      SET revoked_at = ?
      WHERE client_id = ? AND user_id = ? AND session_id IS NULL AND revoked_at IS NULL";
+const CLIENT_ADMISSION_IDENTITIES_SQL: &str =
+    "SELECT provider_id, email, email_verified
+     FROM zeroth_account_identities
+     WHERE user_id = ?1 AND account_namespace = ?2
+     UNION ALL
+     SELECT i.provider_id, i.email, i.email_verified
+     FROM zeroth_identities i
+     WHERE i.user_id = ?1 AND ?2 = 'global'
+       AND NOT EXISTS (
+           SELECT 1 FROM zeroth_account_identities ai
+           WHERE ai.account_namespace = 'global'
+             AND ai.provider_id = i.provider_id AND ai.provider_subject = i.provider_subject
+             AND ai.user_id = i.user_id
+       )
+     LIMIT ?3";
 const SESSION_TTL_SECONDS: i32 = 60 * 60 * 24 * 30;
 const AUTH_TRANSACTION_CLEANUP_LIMIT: i32 = 64;
 const CORS_ORIGIN_SCAN_LIMIT: i32 = 256;
@@ -2113,6 +2128,13 @@ struct IdentityUserRow {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+struct ClientAdmissionIdentity {
+    provider_id: String,
+    email: Option<String>,
+    email_verified: i32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct IdentityCountRow {
     count: i32,
 }
@@ -4095,9 +4117,11 @@ async fn oauth_token(mut request: Request, env: Env) -> worker::Result<Response>
     let config = server_config(&env, &request_url);
     let response = match form.grant_type.as_str() {
         "authorization_code" => {
-            authorization_code_token(&db, &config, &signing_key, &form, now).await
+            authorization_code_token(&db, &config, &signing_key, &registered_client, &form, now).await
         }
-        "refresh_token" => refresh_token_token(&db, &config, &signing_key, &form, now).await,
+        "refresh_token" => {
+            refresh_token_token(&db, &config, &signing_key, &registered_client, &form, now).await
+        }
         TOKEN_EXCHANGE_GRANT_TYPE => {
             native_provider_token(
                 &db,
@@ -4144,6 +4168,7 @@ async fn authorization_code_token(
     db: &worker::d1::D1Database,
     config: &ZerothServerConfig,
     signing_key: &Es256SigningKey,
+    client: &RegisteredClient,
     form: &TokenExchangeForm,
     now: i32,
 ) -> worker::Result<Response> {
@@ -4161,6 +4186,12 @@ async fn authorization_code_token(
 
     if let Err(error) = validate_authorization_code_exchange(&auth_code, &fields, now) {
         return token_exchange_error_json(&error, 400);
+    }
+    if let Err(error) = validate_user_client_admission(db, client, &auth_code.user_id).await? {
+        return token_exchange_error_json(
+            &TokenExchangeError::invalid_grant(error.description),
+            400,
+        );
     }
     if !consume_authorization_code(db, &auth_code.code_hash, now).await? {
         return token_exchange_error_json(
@@ -4213,6 +4244,7 @@ async fn refresh_token_token(
     db: &worker::d1::D1Database,
     config: &ZerothServerConfig,
     signing_key: &Es256SigningKey,
+    client: &RegisteredClient,
     form: &TokenExchangeForm,
     now: i32,
 ) -> worker::Result<Response> {
@@ -4233,6 +4265,13 @@ async fn refresh_token_token(
             revoke_refresh_token_family(db, &refresh_token_row, now).await?;
         }
         return token_exchange_error_json(&error, 400);
+    }
+    if let Err(error) = validate_user_client_admission(db, client, &refresh_token_row.user_id).await? {
+        revoke_refresh_token_family(db, &refresh_token_row, now).await?;
+        return token_exchange_error_json(
+            &TokenExchangeError::invalid_grant(error.description),
+            400,
+        );
     }
     let user_claims = match get_user_token_claims(db, &refresh_token_row.user_id).await? {
         Some(user_claims) => user_claims,
@@ -7894,6 +7933,27 @@ async fn authorize(request: Request, env: Env) -> worker::Result<Response> {
                 )
             })
         {
+            if let Err(error) =
+                validate_user_client_admission(&db, &registered_client, &current.user.id).await?
+            {
+                if authorization_request.prompt != AuthorizationPrompt::None {
+                    return hosted_authorization_document(
+                        &request,
+                        &env,
+                        &url,
+                        &db,
+                        &authorization_request,
+                        &registered_client,
+                    )
+                    .await;
+                }
+                return redirect_to_authorization_request_error(
+                    &authorization_request,
+                    &config.issuer().issuer,
+                    "access_denied",
+                    &error.description,
+                );
+            }
             let zeroth_code = random_token()?;
             put_authorization_code_for_request(
                 &db,
@@ -7943,6 +8003,16 @@ async fn authorize(request: Request, env: Env) -> worker::Result<Response> {
                 &config.issuer().issuer,
                 "login_required",
                 "active browser session is older than max_age",
+            );
+        }
+        if let Err(error) =
+            validate_user_client_admission(&db, &registered_client, &current.user.id).await?
+        {
+            return redirect_to_authorization_request_error(
+                &authorization_request,
+                &config.issuer().issuer,
+                "access_denied",
+                &error.description,
             );
         }
 
@@ -14762,6 +14832,62 @@ fn validate_client_email_domain_policy(
 
     Err(ProviderCallbackError::access_denied(
         "email domain is not allowed for this client",
+    ))
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn validate_user_client_admission(
+    db: &worker::d1::D1Database,
+    client: &RegisteredClient,
+    user_id: &str,
+) -> worker::Result<Result<(), ProviderCallbackError>> {
+    let args = [
+        worker::d1::D1Type::Text(user_id),
+        worker::d1::D1Type::Text(&client.account_scope.namespace),
+        worker::d1::D1Type::Integer(IDENTITY_LIST_LIMIT + PASSKEY_CREDENTIAL_LIST_LIMIT),
+    ];
+    let identities = db
+        .prepare(CLIENT_ADMISSION_IDENTITIES_SQL)
+        .bind_refs(&args)?
+        .all()
+        .await?
+        .results::<ClientAdmissionIdentity>()?;
+    Ok(validate_client_admission_identities(&client.client, &identities))
+}
+
+fn validate_client_admission_identities(
+    client: &Client,
+    identities: &[ClientAdmissionIdentity],
+) -> Result<(), ProviderCallbackError> {
+    if identities.is_empty() {
+        return Err(ProviderCallbackError::access_denied(
+            "account does not belong to this client's account namespace",
+        ));
+    }
+    if client.allowed_email_domains.is_empty() {
+        return Ok(());
+    }
+    // A passkey proves control of its private key, not its registration email.
+    // Older passkey rows incorrectly marked that unverified address as verified.
+    if identities.iter().any(|identity| {
+        identity.provider_id != "passkey"
+            && validate_client_email_domain_policy(
+                client,
+                &ProviderProfile {
+                    provider_id: ProviderId(identity.provider_id.clone()),
+                    subject: Subject(String::new()),
+                    email: identity.email.clone(),
+                    email_verified: identity.email_verified != 0,
+                    display_name: None,
+                    picture_url: None,
+                },
+            )
+            .is_ok()
+    }) {
+        return Ok(());
+    }
+    Err(ProviderCallbackError::access_denied(
+        "verified email domain is not allowed for this client",
     ))
 }
 
@@ -23557,6 +23683,112 @@ mod tests {
         assert_eq!(error.code, "invalid_grant");
         assert_eq!(error.description, "refresh token has already been rotated");
         assert!(refresh_token_replay_detected(&row, "ios"));
+    }
+
+    fn sqlite_client_admission_identities(
+        conn: &Connection,
+        user_id: &str,
+        namespace: &str,
+    ) -> Vec<ClientAdmissionIdentity> {
+        conn.prepare(CLIENT_ADMISSION_IDENTITIES_SQL)
+            .unwrap()
+            .query_map(
+                params![user_id, namespace, IDENTITY_LIST_LIMIT + PASSKEY_CREDENTIAL_LIST_LIMIT],
+                |row| {
+                    Ok(ClientAdmissionIdentity {
+                        provider_id: row.get(0)?,
+                        email: row.get(1)?,
+                        email_verified: row.get(2)?,
+                    })
+                },
+            )
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn client_admission_prevents_sso_across_tenant_and_client_namespaces() {
+        let conn = sqlite_bootstrap();
+        sqlite_seed_authorize_fixtures(&conn);
+        conn.execute(
+            "INSERT INTO zeroth_account_identities (
+                account_namespace, provider_id, provider_subject, user_id, email,
+                email_verified, created_at, updated_at
+             ) VALUES ('tenant:alpha', 'google', 'google-user', 'usr_123',
+                       'user@example.com', 1, 1, 1)",
+            [],
+        )
+        .unwrap();
+        let client = sqlite_client_from_row(&conn, "yl-web");
+
+        for namespace in ["global", "tenant:beta", "client:yl-web"] {
+            let identities = sqlite_client_admission_identities(&conn, "usr_123", namespace);
+            assert!(validate_client_admission_identities(&client, &identities).is_err());
+        }
+        let identities = sqlite_client_admission_identities(&conn, "usr_123", "tenant:alpha");
+        validate_client_admission_identities(&client, &identities).unwrap();
+    }
+
+    #[test]
+    fn client_admission_requires_verified_email_in_target_namespace() {
+        let conn = sqlite_bootstrap();
+        sqlite_seed_authorize_fixtures(&conn);
+        conn.execute_batch(
+            "INSERT INTO zeroth_account_identities (
+                account_namespace, provider_id, provider_subject, user_id, email,
+                email_verified, created_at, updated_at
+             ) VALUES ('tenant:alpha', 'google', 'corporate', 'usr_123',
+                       'user@example.com', 1, 1, 1),
+                      ('global', 'google', 'personal', 'usr_123',
+                       'user@personal.example', 1, 1, 1),
+                      ('global', 'zeroth', 'unverified', 'usr_123',
+                       'user@example.com', 0, 1, 1);
+             INSERT INTO zeroth_identities (
+                provider_id, provider_subject, user_id, email, email_verified, created_at, updated_at
+             ) VALUES ('passkey', 'old-passkey', 'usr_123', 'user@example.com', 1, 1, 1);",
+        )
+        .unwrap();
+        let mut client = sqlite_client_from_row(&conn, "yl-web");
+        client.allowed_email_domains = vec!["example.com".to_owned()];
+
+        let global = sqlite_client_admission_identities(&conn, "usr_123", "global");
+        assert!(validate_client_admission_identities(&client, &global).is_err());
+        let corporate = sqlite_client_admission_identities(&conn, "usr_123", "tenant:alpha");
+        validate_client_admission_identities(&client, &corporate).unwrap();
+
+        // Policy changes also apply to existing codes and refresh grants, which
+        // invoke the same admission check before issuing their next tokens.
+        client.allowed_email_domains = vec!["other.example".to_owned()];
+        assert!(validate_client_admission_identities(&client, &corporate).is_err());
+    }
+
+    #[test]
+    fn client_admission_preserves_global_legacy_login_without_stale_verification() {
+        let conn = sqlite_bootstrap();
+        sqlite_seed_authorize_fixtures(&conn);
+        conn.execute_batch(
+            "INSERT INTO zeroth_identities (
+                provider_id, provider_subject, user_id, email, email_verified, created_at, updated_at
+             ) VALUES ('zeroth', 'user@example.com', 'usr_123', 'user@example.com', 1, 1, 1);",
+        )
+        .unwrap();
+        let mut client = sqlite_client_from_row(&conn, "yl-web");
+        client.allowed_email_domains = vec!["example.com".to_owned()];
+        let identities = sqlite_client_admission_identities(&conn, "usr_123", "global");
+        validate_client_admission_identities(&client, &identities).unwrap();
+
+        conn.execute_batch(
+            "INSERT INTO zeroth_account_identities (
+                account_namespace, provider_id, provider_subject, user_id, email,
+                email_verified, created_at, updated_at
+             ) VALUES ('global', 'zeroth', 'user@example.com', 'usr_123',
+                       'user@example.com', 0, 1, 1);",
+        )
+        .unwrap();
+        let identities = sqlite_client_admission_identities(&conn, "usr_123", "global");
+        assert_eq!(identities.len(), 1);
+        assert!(validate_client_admission_identities(&client, &identities).is_err());
     }
 
     #[test]
