@@ -1,5 +1,7 @@
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 
+#[cfg(test)]
+mod audit_query_tests;
 mod enterprise;
 #[cfg(test)]
 mod enterprise_persistence_tests;
@@ -1838,6 +1840,28 @@ struct AuditEventRow {
     #[serde(default)]
     user_agent: Option<String>,
     details_json: String,
+    #[serde(default)]
+    schema_version: i32,
+    #[serde(default)]
+    organization_id: Option<String>,
+    #[serde(default)]
+    actor_type: Option<String>,
+    #[serde(default)]
+    actor_id: Option<String>,
+    #[serde(default)]
+    target_type: Option<String>,
+    #[serde(default)]
+    target_id: Option<String>,
+    #[serde(default = "legacy_audit_outcome")]
+    outcome: String,
+    #[serde(default)]
+    reason_code: Option<String>,
+    #[serde(default)]
+    request_id: Option<String>,
+    #[serde(default)]
+    recorded_at: Option<i64>,
+    #[serde(default)]
+    event_json: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Eq, PartialEq)]
@@ -1872,12 +1896,34 @@ struct AuditEventResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     user_agent: Option<String>,
     details: serde_json::Value,
+    schema_version: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    organization_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    actor_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    actor_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_id: Option<String>,
+    outcome: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_id: Option<String>,
+    recorded_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    event: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AuditEventsResponse {
     events: Vec<AuditEventResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_cursor: Option<String>,
+    has_more: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1920,6 +1966,30 @@ struct AuditEventFilter {
     user_id: Option<String>,
     client_id: Option<String>,
     provider_id: Option<String>,
+    organization_id: Option<String>,
+    actor_type: Option<String>,
+    actor_id: Option<String>,
+    target_type: Option<String>,
+    target_id: Option<String>,
+    outcome: Option<String>,
+    from: Option<i64>,
+    until: Option<i64>,
+    limit: Option<u16>,
+    cursor: Option<AuditCursor>,
+    csv: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuditCursor {
+    version: u8,
+    recorded_at: i64,
+    id: String,
+    filters: String,
+}
+
+fn legacy_audit_outcome() -> String {
+    "unknown".to_owned()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -4253,22 +4323,41 @@ async fn events(request: Request, env: Env) -> worker::Result<Response> {
     let url = request.url()?;
     let db = env.d1(D1_BINDING)?;
     let config = server_config(&env, &url);
+    // Organization filters narrow the deployment administrator's query. They
+    // never grant organization-level access or replace this authorization gate.
     if let Err(error) =
         validate_admin_request(&request, &env, &db, &config, unix_timestamp_seconds()).await
     {
         return client_management_error_json(&error);
     }
-
     let filter = match audit_event_filter_from_url(&url) {
         Ok(filter) => filter,
         Err(error) => return client_management_error_json(&error),
     };
-    let rows = list_audit_event_rows(&db, &filter).await?;
-    let events = rows
-        .into_iter()
-        .map(audit_event_response_from_row)
-        .collect();
-    json(&AuditEventsResponse { events })
+    let page = audit_event_page(fetch_audit_event_page_rows(&db, &filter).await?, &filter)
+        .map_err(|error| worker_error(error.description))?;
+    let response = if filter.csv {
+        let response = Response::ok(audit_events_csv(&page.events))?;
+        response
+            .headers()
+            .set("Content-Type", "text/csv; charset=utf-8")?;
+        response.headers().set(
+            "Content-Disposition",
+            "attachment; filename=\"zeroth-audit-events.csv\"",
+        )?;
+        response
+    } else {
+        json(&page)?
+    };
+    response.headers().set("Cache-Control", "no-store")?;
+    response.headers().set(
+        "X-Audit-Has-More",
+        if page.has_more { "true" } else { "false" },
+    )?;
+    if let Some(cursor) = page.next_cursor.as_deref() {
+        response.headers().set("X-Audit-Next-Cursor", cursor)?;
+    }
+    Ok(response)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -11745,44 +11834,218 @@ async fn list_audit_event_rows(
     db: &worker::d1::D1Database,
     filter: &AuditEventFilter,
 ) -> worker::Result<Vec<AuditEventRow>> {
-    let mut conditions = Vec::new();
-    let mut args = Vec::new();
-    if let Some(event_type) = &filter.event_type {
-        conditions.push("event_type = ?");
-        args.push(worker::d1::D1Type::Text(event_type));
-    }
-    if let Some(user_id) = &filter.user_id {
-        conditions.push("user_id = ?");
-        args.push(worker::d1::D1Type::Text(user_id));
-    }
-    if let Some(client_id) = &filter.client_id {
-        conditions.push("client_id = ?");
-        args.push(worker::d1::D1Type::Text(client_id));
-    }
-    if let Some(provider_id) = &filter.provider_id {
-        conditions.push("provider_id = ?");
-        args.push(worker::d1::D1Type::Text(provider_id));
-    }
-    args.push(worker::d1::D1Type::Integer(AUDIT_EVENT_LIST_LIMIT));
+    let mut rows = fetch_audit_event_page_rows(db, filter).await?;
+    rows.truncate(audit_page_limit(filter));
+    Ok(rows)
+}
 
+#[cfg(target_arch = "wasm32")]
+async fn fetch_audit_event_page_rows(
+    db: &worker::d1::D1Database,
+    filter: &AuditEventFilter,
+) -> worker::Result<Vec<AuditEventRow>> {
+    let query = audit_event_query(filter).map_err(|error| worker_error(error.description))?;
+    // Bind integer bounds as text and CAST in SQL: workers-rs D1Type::Integer
+    // is i32, whereas the audit contract uses i64 timestamps.
+    let args = query
+        .parameters
+        .iter()
+        .map(|value| worker::d1::D1Type::Text(value))
+        .collect::<Vec<_>>();
+    db.prepare(query.sql)
+        .bind_refs(&args)?
+        .all()
+        .await?
+        .results::<AuditEventRow>()
+}
+
+struct AuditEventQuery {
+    sql: String,
+    parameters: Vec<String>,
+}
+
+fn audit_page_limit(filter: &AuditEventFilter) -> usize {
+    usize::from(filter.limit.unwrap_or(AUDIT_EVENT_LIST_LIMIT as u16))
+}
+
+fn audit_filter_fingerprint(filter: &AuditEventFilter) -> String {
+    let serialized = serde_json::to_string(&(
+        &filter.event_type,
+        &filter.user_id,
+        &filter.client_id,
+        &filter.provider_id,
+        &filter.organization_id,
+        &filter.actor_type,
+        &filter.actor_id,
+        &filter.target_type,
+        &filter.target_id,
+        &filter.outcome,
+        filter.from,
+        filter.until,
+    ))
+    .expect("audit filter consists of serializable strings and integers");
+    hash_secret(&serialized)
+}
+
+fn audit_event_query(filter: &AuditEventFilter) -> Result<AuditEventQuery, ClientManagementError> {
+    let limit = audit_page_limit(filter);
+    if limit == 0 || limit > AUDIT_EVENT_LIST_LIMIT as usize {
+        return Err(ClientManagementError::invalid_request(
+            "audit limit must be between 1 and 100",
+        ));
+    }
+    let mut conditions = Vec::new();
+    let mut parameters = Vec::new();
+    for (column, value) in [
+        ("event_type", &filter.event_type),
+        ("user_id", &filter.user_id),
+        ("client_id", &filter.client_id),
+        ("provider_id", &filter.provider_id),
+        ("organization_id", &filter.organization_id),
+        ("actor_type", &filter.actor_type),
+        ("actor_id", &filter.actor_id),
+        ("target_type", &filter.target_type),
+        ("target_id", &filter.target_id),
+        ("outcome", &filter.outcome),
+    ] {
+        if let Some(value) = value {
+            conditions.push(format!("{column} = ?"));
+            parameters.push(value.clone());
+        }
+    }
+    if let Some(from) = filter.from {
+        conditions.push("COALESCE(recorded_at, created_at) >= CAST(? AS INTEGER)".to_owned());
+        parameters.push(from.to_string());
+    }
+    if let Some(until) = filter.until {
+        conditions.push("COALESCE(recorded_at, created_at) < CAST(? AS INTEGER)".to_owned());
+        parameters.push(until.to_string());
+    }
+    if let Some(cursor) = filter.cursor.as_ref() {
+        validate_audit_cursor(cursor, filter)?;
+        conditions.push("(COALESCE(recorded_at, created_at) < CAST(? AS INTEGER) OR (COALESCE(recorded_at, created_at) = CAST(? AS INTEGER) AND id < ?))".to_owned());
+        parameters.extend([
+            cursor.recorded_at.to_string(),
+            cursor.recorded_at.to_string(),
+            cursor.id.clone(),
+        ]);
+    }
     let where_clause = if conditions.is_empty() {
         String::new()
     } else {
         format!(" WHERE {}", conditions.join(" AND "))
     };
-    let sql = format!(
-        "SELECT id, event_type, user_id, client_id, provider_id, created_at,
-                ip_hash, user_agent, details_json
-           FROM zeroth_audit_events
-          {where_clause}
-          ORDER BY created_at DESC, id DESC
-          LIMIT ?"
-    );
-    db.prepare(sql)
-        .bind_refs(&args)?
-        .all()
-        .await?
-        .results::<AuditEventRow>()
+    parameters.push((limit + 1).to_string());
+    Ok(AuditEventQuery {
+        sql: format!("SELECT id, event_type, user_id, client_id, provider_id, created_at, ip_hash, user_agent, details_json, schema_version, organization_id, actor_type, actor_id, target_type, target_id, outcome, reason_code, request_id, COALESCE(recorded_at, created_at) AS recorded_at, event_json FROM zeroth_audit_events{where_clause} ORDER BY COALESCE(recorded_at, created_at) DESC, id DESC LIMIT CAST(? AS INTEGER)"),
+        parameters,
+    })
+}
+
+fn validate_audit_cursor(
+    cursor: &AuditCursor,
+    filter: &AuditEventFilter,
+) -> Result<(), ClientManagementError> {
+    if cursor.version != 1
+        || cursor.recorded_at < 0
+        || validate_audit_query_token(&cursor.id, "cursor event id").is_err()
+        || cursor.filters != audit_filter_fingerprint(filter)
+    {
+        return Err(ClientManagementError::invalid_request(
+            "invalid audit cursor or cursor filters changed",
+        ));
+    }
+    Ok(())
+}
+
+fn audit_event_page(
+    mut rows: Vec<AuditEventRow>,
+    filter: &AuditEventFilter,
+) -> Result<AuditEventsResponse, ClientManagementError> {
+    let limit = audit_page_limit(filter);
+    let has_more = rows.len() > limit;
+    rows.truncate(limit);
+    let next_cursor = if has_more {
+        rows.last()
+            .map(|row| {
+                let cursor = AuditCursor {
+                    version: 1,
+                    recorded_at: row.recorded_at.unwrap_or(i64::from(row.created_at)),
+                    id: row.id.clone(),
+                    filters: audit_filter_fingerprint(filter),
+                };
+                serde_json::to_vec(&cursor)
+                    .map(|value| URL_SAFE_NO_PAD.encode(value))
+                    .map_err(|_| {
+                        ClientManagementError::invalid_request("could not encode audit cursor")
+                    })
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    Ok(AuditEventsResponse {
+        events: rows
+            .into_iter()
+            .map(audit_event_response_from_row)
+            .collect(),
+        next_cursor,
+        has_more,
+    })
+}
+
+fn audit_csv_cell(value: &str) -> String {
+    let probe = value.trim_start_matches(|ch: char| ch.is_whitespace() || ch == '\u{feff}');
+    let dangerous = probe.starts_with(['=', '+', '-', '@'])
+        || value.chars().next().is_some_and(char::is_control);
+    let text = if dangerous {
+        format!("'{value}")
+    } else {
+        value.to_owned()
+    };
+    format!("\"{}\"", text.replace('"', "\"\""))
+}
+
+fn audit_events_csv(events: &[AuditEventResponse]) -> String {
+    let mut output = "id,recorded_at,event_type,schema_version,organization_id,actor_type,actor_id,target_type,target_id,outcome,reason_code,request_id,user_id,client_id,provider_id,details,event\r\n".to_owned();
+    for event in events {
+        let recorded_at = event.recorded_at.to_string();
+        let schema_version = event.schema_version.to_string();
+        let details = event.details.to_string();
+        let canonical = event
+            .event
+            .as_ref()
+            .map(serde_json::Value::to_string)
+            .unwrap_or_default();
+        let fields = [
+            event.id.as_str(),
+            &recorded_at,
+            &event.event_type,
+            &schema_version,
+            event.organization_id.as_deref().unwrap_or_default(),
+            event.actor_type.as_deref().unwrap_or_default(),
+            event.actor_id.as_deref().unwrap_or_default(),
+            event.target_type.as_deref().unwrap_or_default(),
+            event.target_id.as_deref().unwrap_or_default(),
+            &event.outcome,
+            event.reason_code.as_deref().unwrap_or_default(),
+            event.request_id.as_deref().unwrap_or_default(),
+            event.user_id.as_deref().unwrap_or_default(),
+            event.client_id.as_deref().unwrap_or_default(),
+            event.provider_id.as_deref().unwrap_or_default(),
+            &details,
+            &canonical,
+        ];
+        output.push_str(
+            &fields
+                .iter()
+                .map(|field| audit_csv_cell(field))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        output.push_str("\r\n");
+    }
+    output
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -15061,30 +15324,154 @@ fn validate_audit_event_type(raw: &str) -> Result<String, ClientManagementError>
     Ok(value.to_owned())
 }
 
+fn validate_audit_query_token(raw: &str, field: &str) -> Result<String, ClientManagementError> {
+    let value = raw.trim();
+    if value.is_empty()
+        || value.len() > 256
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':'))
+    {
+        return Err(ClientManagementError::invalid_request(format!(
+            "invalid {field}"
+        )));
+    }
+    Ok(value.to_owned())
+}
+
 fn audit_event_filter_from_url(url: &url::Url) -> Result<AuditEventFilter, ClientManagementError> {
-    let event_type = query_param(url, "event_type")
-        .map(|value| validate_audit_event_type(&value))
-        .transpose()?;
-    let user_id = query_param(url, "user_id")
-        .map(|value| validate_admin_user_id(&value))
-        .transpose()?;
-    let client_id = query_param(url, "client_id")
-        .map(|value| validate_client_id(&value))
-        .transpose()?;
-    let provider_id = query_param(url, "provider_id")
+    let keys = [
+        "event_type",
+        "user_id",
+        "client_id",
+        "provider_id",
+        "organization_id",
+        "actor_type",
+        "actor_id",
+        "target_type",
+        "target_id",
+        "outcome",
+        "from",
+        "until",
+        "limit",
+        "cursor",
+        "format",
+    ];
+    for key in keys {
+        if url.query_pairs().filter(|(name, _)| name == key).count() > 1 {
+            return Err(ClientManagementError::invalid_request(format!(
+                "duplicate audit parameter: {key}"
+            )));
+        }
+    }
+    let token = |name: &str| -> Result<Option<String>, ClientManagementError> {
+        query_param(url, name)
+            .map(|value| validate_audit_query_token(&value, name))
+            .transpose()
+    };
+    let timestamp = |name: &str| -> Result<Option<i64>, ClientManagementError> {
+        query_param(url, name)
+            .map(|value| {
+                value
+                    .trim()
+                    .parse::<i64>()
+                    .ok()
+                    .filter(|value| *value >= 0)
+                    .ok_or_else(|| {
+                        ClientManagementError::invalid_request(format!(
+                            "{name} must be nonnegative Unix seconds"
+                        ))
+                    })
+            })
+            .transpose()
+    };
+    let mut filter = AuditEventFilter {
+        event_type: query_param(url, "event_type")
+            .map(|value| validate_audit_event_type(&value))
+            .transpose()?,
+        user_id: query_param(url, "user_id")
+            .map(|value| validate_admin_user_id(&value))
+            .transpose()?,
+        client_id: query_param(url, "client_id")
+            .map(|value| validate_client_id(&value))
+            .transpose()?,
+        provider_id: query_param(url, "provider_id")
+            .map(|value| {
+                validate_identity_provider_id(&value)
+                    .map_err(ClientManagementError::invalid_request)?;
+                Ok::<_, ClientManagementError>(value)
+            })
+            .transpose()?,
+        organization_id: token("organization_id")?,
+        actor_type: token("actor_type")?,
+        actor_id: token("actor_id")?,
+        target_type: token("target_type")?,
+        target_id: token("target_id")?,
+        outcome: token("outcome")?,
+        from: timestamp("from")?,
+        until: timestamp("until")?,
+        ..AuditEventFilter::default()
+    };
+    if filter
+        .from
+        .zip(filter.until)
+        .is_some_and(|(from, until)| from > until)
+    {
+        return Err(ClientManagementError::invalid_request(
+            "from must not be after until",
+        ));
+    }
+    if filter.outcome.as_deref().is_some_and(|value| {
+        !matches!(
+            value,
+            "success" | "failure" | "denied" | "error" | "unknown"
+        )
+    }) {
+        return Err(ClientManagementError::invalid_request(
+            "invalid audit outcome",
+        ));
+    }
+    filter.limit = query_param(url, "limit")
         .map(|value| {
-            validate_identity_provider_id(&value)
-                .map_err(ClientManagementError::invalid_request)?;
-            Ok::<_, ClientManagementError>(value)
+            value
+                .trim()
+                .parse::<u16>()
+                .ok()
+                .filter(|value| *value >= 1 && i32::from(*value) <= AUDIT_EVENT_LIST_LIMIT)
+                .ok_or_else(|| {
+                    ClientManagementError::invalid_request("audit limit must be between 1 and 100")
+                })
         })
         .transpose()?;
-
-    Ok(AuditEventFilter {
-        event_type,
-        user_id,
-        client_id,
-        provider_id,
-    })
+    filter.csv = match query_param(url, "format").as_deref().map(str::trim) {
+        None | Some("json") => false,
+        Some("csv") => true,
+        _ => {
+            return Err(ClientManagementError::invalid_request(
+                "audit format must be json or csv",
+            ))
+        }
+    };
+    if let Some(encoded) = query_param(url, "cursor") {
+        if encoded.len() > 2048 {
+            return Err(ClientManagementError::invalid_request(
+                "audit cursor is too large",
+            ));
+        }
+        let bytes = URL_SAFE_NO_PAD
+            .decode(encoded)
+            .map_err(|_| ClientManagementError::invalid_request("invalid audit cursor"))?;
+        if bytes.len() > 1024 {
+            return Err(ClientManagementError::invalid_request(
+                "audit cursor is too large",
+            ));
+        }
+        let cursor: AuditCursor = serde_json::from_slice(&bytes)
+            .map_err(|_| ClientManagementError::invalid_request("invalid audit cursor"))?;
+        validate_audit_cursor(&cursor, &filter)?;
+        filter.cursor = Some(cursor);
+    }
+    Ok(filter)
 }
 
 fn validate_client_name(raw: &str) -> Result<String, ClientManagementError> {
@@ -15878,6 +16265,10 @@ fn admin_user_response_from_row(row: AdminUserRow) -> AdminUserResponse {
 fn audit_event_response_from_row(row: AuditEventRow) -> AuditEventResponse {
     let details = serde_json::from_str(&row.details_json)
         .unwrap_or_else(|_| serde_json::json!({ "invalidDetailsJson": true }));
+    let event = row.event_json.as_deref().map(|value| {
+        serde_json::from_str(value)
+            .unwrap_or_else(|_| serde_json::json!({ "invalidEventJson": true }))
+    });
     AuditEventResponse {
         id: row.id,
         event_type: row.event_type,
@@ -15888,6 +16279,17 @@ fn audit_event_response_from_row(row: AuditEventRow) -> AuditEventResponse {
         ip_hash: row.ip_hash,
         user_agent: row.user_agent,
         details,
+        schema_version: row.schema_version,
+        organization_id: row.organization_id,
+        actor_type: row.actor_type,
+        actor_id: row.actor_id,
+        target_type: row.target_type,
+        target_id: row.target_id,
+        outcome: row.outcome,
+        reason_code: row.reason_code,
+        request_id: row.request_id,
+        recorded_at: row.recorded_at.unwrap_or(i64::from(row.created_at)),
+        event,
     }
 }
 
@@ -23610,6 +24012,17 @@ mod tests {
             ip_hash: Some("ip-hash".to_owned()),
             user_agent: Some("agent".to_owned()),
             details_json: r#"{"mode":"hosted"}"#.to_owned(),
+            schema_version: 0,
+            organization_id: None,
+            actor_type: None,
+            actor_id: None,
+            target_type: None,
+            target_id: None,
+            outcome: "unknown".to_owned(),
+            reason_code: None,
+            request_id: None,
+            recorded_at: None,
+            event_json: None,
         });
 
         assert_eq!(response.event_type, "session.login");
@@ -24487,7 +24900,7 @@ mod tests {
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        assert_eq!(migration_versions, (1..=12).collect::<Vec<_>>());
+        assert_eq!(migration_versions, (1..=13).collect::<Vec<_>>());
     }
 
     #[test]
