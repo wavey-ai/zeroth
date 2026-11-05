@@ -76,27 +76,22 @@ const AUTH_CODE_TTL_SECONDS: i32 = 10 * 60;
 const ACCESS_TOKEN_TTL_SECONDS: i32 = 60 * 60;
 const ID_TOKEN_TTL_SECONDS: i32 = 60 * 60;
 const REFRESH_TOKEN_TTL_SECONDS: i32 = 60 * 60 * 24 * 30;
-const INSERT_ROTATED_REFRESH_TOKEN_SQL: &str =
-    "INSERT INTO zeroth_refresh_tokens (
+const INSERT_ROTATED_REFRESH_TOKEN_SQL: &str = "INSERT INTO zeroth_refresh_tokens (
          token_hash, client_id, user_id, session_id, auth_time, scope, created_at, expires_at
      )
      SELECT ?, client_id, user_id, session_id, auth_time, scope, ?, ?
      FROM zeroth_refresh_tokens
      WHERE token_hash = ? AND rotated_at = ? AND revoked_at IS NULL AND expires_at > ?";
-const REVOKE_USER_REFRESH_TOKENS_SQL: &str =
-    "UPDATE zeroth_refresh_tokens
+const REVOKE_USER_REFRESH_TOKENS_SQL: &str = "UPDATE zeroth_refresh_tokens
      SET revoked_at = ?
      WHERE user_id = ? AND revoked_at IS NULL";
-const REVOKE_SESSION_REFRESH_TOKEN_FAMILY_SQL: &str =
-    "UPDATE zeroth_refresh_tokens
+const REVOKE_SESSION_REFRESH_TOKEN_FAMILY_SQL: &str = "UPDATE zeroth_refresh_tokens
      SET revoked_at = ?
      WHERE client_id = ? AND user_id = ? AND session_id = ? AND revoked_at IS NULL";
-const REVOKE_NATIVE_REFRESH_TOKEN_FAMILY_SQL: &str =
-    "UPDATE zeroth_refresh_tokens
+const REVOKE_NATIVE_REFRESH_TOKEN_FAMILY_SQL: &str = "UPDATE zeroth_refresh_tokens
      SET revoked_at = ?
      WHERE client_id = ? AND user_id = ? AND session_id IS NULL AND revoked_at IS NULL";
-const CLIENT_ADMISSION_IDENTITIES_SQL: &str =
-    "SELECT provider_id, email, email_verified
+const CLIENT_ADMISSION_IDENTITIES_SQL: &str = "SELECT provider_id, email, email_verified
      FROM zeroth_account_identities
      WHERE user_id = ?1 AND account_namespace = ?2
      UNION ALL
@@ -1377,6 +1372,8 @@ struct ClientRow {
     #[serde(default)]
     allowed_email_domains_json: String,
     #[serde(default)]
+    enterprise_provider: Option<String>,
+    #[serde(default)]
     issuer_token_audience: Option<String>,
     #[serde(default)]
     issuer_token_ttl_seconds: Option<i32>,
@@ -1406,6 +1403,7 @@ struct ClientResponse {
     redirect_uris: Vec<String>,
     allowed_origins: Vec<String>,
     allowed_email_domains: Vec<String>,
+    enterprise_provider: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     issuer_token_audience: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1693,6 +1691,8 @@ struct ClientUpsertRequest {
     allowed_origins: Vec<String>,
     #[serde(default, alias = "allowed_email_domains")]
     allowed_email_domains: Vec<String>,
+    #[serde(default, alias = "enterprise_provider")]
+    enterprise_provider: Option<String>,
     #[serde(default, alias = "account_sharing_mode")]
     account_sharing_mode: Option<String>,
     #[serde(default, alias = "account_tenant_id")]
@@ -1720,6 +1720,7 @@ struct ValidatedClientUpsert {
     redirect_uris: Vec<String>,
     allowed_origins: Vec<String>,
     allowed_email_domains: Vec<String>,
+    enterprise_provider: Option<String>,
     issuer_token_audience: Option<String>,
     issuer_token_ttl_seconds: Option<i32>,
     account_sharing_mode: AccountSharingMode,
@@ -4127,7 +4128,8 @@ async fn oauth_token(mut request: Request, env: Env) -> worker::Result<Response>
     let config = server_config(&env, &request_url);
     let response = match form.grant_type.as_str() {
         "authorization_code" => {
-            authorization_code_token(&db, &config, &signing_key, &registered_client, &form, now).await
+            authorization_code_token(&db, &config, &signing_key, &registered_client, &form, now)
+                .await
         }
         "refresh_token" => {
             refresh_token_token(&db, &config, &signing_key, &registered_client, &form, now).await
@@ -4276,7 +4278,9 @@ async fn refresh_token_token(
         }
         return token_exchange_error_json(&error, 400);
     }
-    if let Err(error) = validate_user_client_admission(db, client, &refresh_token_row.user_id).await? {
+    if let Err(error) =
+        validate_user_client_admission(db, client, &refresh_token_row.user_id).await?
+    {
         revoke_refresh_token_family(db, &refresh_token_row, now).await?;
         return token_exchange_error_json(
             &TokenExchangeError::invalid_grant(error.description),
@@ -9234,6 +9238,7 @@ fn client_admin_ui_from_row(row: ClientRow) -> Result<ClientAdminUi, String> {
         redirect_uris: response.redirect_uris,
         allowed_origins: response.allowed_origins,
         allowed_email_domains: response.allowed_email_domains,
+        enterprise_provider: response.enterprise_provider,
         issuer_token_audience: response.issuer_token_audience,
         issuer_token_ttl_seconds: response.issuer_token_ttl_seconds,
         account_sharing_mode: response.account_sharing_mode,
@@ -9591,7 +9596,7 @@ async fn get_registered_client(
     let row = db
         .prepare(
             "SELECT id, name, secret_hash, redirect_uris_json, allowed_origins_json,
-                    allowed_email_domains_json, issuer_token_audience,
+                    allowed_email_domains_json, enterprise_provider, issuer_token_audience,
                     issuer_token_ttl_seconds, account_sharing_mode, account_tenant_id,
                     visible_login_methods_json, confidential, disabled_at
              FROM zeroth_clients
@@ -9616,7 +9621,7 @@ async fn get_client_row_for_admin(
     let args = [worker::d1::D1Type::Text(client_id)];
     db.prepare(
         "SELECT id, name, secret_hash, redirect_uris_json, allowed_origins_json,
-                allowed_email_domains_json, issuer_token_audience,
+                allowed_email_domains_json, enterprise_provider, issuer_token_audience,
                 issuer_token_ttl_seconds, account_sharing_mode, account_tenant_id,
                 visible_login_methods_json, confidential, disabled_at
          FROM zeroth_clients
@@ -9633,7 +9638,7 @@ async fn list_client_rows_for_admin(db: &worker::d1::D1Database) -> worker::Resu
     let args = [worker::d1::D1Type::Integer(CLIENT_LIST_LIMIT)];
     db.prepare(
         "SELECT id, name, secret_hash, redirect_uris_json, allowed_origins_json,
-                allowed_email_domains_json, issuer_token_audience,
+                allowed_email_domains_json, enterprise_provider, issuer_token_audience,
                 issuer_token_ttl_seconds, account_sharing_mode, account_tenant_id,
                 visible_login_methods_json, confidential, disabled_at
          FROM zeroth_clients
@@ -9645,6 +9650,32 @@ async fn list_client_rows_for_admin(db: &worker::d1::D1Database) -> worker::Resu
     .await?
     .results::<ClientRow>()
 }
+
+const CLIENT_UPSERT_SQL: &str = "INSERT INTO zeroth_clients (
+             id, name, secret_hash, confidential, redirect_uris_json,
+             allowed_origins_json, allowed_email_domains_json, enterprise_provider, issuer_token_audience,
+             issuer_token_ttl_seconds, account_sharing_mode, account_tenant_id,
+             visible_login_methods_json, created_at, updated_at, disabled_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+             name = excluded.name,
+             secret_hash = CASE
+                 WHEN excluded.confidential = 0 THEN NULL
+                 WHEN excluded.secret_hash IS NOT NULL THEN excluded.secret_hash
+                 ELSE zeroth_clients.secret_hash
+             END,
+             confidential = excluded.confidential,
+             redirect_uris_json = excluded.redirect_uris_json,
+             allowed_origins_json = excluded.allowed_origins_json,
+             allowed_email_domains_json = excluded.allowed_email_domains_json,
+             enterprise_provider = excluded.enterprise_provider,
+             issuer_token_audience = excluded.issuer_token_audience,
+             issuer_token_ttl_seconds = excluded.issuer_token_ttl_seconds,
+             account_sharing_mode = excluded.account_sharing_mode,
+             account_tenant_id = excluded.account_tenant_id,
+             visible_login_methods_json = excluded.visible_login_methods_json,
+             updated_at = excluded.updated_at,
+             disabled_at = excluded.disabled_at";
 
 #[cfg(target_arch = "wasm32")]
 async fn upsert_client(
@@ -9690,6 +9721,7 @@ async fn upsert_client(
         worker::d1::D1Type::Text(&redirect_uris_json),
         worker::d1::D1Type::Text(&allowed_origins_json),
         worker::d1::D1Type::Text(&allowed_email_domains_json),
+        d1_optional_text(client.enterprise_provider.as_deref()),
         issuer_token_audience,
         issuer_token_ttl_seconds,
         worker::d1::D1Type::Text(account_sharing_mode_label(client.account_sharing_mode)),
@@ -9700,35 +9732,10 @@ async fn upsert_client(
         disabled_at,
     ];
 
-    db.prepare(
-        "INSERT INTO zeroth_clients (
-             id, name, secret_hash, confidential, redirect_uris_json,
-             allowed_origins_json, allowed_email_domains_json, issuer_token_audience,
-             issuer_token_ttl_seconds, account_sharing_mode, account_tenant_id,
-             visible_login_methods_json, created_at, updated_at, disabled_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(id) DO UPDATE SET
-             name = excluded.name,
-             secret_hash = CASE
-                 WHEN excluded.confidential = 0 THEN NULL
-                 WHEN excluded.secret_hash IS NOT NULL THEN excluded.secret_hash
-                 ELSE zeroth_clients.secret_hash
-             END,
-             confidential = excluded.confidential,
-             redirect_uris_json = excluded.redirect_uris_json,
-             allowed_origins_json = excluded.allowed_origins_json,
-             allowed_email_domains_json = excluded.allowed_email_domains_json,
-             issuer_token_audience = excluded.issuer_token_audience,
-             issuer_token_ttl_seconds = excluded.issuer_token_ttl_seconds,
-             account_sharing_mode = excluded.account_sharing_mode,
-             account_tenant_id = excluded.account_tenant_id,
-             visible_login_methods_json = excluded.visible_login_methods_json,
-             updated_at = excluded.updated_at,
-             disabled_at = excluded.disabled_at",
-    )
-    .bind_refs(&args)?
-    .run()
-    .await?;
+    db.prepare(CLIENT_UPSERT_SQL)
+        .bind_refs(&args)?
+        .run()
+        .await?;
     Ok(())
 }
 
@@ -11289,9 +11296,9 @@ async fn revoke_active_refresh_tokens_for_user(
         worker::d1::D1Type::Text(user_id),
     ];
     db.prepare(REVOKE_USER_REFRESH_TOKENS_SQL)
-    .bind_refs(&args)?
-    .run()
-    .await?;
+        .bind_refs(&args)?
+        .run()
+        .await?;
     Ok(())
 }
 
@@ -12243,9 +12250,9 @@ async fn revoke_refresh_token_family(
             worker::d1::D1Type::Text(session_id),
         ];
         db.prepare(REVOKE_SESSION_REFRESH_TOKEN_FAMILY_SQL)
-        .bind_refs(&args)?
-        .run()
-        .await?;
+            .bind_refs(&args)?
+            .run()
+            .await?;
         return Ok(());
     }
 
@@ -12255,9 +12262,9 @@ async fn revoke_refresh_token_family(
         worker::d1::D1Type::Text(&row.user_id),
     ];
     db.prepare(REVOKE_NATIVE_REFRESH_TOKEN_FAMILY_SQL)
-    .bind_refs(&args)?
-    .run()
-    .await?;
+        .bind_refs(&args)?
+        .run()
+        .await?;
     Ok(())
 }
 
@@ -13939,10 +13946,7 @@ fn native_provider_token_fields(
 }
 
 fn is_native_token_exchange_provider(provider_id: &str) -> bool {
-    matches!(
-        provider_id,
-        well_known::APPLE | well_known::GOOGLE
-    )
+    matches!(provider_id, well_known::APPLE | well_known::GOOGLE)
 }
 
 fn refresh_token_field(form: &TokenExchangeForm) -> Result<&str, TokenExchangeError> {
@@ -14422,6 +14426,7 @@ fn validate_client_upsert_request(
     let redirect_uris = validate_redirect_uris(&request.redirect_uris)?;
     let allowed_origins = validate_allowed_origins(&request.allowed_origins)?;
     let allowed_email_domains = validate_allowed_email_domains(&request.allowed_email_domains)?;
+    let enterprise_provider = validate_enterprise_provider(request.enterprise_provider.as_deref())?;
     let visible_login_methods = validate_visible_login_methods(&request.visible_login_methods)?;
     let issuer_token_audience =
         validate_issuer_token_audience(request.issuer_token_audience.as_deref())?;
@@ -14448,6 +14453,7 @@ fn validate_client_upsert_request(
         redirect_uris,
         allowed_origins,
         allowed_email_domains,
+        enterprise_provider,
         issuer_token_audience,
         issuer_token_ttl_seconds,
         account_sharing_mode,
@@ -14478,6 +14484,20 @@ fn validate_client_id(raw: &str) -> Result<String, ClientManagementError> {
         ));
     }
     Ok(value.to_owned())
+}
+
+fn validate_enterprise_provider(
+    value: Option<&str>,
+) -> Result<Option<String>, ClientManagementError> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    match value {
+        "entra" | "google_workspace" => Ok(Some(value.to_owned())),
+        _ => Err(ClientManagementError::invalid_request(
+            "enterpriseProvider must be entra, google_workspace, or null",
+        )),
+    }
 }
 
 fn validate_admin_user_id(raw: &str) -> Result<String, ClientManagementError> {
@@ -14949,7 +14969,10 @@ async fn validate_user_client_admission(
         .all()
         .await?
         .results::<ClientAdmissionIdentity>()?;
-    Ok(validate_client_admission_identities(&client.client, &identities))
+    Ok(validate_client_admission_identities(
+        &client.client,
+        &identities,
+    ))
 }
 
 fn validate_client_admission_identities(
@@ -15271,6 +15294,8 @@ fn normalize_admin_token_hash(value: &str) -> Result<String, String> {
 fn client_response_from_row(row: ClientRow) -> Result<ClientResponse, String> {
     let account_scope = client_account_scope_from_row(&row)?;
     let visible_login_methods = client_visible_login_methods_from_row(&row)?;
+    let enterprise_provider = validate_enterprise_provider(row.enterprise_provider.as_deref())
+        .map_err(|error| error.description)?;
     Ok(ClientResponse {
         id: row.id,
         name: row.name,
@@ -15283,6 +15308,7 @@ fn client_response_from_row(row: ClientRow) -> Result<ClientResponse, String> {
             &row.allowed_email_domains_json,
             "allowed_email_domains_json",
         )?,
+        enterprise_provider,
         issuer_token_audience: row.issuer_token_audience,
         issuer_token_ttl_seconds: row.issuer_token_ttl_seconds,
         account_sharing_mode: account_sharing_mode_label(account_scope.sharing_mode).to_owned(),
@@ -18880,6 +18906,8 @@ fn client_from_row(row: ClientRow) -> Result<Option<Client>, String> {
         return Ok(None);
     }
 
+    let enterprise_provider = validate_enterprise_provider(row.enterprise_provider.as_deref())
+        .map_err(|error| error.description)?;
     Ok(Some(Client {
         id: ClientId(row.id),
         name: row.name,
@@ -18892,6 +18920,7 @@ fn client_from_row(row: ClientRow) -> Result<Option<Client>, String> {
             &row.allowed_email_domains_json,
             "allowed_email_domains_json",
         )?,
+        enterprise_provider,
         confidential: row.confidential != 0,
     }))
 }
@@ -20979,10 +21008,10 @@ mod tests {
         conn.execute(
             "INSERT INTO zeroth_clients (
                 id, name, secret_hash, confidential, redirect_uris_json,
-                allowed_origins_json, allowed_email_domains_json, issuer_token_audience,
+                allowed_origins_json, allowed_email_domains_json, enterprise_provider, issuer_token_audience,
                 issuer_token_ttl_seconds, account_sharing_mode, account_tenant_id,
                 visible_login_methods_json, created_at, updated_at, disabled_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 "yl-web",
                 "YL Web",
@@ -20991,6 +21020,7 @@ mod tests {
                 r#"["https://yl.vin/auth/callback"]"#,
                 r#"["https://yl.vin"]"#,
                 "[]",
+                Option::<String>::None,
                 Option::<String>::None,
                 Option::<i32>::None,
                 "global",
@@ -21027,11 +21057,12 @@ mod tests {
             redirect_uris_json,
             allowed_origins_json,
             allowed_email_domains_json,
+            enterprise_provider,
             confidential,
-        ): (String, String, String, String, i32) = conn
+        ): (String, String, String, String, Option<String>, i32) = conn
             .query_row(
                 "SELECT name, redirect_uris_json, allowed_origins_json,
-                        allowed_email_domains_json, confidential
+                        allowed_email_domains_json, enterprise_provider, confidential
                  FROM zeroth_clients
                  WHERE id = ?",
                 params![client_id],
@@ -21042,6 +21073,7 @@ mod tests {
                         row.get(2)?,
                         row.get(3)?,
                         row.get(4)?,
+                        row.get(5)?,
                     ))
                 },
             )
@@ -21053,6 +21085,7 @@ mod tests {
             redirect_uris: serde_json::from_str(&redirect_uris_json).unwrap(),
             allowed_origins: serde_json::from_str(&allowed_origins_json).unwrap(),
             allowed_email_domains: serde_json::from_str(&allowed_email_domains_json).unwrap(),
+            enterprise_provider,
             confidential: confidential != 0,
         }
     }
@@ -21886,6 +21919,7 @@ mod tests {
             redirect_uris: vec!["https://app.example.com/callback".to_owned()],
             allowed_origins: vec!["https://app.example.com".to_owned()],
             allowed_email_domains: Vec::new(),
+            enterprise_provider: None,
             confidential: false,
         };
 
@@ -21909,6 +21943,7 @@ mod tests {
             redirect_uris: vec!["https://app.example.com/callback".to_owned()],
             allowed_origins: vec!["https://app.example.com".to_owned()],
             allowed_email_domains: Vec::new(),
+            enterprise_provider: None,
             confidential: false,
         };
         let mut catalog = LoginThemeCatalog::default();
@@ -21961,6 +21996,7 @@ mod tests {
             redirect_uris: vec!["https://app.example.com/callback".to_owned()],
             allowed_origins: vec!["https://app.example.com".to_owned()],
             allowed_email_domains: Vec::new(),
+            enterprise_provider: None,
             confidential: false,
         };
         let mut catalog = LoginThemeCatalog::default();
@@ -22002,6 +22038,7 @@ mod tests {
             redirect_uris: vec!["https://app.example.com/callback".to_owned()],
             allowed_origins: vec!["https://app.example.com".to_owned()],
             allowed_email_domains: Vec::new(),
+            enterprise_provider: None,
             confidential: false,
         };
         let mut catalog = LoginThemeCatalog::default();
@@ -22239,6 +22276,7 @@ mod tests {
             account_sharing_mode: None,
             account_tenant_id: None,
             visible_login_methods_json: None,
+            enterprise_provider: None,
             confidential: 0,
             disabled_at: None,
         })
@@ -22248,6 +22286,132 @@ mod tests {
         assert_eq!(client.id, ClientId("ios".to_owned()));
         assert_eq!(client.redirect_uris, vec!["wavey://auth/callback"]);
         assert!(!client.confidential);
+    }
+
+    #[test]
+    fn enterprise_client_policy_accepts_only_explicit_enterprise_provider_ids() {
+        for provider in ["entra", "google_workspace"] {
+            let upsert = client_upsert_from_value(serde_json::json!({
+                "id": "enterprise", "name": "Enterprise",
+                "redirectUris": ["https://app.example.com/callback"],
+                "enterpriseProvider": format!(" {provider} ")
+            }))
+            .unwrap();
+            assert_eq!(upsert.enterprise_provider.as_deref(), Some(provider));
+        }
+        for provider in [None, Some(""), Some("   ")] {
+            assert_eq!(validate_enterprise_provider(provider).unwrap(), None);
+        }
+        for provider in [
+            "google",
+            "apple",
+            "magic_link",
+            "ENTRA",
+            "common",
+            "https://attacker.example/issuer",
+        ] {
+            assert!(
+                validate_enterprise_provider(Some(provider)).is_err(),
+                "{provider}"
+            );
+        }
+        let alias = client_upsert_from_value(serde_json::json!({
+            "id": "enterprise", "name": "Enterprise",
+            "redirectUris": ["https://app.example.com/callback"],
+            "enterprise_provider": "entra"
+        }))
+        .unwrap();
+        assert_eq!(alias.enterprise_provider.as_deref(), Some("entra"));
+    }
+
+    #[test]
+    fn enterprise_client_policy_survives_registered_client_response_and_admin_ui() {
+        let row: ClientRow = serde_json::from_value(serde_json::json!({
+            "id": "enterprise", "name": "Enterprise",
+            "redirect_uris_json": "[\"https://app.example.com/callback\"]",
+            "allowed_origins_json": "[]", "allowed_email_domains_json": "[]",
+            "enterprise_provider": "google_workspace"
+        }))
+        .unwrap();
+        let registered = registered_client_from_row(row.clone()).unwrap().unwrap();
+        assert_eq!(
+            registered.client.enterprise_provider.as_deref(),
+            Some("google_workspace")
+        );
+        let response = client_response_from_row(row.clone()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&response).unwrap()["enterpriseProvider"],
+            "google_workspace"
+        );
+        let admin = client_admin_ui_from_row(row.clone()).unwrap();
+        assert_eq!(
+            admin.enterprise_provider.as_deref(),
+            Some("google_workspace")
+        );
+
+        let mut invalid = row;
+        invalid.enterprise_provider = Some("google".to_owned());
+        assert!(registered_client_from_row(invalid.clone()).is_err());
+        assert!(client_response_from_row(invalid).is_err());
+    }
+
+    #[test]
+    fn enterprise_client_upsert_replaces_and_explicitly_clears_persisted_policy() {
+        let conn = sqlite_bootstrap();
+        let persist = |client: &ValidatedClientUpsert, now: i32| {
+            conn.execute(
+                CLIENT_UPSERT_SQL,
+                params![
+                    client.id,
+                    client.name,
+                    client.secret_hash,
+                    i32::from(client.confidential),
+                    serde_json::to_string(&client.redirect_uris).unwrap(),
+                    serde_json::to_string(&client.allowed_origins).unwrap(),
+                    serde_json::to_string(&client.allowed_email_domains).unwrap(),
+                    client.enterprise_provider,
+                    client.issuer_token_audience,
+                    client.issuer_token_ttl_seconds,
+                    account_sharing_mode_label(client.account_sharing_mode),
+                    client.account_tenant_id,
+                    serde_json::to_string(&client.visible_login_methods).unwrap(),
+                    now,
+                    now,
+                    client.disabled.then_some(now),
+                ],
+            )
+            .unwrap();
+        };
+        for provider in [Some("entra"), Some("google_workspace"), None] {
+            let request = client_upsert_from_value(serde_json::json!({
+                "id": "enterprise", "name": "Enterprise",
+                "redirectUris": ["https://app.example.com/callback"],
+                "enterpriseProvider": provider
+            }))
+            .unwrap();
+            persist(&request, 1_780_000_000);
+            assert_eq!(
+                sqlite_client_from_row(&conn, "enterprise")
+                    .enterprise_provider
+                    .as_deref(),
+                provider
+            );
+        }
+        // Client upsert is complete replacement. Older API clients that omit the
+        // property clear the requirement; the hosted form always sends its value.
+        let mut require_enterprise = client_upsert_from_value(serde_json::json!({
+            "id": "enterprise", "name": "Enterprise",
+            "redirectUris": ["https://app.example.com/callback"],
+            "enterpriseProvider": "entra"
+        }))
+        .unwrap();
+        persist(&require_enterprise, 1_780_000_001);
+        require_enterprise.enterprise_provider = None;
+        persist(&require_enterprise, 1_780_000_002);
+        assert_eq!(
+            sqlite_client_from_row(&conn, "enterprise").enterprise_provider,
+            None
+        );
     }
 
     #[test]
@@ -22264,6 +22428,7 @@ mod tests {
             account_sharing_mode: None,
             account_tenant_id: None,
             visible_login_methods_json: None,
+            enterprise_provider: None,
             confidential: 1,
             disabled_at: Some(1_780_000_000),
         })
@@ -22595,6 +22760,7 @@ mod tests {
             redirect_uris: vec!["https://id.example.com/admin".to_owned()],
             allowed_origins: vec![],
             allowed_email_domains: vec!["wavey.ai".to_owned()],
+            enterprise_provider: None,
             confidential: false,
         };
         let mut profile = ProviderProfile {
@@ -22651,6 +22817,7 @@ mod tests {
             account_sharing_mode: Some(ACCOUNT_SHARING_MODE_GLOBAL.to_owned()),
             account_tenant_id: Some(ACCOUNT_NAMESPACE_GLOBAL.to_owned()),
             visible_login_methods_json: Some(r#"["passkey","magic_link"]"#.to_owned()),
+            enterprise_provider: None,
             confidential: 1,
             disabled_at: Some(1_780_000_000),
         })
@@ -22822,6 +22989,7 @@ mod tests {
             account_sharing_mode: None,
             account_tenant_id: None,
             visible_login_methods_json: Some(r#"["passkey"]"#.to_owned()),
+            enterprise_provider: None,
             confidential: 1,
             disabled_at: Some(1_780_000_000),
         })
@@ -22912,6 +23080,7 @@ mod tests {
             redirect_uris: vec!["https://app.example.com/auth/callback".to_owned()],
             allowed_origins: vec!["https://app.example.com".to_owned()],
             allowed_email_domains: vec![],
+            enterprise_provider: None,
             confidential: false,
         };
 
@@ -22949,6 +23118,7 @@ mod tests {
             redirect_uris: vec!["https://app.example.com/auth/callback".to_owned()],
             allowed_origins: vec!["https://app.example.com".to_owned()],
             allowed_email_domains: vec![],
+            enterprise_provider: None,
             confidential: false,
         };
 
@@ -22989,6 +23159,7 @@ mod tests {
             redirect_uris: vec!["https://app.example.com/auth/callback".to_owned()],
             allowed_origins: vec!["https://app.example.com".to_owned()],
             allowed_email_domains: vec![],
+            enterprise_provider: None,
             confidential: false,
         };
         let google_transaction = auth_transaction_from_session_login_request(
@@ -23027,6 +23198,7 @@ mod tests {
             redirect_uris: vec!["wavey://auth/callback".to_owned()],
             allowed_origins: vec!["https://app.example.com".to_owned()],
             allowed_email_domains: vec![],
+            enterprise_provider: None,
             confidential: false,
         };
 
@@ -23118,6 +23290,7 @@ mod tests {
             redirect_uris: vec!["wavey://auth/callback".to_owned()],
             allowed_origins: vec!["https://app.example.com".to_owned()],
             allowed_email_domains: vec![],
+            enterprise_provider: None,
             confidential: false,
         };
 
@@ -23166,6 +23339,7 @@ mod tests {
                 redirect_uris: vec!["https://app.example.com/auth/callback".to_owned()],
                 allowed_origins: vec!["https://app.example.com".to_owned()],
                 allowed_email_domains: vec![],
+                enterprise_provider: None,
                 confidential: false,
             },
             well_known::GOOGLE,
@@ -23211,6 +23385,7 @@ mod tests {
             redirect_uris: vec!["https://app.example.com/auth/callback".to_owned()],
             allowed_origins: vec!["https://app.example.com".to_owned()],
             allowed_email_domains: vec![],
+            enterprise_provider: None,
             confidential: false,
         };
         let transaction = auth_transaction_from_session_login_request(
@@ -23290,6 +23465,7 @@ mod tests {
             redirect_uris: vec!["https://app.example.com/auth/callback".to_owned()],
             allowed_origins: vec!["https://app.example.com".to_owned()],
             allowed_email_domains: vec![],
+            enterprise_provider: None,
             confidential: false,
         };
         let transaction = auth_transaction_from_session_login_request(
@@ -23472,6 +23648,7 @@ mod tests {
             redirect_uris: vec!["https://wavey.ai/auth/callback".to_owned()],
             allowed_origins: vec!["https://wavey.ai".to_owned()],
             allowed_email_domains: vec![],
+            enterprise_provider: None,
             confidential: false,
         };
         let url = url::Url::parse("https://id.example.com/login").unwrap();
@@ -23490,6 +23667,7 @@ mod tests {
             redirect_uris: vec!["https://wavey.ai/auth/callback".to_owned()],
             allowed_origins: vec!["https://wavey.ai".to_owned()],
             allowed_email_domains: vec![],
+            enterprise_provider: None,
             confidential: false,
         };
         let url = url::Url::parse(
@@ -23520,6 +23698,7 @@ mod tests {
             redirect_uris: vec!["wavey://auth/callback".to_owned()],
             allowed_origins: vec![],
             allowed_email_domains: vec![],
+            enterprise_provider: None,
             confidential: false,
         };
         let request = AuthorizationRequest {
@@ -23630,7 +23809,7 @@ mod tests {
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        assert_eq!(migration_versions, (1..=11).collect::<Vec<_>>());
+        assert_eq!(migration_versions, (1..=12).collect::<Vec<_>>());
     }
 
     #[test]
@@ -23735,13 +23914,20 @@ mod tests {
         form.provider = Some(well_known::SPOTIFY.to_owned());
         form.subject_token = Some("token-issued-to-a-third-party-app".to_owned());
         form.provider_client_id = Some("allowlisted-spotify-client".to_owned());
-        for token_type in [None, Some(ACCESS_TOKEN_SUBJECT_TOKEN_TYPE), Some(ID_TOKEN_SUBJECT_TOKEN_TYPE)] {
+        for token_type in [
+            None,
+            Some(ACCESS_TOKEN_SUBJECT_TOKEN_TYPE),
+            Some(ID_TOKEN_SUBJECT_TOKEN_TYPE),
+        ] {
             form.subject_token_type = token_type.map(str::to_owned);
             // This is the form validation invoked before any provider network
             // call. A user-supplied client ID cannot establish token audience.
             let error = validate_token_exchange_form(&form).unwrap_err();
             assert_eq!(error.code, "invalid_request");
-            assert_eq!(error.description, "token exchange provider must be apple or google");
+            assert_eq!(
+                error.description,
+                "token exchange provider must be apple or google"
+            );
         }
     }
 
@@ -23848,8 +24034,8 @@ mod tests {
                 )),
                 code_challenge_method: Some(PkceChallengeMethod::S256),
             };
-            let error = validate_issuer_authorization_request_for_client(&request, &client)
-                .unwrap_err();
+            let error =
+                validate_issuer_authorization_request_for_client(&request, &client).unwrap_err();
             assert_eq!(error.code, "invalid_scope");
         }
         let error = native_token_scope(Some("openid billing:read")).unwrap_err();
@@ -23868,14 +24054,13 @@ mod tests {
         let mut form = valid_token_exchange_form();
         form.code_verifier = Some(verifier.to_owned());
         let fields = authorization_code_fields(&form).unwrap();
-        let error = validate_authorization_code_exchange(&code, &fields, 1_780_000_100)
-            .unwrap_err();
+        let error =
+            validate_authorization_code_exchange(&code, &fields, 1_780_000_100).unwrap_err();
         assert_eq!(error.code, "invalid_grant");
 
         let mut refresh = valid_refresh_token_row();
         refresh.scope = "openid api:write".to_owned();
-        let error = validate_refresh_token_exchange(&refresh, "ios", 1_780_000_100)
-            .unwrap_err();
+        let error = validate_refresh_token_exchange(&refresh, "ios", 1_780_000_100).unwrap_err();
         assert_eq!(error.code, "invalid_grant");
 
         // The final issuer boundary also rejects the grant, even if another
@@ -24051,7 +24236,11 @@ mod tests {
         conn.prepare(CLIENT_ADMISSION_IDENTITIES_SQL)
             .unwrap()
             .query_map(
-                params![user_id, namespace, IDENTITY_LIST_LIMIT + PASSKEY_CREDENTIAL_LIST_LIMIT],
+                params![
+                    user_id,
+                    namespace,
+                    IDENTITY_LIST_LIMIT + PASSKEY_CREDENTIAL_LIST_LIMIT
+                ],
                 |row| {
                     Ok(ClientAdmissionIdentity {
                         provider_id: row.get(0)?,
@@ -24292,7 +24481,15 @@ mod tests {
                 "SELECT client_id, user_id, session_id, auth_time, scope
                  FROM zeroth_refresh_tokens WHERE token_hash = 'child'",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .unwrap();
         assert_eq!(
@@ -26766,6 +26963,7 @@ mod tests {
                 redirect_uris: vec!["wavey://auth/callback".to_owned()],
                 allowed_origins: vec![],
                 allowed_email_domains: vec![],
+                enterprise_provider: None,
                 confidential: false,
             },
             secret_hash: None,
@@ -26786,6 +26984,7 @@ mod tests {
                 redirect_uris: vec!["https://app.example.com/auth/callback".to_owned()],
                 allowed_origins: vec!["https://app.example.com".to_owned()],
                 allowed_email_domains: vec![],
+                enterprise_provider: None,
                 confidential: true,
             },
             secret_hash: Some(format!("sha256:{}", hash_secret(secret))),
