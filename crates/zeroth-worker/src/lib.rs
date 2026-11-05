@@ -221,6 +221,7 @@ const APPLE_CLIENT_SECRET_CACHE_REFRESH_SECONDS: i64 = 60 * 60;
 const PROVIDER_JWKS_CACHE_TTL_SECONDS: i32 = 60 * 60;
 const TOKEN_EXCHANGE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
 const ID_TOKEN_SUBJECT_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:id_token";
+#[cfg(test)]
 const ACCESS_TOKEN_SUBJECT_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:access_token";
 const DEFAULT_NATIVE_TOKEN_SCOPE: &str = "openid profile email";
 const CORS_ALLOW_METHODS: &str = "GET, POST, PATCH, DELETE, OPTIONS";
@@ -4402,7 +4403,6 @@ async fn resolve_native_provider_profile(
         well_known::APPLE | well_known::GOOGLE => {
             resolve_native_oidc_provider_profile(fields, provider_client_id, now).await
         }
-        well_known::SPOTIFY => resolve_native_spotify_profile(fields, provider_client_id).await,
         provider_id => Err((
             ProviderProfileError::invalid_response(format!(
                 "unsupported native provider: {provider_id}"
@@ -4447,24 +4447,6 @@ async fn resolve_native_oidc_provider_profile(
         fields.provider_id,
         verified,
     ))
-}
-
-#[cfg(target_arch = "wasm32")]
-async fn resolve_native_spotify_profile(
-    fields: &NativeProviderTokenFields<'_>,
-    provider_client_id: &str,
-) -> Result<ResolvedProviderProfile, (ProviderProfileError, u16)> {
-    let provider = OAuthProvider::spotify(provider_client_id);
-    let token_set = ProviderTokenSet {
-        access_token: Some(fields.subject_token.to_owned()),
-        id_token: None,
-        refresh_token: None,
-        expires_in: None,
-    };
-
-    fetch_spotify_profile(&provider, &token_set)
-        .await
-        .map_err(|error| (error, 401))
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -13866,7 +13848,7 @@ fn native_provider_token_fields(
     let provider_id = form.provider.as_deref().unwrap_or(well_known::APPLE);
     if !is_native_token_exchange_provider(provider_id) {
         return Err(TokenExchangeError::invalid_request(
-            "token exchange provider must be apple, google, or spotify",
+            "token exchange provider must be apple or google",
         ));
     }
     let subject_token_type = match (provider_id, form.subject_token_type.as_deref()) {
@@ -13876,14 +13858,6 @@ fn native_provider_token_fields(
         (well_known::APPLE | well_known::GOOGLE, Some(_)) => {
             return Err(TokenExchangeError::invalid_request(
                 "subject_token_type must be urn:ietf:params:oauth:token-type:id_token",
-            ))
-        }
-        (well_known::SPOTIFY, Some(ACCESS_TOKEN_SUBJECT_TOKEN_TYPE)) => {
-            ACCESS_TOKEN_SUBJECT_TOKEN_TYPE
-        }
-        (well_known::SPOTIFY, _) => {
-            return Err(TokenExchangeError::invalid_request(
-                "subject_token_type must be urn:ietf:params:oauth:token-type:access_token",
             ))
         }
         _ => unreachable!("native provider was checked above"),
@@ -13901,7 +13875,7 @@ fn native_provider_token_fields(
 fn is_native_token_exchange_provider(provider_id: &str) -> bool {
     matches!(
         provider_id,
-        well_known::APPLE | well_known::GOOGLE | well_known::SPOTIFY
+        well_known::APPLE | well_known::GOOGLE
     )
 }
 
@@ -23554,20 +23528,19 @@ mod tests {
     }
 
     #[test]
-    fn token_exchange_form_accepts_native_spotify_access_token_grant() {
+    fn native_spotify_token_exchange_rejects_unverifiable_client_audience() {
         let mut form = valid_native_apple_token_exchange_form();
         form.provider = Some(well_known::SPOTIFY.to_owned());
-        form.subject_token = Some("spotify.access.token".to_owned());
-        form.subject_token_type = Some(ACCESS_TOKEN_SUBJECT_TOKEN_TYPE.to_owned());
-        form.provider_client_id = Some("spotify-ios-client".to_owned());
-
-        let fields = native_provider_token_fields(&form).unwrap();
-
-        assert_eq!(fields.provider_id, well_known::SPOTIFY);
-        assert_eq!(fields.subject_token, "spotify.access.token");
-        assert_eq!(fields.provider_client_id, Some("spotify-ios-client"));
-        assert_eq!(fields.subject_token_type, ACCESS_TOKEN_SUBJECT_TOKEN_TYPE);
-        validate_token_exchange_form(&form).unwrap();
+        form.subject_token = Some("token-issued-to-a-third-party-app".to_owned());
+        form.provider_client_id = Some("allowlisted-spotify-client".to_owned());
+        for token_type in [None, Some(ACCESS_TOKEN_SUBJECT_TOKEN_TYPE), Some(ID_TOKEN_SUBJECT_TOKEN_TYPE)] {
+            form.subject_token_type = token_type.map(str::to_owned);
+            // This is the form validation invoked before any provider network
+            // call. A user-supplied client ID cannot establish token audience.
+            let error = validate_token_exchange_form(&form).unwrap_err();
+            assert_eq!(error.code, "invalid_request");
+            assert_eq!(error.description, "token exchange provider must be apple or google");
+        }
     }
 
     #[test]
@@ -23580,21 +23553,7 @@ mod tests {
         assert_eq!(error.code, "invalid_request");
         assert_eq!(
             error.description,
-            "token exchange provider must be apple, google, or spotify"
-        );
-    }
-
-    #[test]
-    fn native_spotify_token_grant_requires_access_token_type() {
-        let mut form = valid_native_apple_token_exchange_form();
-        form.provider = Some(well_known::SPOTIFY.to_owned());
-
-        let error = validate_token_exchange_form(&form).unwrap_err();
-
-        assert_eq!(error.code, "invalid_request");
-        assert_eq!(
-            error.description,
-            "subject_token_type must be urn:ietf:params:oauth:token-type:access_token"
+            "token exchange provider must be apple or google"
         );
     }
 

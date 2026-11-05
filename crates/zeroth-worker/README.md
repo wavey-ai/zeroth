@@ -313,7 +313,7 @@ wrangler secret put MAILCHANNELS_API_KEY # optional for MAGIC_LINK_DELIVERY=mail
 
 Non-secret deployment vars include `PUBLIC_BASE_URL`, `SESSION_COOKIE_NAME`,
 `TX_COOKIE_NAME`, `APPLE_NATIVE_CLIENT_IDS`, `GOOGLE_NATIVE_CLIENT_IDS`,
-`SPOTIFY_NATIVE_CLIENT_IDS`, `MAGIC_LINK_FROM`, optional
+`MAGIC_LINK_FROM`, optional
 `MAGIC_LINK_DELIVERY`, optional `MAGIC_LINK_WEBHOOK_URL`, and optional
 `SESSION_COOKIE_DOMAIN`.
 
@@ -326,12 +326,13 @@ subdomains. Unrelated domains still need OIDC redirects and app-local sessions.
 native Sign in with Apple. For example, use `ai.wavey.id`.
 `GOOGLE_NATIVE_CLIENT_IDS` allowlists Google
 native OAuth client IDs whose ID-token `aud` values Zeroth may accept.
-`SPOTIFY_NATIVE_CLIENT_IDS` records the Spotify native app client IDs allowed to
-request native access-token exchange. Spotify access tokens are validated by
-calling Spotify's profile endpoint because Spotify does not expose an OIDC ID
-token for that mobile SDK path. When Spotify returns `account_id`, Zeroth uses
-that immutable profile value for account linking and falls back to legacy `id`
-only for older responses.
+Native Spotify access-token exchange is rejected. Spotify's profile endpoint
+proves the user associated with a token, but does not identify the OAuth client
+that received it. A caller-supplied `provider_client_id` cannot supply that proof.
+Use the hosted Spotify authorization-code flow instead. Existing
+`SPOTIFY_NATIVE_CLIENT_IDS` settings no longer enable native exchange. The hosted
+flow still uses Spotify `account_id` for account linking, with legacy `id` as a
+fallback for older responses.
 
 Password, magic-link, and passkey authentication currently require a registered
 client with `account_sharing_mode=global`. Their credential and email lookups are
