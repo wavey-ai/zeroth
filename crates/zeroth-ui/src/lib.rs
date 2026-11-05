@@ -3054,12 +3054,16 @@ fn identity_row(
         "Unverified"
     };
     let email = identity.email.unwrap_or_else(|| "No email".to_owned());
+    let provider_label = match identity.provider_id.as_str() {
+        "magic_link" => "Magic link".to_owned(),
+        _ => identity.provider_id.clone(),
+    };
 
     view! {
         <div class="zeroth-row">
             <span class="zeroth-provider-badge">{provider_initial_by_id(&identity.provider_id)}</span>
             <div>
-                <div class="zeroth-row-title">{identity.provider_id}</div>
+                <div class="zeroth-row-title">{provider_label}</div>
                 <div class="zeroth-row-meta">{identity.provider_subject}</div>
                 <div class="zeroth-row-meta">{email} " · " {verification}</div>
             </div>
