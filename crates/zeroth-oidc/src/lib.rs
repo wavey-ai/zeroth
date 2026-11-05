@@ -1493,6 +1493,45 @@ mod tests {
     }
 
     #[test]
+    fn zeroth_access_token_verifier_accepts_pre_upgrade_es256_signature() {
+        // Frozen with p256 0.13.2 and the test scalar [1; 32]. This verifies
+        // signature and JWK compatibility across the crypto dependency upgrade.
+        let jwks = ZerothJwks {
+            keys: vec![ZerothJwk {
+                kty: "EC".into(),
+                key_use: "sig".into(),
+                kid: "compat-p256-013".into(),
+                alg: "ES256".into(),
+                crv: "P-256".into(),
+                x: "b_A7lJJBzh2t1DUZ5pYOCoW0GmmgXDKBA6orzhWUyhY".into(),
+                y: "PE91OlW_AdxT9sCwx-7ni0DG_30lqW4igrmJzvccFEo".into(),
+            }],
+        };
+        let token = concat!(
+            "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNvbXBhdC1wMjU2LTAxMyJ9.",
+            "eyJpc3MiOiJodHRwczovL2lkLmV4YW1wbGUuY29tIiwic3ViIjoiY29tcGF0LXVzZXIiLCJhdWQiOiJjb21wYXQtYXBwIiwiaWF0IjoxNzgwMDAwMDAwLCJleHAiOjE3ODAwMDAzMDAsImNsaWVudF9pZCI6ImNvbXBhdC1hcHAiLCJ0b2tlbl91c2UiOiJhY2Nlc3MifQ.",
+            "LJB-Dt2ubT0alxSz2U_SkaTRfkZqmppvz54nzBXo_OKnh7SZaanI885_bS30uUWYbIunlODEMnP9UOZD5nfXkg",
+        );
+        let verified = verify_zeroth_access_token(
+            token,
+            &jwks,
+            "https://id.example.com",
+            "compat-app",
+            1_780_000_001,
+        )
+        .unwrap();
+        assert_eq!(verified.sub, "compat-user");
+        assert!(verify_zeroth_access_token(
+            &token_with_bad_signature(token.into()),
+            &jwks,
+            "https://id.example.com",
+            "compat-app",
+            1_780_000_001,
+        )
+        .is_err());
+    }
+
+    #[test]
     fn zeroth_access_token_verifier_rejects_wrong_use_audience_and_expiry() {
         let signing_key = test_signing_key();
         let jwks = test_jwks(&signing_key, "test-key");
@@ -1941,7 +1980,7 @@ mod tests {
 
     fn test_jwks(signing_key: &SigningKey, kid: &str) -> ZerothJwks {
         let verifying_key = signing_key.verifying_key();
-        let point = verifying_key.to_encoded_point(false);
+        let point = verifying_key.to_sec1_point(false);
         let x = point.x().unwrap();
         let y = point.y().unwrap();
         ZerothJwks {

@@ -15,6 +15,7 @@ use p256::pkcs8::DecodePrivateKey;
 #[cfg(any(test, not(target_arch = "wasm32")))]
 use rsa::{
     pkcs1v15::{Signature as RsaPkcs1v15Signature, VerifyingKey as RsaPkcs1v15VerifyingKey},
+    signature::Verifier as _,
     BigUint, RsaPublicKey,
 };
 use serde::{Deserialize, Deserializer, Serialize};
@@ -15426,7 +15427,7 @@ fn eip191_personal_message_hash(message: &str) -> [u8; 32] {
 }
 
 fn evm_address_from_verifying_key(key: &EvmVerifyingKey) -> String {
-    let point = key.to_encoded_point(false);
+    let point = key.to_sec1_point(false);
     let bytes = point.as_bytes();
     let digest = Keccak256::digest(&bytes[1..]);
     format!("0x{}", bytes_to_hex(&digest[12..]))
@@ -18169,7 +18170,7 @@ fn jwks_response(
 
 fn es256_public_jwk(signing_key: &Es256SigningKey) -> Result<JwkKey, String> {
     let verifying_key = signing_key.signing_key.verifying_key();
-    let point = verifying_key.to_encoded_point(false);
+    let point = verifying_key.to_sec1_point(false);
     let x = point
         .x()
         .ok_or_else(|| "ES256 public key is missing x coordinate".to_owned())?;
@@ -21380,7 +21381,7 @@ mod tests {
     fn passkey_es256_signature_verifies_signed_authenticator_payload() {
         let signing_key = SigningKey::from_slice(&[11u8; 32]).unwrap();
         let verifying_key = signing_key.verifying_key();
-        let point = verifying_key.to_encoded_point(false);
+        let point = verifying_key.to_sec1_point(false);
         let x = point.x().unwrap();
         let y = point.y().unwrap();
         let credential = PasskeyCredentialRow {
@@ -24793,8 +24794,9 @@ mod tests {
         let prefix = format!("\x19Ethereum Signed Message:\n{}", message.as_bytes().len());
         let digest = Keccak256::new()
             .chain_update(prefix.as_bytes())
-            .chain_update(message.as_bytes());
-        let (signature, recovery_id) = signing_key.sign_digest_recoverable(digest).unwrap();
+            .chain_update(message.as_bytes())
+            .finalize();
+        let (signature, recovery_id) = signing_key.sign_prehash_recoverable(&digest);
         let mut signature_bytes = [0u8; EVM_WALLET_SIGNATURE_HEX_BYTES];
         signature_bytes[..64].copy_from_slice(signature.to_bytes().as_slice());
         signature_bytes[64] = recovery_id.to_byte() + 27;
@@ -24807,6 +24809,25 @@ mod tests {
         assert_eq!(
             recover_evm_wallet_address(&message, &signature_hex[..130]).unwrap_err(),
             "wallet signature must be a 65 byte hex value"
+        );
+    }
+
+    #[test]
+    fn evm_wallet_recovers_pre_upgrade_signature() {
+        // Frozen with k256 0.13.4 and test scalar [7; 32], using EIP-191.
+        let message = "Zeroth crypto compatibility fixture";
+        let signature = concat!(
+            "0x8aebed8a25a65c021ece77b2a0d2f6537111608f4136f34c61f600a0f47bd7533",
+            "f080a79b74af1d7d9cecb436d11d45c74eff7119dfee304e4a14cfe68a83ef11b",
+        );
+        let address = "0x4a62316623ad457f02cdc5d997ded67a383ec569";
+        assert_eq!(
+            recover_evm_wallet_address(message, signature).unwrap(),
+            address
+        );
+        assert_ne!(
+            recover_evm_wallet_address("different message", signature).unwrap(),
+            address
         );
     }
 

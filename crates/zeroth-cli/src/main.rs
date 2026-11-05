@@ -667,7 +667,7 @@ fn signing_key_artifact_from_scalar(
     let signing_key = SigningKey::from_slice(scalar)
         .map_err(|error| format!("invalid ES256 signing key scalar: {error}"))?;
     let verifying_key = signing_key.verifying_key();
-    let point = verifying_key.to_encoded_point(false);
+    let point = verifying_key.to_sec1_point(false);
     let x = point
         .x()
         .ok_or_else(|| "ES256 public key is missing x coordinate".to_owned())?;

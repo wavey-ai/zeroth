@@ -144,7 +144,7 @@ mod tests {
 
     fn fixture() -> (Authorizer, SigningKey) {
         let key = SigningKey::from_slice(&[7; 32]).unwrap();
-        let point = key.verifying_key().to_encoded_point(false);
+        let point = key.verifying_key().to_sec1_point(false);
         let jwks = ZerothJwks {
             keys: vec![ZerothJwk {
                 kty: "EC".into(),
