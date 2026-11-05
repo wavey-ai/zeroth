@@ -8,6 +8,12 @@
 use url::Url;
 use zeroth_core::{ProviderId, Subject};
 
+mod enterprise;
+pub use enterprise::{
+    normalize_entra_tenant_id, normalize_workspace_domain, EnterpriseOidcEvidence,
+    EnterpriseProviderKind, EnterpriseProviderPolicy, ENTERPRISE_CLOCK_SKEW_SECONDS,
+};
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderConfig {
     pub id: ProviderId,
@@ -94,6 +100,7 @@ pub struct ProviderError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OAuthProvider {
     config: ProviderConfig,
+    enterprise_policy: Option<EnterpriseProviderPolicy>,
 }
 
 pub trait Provider {
@@ -120,11 +127,61 @@ pub trait Provider {
 
 impl OAuthProvider {
     pub fn new(config: ProviderConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            enterprise_policy: None,
+        }
     }
 
     pub fn config(&self) -> &ProviderConfig {
         &self.config
+    }
+
+    pub fn enterprise_policy(&self) -> Option<&EnterpriseProviderPolicy> {
+        self.enterprise_policy.as_ref()
+    }
+
+    pub fn entra(
+        client_id: impl Into<String>,
+        tenant_id: impl AsRef<str>,
+    ) -> Result<Self, ProviderError> {
+        let client_id = client_id.into();
+        enterprise::validate_enterprise_client_id(&client_id)?;
+        let policy = EnterpriseProviderPolicy::entra(tenant_id)?;
+        let tenant = policy.tenant_id().expect("validated Entra tenant");
+        Ok(Self {
+            config: ProviderConfig {
+                id: ProviderId(well_known::ENTRA.to_owned()),
+                client_id,
+                authorization_endpoint: format!(
+                    "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/authorize"
+                ),
+                token_endpoint: format!(
+                    "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
+                ),
+                profile_endpoint: None,
+                default_scopes: vec![
+                    "openid".to_owned(),
+                    "email".to_owned(),
+                    "profile".to_owned(),
+                ],
+                response_mode: None,
+                token_auth: TokenAuth::ClientSecretPost,
+            },
+            enterprise_policy: Some(policy),
+        })
+    }
+
+    pub fn google_workspace(
+        client_id: impl Into<String>,
+        domains: impl IntoIterator<Item = impl AsRef<str>>,
+    ) -> Result<Self, ProviderError> {
+        let client_id = client_id.into();
+        enterprise::validate_enterprise_client_id(&client_id)?;
+        let mut provider = Self::google(client_id);
+        provider.config.id = ProviderId(well_known::GOOGLE_WORKSPACE.to_owned());
+        provider.enterprise_policy = Some(EnterpriseProviderPolicy::google_workspace(domains)?);
+        Ok(provider)
     }
 
     pub fn google(client_id: impl Into<String>) -> Self {
@@ -180,6 +237,7 @@ impl Provider for OAuthProvider {
         &self,
         request: ProviderAuthorizeRequest<'_>,
     ) -> Result<ProviderAuthorization, ProviderError> {
+        self.validate_enterprise_configuration()?;
         let mut url = Url::parse(&self.config.authorization_endpoint)
             .map_err(|_| ProviderError::invalid_config("authorization_endpoint is not a URL"))?;
         {
@@ -199,6 +257,15 @@ impl Provider for OAuthProvider {
             if let Some(response_mode) = &self.config.response_mode {
                 pairs.append_pair("response_mode", response_mode);
             }
+            if let Some(policy) = &self.enterprise_policy {
+                if policy.kind() == EnterpriseProviderKind::GoogleWorkspace
+                    && policy.domains().len() == 1
+                {
+                    // This is a login hint. The signed ID-token hd claim is
+                    // separately checked against every configured domain.
+                    pairs.append_pair("hd", &policy.domains()[0]);
+                }
+            }
         }
 
         Ok(ProviderAuthorization {
@@ -215,6 +282,7 @@ impl Provider for OAuthProvider {
         code_verifier: Option<&str>,
         client_secret: Option<&str>,
     ) -> Result<TokenExchangeRequest, ProviderError> {
+        self.validate_enterprise_configuration()?;
         let mut params = vec![
             ("grant_type".to_owned(), "authorization_code".to_owned()),
             ("client_id".to_owned(), self.config.client_id.clone()),
@@ -247,6 +315,7 @@ impl Provider for OAuthProvider {
         &self,
         source: ProviderProfileSource,
     ) -> Result<ProviderProfile, ProviderError> {
+        self.validate_enterprise_configuration()?;
         match source {
             ProviderProfileSource::OidcClaims {
                 sub,
@@ -256,9 +325,18 @@ impl Provider for OAuthProvider {
                 picture,
             } => Ok(ProviderProfile {
                 provider_id: self.config.id.clone(),
-                subject: Subject(sub),
+                subject: Subject(match &self.enterprise_policy {
+                    Some(policy) => policy.normalize_subject(&sub)?,
+                    None => sub,
+                }),
                 email,
-                email_verified,
+                email_verified: email_verified
+                    && !matches!(
+                        self.enterprise_policy
+                            .as_ref()
+                            .map(EnterpriseProviderPolicy::kind),
+                        Some(EnterpriseProviderKind::Entra)
+                    ),
                 display_name: name,
                 picture_url: picture,
             }),
@@ -287,6 +365,19 @@ impl Provider for OAuthProvider {
 }
 
 impl OAuthProvider {
+    fn validate_enterprise_configuration(&self) -> Result<(), ProviderError> {
+        if matches!(
+            self.config.id.0.as_str(),
+            well_known::ENTRA | well_known::GOOGLE_WORKSPACE
+        ) && self.enterprise_policy.is_none()
+        {
+            return Err(ProviderError::invalid_config(
+                "enterprise providers require a validated tenant or hosted-domain policy",
+            ));
+        }
+        Ok(())
+    }
+
     fn scope_string(&self, scopes: Option<&[&str]>) -> String {
         scopes
             .map(|scopes| scopes.iter().map(|scope| (*scope).to_owned()).collect())
@@ -296,6 +387,13 @@ impl OAuthProvider {
 }
 
 impl ProviderError {
+    pub fn invalid_token(description: impl Into<String>) -> Self {
+        Self {
+            code: "invalid_provider_token".to_owned(),
+            description: description.into(),
+        }
+    }
+
     pub fn invalid_config(description: impl Into<String>) -> Self {
         Self {
             code: "invalid_provider_config".to_owned(),
@@ -314,6 +412,8 @@ impl ProviderError {
 pub mod well_known {
     pub const APPLE: &str = "apple";
     pub const GOOGLE: &str = "google";
+    pub const GOOGLE_WORKSPACE: &str = "google_workspace";
+    pub const ENTRA: &str = "entra";
     pub const SPOTIFY: &str = "spotify";
 }
 
