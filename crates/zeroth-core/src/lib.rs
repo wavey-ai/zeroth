@@ -50,6 +50,8 @@ pub struct Client {
     pub redirect_uris: Vec<String>,
     pub allowed_origins: Vec<String>,
     pub allowed_email_domains: Vec<String>,
+    /// Required deploy-managed enterprise provider, or no enterprise requirement.
+    pub enterprise_provider: Option<String>,
     pub confidential: bool,
 }
 
@@ -108,6 +110,12 @@ pub struct AuthTransaction {
     pub app_state: Option<String>,
     pub nonce: Option<String>,
     pub provider_nonce: Option<String>,
+    /// Fingerprint of provider policy at authorization start. Callbacks must
+    /// match the active policy before accepting an enterprise authentication.
+    pub provider_policy_hash: Option<String>,
+    /// Upstream PKCE secret for this one-time transaction; never expose it to
+    /// downstream clients or include it in audit records.
+    pub provider_code_verifier: Option<String>,
     pub code_challenge: Option<String>,
     pub code_challenge_method: Option<String>,
     pub scope: ScopeSet,

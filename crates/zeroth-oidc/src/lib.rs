@@ -1896,6 +1896,7 @@ mod tests {
             redirect_uris: vec!["wavey://auth/callback".to_owned()],
             allowed_origins: vec![],
             allowed_email_domains: vec![],
+            enterprise_provider: None,
             confidential: false,
         };
 
@@ -1924,6 +1925,7 @@ mod tests {
             redirect_uris: vec!["http://localhost/oidc-callback".to_owned()],
             allowed_origins: vec![],
             allowed_email_domains: vec![],
+            enterprise_provider: None,
             confidential: false,
         };
 
@@ -1941,6 +1943,7 @@ mod tests {
             redirect_uris: vec!["http://localhost/oidc-callback".to_owned()],
             allowed_origins: vec![],
             allowed_email_domains: vec![],
+            enterprise_provider: None,
             confidential: false,
         };
 
