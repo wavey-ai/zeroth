@@ -167,6 +167,13 @@ already produced outside the Worker. `allowedEmailDomains` accepts up to 32
 ASCII domains and requires provider emails to be verified before matching.
 `DELETE /clients?client_id=...` disables the client instead of deleting the row.
 
+`enterpriseProvider` accepts `entra`, `google_workspace`, or `null`; the JSON
+input also accepts `enterprise_provider`. Empty strings clear the requirement.
+Client upsert replaces the complete client configuration: send the current
+`enterpriseProvider` on every edit to preserve it. Omitting it or sending
+`null` clears the enterprise-provider requirement. The hosted admin form sends
+the selected value on every edit.
+
 `GET /ready` is the public deployment preflight endpoint. It returns `200` only
 when the issuer URL uses HTTPS and Zeroth signing material is valid. Apple,
 Google, and Spotify provider credentials must also be configured. Empty values
