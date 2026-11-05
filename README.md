@@ -134,9 +134,10 @@ Implemented so far:
   when the code used PKCE. It consumes the D1 code before it mints credentials
 - Worker `/oauth/token` native provider token exchange for Swift and mobile apps.
   It verifies Apple and Google ID tokens against provider JWKS and native client
-  ID allowlists. It validates Spotify access tokens through the profile endpoint.
-  It uses Spotify `account_id` as the stable linking subject when present. Each
-  provider flow stores the identity in D1 and applies the client's email-domain
+  ID allowlists. Native Spotify access-token exchange is rejected because its
+  profile endpoint cannot verify the token's issuing client; use the hosted
+  Spotify authorization-code flow. Each supported native provider flow stores
+  the identity in D1 and applies the client's email-domain
   policy. It returns Zeroth-owned access and ID tokens
 - registered-client CORS/preflight support for browser calls to token,
   revocation, introspection, userinfo, session, sessions, profile, identities,
