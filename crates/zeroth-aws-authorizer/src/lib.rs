@@ -79,15 +79,22 @@ impl Authorizer {
     }
 
     pub async fn authorize(&self, event: &Value) -> Value {
+        self.authorize_with_clock(event, || {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |time| time.as_secs() as i64)
+        })
+        .await
+    }
+
+    async fn authorize_with_clock(&self, event: &Value, clock: impl FnOnce() -> i64) -> Value {
         let Some(token) = bearer_token(event) else {
             return denied();
         };
         let Some(keys) = self.keys().await else {
             return denied();
         };
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |time| time.as_secs() as i64);
+        let now = clock();
         let Ok(claims) = verify_zeroth_issued_access_token(
             token,
             &keys,
@@ -176,16 +183,13 @@ mod tests {
     #[tokio::test]
     async fn signed_mstr_token_authorizes_only_its_subject() {
         let (authorizer, key) = fixture();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
+        let now = 1_700_000_000;
         let claims = json!({"iss":"https://id.test","sub":"artist-1","aud":"MSTR",
             "iat":now,"exp":now+300,"jti":"test-1","client_id":"yl-web"});
         let good = token(&key, claims.clone());
         let event = json!({"headers":{"Authorization":format!("Bearer {good}")}});
         assert_eq!(
-            authorizer.authorize(&event).await["context"]["user"],
+            authorizer.authorize_with_clock(&event, || now).await["context"]["user"],
             "artist-1"
         );
         for changed in [
@@ -201,8 +205,16 @@ mod tests {
                 .extend(changed.as_object().unwrap().clone());
             let event =
                 json!({"headers":{"authorization":format!("Bearer {}",token(&key,altered))}});
-            assert_eq!(authorizer.authorize(&event).await, denied());
+            assert_eq!(
+                authorizer.authorize_with_clock(&event, || now).await,
+                denied()
+            );
         }
-        assert_eq!(authorizer.authorize(&json!({"headers":{}})).await, denied());
+        assert_eq!(
+            authorizer
+                .authorize_with_clock(&json!({"headers":{}}), || now)
+                .await,
+            denied()
+        );
     }
 }
