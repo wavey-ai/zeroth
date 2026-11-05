@@ -44,6 +44,11 @@ export async function handleGateRequest(request, env = {}, _ctx = {}) {
 export async function isAuthenticated(request, env = {}) {
   if (authBypassEnabled(request, env)) return true;
 
+  // /validate accepts credentials for every registered client. Authentication
+  // there grants access here only when the credential belongs to this app.
+  const clientId = String(env.ZEROTH_CLIENT_ID || "").trim();
+  if (!clientId) return false;
+
   const validateUrl = new URL(env.ZEROTH_VALIDATE_URL || "/validate", issuerFromEnv(env));
   const headers = new Headers({ Accept: "application/json" });
   const cookie = request.headers.get("Cookie");
@@ -62,7 +67,7 @@ export async function isAuthenticated(request, env = {}) {
     });
     if (!response.ok) return false;
     const result = await response.json().catch(() => null);
-    return Boolean(result && (result.valid || result.authenticated));
+    return result?.valid === true && result.clientId === clientId;
   } catch (error) {
     console.warn("[zeroth-gate] validation failed", error && (error.message || error));
     return false;
@@ -172,7 +177,15 @@ function withSecurityHeaders(response, url, env, headOnly = false) {
   for (const [name, value] of Object.entries({ ...DEFAULT_SECURITY_HEADERS, ...configured })) {
     if (value) headers.set(name, value);
   }
-  if (!headers.has("Cache-Control")) headers.set("Cache-Control", cacheControlForPath(url.pathname));
+  // Asset bindings commonly return public cache headers. Shared caches must
+  // never reuse a response that passed this gate for another browser.
+  const noStore = (headers.get("Cache-Control") || "")
+    .split(",")
+    .some((directive) => directive.trim().toLowerCase() === "no-store");
+  headers.set("Cache-Control", noStore ? "no-store" : cacheControlForPath(url.pathname));
+  for (const name of ["CDN-Cache-Control", "Cloudflare-CDN-Cache-Control", "Surrogate-Control"]) {
+    headers.delete(name);
+  }
 
   return new Response(headOnly ? null : response.body, {
     status: response.status,

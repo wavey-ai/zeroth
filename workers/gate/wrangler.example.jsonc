@@ -13,6 +13,8 @@
   },
   "vars": {
     "ZEROTH_ISSUER": "https://id.wavey.ai",
+    // Required: only /validate credentials for this exact registered client
+    // may read gated assets. Missing client configuration denies access.
     "ZEROTH_CLIENT_ID": "example-web",
     "ZEROTH_PROTECTED_PREFIXES": "/private",
     "ZEROTH_ASSET_PREFIX": "/private"
