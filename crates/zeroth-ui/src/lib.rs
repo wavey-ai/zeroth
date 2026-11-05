@@ -1571,6 +1571,7 @@ pub struct ZerothUiConfig {
     pub csrf_token: Option<String>,
     pub link_identities: bool,
     pub provider_authorize_path: String,
+    pub allow_local_login: bool,
     pub show_passkey_login: bool,
     pub show_magic_link_login: bool,
 }
@@ -1595,6 +1596,7 @@ impl ZerothUiConfig {
             csrf_token: None,
             link_identities: true,
             provider_authorize_path: "/authorize".to_owned(),
+            allow_local_login: true,
             show_passkey_login: false,
             show_magic_link_login: false,
         }
@@ -1973,7 +1975,8 @@ pub fn provider_link_url(config: &ZerothUiConfig, provider_id: &str) -> String {
 
 /// Renders the default Zeroth UI body as server-side HTML.
 pub fn render_account_html(state: ZerothUiState) -> String {
-    if state.profile.is_none() && state.theme.uses_yl_vin_login() {
+    if state.profile.is_none() && state.config.allow_local_login && state.theme.uses_yl_vin_login()
+    {
         return render_yl_vin_login_html(&state);
     }
     view! { <AccountApp state=state /> }.to_html()
@@ -1981,7 +1984,8 @@ pub fn render_account_html(state: ZerothUiState) -> String {
 
 /// Renders a complete HTML document with the default Zeroth stylesheet.
 pub fn render_account_document(state: ZerothUiState) -> String {
-    if state.profile.is_none() && state.theme.uses_yl_vin_login() {
+    if state.profile.is_none() && state.config.allow_local_login && state.theme.uses_yl_vin_login()
+    {
         let favicon = state
             .theme
             .brand_icon
@@ -2177,7 +2181,7 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
     let signed_in_account_mode = signed_in && config.link_identities;
     let signed_in_login_flow = signed_in && !config.link_identities;
     let login_mode = !signed_in;
-    let uses_yl_vin_login = login_mode && theme.uses_yl_vin_login();
+    let uses_yl_vin_login = login_mode && config.allow_local_login && theme.uses_yl_vin_login();
     let uses_minimal_login = login_mode && theme.uses_minimal_login();
     let shell_class = if uses_yl_vin_login {
         "zeroth-shell zeroth-login-mode zeroth-yl-login"
@@ -2312,7 +2316,7 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
         .map(|session| session_row(&logout_action, &sessions_action, &csrf_token, session))
         .collect_view();
     let application_rows = applications.into_iter().map(application_row).collect_view();
-    let magic_link_section = config.show_magic_link_login.then(|| {
+    let magic_link_section = (config.allow_local_login && config.show_magic_link_login).then(|| {
         view! {
             <div class="zeroth-auth-group">
                 <div class="zeroth-divider">"Continue with email"</div>
@@ -2334,7 +2338,7 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
             </div>
         }
     });
-    let passkey_section = config.show_passkey_login.then(|| {
+    let passkey_section = (config.allow_local_login && config.show_passkey_login).then(|| {
         view! {
             <div>
                 <div class="zeroth-divider">"Passkey"</div>
@@ -2446,6 +2450,7 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
                                 {magic_link_section}
                                 <div class=provider_list_class>{provider_rows}</div>
 
+                                {config.allow_local_login.then(|| view! {
                                 <details class="zeroth-more-options">
                                     <summary>"More options"</summary>
                                     {passkey_section}
@@ -2492,6 +2497,7 @@ pub fn AccountApp(state: ZerothUiState) -> impl IntoView {
                                         </form>
                                     </div>
                                 </details>
+                                })}
 
                             </div>
                         </section>
@@ -5458,6 +5464,45 @@ mod tests {
             assert_eq!(query(&url, "provider").as_deref(), Some(id));
             assert_eq!(query(&url, "client_id").as_deref(), Some("enterprise-app"));
             assert_ne!(provider.id, ProviderUi::google(false).id);
+        }
+    }
+
+    #[test]
+    fn enterprise_only_login_omits_local_authentication_forms_and_keeps_provider() {
+        for provider in [
+            ProviderUi::entra(false),
+            ProviderUi::google_workspace(false),
+        ] {
+            for login_style in [None, Some("yl-vin")] {
+                let mut state = ZerothUiState::new(ZerothUiConfig::new(
+                    "https://id.example.com",
+                    "enterprise-app",
+                    "https://app.example.com/callback",
+                ));
+                state.config.provider_authorize_path = "/login".into();
+                state.config.link_identities = false;
+                state.config.allow_local_login = false;
+                // The global local-login gate wins even if method flags or a
+                // specialized social-login theme were enabled elsewhere.
+                state.config.show_passkey_login = true;
+                state.config.show_magic_link_login = true;
+                state.theme.login_style = login_style.map(str::to_owned);
+                state.providers = vec![provider.clone()];
+                let html = render_account_html(state);
+                assert!(html.contains(&format!("Continue with {}", provider.label)));
+                assert!(html.contains(&format!("provider={}", provider.id)));
+                for forbidden in [
+                    "Connect wallet",
+                    "Email and password",
+                    "Use passkey",
+                    "Continue with email",
+                    "zeroth-magic-link-form",
+                    "zeroth-account-passkey-register-form",
+                    "zeroth-more-options",
+                ] {
+                    assert!(!html.contains(forbidden), "{forbidden} in enterprise login");
+                }
+            }
         }
     }
 
