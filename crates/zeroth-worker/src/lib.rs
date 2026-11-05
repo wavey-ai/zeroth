@@ -7577,7 +7577,9 @@ async fn hosted_login(request: Request, env: Env) -> worker::Result<Response> {
             }
         };
     let client = &registered_client.client;
-    if let Err(error) = validate_authorization_request_for_client(&authorization_request, client) {
+    if let Err(error) =
+        validate_issuer_authorization_request_for_client(&authorization_request, client)
+    {
         return auth_error_json(&error, 400);
     }
 
@@ -7927,7 +7929,9 @@ async fn authorize(request: Request, env: Env) -> worker::Result<Response> {
         };
     let client = &registered_client.client;
 
-    if let Err(error) = validate_authorization_request_for_client(&authorization_request, client) {
+    if let Err(error) =
+        validate_issuer_authorization_request_for_client(&authorization_request, client)
+    {
         if let Some(redirect_url) = authorization_request_error_redirect_url_for_client(
             &authorization_request,
             client,
@@ -13921,6 +13925,8 @@ fn validate_refresh_token_exchange(
             "refresh token has expired",
         ));
     }
+    validate_issuer_scope(&row.scope)
+        .map_err(|error| TokenExchangeError::invalid_grant(error.description))?;
 
     Ok(())
 }
@@ -13992,6 +13998,8 @@ fn validate_authorization_code_exchange(
         }
     }
 
+    validate_issuer_scope(&code.scope)
+        .map_err(|error| TokenExchangeError::invalid_grant(error.description))?;
     Ok(())
 }
 
@@ -14002,6 +14010,7 @@ fn token_response(
     refresh_token: Option<String>,
     now: i32,
 ) -> Result<TokenResponse, String> {
+    validate_issuer_scope(&issue.scope).map_err(|error| error.description)?;
     let access_claims = JwtClaims {
         iss: config.issuer().issuer.clone(),
         sub: issue.user_id.clone(),
@@ -14939,6 +14948,33 @@ fn provider_profile_email_domain(
     Ok(domain.to_ascii_lowercase())
 }
 
+#[cfg(any(test, target_arch = "wasm32"))]
+fn validate_issuer_authorization_request_for_client(
+    request: &AuthorizationRequest,
+    client: &Client,
+) -> Result<(), AuthorizationRequestError> {
+    validate_authorization_request_for_client(request, client)?;
+    validate_issuer_scope(&request.scope.as_slice().join(" "))
+}
+
+fn validate_issuer_scope(scope: &str) -> Result<(), AuthorizationRequestError> {
+    let mut has_openid = false;
+    for scope in scope.split_whitespace() {
+        if !matches!(scope, "openid" | "profile" | "email" | "offline_access") {
+            return Err(AuthorizationRequestError::invalid_scope(
+                "custom scopes require an explicit client grant policy and are not supported",
+            ));
+        }
+        has_openid |= scope == "openid";
+    }
+    if !has_openid {
+        return Err(AuthorizationRequestError::invalid_scope(
+            "scope must include openid",
+        ));
+    }
+    Ok(())
+}
+
 fn native_token_scope(scope: Option<&str>) -> Result<String, TokenExchangeError> {
     let raw = scope.unwrap_or(DEFAULT_NATIVE_TOKEN_SCOPE);
     let mut scopes = Vec::new();
@@ -14964,7 +15000,10 @@ fn native_token_scope(scope: Option<&str>) -> Result<String, TokenExchangeError>
             "scope must include openid",
         ));
     }
-    Ok(scopes.join(" "))
+    let scope = scopes.join(" ");
+    validate_issuer_scope(&scope)
+        .map_err(|error| TokenExchangeError::invalid_scope(error.description))?;
+    Ok(scope)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -20584,6 +20623,13 @@ impl ClientManagementError {
 }
 
 impl TokenExchangeError {
+    fn invalid_scope(description: impl Into<String>) -> Self {
+        Self {
+            code: "invalid_scope".to_owned(),
+            description: description.into(),
+        }
+    }
+
     fn invalid_request(description: impl Into<String>) -> Self {
         Self {
             code: "invalid_request".to_owned(),
@@ -23627,6 +23673,64 @@ mod tests {
 
         let error = native_token_scope(Some("email profile")).unwrap_err();
         assert_eq!(error.description, "scope must include openid");
+    }
+
+    #[test]
+    fn issuer_rejects_self_requested_privileged_scopes_for_all_client_types() {
+        for confidential in [false, true] {
+            let mut client = registered_public_client().client;
+            client.confidential = confidential;
+            let request = AuthorizationRequest {
+                client_id: client.id.clone(),
+                redirect_uri: client.redirect_uris[0].clone(),
+                scope: ScopeSet::new(["openid", "api:write"]),
+                state: Some("attacker-state".to_owned()),
+                nonce: None,
+                prompt: AuthorizationPrompt::None,
+                max_age: None,
+                code_challenge: Some(pkce_s256_challenge(
+                    "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk",
+                )),
+                code_challenge_method: Some(PkceChallengeMethod::S256),
+            };
+            let error = validate_issuer_authorization_request_for_client(&request, &client)
+                .unwrap_err();
+            assert_eq!(error.code, "invalid_scope");
+        }
+        let error = native_token_scope(Some("openid billing:read")).unwrap_err();
+        assert_eq!(error.code, "invalid_scope");
+        assert_eq!(
+            native_token_scope(Some("openid profile email offline_access")).unwrap(),
+            "openid profile email offline_access"
+        );
+    }
+
+    #[test]
+    fn legacy_custom_scopes_cannot_be_redeemed_refreshed_or_minted() {
+        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        let mut code = valid_auth_code_row(pkce_s256_challenge(verifier));
+        code.scope = "openid api:write".to_owned();
+        let mut form = valid_token_exchange_form();
+        form.code_verifier = Some(verifier.to_owned());
+        let fields = authorization_code_fields(&form).unwrap();
+        let error = validate_authorization_code_exchange(&code, &fields, 1_780_000_100)
+            .unwrap_err();
+        assert_eq!(error.code, "invalid_grant");
+
+        let mut refresh = valid_refresh_token_row();
+        refresh.scope = "openid api:write".to_owned();
+        let error = validate_refresh_token_exchange(&refresh, "ios", 1_780_000_100)
+            .unwrap_err();
+        assert_eq!(error.code, "invalid_grant");
+
+        // The final issuer boundary also rejects the grant, even if another
+        // caller bypasses the authorization-code/native/refresh validators.
+        let config = ZerothServerConfig {
+            public_base_url: "https://id.example.com".to_owned(),
+            ..ZerothServerConfig::default()
+        };
+        let issue = TokenIssue::from_auth_code(&code);
+        assert!(token_response(&config, &test_signing_key(), &issue, None, 1_780_000_100).is_err());
     }
 
     #[test]

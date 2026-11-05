@@ -151,6 +151,10 @@ Implemented so far:
   exact and prefix protected paths locally. They verify Zeroth access tokens from
   cached JWKS and check role and scope claims without calling Zeroth each time.
 
+- issuer scope validation limited to `openid`, `profile`, `email`, and
+  `offline_access`. Custom permission scopes are rejected until a client grant
+  policy exists; authorization codes and refresh tokens cannot renew old custom
+  grants
 - OIDC discovery metadata for query-mode code responses and rejection of
   unsupported `response_mode` values. It advertises the response `iss` flag and
   Zeroth issuer and JWKS endpoints. It includes OAuth Authorization Server

@@ -1,5 +1,17 @@
 # Zeroth Worker Path Protection
 
+The Worker issuer accepts only `openid`, `profile`, `email`, and `offline_access`.
+It rejects custom scopes in authorization and native exchange requests, and in
+stored authorization-code and refresh grants. Custom scopes need an explicit
+client grant policy before they can represent application permissions. Requesting
+a scope must never grant the requested permission by itself.
+
+The relying-party helpers can check scope claims, but the current Worker issuer
+does not mint scopes such as `billing:read` or `api:write`. Use application
+permissions or the issuer's persisted role memberships for privileged routes.
+Previously issued custom-scope access tokens remain valid to local JWT verifiers
+until they expire; refresh cannot renew those grants.
+
 ```mermaid
 sequenceDiagram
     autonumber
@@ -53,8 +65,8 @@ flowchart LR
     subgraph Path policies
         P1["/account/* requires role user"]
         P2["/admin/* requires role admin"]
-        P3["/api/billing/* requires scope billing:read"]
-        P4["/api/write/* requires scope api:write"]
+        P3["/api/billing/* requires role admin"]
+        P4["/api/write/* requires role admin"]
     end
 
     subgraph Cached trust material
@@ -74,7 +86,7 @@ flowchart TB
     Token --> Sub["sub = user id"]
     Token --> Use["token_use = access"]
     Token --> Roles["roles = user, admin"]
-    Token --> Scope["scope = openid profile api:read"]
+    Token --> Scope["scope = openid profile email"]
     Token --> Sid["sid = browser session id"]
 
     Edge[Product Worker] -->|checks locally under 10 ms target| Iss
