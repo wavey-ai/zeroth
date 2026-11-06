@@ -1,0 +1,14 @@
+[package]
+name = "zeroth-machine"
+version.workspace = true
+edition.workspace = true
+description = "Portable service identity policy, signed client assertions and access-token verification"
+license.workspace = true
+homepage.workspace = true
+
+[dependencies]
+base64.workspace = true
+p256.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+url.workspace = true

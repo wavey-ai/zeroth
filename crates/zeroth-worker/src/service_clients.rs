@@ -1,12 +1,12 @@
 //! Machine identities have their own registry, assertion replay ledger and token records.
 use super::*;
 #[cfg(any(test, target_arch = "wasm32"))]
-use zeroth_oidc::service::build_service_access_token_claims;
-use zeroth_oidc::service::{
+use zeroth_machine::build_service_access_token_claims;
+use zeroth_machine::{
     verify_service_access_token, ServiceAccessTokenValidation, ServiceClient, ServiceJwks,
 };
 #[cfg(target_arch = "wasm32")]
-use zeroth_oidc::service::{
+use zeroth_machine::{
     verify_service_client_assertion, ServiceAssertionValidation, ServiceTokenResponse,
 };
 
@@ -826,7 +826,7 @@ fn service_claims_for_introspection(
     issuer: &str,
     jwks: &JwksResponse,
     now: i32,
-) -> Option<zeroth_oidc::service::ServiceAccessTokenClaims> {
+) -> Option<zeroth_machine::ServiceAccessTokenClaims> {
     // Untrusted audience only chooses among this client's exact allowlist; verification authenticates it.
     let payload = token.split('.').nth(1)?;
     let bytes = URL_SAFE_NO_PAD.decode(payload).ok()?;

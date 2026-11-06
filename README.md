@@ -24,6 +24,7 @@ crates/zeroth-oidc
 crates/zeroth-providers
 crates/zeroth-storage
 crates/zeroth-server
+crates/zeroth-machine
 crates/zeroth-cli
 crates/zeroth-ui
 crates/zeroth-worker
@@ -31,6 +32,11 @@ crates/zeroth-worker
 
 The facade crate keeps the Leptos UI behind the optional `ui` feature so API and
 Worker consumers do not pull UI dependencies by default.
+
+`zeroth-machine` owns the portable machine identity policy, signed client
+assertions and service access-token verification. It has no dependency on OIDC,
+Worker, storage or cloud adapters. `zeroth-oidc` retains the compatible
+`zeroth_oidc::service` import path.
 
 `zeroth-worker` follows the existing Rust Cloudflare Worker shape in this repo:
 `worker-build` produces `build/worker/shim.mjs`, and D1 is exposed through a
@@ -162,7 +168,7 @@ Implemented so far:
   of cloud IAM. See the [machine authentication guide](docs/machine-authentication.html)
   for registration, key rotation, introspection and revocation behavior
 - CLI `service-assertion` signs a fresh two-minute assertion from a private key on
-  stdin; `zeroth-oidc::service` exposes the portable signing and verification APIs
+  stdin; `zeroth-machine` exposes the portable signing and verification APIs
 - Worker `/oauth/token` authorization-code validation for public PKCE and
   confidential clients. It verifies the registered client, secret, code,
   expiry, reuse state, and redirect URI. It validates the S256 `code_verifier`
@@ -272,6 +278,7 @@ already-published packages:
 ```sh
 cargo publish -p zeroth-core
 cargo publish -p zeroth-providers
+cargo publish -p zeroth-machine
 cargo publish -p zeroth-oidc
 cargo publish -p zeroth-storage
 cargo publish -p zeroth-server

@@ -7,11 +7,10 @@
 use std::collections::HashSet;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use p256::ecdsa::{signature::Signer as _, Signature, SigningKey};
+use p256::ecdsa::{signature::Signer as _, Signature, SigningKey, VerifyingKey};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use url::Url;
 
-use crate::{es256_verifying_key_from_jwk, Es256Signature, ZerothJwk};
 use p256::ecdsa::signature::Verifier as _;
 
 pub const MAX_SERVICE_KEYS: usize = 8;
@@ -62,16 +61,20 @@ pub struct ServiceJwk {
 }
 
 impl ServiceJwk {
-    fn as_zeroth_key(&self) -> ZerothJwk {
-        ZerothJwk {
-            kty: self.kty.clone(),
-            key_use: self.key_use.clone(),
-            kid: self.kid.clone(),
-            alg: self.alg.clone(),
-            crv: self.crv.clone(),
-            x: self.x.clone(),
-            y: self.y.clone(),
+    fn verifying_key(&self) -> Result<VerifyingKey, ServiceTokenError> {
+        if self.kty != "EC" || self.key_use != "sig" || self.alg != "ES256" || self.crv != "P-256" {
+            return Err(invalid());
         }
+        let x = URL_SAFE_NO_PAD.decode(&self.x).map_err(|_| invalid())?;
+        let y = URL_SAFE_NO_PAD.decode(&self.y).map_err(|_| invalid())?;
+        if x.len() != 32 || y.len() != 32 {
+            return Err(invalid());
+        }
+        let mut point = Vec::with_capacity(65);
+        point.push(0x04);
+        point.extend_from_slice(&x);
+        point.extend_from_slice(&y);
+        VerifyingKey::from_sec1_bytes(&point).map_err(|_| invalid())
     }
 }
 
@@ -118,7 +121,7 @@ impl ServiceJwks {
                     ));
                 }
             }
-            es256_verifying_key_from_jwk(&key.as_zeroth_key())
+            key.verifying_key()
                 .map_err(|_| error("invalid_client_metadata", "invalid ES256 public key"))?;
         }
         Ok(())
@@ -469,15 +472,14 @@ fn verify_signed<T: DeserializeOwned>(
     // Decode and bound all parts before curve work or deserializing claim types.
     let payload = decode_segment(payload, MAX_CLAIMS_BYTES)?;
     let signature = decode_segment(signature, 64)?;
-    let signature = Es256Signature::try_from(signature.as_slice()).map_err(|_| invalid())?;
+    let signature = Signature::try_from(signature.as_slice()).map_err(|_| invalid())?;
     jwks.validate()?;
     let key = jwks
         .keys
         .iter()
         .find(|key| key.kid == header.kid)
         .ok_or_else(invalid)?;
-    let verifying_key =
-        es256_verifying_key_from_jwk(&key.as_zeroth_key()).map_err(|_| invalid())?;
+    let verifying_key = key.verifying_key().map_err(|_| invalid())?;
     let input = token.rsplit_once('.').ok_or_else(invalid)?.0;
     verifying_key
         .verify(input.as_bytes(), &signature)

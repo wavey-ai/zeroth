@@ -3,7 +3,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use p256::ecdsa::SigningKey;
 use std::io::{self, Read};
 use std::time::{SystemTime, UNIX_EPOCH};
-use zeroth_oidc::service::{build_service_client_assertion_claims, sign_service_client_assertion};
+use zeroth_machine::{build_service_client_assertion_claims, sign_service_client_assertion};
 
 #[derive(Debug, Eq, PartialEq)]
 struct Options {
@@ -77,7 +77,7 @@ fn create(options: &Options, private_key: &str, now: i64) -> Result<String, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zeroth_oidc::service::{
+    use zeroth_machine::{
         verify_service_client_assertion, ServiceAssertionValidation, ServiceClient, ServiceJwks,
     };
 

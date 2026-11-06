@@ -37,6 +37,7 @@ zeroth-core.workspace = true
 zeroth-oidc.workspace = true
 zeroth-providers.workspace = true
 zeroth-server.workspace = true
+zeroth-machine.workspace = true
 zeroth-storage.workspace = true
 zeroth-ui.workspace = true
 

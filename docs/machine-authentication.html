@@ -55,7 +55,7 @@ curl --fail-with-body https://id.example.com/oauth/token \
   "expires_in": 600,
   "scope": "releases:read receipts:write"
 }</pre>
-<p>The Rust API in <code>zeroth_oidc::service</code> exposes assertion construction and signing helpers, service policy types and access-token verification. Applications can keep keys in their own signing system while using the same HTTP protocol.</p>
+<p>The separate <code>zeroth-machine</code> crate owns assertion construction and signing helpers, service policy types and access-token verification. It depends on portable cryptography and URL libraries, with no OIDC, Worker, storage or cloud adapter dependency. Rust applications import <code>zeroth_machine</code>; the existing <code>zeroth_oidc::service</code> path remains compatible. Applications can keep keys in their own signing system while using the same HTTP protocol.</p>
 
 <h2>3. Verify identity at the receiving API</h2>
 <p>Use <code>verify_service_access_token</code> with trusted issuer keys and explicit expected issuer, tenant, audience, required scopes and current time. Obtain Zeroth’s public keys from its configured JWKS endpoint and maintain a bounded key cache. Select the separate service-token verifier when authorizing machine requests.</p>
@@ -81,7 +81,7 @@ curl --fail-with-body https://id.example.com/oauth/token \
 <p>An enabled service can introspect its own tokens through <code>POST /oauth/introspect</code>, using a fresh client assertion whose audience is the exact introspection endpoint. Include <code>client_id</code>, <code>client_assertion_type</code>, <code>client_assertion</code> and <code>token</code>. Expired, foreign-client or old-revision tokens return <code>active: false</code>. A disabled service cannot authenticate to this endpoint. Cross-client resource-server introspection is outside the current grant model.</p>
 
 <h2>5. Cloud boundaries</h2>
-<p>The identity exchange needs outbound HTTPS and the service’s registered signing key. It requires no cross-account IAM role. The current hosted issuer uses the existing Worker/D1 adapter; the protocol and <code>zeroth-oidc</code> verification library carry no cloud IAM requirement.</p>
+<p>The identity exchange needs outbound HTTPS and the service’s registered signing key. It requires no cross-account IAM role. The current hosted issuer uses the existing Worker/D1 adapter; the protocol and <code>zeroth-machine</code> verification library carry no cloud IAM requirement.</p>
 <p>A tier still needs local permissions for its infrastructure. AWS registry pulls and deployment calls use the AWS adapter’s IAM permissions. Azure and Google adapters use their own registry, secret and deployment credentials. A Zeroth access token is not an ECR login token.</p>
 <p>Zeroth supplies identity, scopes and identity audit. The release catalog, signed deployment manifests, durable receipts and tier adoption policy remain separate release-system responsibilities.</p>
 

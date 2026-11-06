@@ -1,6 +1,7 @@
 //! OIDC protocol surface for Zeroth.
 
-pub mod service;
+/// Compatibility path for the portable service authentication crate.
+pub use zeroth_machine as service;
 
 use base64::{
     engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD},

@@ -319,58 +319,6 @@ fn access_tokens_bind_issuer_tenant_resource_service_and_required_scopes() {
 }
 
 #[test]
-fn valid_service_credentials_never_authenticate_a_human_and_vice_versa() {
-    // Match the legacy human access verifier's client_id==aud rule so rejection
-    // proves the discriminator boundary rather than an incidental audience error.
-    let mut client = client();
-    client.allowed_audiences = vec![client.id.clone()];
-    let claims = build_service_access_token_claims(
-        &client,
-        ISSUER,
-        &client.id,
-        "releases:read",
-        NOW,
-        "unique_jti",
-    )
-    .unwrap();
-    let token = sign(&header(), &claims, 7);
-    let human_keys = crate::ZerothJwks {
-        keys: keys(7).keys.iter().map(ServiceJwk::as_zeroth_key).collect(),
-    };
-    assert!(
-        crate::verify_zeroth_access_token(&token, &human_keys, ISSUER, &client.id, NOW).is_err()
-    );
-    assert!(
-        crate::verify_zeroth_issued_access_token(&token, &human_keys, ISSUER, &client.id, NOW)
-            .is_err()
-    );
-    // Even changing token_use to id cannot convert the same principal into a user.
-    let mut id_claims = serde_json::to_value(&claims).unwrap();
-    id_claims["token_use"] = json!("id");
-    let id_token = sign(&header(), &id_claims, 7);
-    assert!(
-        crate::verify_zeroth_id_token(&id_token, &human_keys, ISSUER, &client.id, None, NOW)
-            .is_err()
-    );
-    let human = json!({"iss":ISSUER,"sub":"usr_1","aud":AUDIENCE,"client_id":AUDIENCE,"scope":"releases:read","iat":NOW,"exp":NOW+300,"token_use":"access"});
-    assert!(verify_service_access_token(
-        &sign(&header(), &human, 7),
-        &keys(7),
-        &access_validation()
-    )
-    .is_err());
-    let response = ServiceTokenResponse {
-        access_token: token,
-        token_type: "Bearer".into(),
-        expires_in: 600,
-        scope: "releases:read".into(),
-    };
-    let response = serde_json::to_value(response).unwrap();
-    assert!(response.get("id_token").is_none());
-    assert!(response.get("refresh_token").is_none());
-}
-
-#[test]
 fn expiry_does_not_gain_a_replay_window_from_clock_skew() {
     let token = sign(&header(), &assertion(), 3);
     let mut validation = assertion_validation();

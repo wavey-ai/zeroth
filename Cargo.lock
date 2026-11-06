@@ -4738,7 +4738,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "zeroth-core",
- "zeroth-oidc",
+ "zeroth-machine",
  "zeroth-server",
  "zeroth-storage",
 ]
@@ -4748,6 +4748,17 @@ name = "zeroth-core"
 version = "0.2.0"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "zeroth-machine"
+version = "0.2.0"
+dependencies = [
+ "base64 0.22.1",
+ "p256",
+ "serde",
+ "serde_json",
+ "url",
 ]
 
 [[package]]
@@ -4761,6 +4772,7 @@ dependencies = [
  "sha2 0.10.9",
  "url",
  "zeroth-core",
+ "zeroth-machine",
 ]
 
 [[package]]
@@ -4841,6 +4853,7 @@ dependencies = [
  "worker",
  "zeroth-audit",
  "zeroth-core",
+ "zeroth-machine",
  "zeroth-oidc",
  "zeroth-providers",
  "zeroth-server",
