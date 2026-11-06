@@ -154,6 +154,15 @@ Implemented so far:
 - client-bound authorization error redirects after redirect URI validation.
   Relying apps receive an OIDC error response instead of JSON. It contains
   `error`, original app state, and `iss` for failures that are safe to redirect.
+- tenant-scoped service clients managed at `/admin/service-clients`, with
+  ES256 `private_key_jwt` authentication and the `client_credentials` grant at
+  `/oauth/token`. Service tokens carry explicit audiences/scopes and expire in
+  at most ten minutes; assertion replay checks, issuance and audit capture commit
+  together. Machine identities use public-key registration over HTTPS independently
+  of cloud IAM. See the [machine authentication guide](docs/machine-authentication.html)
+  for registration, key rotation, introspection and revocation behavior
+- CLI `service-assertion` signs a fresh two-minute assertion from a private key on
+  stdin; `zeroth-oidc::service` exposes the portable signing and verification APIs
 - Worker `/oauth/token` authorization-code validation for public PKCE and
   confidential clients. It verifies the registered client, secret, code,
   expiry, reuse state, and redirect URI. It validates the S256 `code_verifier`

@@ -10,7 +10,7 @@ pub(super) const INSERT_OUTBOX_SQL: &str = "INSERT INTO zeroth_audit_outbox
     (event_id, event_json, created_at) VALUES (?, ?, ?)";
 
 pub(super) const AUDIT_SCOPE_GUARD_SQL: &str = "INSERT INTO zeroth_audit_write_guards (id,valid)
-    SELECT ?1, CASE WHEN (SELECT tenant_id FROM zeroth_tenant_clients WHERE client_id=?3) IS ?2 THEN 1 ELSE 0 END";
+    SELECT ?1, CASE WHEN COALESCE((SELECT tenant_id FROM zeroth_tenant_clients WHERE client_id=?3), (SELECT tenant_id FROM zeroth_service_clients WHERE id=?3)) IS ?2 THEN 1 ELSE 0 END";
 
 // User-wide lifecycle actions retain a platform record and a separate projection
 // for each explicitly registered tenant affected at the instant of capture.
@@ -32,7 +32,8 @@ pub(super) const FANOUT_USER_OUTBOX_SQL: &str =
     JOIN zeroth_tenants t ON a.id=?1 || '_tenant_' || t.id";
 
 pub(super) const CLIENT_POLICY_GUARD_SQL: &str = "INSERT INTO zeroth_audit_write_guards (id, valid)
-    SELECT ?1, CASE WHEN
+    SELECT ?1, CASE WHEN NOT EXISTS(SELECT 1 FROM zeroth_service_clients WHERE id=?2)
+      AND (?3=1 OR substr(?2,1,4)!='svc_') AND (
       (?3 = 0 AND NOT EXISTS (SELECT 1 FROM zeroth_clients WHERE id=?2)) OR
       (?3 = 1 AND EXISTS (SELECT 1 FROM zeroth_clients WHERE id=?2
         AND name IS ?4 AND secret_hash IS ?5 AND redirect_uris_json IS ?6
@@ -40,7 +41,7 @@ pub(super) const CLIENT_POLICY_GUARD_SQL: &str = "INSERT INTO zeroth_audit_write
         AND enterprise_provider IS ?9 AND issuer_token_audience IS ?10
         AND issuer_token_ttl_seconds IS ?11 AND account_sharing_mode IS ?12
         AND account_tenant_id IS ?13 AND visible_login_methods_json IS ?14
-        AND confidential IS ?15 AND disabled_at IS ?16)) THEN 1 ELSE 0 END";
+        AND confidential IS ?15 AND disabled_at IS ?16))) THEN 1 ELSE 0 END";
 
 // One predicate supplies both the historical core-only SQL and the production
 // composite guard, so tenant/provider checks cannot diverge between them.

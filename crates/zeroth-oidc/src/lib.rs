@@ -1,5 +1,7 @@
 //! OIDC protocol surface for Zeroth.
 
+pub mod service;
+
 use base64::{
     engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD},
     Engine as _,
@@ -772,6 +774,14 @@ fn verify_zeroth_signed_token<T: DeserializeOwned>(
         .verify(signing_input.as_bytes(), &signature)
         .map_err(|_| ZerothTokenError::invalid_token("JWT signature did not verify"))?;
 
+    // Machine principals have their own verifier and must never become a user
+    // merely because a permissive claims deserializer drops their discriminator.
+    let principal: serde_json::Value = decode_jwt_segment(segments[1])?;
+    if principal.get("principal_type").is_some() {
+        return Err(ZerothTokenError::invalid_token(
+            "machine principal claims are not user tokens",
+        ));
+    }
     let claims = decode_jwt_segment::<T>(segments[1])?;
     Ok(claims)
 }

@@ -1,8 +1,8 @@
 //! Local, non-production fixture for reviewing administration layouts.
 use zeroth_ui::{
-    render_clients_admin_document, render_tenants_admin_document, ClientAdminUi,
-    ClientsAdminUiState, EventAdminUi, ProviderAdminUi, TenantAdminUi, TenantAuditReaderUi,
-    UserAdminUi,
+    render_clients_admin_document, render_service_clients_admin_document,
+    render_tenants_admin_document, ClientAdminUi, ClientsAdminUiState, EventAdminUi,
+    ProviderAdminUi, ServiceClientAdminUi, TenantAdminUi, TenantAuditReaderUi, UserAdminUi,
 };
 
 fn main() {
@@ -121,7 +121,22 @@ fn main() {
         activation_requirements: vec![],
         last_failure: None,
     });
-    let document = if std::env::args().any(|arg| arg == "tenants") {
+    state.service_clients.push(ServiceClientAdminUi {
+        id: "svc_release_agent".into(),
+        tenant_id: "acme".into(),
+        name: "Acme release agent".into(),
+        audiences: vec!["https://releases.example.com".into()],
+        scopes: vec!["releases:read".into(), "rollouts:report".into()],
+        public_jwks_json: r#"{"keys":[{"kid":"release-2026-11","kty":"EC","crv":"P-256","alg":"ES256","use":"sig","x":"axfR8uEsQkf4vOblY6RA8ncDfYEt6zOg9KE5RdiYwpY","y":"T-NC4v4af5uO5-tKfA-eFivOM1drMV7Oy7ZAaDe_UfU"}]}"#.into(),
+        disabled: false,
+        revision: 2,
+        token_ttl_seconds: 600,
+        created_at: Some("1793836800".into()),
+        updated_at: Some("1793871000".into()),
+    });
+    let document = if std::env::args().any(|arg| arg == "service-clients") {
+        render_service_clients_admin_document(state)
+    } else if std::env::args().any(|arg| arg == "tenants") {
         render_tenants_admin_document(state)
     } else {
         render_clients_admin_document(state)

@@ -3,6 +3,7 @@
   const clientsEndpoint = "/clients";
   const usersEndpoint = "/users";
   const tenantsEndpoint = "/tenants";
+  const serviceClientsEndpoint = "/service-clients";
   const providersEndpoint = "/providers/status";
   const localAuthEndpoint = "/local-auth/status";
   const eventsEndpoint = "/events";
@@ -52,6 +53,14 @@
   let directoryStatus = null;
   const scimForm = $("zeroth-scim-form");
   const directoryForm = $("zeroth-google-directory-form");
+  const serviceRows = $("zeroth-service-rows");
+  const serviceForm = $("zeroth-service-form");
+  const serviceEditor = $("zeroth-service-editor");
+  const serviceTenantFilter = $("zeroth-service-tenant-filter");
+  let loadedServiceClients = [];
+  let editingServiceClient = null;
+  let serviceRequestId = 0;
+  let serviceBusy = false;
 
   function setMessage(value, error = false) {
     if (!message) return;
@@ -1117,6 +1126,205 @@
     const current = select.value; select.replaceChildren(new Option("All tenants", ""));
     for (const tenant of loadedTenants) select.add(new Option(tenant.name, tenant.id));
     select.value = current;
+    refreshServiceTenantOptions();
+  }
+
+  function refreshServiceTenantOptions() {
+    if (!serviceForm) return;
+    const owner = serviceForm.elements.tenantId;
+    const selectedOwner = owner.value;
+    const selectedFilter = serviceTenantFilter.value;
+    owner.replaceChildren(new Option("Choose a tenant", ""));
+    serviceTenantFilter.replaceChildren(new Option("All tenants", ""));
+    for (const tenant of loadedTenants) {
+      const option = new Option(`${tenant.name}${tenant.disabled ? " (disabled)" : ""}`, tenant.id);
+      option.disabled = Boolean(tenant.disabled);
+      owner.add(option);
+      serviceTenantFilter.add(new Option(tenant.name, tenant.id));
+    }
+    owner.value = editingServiceClient ? editingServiceClient.tenantId : selectedOwner;
+    serviceTenantFilter.value = selectedFilter;
+    const unavailable = !loadedTenants.some((tenant) => !tenant.disabled);
+    $("zeroth-service-new").disabled = unavailable || serviceBusy;
+    $("zeroth-service-tenant-help").textContent = unavailable
+      ? "Create and enable a tenant before registering a service client."
+      : "Tenant ownership cannot be changed after registration.";
+  }
+
+  function renderServiceRows(clients) {
+    if (!serviceRows) return;
+    serviceRows.replaceChildren();
+    if (!clients.length) {
+      const row = document.createElement("tr");
+      const cell = document.createElement("td"); cell.colSpan = 7; cell.className = "zeroth-empty";
+      cell.textContent = serviceTenantFilter.value
+        ? "No service clients for this tenant. Register a machine identity or choose another tenant."
+        : "No service clients registered. Register a machine identity to grant a service access to tenant APIs.";
+      row.appendChild(cell); serviceRows.appendChild(row);
+    }
+    for (const client of clients) {
+      const row = document.createElement("tr"); row.dataset.serviceClientId = client.id;
+      const identity = document.createElement("td"); setText(identity, client.name, "zeroth-row-title"); setText(identity, client.id, "zeroth-row-meta zeroth-code");
+      const owner = document.createElement("td");
+      const tenant = loadedTenants.find((item) => item.id === client.tenantId);
+      setText(owner, tenant ? tenant.name : client.tenantId); setText(owner, client.tenantId, "zeroth-row-meta zeroth-code");
+      const state = document.createElement("td");
+      const disabled = client.disabled || Boolean(tenant && tenant.disabled);
+      const label = client.disabled ? "Disabled" : disabled ? "Tenant disabled" : "Enabled";
+      setText(state, label, disabled ? "zeroth-status zeroth-status-warn" : "zeroth-status zeroth-status-ok");
+      setText(state, `Revision ${client.revision} · ${client.tokenTtlSeconds}s tokens`, "zeroth-row-meta");
+      const audiences = document.createElement("td"); audiences.className = "zeroth-code zeroth-service-values"; audiences.textContent = (client.audiences || []).join("\n");
+      const scopes = document.createElement("td"); scopes.className = "zeroth-code zeroth-service-values"; scopes.textContent = (client.scopes || []).join("\n");
+      const keys = document.createElement("td"); keys.className = "zeroth-code zeroth-service-values";
+      keys.textContent = ((client.publicJwks && client.publicJwks.keys) || []).map((key) => key.kid).join("\n") || "No public keys";
+      const actions = document.createElement("td"); actions.className = "zeroth-row-actions";
+      for (const [text, name] of [["Edit / rotate keys", "zerothEditService"], [client.disabled ? "Enable" : "Disable", "zerothToggleService"]]) {
+        const button = document.createElement("button"); button.type = "button"; button.className = "zeroth-action";
+        button.textContent = text; button.dataset[name] = "true"; button.disabled = serviceBusy; actions.appendChild(button);
+      }
+      row.append(identity, owner, state, audiences, scopes, keys, actions); serviceRows.appendChild(row);
+    }
+    $("zeroth-service-summary").textContent = `${clients.length} service client${clients.length === 1 ? "" : "s"}${serviceTenantFilter.value ? ` · tenant ${serviceTenantFilter.value}` : ""}`;
+  }
+
+  async function loadServiceClients() {
+    if (!serviceRows) return;
+    const requestId = ++serviceRequestId;
+    const tenant = serviceTenantFilter.value;
+    serviceRows.setAttribute("aria-busy", "true");
+    loadedServiceClients = []; serviceRows.replaceChildren();
+    $("zeroth-service-summary").textContent = "Loading service clients…";
+    try {
+      const body = await api(tenant ? `${serviceClientsEndpoint}?tenant_id=${encodeURIComponent(tenant)}` : serviceClientsEndpoint);
+      if (requestId !== serviceRequestId) return;
+      if (!body || !Array.isArray(body.serviceClients)) throw new Error("Unexpected service client response");
+      loadedServiceClients = body.serviceClients; renderServiceRows(loadedServiceClients);
+    } catch (error) {
+      if (requestId === serviceRequestId) $("zeroth-service-summary").textContent = "Could not load service clients. Refresh to try again.";
+      throw error;
+    } finally {
+      if (requestId === serviceRequestId) serviceRows.setAttribute("aria-busy", "false");
+    }
+  }
+
+  function editServiceClient(client = null) {
+    if (serviceBusy) return;
+    editingServiceClient = client;
+    serviceForm.reset();
+    for (const name of ["id", "name", "tokenTtlSeconds"]) serviceForm.elements[name].value = client ? client[name] : name === "tokenTtlSeconds" ? 600 : "";
+    serviceForm.elements.id.disabled = Boolean(client);
+    serviceForm.elements.tenantId.value = client ? client.tenantId : serviceTenantFilter.value;
+    serviceForm.elements.tenantId.disabled = Boolean(client);
+    serviceForm.elements.audiences.value = client ? client.audiences.join("\n") : "";
+    serviceForm.elements.scopes.value = client ? client.scopes.join("\n") : "";
+    serviceForm.elements.publicJwks.value = client ? JSON.stringify(client.publicJwks, null, 2) : "";
+    serviceForm.elements.disabled.checked = Boolean(client && client.disabled);
+    $("zeroth-service-editor-title").textContent = client ? `Edit ${client.name}` : "Register service client";
+    $("zeroth-service-save").textContent = client ? "Save changes" : "Register service client";
+    $("zeroth-service-revoke").hidden = !client;
+    $("zeroth-service-revision").textContent = client ? `Current revision ${client.revision}` : "";
+    serviceEditor.hidden = false;
+    serviceEditor.scrollIntoView({block:"start", behavior:"smooth"});
+    serviceForm.elements[client ? "name" : "id"].focus({preventScroll:true});
+  }
+
+  function publicServiceJwks(raw) {
+    if (new TextEncoder().encode(raw).length > 16384) throw new Error("Public JWKS must not exceed 16 KiB.");
+    let jwks;
+    try { jwks = JSON.parse(raw); }
+    catch (_) {
+      if (raw.includes("PRIVATE KEY")) serviceForm.elements.publicJwks.value = "";
+      throw new Error("Enter a public JWKS JSON object. Never paste a private key.");
+    }
+    const isObject = (value) => value && typeof value === "object" && !Array.isArray(value);
+    if (!isObject(jwks) || Object.keys(jwks).some((key) => key !== "keys") || !Array.isArray(jwks.keys) || jwks.keys.length < 1 || jwks.keys.length > 8) throw new Error("Public JWKS must contain a keys array with 1–8 public ES256 keys.");
+    const allowed = new Set(["kty", "crv", "alg", "use", "kid", "x", "y"]);
+    const privateFields = new Set(["d", "p", "q", "dp", "dq", "qi", "oth", "k"]);
+    const ids = new Set();
+    for (const key of jwks.keys) {
+      if (isObject(key) && Object.keys(key).some((field) => privateFields.has(field))) {
+        serviceForm.elements.publicJwks.value = "";
+        throw new Error("Private key material was removed from this form and was not submitted. Register public keys only.");
+      }
+      if (!isObject(key) || Object.keys(key).some((field) => !allowed.has(field)) || key.kty !== "EC" || key.crv !== "P-256" || key.alg !== "ES256" || key.use !== "sig") throw new Error("Each public key requires kty EC, crv P-256, alg ES256, use sig, kid, x and y. Additional fields are not accepted.");
+      if (typeof key.kid !== "string" || !/^[A-Za-z0-9._:-]{1,128}$/.test(key.kid) || ids.has(key.kid)) throw new Error("Use distinct key IDs (kid), up to 128 ASCII letters, numbers, dots, colons, underscores or dashes.");
+      ids.add(key.kid);
+      for (const name of ["x", "y"]) {
+        const value = key[name];
+        if (typeof value !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(value)) throw new Error("P-256 public key coordinates must be unpadded base64url for 32 bytes.");
+        const decoded = base64urlToBuffer(value);
+        if (decoded.byteLength !== 32 || bufferToBase64url(decoded) !== value) throw new Error("P-256 public key coordinates must use canonical base64url.");
+      }
+    }
+    return jwks;
+  }
+
+  function serviceClientPayload() {
+    const list = (name) => [...new Set(splitLines(serviceForm.elements[name].value))];
+    const audiences = list("audiences"), scopes = list("scopes");
+    if (audiences.length < 1 || audiences.length > 10) throw new Error("Register 1–10 allowed audiences, one per line.");
+    if (audiences.some((audience) => audience.length > 256 || !/^[\x21-\x7e]+$/.test(audience) || audience.includes("*"))) throw new Error("Audiences must be exact ASCII identifiers of up to 256 characters, with no spaces or wildcards.");
+    if (scopes.length < 1 || scopes.length > 32) throw new Error("Register 1–32 allowed scopes, one per line.");
+    const reserved = new Set(["openid", "profile", "email", "offline_access", "address", "phone", "groups", "roles", "admin"]);
+    if (scopes.some((scope) => scope.length > 128 || !/^[a-z0-9._:/-]+$/.test(scope) || reserved.has(scope))) throw new Error("Use service-specific scopes of up to 128 characters with lowercase letters, numbers or ._:/-. Human login and reserved privilege scopes are not allowed.");
+    const ttl = Number(serviceForm.elements.tokenTtlSeconds.value);
+    if (!Number.isInteger(ttl) || ttl < 60 || ttl > 600) throw new Error("Access token lifetime must be an integer between 60 and 600 seconds.");
+    const payload = {
+      id: serviceForm.elements.id.value.trim(), tenantId: serviceForm.elements.tenantId.value,
+      name: serviceForm.elements.name.value.trim(), audiences, scopes,
+      publicJwks: publicServiceJwks(serviceForm.elements.publicJwks.value),
+      disabled: serviceForm.elements.disabled.checked, tokenTtlSeconds: ttl,
+    };
+    if (!/^svc_[A-Za-z0-9._:-]+$/.test(payload.id) || payload.id.length > 128) throw new Error("Choose a service client ID beginning with svc_, using ASCII letters, numbers, dots, colons, underscores or dashes.");
+    if (!payload.name || !payload.tenantId) throw new Error("Choose a tenant and a display name.");
+    if (Array.from(payload.name).length > 128 || /[\x00-\x1f\x7f]/.test(payload.name)) throw new Error("Use a display name of up to 128 characters without control characters.");
+    if (editingServiceClient) payload.expectedRevision = editingServiceClient.revision;
+    return payload;
+  }
+
+  function setServiceBusy(busy) {
+    serviceBusy = busy;
+    for (const control of serviceEditor.querySelectorAll("input, textarea, select, button")) control.disabled = busy;
+    if (!busy && editingServiceClient) {
+      serviceForm.elements.id.disabled = true;
+      serviceForm.elements.tenantId.disabled = true;
+    }
+    serviceTenantFilter.disabled = busy;
+    $("zeroth-services-refresh").disabled = busy;
+    refreshServiceTenantOptions();
+    for (const button of serviceRows.querySelectorAll("button")) button.disabled = busy;
+  }
+
+  async function persistServiceClient(payload, success) {
+    if (serviceBusy) return;
+    setServiceBusy(true);
+    try {
+      await api(serviceClientsEndpoint, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(payload)});
+      serviceEditor.hidden = true;
+      editingServiceClient = null;
+      serviceForm.reset();
+      try { await loadServiceClients(); }
+      catch (_) { setMessage(`${success} The list could not be refreshed. Refresh it before making another change.`, true); return; }
+      setMessage(success);
+    } finally { setServiceBusy(false); }
+  }
+
+  async function saveServiceClient(event) {
+    event.preventDefault();
+    if (serviceBusy) return;
+    const payload = serviceClientPayload();
+    if (editingServiceClient && !window.confirm(`Save changes to ${payload.name}? This advances its revision. Introspection will reject previously issued tokens; offline JWTs remain valid until expiry.`)) return;
+    await persistServiceClient(payload, `Saved ${payload.name}. ${editingServiceClient ? "The client revision has advanced." : "The machine identity is registered."}`);
+  }
+
+  async function changeServiceClient(client, revokeOnly = false) {
+    if (serviceBusy) return;
+    const action = revokeOnly ? "Revoke issued tokens" : client.disabled ? "Enable service client" : "Disable service client";
+    if (!window.confirm(`${action} ${client.name}? This advances its revision. Introspection enforces the change; offline JWTs can remain valid until expiry.${revokeOnly ? " The service can request new tokens with its registered signing keys." : ""}`)) return;
+    const payload = {id:client.id, tenantId:client.tenantId, name:client.name, audiences:client.audiences, scopes:client.scopes, publicJwks:client.publicJwks, tokenTtlSeconds:client.tokenTtlSeconds, disabled:revokeOnly ? client.disabled : !client.disabled, expectedRevision:client.revision};
+    // Revalidate the public-only boundary before serializing a cached resource.
+    payload.publicJwks = publicServiceJwks(JSON.stringify(payload.publicJwks));
+    await persistServiceClient(payload, `${action}: ${client.name}. The client revision has advanced.`);
   }
 
   async function saveTenant(event) {
@@ -1227,6 +1435,10 @@
     }
     await Promise.all([loadUsers(), loadEvents(), loadClients(), loadTenants()]);
     setMessage("");
+    // A service-client outage must not prevent other administration sections from loading.
+    await loadServiceClients().catch((error) => {
+      if (window.location.hash === "#service-clients" || document.querySelector("[data-zeroth-default-section='#service-clients']")) setMessage(error.message, true);
+    });
   }
 
   async function saveClient(event) {
@@ -1539,4 +1751,25 @@
   $("zeroth-client-reset").addEventListener("click", () => {
     resetClientForm();
   });
+
+  if (serviceForm) {
+    $("zeroth-service-new").addEventListener("click", () => editServiceClient());
+    $("zeroth-services-refresh").addEventListener("click", () => loadServiceClients().catch((error) => setMessage(error.message, true)));
+    serviceTenantFilter.addEventListener("change", () => {
+      serviceEditor.hidden = true; editingServiceClient = null;
+      loadServiceClients().catch((error) => setMessage(error.message, true));
+    });
+    for (const id of ["zeroth-service-close", "zeroth-service-cancel"]) $(id).addEventListener("click", () => { if (!serviceBusy) { serviceEditor.hidden = true; serviceForm.reset(); editingServiceClient = null; } });
+    serviceForm.addEventListener("submit", (event) => saveServiceClient(event).catch((error) => setMessage(error.message, true)));
+    $("zeroth-service-revoke").addEventListener("click", () => { if (editingServiceClient) changeServiceClient(editingServiceClient, true).catch((error) => setMessage(error.message, true)); });
+    serviceRows.addEventListener("click", (event) => {
+      const button = event.target instanceof Element && event.target.closest("button");
+      if (!button || serviceBusy) return;
+      const row = button.closest("tr");
+      const client = row && loadedServiceClients.find((item) => item.id === row.dataset.serviceClientId);
+      if (!client) { setMessage("Refresh service clients before editing this record.", true); return; }
+      if (button.dataset.zerothEditService) editServiceClient(client);
+      else if (button.dataset.zerothToggleService) changeServiceClient(client).catch((error) => setMessage(error.message, true));
+    });
+  }
 })();

@@ -18,6 +18,8 @@ use zeroth_core::{
 };
 use zeroth_server::{ZerothServerConfig, ROUTES};
 
+mod service_assertion;
+
 fn main() {
     let mut args = std::env::args().skip(1).collect::<Vec<_>>();
     let command = args.first().cloned().unwrap_or_else(|| "help".to_owned());
@@ -26,6 +28,7 @@ fn main() {
     }
 
     let result = match command.as_str() {
+        "service-assertion" => service_assertion::run(args),
         "routes" => {
             for route in ROUTES {
                 println!("{} {}", route.method, route.path);
@@ -762,6 +765,7 @@ fn print_usage() {
   zeroth password-policy benchmark
   zeroth password-policy validate
   zeroth validate-secret es256-private-key|apple-private-key|previous-public-jwks < secret-value
+  zeroth service-assertion --client-id SERVICE --key-id KID --audience HTTPS_ENDPOINT < private-key
   zeroth apple-client-secret --team-id TEAM --key-id KEY --client-id CLIENT --private-key AuthKey.p8 [--ttl-days 180]
   zeroth signing-key [--kid KID] [--format env|json]"
     );

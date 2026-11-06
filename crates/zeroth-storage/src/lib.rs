@@ -179,6 +179,12 @@ pub mod migrations {
         sql: include_str!("../migrations/0016_google_directory.sql"),
     };
 
+    pub const SERVICE_CLIENTS: Migration = Migration {
+        version: 17,
+        name: "service_clients",
+        sql: include_str!("../migrations/0017_service_clients.sql"),
+    };
+
     pub const ALL: &[Migration] = &[
         INIT,
         PASSKEYS,
@@ -196,6 +202,7 @@ pub mod migrations {
         TENANTS,
         PROVISIONING,
         GOOGLE_DIRECTORY,
+        SERVICE_CLIENTS,
     ];
 }
 
@@ -228,6 +235,9 @@ pub const REQUIRED_TABLES: &[&str] = &[
     "zeroth_directory_users",
     "zeroth_directory_links",
     "zeroth_google_directory",
+    "zeroth_service_clients",
+    "zeroth_service_assertions",
+    "zeroth_service_tokens",
 ];
 
 pub mod compatibility {
@@ -455,7 +465,8 @@ mod tests {
     fn init_migration_contains_auth_tables() {
         let sql = migrations::INIT.sql;
         for table in super::REQUIRED_TABLES.iter().copied().filter(|table| {
-            !table.starts_with("zeroth_passkey_")
+            !table.starts_with("zeroth_service_")
+                && !table.starts_with("zeroth_passkey_")
                 && *table != "zeroth_admin_memberships"
                 && *table != "zeroth_local_credentials"
                 && *table != "zeroth_magic_links"

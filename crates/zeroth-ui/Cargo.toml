@@ -8,5 +8,6 @@ homepage.workspace = true
 
 [dependencies]
 leptos.workspace = true
+serde_json.workspace = true
 url.workspace = true
 zeroth-providers.workspace = true

@@ -21,6 +21,7 @@ mod google_directory_worker;
 mod provisioning;
 mod provisioning_admin;
 mod scim;
+mod service_clients;
 mod tenants;
 #[cfg(any(test, target_arch = "wasm32"))]
 use enterprise::provider_policy_hash;
@@ -3639,13 +3640,16 @@ async fn handle_request(request: Request, env: Env) -> worker::Result<Response> 
         (Method::Get, "/profile-menu.js") => profile_menu_script(),
         (Method::Get, "/profile-panel.js") => profile_panel_script(),
         (Method::Get, "/admin") => hosted_clients_admin(request, env).await,
-        (Method::Get, "/admin/clients" | "/admin/tenants") => {
+        (Method::Get, "/admin/clients" | "/admin/tenants" | "/admin/service-clients") => {
             hosted_clients_admin(request, env).await
         }
         (Method::Get, "/authorize") => authorize(request, env).await,
         (Method::Get, "/__zeroth/db/status") => d1_schema_status(request, env).await,
         (Method::Post, "/__zeroth/db/ensure") => ensure_d1_schema(request, env).await,
         (Method::Get | Method::Post, "/oauth2/callback") => provider_callback(request, env).await,
+        (Method::Get | Method::Post, "/service-clients") => {
+            service_clients::manage(request, env).await
+        }
         (Method::Post, "/oauth/token") => oauth_token(request, env).await,
         (Method::Post, "/oauth/revoke") => oauth_revoke(request, env).await,
         (Method::Post, "/oauth/introspect") => oauth_introspect(request, env).await,
@@ -4243,6 +4247,11 @@ async fn clients(mut request: Request, env: Env) -> worker::Result<Response> {
             }
 
             let previous = get_client_row_for_admin(&db, &upsert.id).await?;
+            if upsert.id.starts_with("svc_") && previous.is_none() {
+                return client_management_error_json(&ClientManagementError::invalid_request(
+                    "svc_ client IDs are reserved for new service clients",
+                ));
+            }
             let details = client_audit_policy_details(previous.as_ref(), &upsert);
             let event = prepare_audit_event(
                 &db,
@@ -4665,6 +4674,9 @@ async fn events(request: Request, env: Env) -> worker::Result<Response> {
 
 #[cfg(target_arch = "wasm32")]
 async fn oauth_token(mut request: Request, env: Env) -> worker::Result<Response> {
+    if let Some(response) = service_clients::maybe_handle(&request, &env, false).await? {
+        return Ok(response);
+    }
     let request_url = request.url()?;
     let origin = request_origin(&request)?;
     let rate_limit_key = rate_limit_key_from_env(&env).map_err(worker_error)?;
@@ -5308,6 +5320,9 @@ async fn oauth_revoke(mut request: Request, env: Env) -> worker::Result<Response
 
 #[cfg(target_arch = "wasm32")]
 async fn oauth_introspect(mut request: Request, env: Env) -> worker::Result<Response> {
+    if let Some(response) = service_clients::maybe_handle(&request, &env, true).await? {
+        return Ok(response);
+    }
     let request_url = request.url()?;
     let origin = request_origin(&request)?;
     let form = match token_introspection_form_from_request(&mut request).await {
@@ -8795,6 +8810,7 @@ async fn hosted_clients_admin(request: Request, env: Env) -> worker::Result<Resp
             state.local_auth =
                 local_auth_admin_ui_rows(&env, magic_link_delivery_status(&db).await?);
             state.tenants = tenants::list_ui(&db, &env).await?;
+            state.service_clients = service_clients::list_ui(&db).await?;
             let rows = list_client_rows_for_admin(&db).await?;
             state.clients = rows
                 .into_iter()
@@ -8825,7 +8841,9 @@ async fn hosted_clients_admin(request: Request, env: Env) -> worker::Result<Resp
         }
     }
 
-    if canonical_route_path(url.path()) == "/admin/tenants" {
+    if canonical_route_path(url.path()) == "/admin/service-clients" {
+        html(zeroth_ui::render_service_clients_admin_document(state))
+    } else if canonical_route_path(url.path()) == "/admin/tenants" {
         html(render_tenants_admin_document(state))
     } else {
         html(render_clients_admin_document(state))
@@ -14937,6 +14955,7 @@ fn return_to_is_hosted_url(url: &url::Url, issuer_base_url: Option<&str>) -> boo
                 | "/admin"
                 | "/admin/clients"
                 | "/admin/tenants"
+                | "/admin/service-clients"
                 | "/admin/setup"
                 | "/audit"
                 | "/authorize"
@@ -20732,11 +20751,13 @@ fn discovery_response(config: &ZerothServerConfig) -> DiscoveryResponse {
         grant_types_supported: vec![
             "authorization_code",
             "refresh_token",
+            "client_credentials",
             TOKEN_EXCHANGE_GRANT_TYPE,
         ],
         scopes_supported: vec!["openid", "profile", "email", "offline_access"],
         code_challenge_methods_supported: vec!["S256"],
         token_endpoint_auth_methods_supported: vec![
+            "private_key_jwt",
             "none",
             "client_secret_post",
             "client_secret_basic",
@@ -20747,6 +20768,7 @@ fn discovery_response(config: &ZerothServerConfig) -> DiscoveryResponse {
             "client_secret_basic",
         ],
         introspection_endpoint_auth_methods_supported: vec![
+            "private_key_jwt",
             "client_secret_post",
             "client_secret_basic",
         ],

@@ -27,6 +27,8 @@ Zeroth now:
 - tenant SCIM endpoint and token-binding configuration, provisioned-user
   admission policy, and Google Directory polling, freshness and manual sync
 - audit filters, cursor navigation, and CSV export of the displayed page
+- tenant-owned service clients with public signing keys, audience/scope policy,
+  overlapping key rotation, revision revocation, and disable controls
 
 It is server-renderable today with `render_account_html` or
 `render_account_document` for login/account surfaces, and
@@ -35,6 +37,17 @@ management surface. `zeroth-worker` serves these Leptos documents from `/login`,
 `/authorize` provider-selection responses, `/account`, `/admin`, and
 `/admin/clients`. `render_tenants_admin_document` selects tenant management in
 the same shell at `/admin/tenants`.
+`render_service_clients_admin_document` selects `/admin/service-clients` using
+`ServiceClientsAdminUiState` and its `service_clients` rows. This state is an
+alias of the shared administration state, so tenant choices and CSRF handling
+stay consistent across screens.
+
+Service-client forms submit public ES256 JWKS only to `/service-clients`.
+Private JWK parameters are rejected before submission. Updates carry the
+loaded `expectedRevision` so a stale editor cannot overwrite a newer rotation.
+Every saved change advances the revision, which introspection enforces.
+Offline JWT verification can accept an issued token until its short expiry.
+The console never generates, returns, or stores a service's private key.
 
 Tenant forms accept a deployment secret **binding name**, never the provider
 secret value. Configuration presence is distinct from a successful provider
@@ -73,3 +86,14 @@ screenshots are saved. It verifies UI/API contracts, CSRF headers, confirmations
 filtering, paging, and exports; it does not exercise a live identity provider.
 It also checks binding-only provisioning writes, source-status isolation when
 switching tenants, immutable customer IDs, and completed/failed sync feedback.
+
+Preview and check machine identity management separately:
+
+```sh
+cargo run -p zeroth-ui --example admin_preview -- service-clients > /tmp/zeroth-service-clients-admin.html
+node crates/zeroth-ui/tests/service_clients_browser.cjs /tmp/zeroth-service-clients-admin.html
+```
+
+This browser fixture covers public-only registration, key rotation, stale
+revision conflicts, failed saves, revocation, disable, tenant-response races,
+empty/error states, and mobile overflow. It does not test live token issuance.

@@ -100,7 +100,7 @@ fn validate_consumer(value: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
-fn validate_endpoint(url: &url::Url) -> Result<(), &'static str> {
+pub(super) fn validate_endpoint(url: &url::Url) -> Result<(), &'static str> {
     let loopback = match url.host() {
         Some(url::Host::Domain(host)) => host == "localhost",
         Some(url::Host::Ipv4(ip)) => ip.is_loopback(),

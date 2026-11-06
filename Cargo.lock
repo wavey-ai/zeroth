@@ -4738,6 +4738,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "zeroth-core",
+ "zeroth-oidc",
  "zeroth-server",
  "zeroth-storage",
 ]
@@ -4795,6 +4796,7 @@ name = "zeroth-ui"
 version = "0.2.0"
 dependencies = [
  "leptos",
+ "serde_json",
  "url",
  "zeroth-providers",
 ]

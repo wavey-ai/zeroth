@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Zeroth machine authentication</title>
+<style>
+:root{color-scheme:light;--ink:#17313d;--muted:#52616a;--rule:#d5d8d5;--accent:#22636a}
+*{box-sizing:border-box}body{margin:0;background:#eeeee8;color:var(--ink);font:17px/1.65 Georgia,serif}main{max-width:1000px;margin:45px auto;padding:65px 72px;background:#fffef9}header{border-top:5px solid var(--accent);padding-top:25px;margin-bottom:35px}.eyebrow,.meta,th,footer{font-family:Arial,sans-serif}.eyebrow{font-size:12px;text-transform:uppercase;letter-spacing:.13em;color:var(--accent)}h1{font-size:46px;font-weight:normal;line-height:1.13;margin:18px 0 24px}.meta{font-size:12px;line-height:1.9;color:var(--muted);border-top:1px solid var(--rule);padding-top:15px}.meta span{display:inline-block;margin-right:24px}.summary{font-size:21px}h2{font-size:26px;font-weight:normal;border-top:1px solid var(--rule);padding-top:23px;margin:37px 0 18px}h3{font-size:20px;font-weight:normal;margin:25px 0 12px}a{color:var(--accent);text-underline-offset:3px}code,pre{font:13px/1.6 ui-monospace,Consolas,monospace}code{overflow-wrap:anywhere}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f1f3ef;padding:20px;border-left:3px solid var(--accent)}table{width:100%;border-collapse:collapse;font-size:15px}th,td{text-align:left;vertical-align:top;border-bottom:1px solid var(--rule);padding:12px 10px}th{font-size:11px;text-transform:uppercase;letter-spacing:.05em;border-top:2px solid var(--ink)}th:first-child,td:first-child{padding-left:0}li{margin-bottom:12px}footer{font-size:12px;color:var(--muted);margin-top:40px;border-top:1px solid var(--rule);padding-top:18px}
+@media(max-width:720px){main{margin:0;padding:32px 22px}h1{font-size:35px}.summary{font-size:19px}}
+@media print{body{background:white;font-size:11pt}main{margin:0;padding:0}h1{font-size:31pt}h2,h3{break-after:avoid}pre,tr{break-inside:avoid}a{color:inherit}}@page{size:A4;margin:20mm 17mm}
+</style></head><body><main>
+<header><div class="eyebrow">Zeroth · implementation guide</div><h1>Machine authentication</h1><div class="meta"><span>Ticket: not assigned</span><span>Date: 6 November 2026</span><span>Author: Codex, for Jamie</span></div></header>
+<p class="summary">A service registers its public keys with Zeroth and obtains short-lived, scoped access tokens over HTTPS. Its private key stays with the service. This authentication protocol works independently of AWS IAM, Azure subscriptions or Google Cloud projects.</p>
+<p>The <code>client_credentials</code> grant issues an access token to the service itself. <code>private_key_jwt</code> authenticates that service to the token endpoint using a signed assertion. This follows <a href="https://www.rfc-editor.org/rfc/rfc6749#section-4.4">RFC 6749 §4.4</a> and <a href="https://www.rfc-editor.org/rfc/rfc7523.html">RFC 7523</a>.</p>
+
+<h2>1. Register the service</h2>
+<p>Apply the ordinary Zeroth schema migrations, including <code>0017_service_clients</code>, before enabling the new endpoints. Use an administrator session to open <code>/admin/service-clients</code>. Select an existing tenant and register a service ID beginning with <code>svc_</code>, a display name, allowed API audiences, allowed scopes and a public JWKS. Choose a token lifetime between 60 and 600 seconds.</p>
+<p>Service identities have their own registry and do not create human accounts, browser sessions, ID tokens or refresh tokens. Their tenant binding is permanent. Tenant disablement blocks new service-token issuance.</p>
+<p>Generate an ES256 key in a secure directory outside the source checkout. The existing key generator produces both the private scalar and public JWKS:</p>
+<pre>umask 077
+zeroth signing-key --kid tier-key-v1 --format json &gt; /secure/tier-key.json
+jq '.public_jwks' /secure/tier-key.json</pre>
+<p>Paste only the public JWKS into the console. Keep the private file in the tier’s secret store. Register one to eight ES256/P-256 public keys with distinct <code>kid</code> values. Private JWK fields, unknown key parameters and unsupported algorithms are rejected.</p>
+<pre>{
+  "id": "svc_beta_runner",
+  "tenantId": "beta",
+  "name": "Beta release agent",
+  "audiences": ["https://control.example.com/releases"],
+  "scopes": ["releases:read", "receipts:write"],
+  "publicJwks": {"keys": ["REPLACE WITH THE PUBLIC JWK OBJECT"]},
+  "disabled": false,
+  "tokenTtlSeconds": 600
+}</pre>
+<p>The JSON above illustrates the management fields; replace the key placeholder with the public object emitted by the CLI. Administrators can also use <code>GET /service-clients?tenant_id=beta</code> and <code>POST /service-clients</code>. Browser mutations require the existing same-origin and <code>X-Zeroth-CSRF</code> checks. Updates must include the current <code>expectedRevision</code>.</p>
+
+<h2>2. Obtain an access token</h2>
+<p>Generate a fresh assertion for every HTTP attempt. The CLI reads the private scalar or private JWK from standard input, creates a random assertion identifier and signs a two-minute assertion. It writes the assertion without a trailing newline so curl can read it directly from a file.</p>
+<pre>jq -r '.jwt_es256_private_key' /secure/tier-key.json |
+  zeroth service-assertion \
+    --client-id svc_beta_runner \
+    --key-id tier-key-v1 \
+    --audience https://id.example.com/oauth/token \
+  &gt; /secure/assertion.jwt
+
+curl --fail-with-body https://id.example.com/oauth/token \
+  --data-urlencode grant_type=client_credentials \
+  --data-urlencode client_id=svc_beta_runner \
+  --data-urlencode client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer \
+  --data-urlencode client_assertion@/secure/assertion.jwt \
+  --data-urlencode resource=https://control.example.com/releases \
+  --data-urlencode 'scope=releases:read receipts:write'</pre>
+<p>The assertion’s <code>iss</code> and <code>sub</code> must both equal the service ID. Its <code>aud</code> must exactly match the configured HTTPS token endpoint. Zeroth requires an issued-at time, a short expiry and a unique <code>jti</code>. Assertion identifiers are consumed durably. A concurrent replay can produce only one successful issuance.</p>
+<p><code>resource</code> selects one registered audience. The compatibility field <code>audience</code> is accepted when supplied alone. Supplying both is rejected. Requested scopes must be explicitly granted to the service; human OIDC scopes are reserved.</p>
+<pre>{
+  "access_token": "SIGNED SERVICE ACCESS TOKEN",
+  "token_type": "Bearer",
+  "expires_in": 600,
+  "scope": "releases:read receipts:write"
+}</pre>
+<p>The Rust API in <code>zeroth_oidc::service</code> exposes assertion construction and signing helpers, service policy types and access-token verification. Applications can keep keys in their own signing system while using the same HTTP protocol.</p>
+
+<h2>3. Verify identity at the receiving API</h2>
+<p>Use <code>verify_service_access_token</code> with trusted issuer keys and explicit expected issuer, tenant, audience, required scopes and current time. Obtain Zeroth’s public keys from its configured JWKS endpoint and maintain a bounded key cache. Select the separate service-token verifier when authorizing machine requests.</p>
+<table><thead><tr><th>Claim</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>sub</code>, <code>client_id</code></td><td>The same registered service identity.</td></tr>
+<tr><td><code>tenant_id</code></td><td>The immutable tenant that owns the service.</td></tr>
+<tr><td><code>aud</code>, <code>scope</code></td><td>The intended API and explicitly granted operations.</td></tr>
+<tr><td><code>principal_type</code>, <code>token_use</code></td><td><code>service</code> and <code>access</code>. Human-token verification rejects the service discriminator.</td></tr>
+<tr><td><code>client_revision</code></td><td>The service policy revision at issuance.</td></tr>
+<tr><td><code>iat</code>, <code>exp</code>, <code>jti</code></td><td>Issue time, bounded expiry and a token identifier.</td></tr>
+</tbody></table>
+<p>The receiving API maps the service identity to its own resource permissions. For release management, that means mapping the service to one tier and enforcing access to that tier’s catalog and receipts. Deployment approval and local cloud permissions belong to the release system.</p>
+
+<h2>4. Rotate keys and revoke access</h2>
+<ol>
+<li>Add the new public key alongside the old one using an update with the current revision.</li>
+<li>Switch the service to signing assertions with the new key and key ID.</li>
+<li>Remove the old public key in another revision-checked update. Old-key assertions will then fail.</li>
+<li>Disable the service to block its authentication and new token issuance. The console’s revoke action advances the policy revision while leaving the service enabled.</li>
+</ol>
+<p>Every update advances the policy revision. Concurrent stale edits are rejected. Issuance checks the current client and tenant policy in the same database transaction as the replay claim, token record and audit evidence.</p>
+<p><strong>Offline verification has a bounded revocation delay.</strong> A signed token can remain valid until its expiry, at most ten minutes. APIs requiring a fresher decision must perform an online policy check. Existing tokens never gain new permissions from a subsequent policy expansion.</p>
+<p>An enabled service can introspect its own tokens through <code>POST /oauth/introspect</code>, using a fresh client assertion whose audience is the exact introspection endpoint. Include <code>client_id</code>, <code>client_assertion_type</code>, <code>client_assertion</code> and <code>token</code>. Expired, foreign-client or old-revision tokens return <code>active: false</code>. A disabled service cannot authenticate to this endpoint. Cross-client resource-server introspection is outside the current grant model.</p>
+
+<h2>5. Cloud boundaries</h2>
+<p>The identity exchange needs outbound HTTPS and the service’s registered signing key. It requires no cross-account IAM role. The current hosted issuer uses the existing Worker/D1 adapter; the protocol and <code>zeroth-oidc</code> verification library carry no cloud IAM requirement.</p>
+<p>A tier still needs local permissions for its infrastructure. AWS registry pulls and deployment calls use the AWS adapter’s IAM permissions. Azure and Google adapters use their own registry, secret and deployment credentials. A Zeroth access token is not an ECR login token.</p>
+<p>Zeroth supplies identity, scopes and identity audit. The release catalog, signed deployment manifests, durable receipts and tier adoption policy remain separate release-system responsibilities.</p>
+
+<h2>6. Validation</h2>
+<p>The native suite covers assertion signatures, client and audience binding, input bounds, scope grants, tenant binding, human/service token separation and SQL transaction guards. The local Worker/D1 acceptance harness exercises real HTTP registration, issuance, concurrent replay, rotation, disablement, restart persistence and audit redaction:</p>
+<pre>cargo test --workspace --all-targets --locked
+cargo check -p zeroth-worker --target wasm32-unknown-unknown --locked
+node crates/zeroth-worker/test/machine-http-integration.mjs</pre>
+<p>The HTTP harness uses synthetic keys and a private temporary D1 database. It requires the same local worker-build, wasm-bindgen and Wrangler tools as <code>test/local-http-integration.mjs</code>. It contacts no Cloudflare account or live tenant.</p>
+<footer>Zeroth · Machine identities · Authentication protocol: OAuth client credentials and signed JWT client assertions</footer>
+</main></body></html>

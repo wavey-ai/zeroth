@@ -51,6 +51,14 @@ pub const ROUTES: &[Route] = &[
     },
     Route {
         method: "GET",
+        path: "/service-clients",
+    },
+    Route {
+        method: "POST",
+        path: "/service-clients",
+    },
+    Route {
+        method: "GET",
         path: "/users",
     },
     Route {
@@ -140,6 +148,10 @@ pub const ROUTES: &[Route] = &[
     Route {
         method: "GET",
         path: "/admin/tenants",
+    },
+    Route {
+        method: "GET",
+        path: "/admin/service-clients",
     },
     Route {
         method: "GET",

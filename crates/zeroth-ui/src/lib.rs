@@ -7,6 +7,9 @@ use leptos::prelude::*;
 
 mod provisioning;
 use provisioning::TenantProvisioningPanel;
+mod service_clients;
+pub use service_clients::ServiceClientAdminUi;
+use service_clients::ServiceClientsAdminPanel;
 use url::{form_urlencoded, Url};
 use zeroth_providers::well_known;
 
@@ -1916,6 +1919,7 @@ pub struct ClientsAdminUiState {
     pub users: Vec<UserAdminUi>,
     pub events: Vec<EventAdminUi>,
     pub tenants: Vec<TenantAdminUi>,
+    pub service_clients: Vec<ServiceClientAdminUi>,
     pub initial_section: String,
 }
 
@@ -1934,6 +1938,7 @@ impl ClientsAdminUiState {
             users: Vec::new(),
             events: Vec::new(),
             tenants: Vec::new(),
+            service_clients: Vec::new(),
             initial_section: "#overview".to_owned(),
         }
     }
@@ -1956,6 +1961,9 @@ impl ClientsAdminUiState {
 
 /// Tenant management uses the same deployment administration shell.
 pub type TenantsAdminUiState = ClientsAdminUiState;
+
+/// Service identities use the same deployment administration shell.
+pub type ServiceClientsAdminUiState = ClientsAdminUiState;
 
 /// Complete state for the default Zeroth UI.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2151,6 +2159,12 @@ pub fn render_clients_admin_document(state: ClientsAdminUiState) -> String {
 /// Renders tenant settings with the tenant section selected on first load.
 pub fn render_tenants_admin_document(mut state: TenantsAdminUiState) -> String {
     state.initial_section = "#tenants".to_owned();
+    render_clients_admin_document(state)
+}
+
+/// Renders machine identity management with its section selected on first load.
+pub fn render_service_clients_admin_document(mut state: ServiceClientsAdminUiState) -> String {
+    state.initial_section = "#service-clients".to_owned();
     render_clients_admin_document(state)
 }
 
@@ -2645,6 +2659,7 @@ pub fn ClientsAdminApp(state: ClientsAdminUiState) -> impl IntoView {
         users,
         events,
         tenants,
+        service_clients,
         initial_section,
     } = state;
     let client_count = clients.len().to_string();
@@ -2676,6 +2691,7 @@ pub fn ClientsAdminApp(state: ClientsAdminUiState) -> impl IntoView {
             }
         })
         .collect_view();
+    let service_client_tenants = tenants.clone();
     let tenant_rows = tenants.into_iter().map(tenant_admin_row).collect_view();
     let user_rows = users.into_iter().map(user_admin_row).collect_view();
     let event_rows = events.into_iter().map(event_admin_row).collect_view();
@@ -2683,8 +2699,11 @@ pub fn ClientsAdminApp(state: ClientsAdminUiState) -> impl IntoView {
     let tenant_callback_url = format!("{}/oauth2/callback", issuer_base_url.trim_end_matches('/'));
     let admin_signin_url = admin_login_url.clone();
     let tenant_initial = initial_section == "#tenants";
+    let service_clients_initial = initial_section == "#service-clients";
     let initial_title = if tenant_initial {
         "Tenants"
+    } else if service_clients_initial {
+        "Service clients"
     } else {
         "Overview"
     };
@@ -2701,12 +2720,13 @@ pub fn ClientsAdminApp(state: ClientsAdminUiState) -> impl IntoView {
                 </div>
                 <nav class="zeroth-nav" aria-label="Management sections" data-zeroth-section-nav="true" data-zeroth-tabs="true" data-zeroth-default-section=initial_section>
                     <div class="zeroth-nav-section">"Workspace"</div>
-                    <a href="#overview" aria-current=(!tenant_initial).then_some("page")>"Overview"</a>
+                    <a href="#overview" aria-current=(!tenant_initial && !service_clients_initial).then_some("page")>"Overview"</a>
                     <div class="zeroth-nav-section">"User Management"</div>
                     <a href="#users">"Users"</a>
                     <a href="#tenants" aria-current=tenant_initial.then_some("page")>"Tenants"</a>
                     <div class="zeroth-nav-section">"Applications"</div>
                     <a href="#clients">"Applications"</a>
+                    <a href="#service-clients" aria-current=service_clients_initial.then_some("page")>"Service clients"</a>
                     <div class="zeroth-nav-section">"Authentication"</div>
                     <a href="#providers">"Connections"</a>
                     <a href="#local-auth">"Login methods"</a>
@@ -2966,6 +2986,8 @@ pub fn ClientsAdminApp(state: ClientsAdminUiState) -> impl IntoView {
                             <div class="zeroth-table-scroll"><table class="zeroth-table"><thead><tr><th>"Recorded event"</th><th>"Actor / subject"</th><th>"Tenant / application"</th><th>"Outcome"</th><th>"Evidence"</th></tr></thead><tbody id="zeroth-event-rows">{event_rows}</tbody></table></div>
                             <div class="zeroth-pagination"><span id="zeroth-events-page-status" role="status">"Latest loaded events"</span><div class="zeroth-actions"><button class="zeroth-action" id="zeroth-events-latest" type="button">"Back to latest"</button><button class="zeroth-action" id="zeroth-events-next" type="button" disabled=true>"Older events →"</button></div></div>
                         </section>
+
+                        <ServiceClientsAdminPanel clients=service_clients tenants=service_client_tenants />
 
                         <section id="clients" class="zeroth-panel">
                             <div class="zeroth-panel-header">

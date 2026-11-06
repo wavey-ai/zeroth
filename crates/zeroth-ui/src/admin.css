@@ -103,3 +103,13 @@
 .zeroth-tenant-access { max-width: 230px; font-weight: 600; }
 .zeroth-tenant-access[data-state="active"] { color: var(--z-green); }
 .zeroth-tenant-access[data-state="inactive"], .zeroth-tenant-access[data-state="deleted"], .zeroth-tenant-access[data-state="unprovisioned"], .zeroth-tenant-access[data-state="stale"], .zeroth-tenant-access[data-state="tenant_disabled"] { color: var(--z-red); }
+.zeroth-service-intro { display: grid; grid-template-columns: minmax(0, 1fr) minmax(180px, 260px); gap: 12px 28px; align-items: start; }
+.zeroth-service-intro > .zeroth-help:last-child { grid-column: 1 / -1; margin-bottom: 0; }
+.zeroth-admin #service-clients .zeroth-table { min-width: 1020px; }
+.zeroth-admin #service-clients .zeroth-table td { max-width: 260px; overflow-wrap: anywhere; }
+.zeroth-admin #service-clients .zeroth-table td:nth-child(4) { min-width: 210px; }
+.zeroth-admin #service-clients .zeroth-table td:nth-child(5), .zeroth-admin #service-clients .zeroth-table td:nth-child(6) { min-width: 160px; }
+.zeroth-service-values { white-space: pre-wrap; }
+.zeroth-service-jwks { width: 100%; resize: vertical; line-height: 1.6; min-height: 200px; }
+.zeroth-service-revocation .zeroth-help { max-width: 85ch; }
+@media(max-width:600px) { .zeroth-service-intro { grid-template-columns: minmax(0, 1fr); } .zeroth-admin #service-clients > .zeroth-panel-header { align-items: flex-start; flex-direction: column; gap: 14px; } }
